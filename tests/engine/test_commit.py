@@ -110,6 +110,7 @@ def test_second_call_after_commit_makes_no_new_commit(tmp_path: Path) -> None:
 
     ok, detail = gate.commit_and_push(paths(root), [PLAN_REL], MSG)
     assert ok is True, detail
+    assert detail == git(root, "rev-parse", "--short", "HEAD")
     head_after_first = git(root, "rev-parse", "HEAD")
     count_after_first = commit_count(root)
 
@@ -117,6 +118,7 @@ def test_second_call_after_commit_makes_no_new_commit(tmp_path: Path) -> None:
 
     assert ok is True, detail
     assert "нечего коммитить" in detail
+    assert detail == f"нечего коммитить: своих изменений нет (HEAD {git(root, 'rev-parse', '--short', 'HEAD')})"
     assert git(root, "rev-parse", "HEAD") == head_after_first
     assert commit_count(root) == count_after_first
     assert head_files(root) == [PLAN_REL]
@@ -143,4 +145,14 @@ def test_push_runs_when_upstream_configured(tmp_path: Path) -> None:
 
     assert ok is True, detail
     assert head_files(root) == sorted([PLAN_REL, REPORT_REL])
+    assert git(root, "rev-parse", "origin/main") == git(root, "rev-parse", "HEAD")
+    assert detail.split(" · ")[0] == git(root, "rev-parse", "--short", "HEAD")
+
+    # D3: повтор после успешного коммита и пуша — «нечего коммитить», но пуш всё равно
+    # доходит до origin (иначе отложенный коммит из pending_commit не дотолкает изменения).
+    ok, detail = gate.commit_and_push(paths(root), [PLAN_REL, REPORT_REL], MSG)
+
+    assert ok is True, detail
+    assert "нечего коммитить" in detail
+    assert "пуш выполнен" in detail
     assert git(root, "rev-parse", "origin/main") == git(root, "rev-parse", "HEAD")

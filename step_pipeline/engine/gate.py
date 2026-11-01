@@ -285,17 +285,18 @@ def commit_and_push(p: Paths, files: list[str], message: str) -> tuple[bool, str
     add = _run(["git", "add", "--", *files], p.repo)
     if add.returncode != 0:
         return False, f"git add: {add.stderr.strip()[:200]}"
-    changed = [ln.strip() for ln in _run(
-        ["git", "diff", "--cached", "--name-only", "--", *files], p.repo).stdout.splitlines()
-        if ln.strip()]
-    sha = _run(["git", "rev-parse", "--short", "HEAD"], p.repo).stdout.strip()
+    diff = _run(["git", "diff", "--cached", "--name-only", "--", *files], p.repo)
+    if diff.returncode != 0:
+        return False, f"git diff: {diff.stderr.strip()[:200]}"
+    changed = [ln.strip() for ln in diff.stdout.splitlines() if ln.strip()]
     if changed:
         commit = _run(["git", "commit", "-m", message, "--", *files], p.repo)
         if commit.returncode != 0:
             return False, f"git commit: {(commit.stderr or commit.stdout).strip()[:200]}"
-        detail = sha
-    else:
-        detail = f"нечего коммитить: своих изменений нет (HEAD {sha})"
+    # sha читается один раз и уже ПОСЛЕ коммита: в ветке «нечего коммитить» HEAD не меняется,
+    # поэтому одно чтение покрывает обе ветки, а detail всегда указывает на коммит шага.
+    sha = _run(["git", "rev-parse", "--short", "HEAD"], p.repo).stdout.strip()
+    detail = sha if changed else f"нечего коммитить: своих изменений нет (HEAD {sha})"
     if p.cfg.git_push:
         upstream = _run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name",
                          "@{upstream}"], p.repo)
