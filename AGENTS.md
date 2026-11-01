@@ -42,8 +42,9 @@ hermes plugins validate step_pipeline   # манифест, инструмент
 
 ## Типовые задачи
 
-**Добавить роль.** Скилл в `step_pipeline/roles/<имя>/SKILL.md`, имя в `SKILL_MAP`
-(`setup_flow.py`), список ролей и лимиты — в `templates/pipeline.json.example`.
+**Добавить роль.** Скилл в `step_pipeline/roles/<имя>/SKILL.md`, строка в
+`SKILL_CATEGORIES` (`setup_flow.py`) — какая категория `.hermes/skills/` её получит,
+и упоминание в `templates/pipeline.json.example` (роль + лимиты).
 
 **Изменить движок.** Правится только `step_pipeline/engine/`; затем `pytest` целиком
 (тесты движка в `tests/engine/`), инкремент версии, `CHANGELOG.md`, а в проектах —
