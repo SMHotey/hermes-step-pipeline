@@ -67,8 +67,13 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def section_blocks(lines: list[str]) -> list[tuple[str, str]]:
-    """Пункты раздела плана: (метка, текст). Метка — префикс пункта до двоеточия."""
+def section_blocks(lines: list[str]) -> list[tuple[str, str, str]]:
+    """Пункты раздела плана: (метка, текст, полный текст).
+
+    Метка — префикс пункта до двоеточия, текст — остаток после него, полный —
+    весь пункт целиком (метка + текст): по нему ищется критерий «Готово =»,
+    даже если внутри критерия есть своё двоеточие.
+    """
     chunks: list[tuple[str, list[str]]] = []
     for line in lines:
         if not line.strip():
@@ -80,7 +85,7 @@ def section_blocks(lines: list[str]) -> list[tuple[str, str]]:
             chunks[-1][1].append(line.strip())
         else:
             chunks.append((line.strip(), []))
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
     for head, rest in chunks:
         label = ""
         if ":" in head:
@@ -88,7 +93,10 @@ def section_blocks(lines: list[str]) -> list[tuple[str, str]]:
             if 0 < len(candidate) <= 40 and "`" not in candidate:
                 label = candidate.strip().lower()
         body = head.split(":", 1)[1].strip() if label else head
-        out.append((label, _norm(body + " " + " ".join(rest)) if rest else _norm(body)))
+        tail = " ".join(rest)
+        text = _norm(body + " " + tail) if rest else _norm(body)
+        full = _norm(head + " " + tail) if rest else _norm(head)
+        out.append((label, text, full))
     return out
 
 
@@ -131,7 +139,7 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
     title = _norm(title_src) or _norm(raw_title)
     blocks = section_blocks(body)
     goal = ""
-    for label, text in blocks:
+    for label, text, _full in blocks:
         if len(text) < 15 or (label and label.startswith(_GOAL_SKIP_LABELS)):
             continue
         if text.lower().startswith("готово"):
@@ -144,7 +152,7 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
     gates: list[str] = []
     dod = ""
     notes: list[str] = []
-    for label, text in blocks:
+    for label, text, full in blocks:
         if label.startswith("файл"):
             files += [t for t in _backticks(text) if _looks_like_path(t)]
         elif label.startswith(("тест", "гейт", "проверк")):
@@ -156,7 +164,7 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
             if m:
                 owner = m.group(1)
         if not dod:
-            ready = _READY_RE.search(text)
+            ready = _READY_RE.search(full)
             if ready:
                 dod = ready.group("rest").strip()
     return Step(id=sid, epoch="", title=title, days=days, owner=owner, goal=goal,
@@ -167,7 +175,9 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
 def plan_steps(cfg: config_mod.Config, plan_file: Path) -> list[Step]:
     """Шаги плана из файла: раздел шагов → заголовки `### <ШАГ>. название`.
 
-    Жёсткого списка идентификаторов нет — годится `T10`, `E15a`, `S25-8`.
+    Идентификатор шага разбирается выражением `step_id_regex` из `pipeline.json`
+    (жёсткого списка нет — годится `T10`, `E15a`, `S25-8`); после идентификатора
+    в заголовке обязательна точка: `### Ш1. Название` — шаг, `### Шаг первый` — нет.
     Пустой список = в плане нет раздела шагов с такими заголовками.
     """
     path = Path(plan_file)
@@ -180,13 +190,18 @@ def plan_steps(cfg: config_mod.Config, plan_file: Path) -> list[Step]:
     start, end = span
     inside = [h for h in registry.headings(lines) if start < h[0] < end]
     steps: list[Step] = []
-    for pos, (idx, _level, _title) in enumerate(inside):
-        m = re.match(r"^#{1,6}\s+(?P<id>[A-Za-z]{1,4}\d+[A-Za-z]?(?:-\d+)?)\.\s*(?P<title>.+?)\s*$",
-                     lines[idx])
+    for pos, (idx, _level, title) in enumerate(inside):
+        m = cfg.step_regex.match(title)
         if not m:
             continue
+        rest = title[m.end():].strip()
+        if not rest.startswith("."):
+            continue
+        step_title = rest[1:].strip()
+        if not step_title:
+            continue
         body_end = registry.section_end(inside, pos, end)
-        steps.append(_step_from_section(cfg, m.group("id").upper(), m.group("title"),
+        steps.append(_step_from_section(cfg, m.group("id").upper(), step_title,
                                         lines[idx + 1:body_end], path))
     return steps
 

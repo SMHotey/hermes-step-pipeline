@@ -216,25 +216,10 @@ def verdict_of(p: Paths, step_id: str) -> dict | None:
 # ───────────────────────────── журнал плана ─────────────────────────────
 
 def _journal_rows(p: Paths) -> list[int]:
-    """Индексы строк таблицы журнала (после заголовка раздела своего плана)."""
+    """Индексы строк таблицы журнала: раздел ищет реестр планов, не страж."""
     lines = Path(p.plan_file).read_text(encoding="utf-8", errors="replace").splitlines()
-    marker = p.cfg.journal_marker
-    start = None
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("#") and marker in stripped.lower():
-            start = i
-            break
-    if start is None:
-        return []
-    rows: list[int] = []
-    for i in range(start + 1, len(lines)):
-        stripped = lines[i].strip()
-        if stripped.startswith("## "):
-            break
-        if stripped.startswith("|"):
-            rows.append(i)
-    return rows
+    found = registry.journal_section(lines, p.cfg.journal_marker, p.step_re)
+    return list(found[1]) if found else []
 
 
 def journal_closed(p: Paths, step_id: str) -> bool:
@@ -244,13 +229,9 @@ def journal_closed(p: Paths, step_id: str) -> bool:
         return False
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     for i in _journal_rows(p):
-        cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
-        if len(cells) < 5:
+        if registry.step_of_row(lines[i], p.step_re) != step_id.upper():
             continue
-        m = p.step_re.match(cells[1])
-        if not m or m.group("id").upper() != step_id.upper():
-            continue
-        if cells[-1].upper().startswith("ЗАКРЫТ"):
+        if registry.status_of_row(lines[i]).startswith("ЗАКРЫТ"):
             return True
     return False
 
@@ -276,11 +257,7 @@ def append_journal_row(p: Paths, step_id: str, title: str, commit: str, evidence
     row = "| " + " | ".join(c.replace("|", "/").replace("\n", " ") for c in cells) + " |"
     target = None
     for i in rows:
-        row_cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
-        if len(row_cells) < 2:
-            continue
-        m = p.step_re.match(row_cells[1])
-        if m and m.group("id").upper() == step_id.upper():
+        if registry.step_of_row(lines[i], p.step_re) == step_id.upper():
             target = i
             break
     if target is not None:

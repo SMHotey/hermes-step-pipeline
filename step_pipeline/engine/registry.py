@@ -8,6 +8,8 @@
 
 Журнал проекта устроен так: `| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |`.
 Ограничение обобщения сознательное: колонка шага обязана быть второй.
+Идентификатор шага в строке журнала распознаётся выражением `step_id_regex` из
+`pipeline.json`, а строка журнала — ровно пять колонок (`JOURNAL_COLUMNS`).
 
 Файлы состояния — по одному комплекту на план: `plan_<НОМЕР>_state.json` и
 `plan_<НОМЕР>_stop.json` в каталоге `paths.state`.
@@ -27,6 +29,8 @@ import config as config_mod  # noqa: E402 - модуль рядом
 
 _PLAN_FILE_RE = re.compile(r"^(?P<id>\d{1,2})-")
 _HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>\S.*?)\s*$")
+# Строка журнала: `Дата | Шаг | Коммиты | Прогоны и доказательства | Статус`.
+JOURNAL_COLUMNS = 5
 
 
 class PlanNotFound(LookupError):
@@ -94,34 +98,38 @@ def section_end(found: list[tuple[int, int, str]], pos: int, limit: int) -> int:
     return limit
 
 
-def journal_section(lines: list[str], marker: str) -> tuple[str, list[int]] | None:
-    """Заголовок первого раздела-журнала со строками шагов и индексы его таблицы."""
+def journal_section(lines: list[str], marker: str,
+                    step_re: re.Pattern) -> tuple[str, list[int]] | None:
+    """Заголовок первого раздела-журнала со строками шагов и индексы его таблицы.
+
+    Разделом может быть только заголовок уровня не ниже 2 (H1 — заголовок документа),
+    а строка шага распознаётся выражением `step_id_regex` из `pipeline.json`.
+    """
     found = headings(lines)
-    for pos, (_idx, _level, title) in enumerate(found):
-        if marker not in title.lower():
+    for pos, (_idx, level, title) in enumerate(found):
+        if level < 2 or marker not in title.lower():
             continue
         start = found[pos][0]
         end = section_end(found, pos, len(lines))
         rows = [i for i in range(start + 1, end) if lines[i].strip().startswith("|")]
-        if any(step_of_row(lines[i], None) for i in rows):
+        if any(step_of_row(lines[i], step_re) for i in rows):
             return lines[start].strip(), rows
     return None
 
 
-def step_of_row(line: str, step_re: re.Pattern | None) -> str | None:
+def step_of_row(line: str, step_re: re.Pattern) -> str | None:
     """Идентификатор шага из строки журнала (вторая колонка) или None."""
     cells = [c.strip() for c in line.strip().strip("|").split("|")]
-    if len(cells) < 3:
+    if len(cells) < JOURNAL_COLUMNS:
         return None
-    pattern = step_re or re.compile(r"^(?P<id>[A-Za-z]{1,4}\d+[A-Za-z]?(?:-\d+)?)")
-    m = pattern.match(cells[1])
+    m = step_re.match(cells[1])
     return m.group("id").upper() if m else None
 
 
 def status_of_row(line: str) -> str:
     """Статус шага — последняя колонка строки журнала (в верхнем регистре)."""
     cells = [c.strip() for c in line.strip().strip("|").split("|")]
-    return cells[-1].upper() if len(cells) >= 3 else ""
+    return cells[-1].upper() if len(cells) >= JOURNAL_COLUMNS else ""
 
 
 def closed_steps(spec: PlanSpec, cfg: config_mod.Config) -> list[str]:
@@ -130,7 +138,7 @@ def closed_steps(spec: PlanSpec, cfg: config_mod.Config) -> list[str]:
     if not path.is_file():
         return []
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    found = journal_section(lines, cfg.journal_marker)
+    found = journal_section(lines, cfg.journal_marker, cfg.step_regex)
     if not found:
         return []
     closed: set[str] = set()
@@ -168,7 +176,7 @@ def discover(cfg: config_mod.Config) -> list[PlanSpec]:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
-        section = journal_section(lines, cfg.journal_marker)
+        section = journal_section(lines, cfg.journal_marker, cfg.step_regex)
         if not section:
             continue
         found.append(_make_spec(cfg, normalize(m.group("id")), path, section[0]))

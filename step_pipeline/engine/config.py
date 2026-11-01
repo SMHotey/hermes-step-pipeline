@@ -207,6 +207,13 @@ def load(repo: Path | str | None = None) -> Config:
         state_dir = root / state_dir
 
     regex = str(raw.get("step_id_regex") or DEFAULTS["step_id_regex"])
+    pattern = regex if regex.startswith("^") else "^" + regex
+    try:
+        step_regex = re.compile(pattern)
+    except re.error as exc:
+        raise ConfigError(f"step_id_regex не компилируется: {pattern}: {exc}") from exc
+    if "id" not in step_regex.groupindex:
+        raise ConfigError(f"в step_id_regex нет именованной группы id: {pattern}")
 
     cfg = Config(
         repo=root,
@@ -224,7 +231,7 @@ def load(repo: Path | str | None = None) -> Config:
         state_dir=state_dir,
         journal_marker=str((raw.get("markers") or {}).get("journal") or "журнал").lower(),
         steps_marker=str((raw.get("markers") or {}).get("steps") or "шаг").lower(),
-        step_regex=re.compile("^" + regex if not regex.startswith("^") else regex),
+        step_regex=step_regex,
         default_plan=(str(raw["default_plan"]) if raw.get("default_plan") else None),
         driven=driven,
         require_prompt=bool(raw.get("require_prompt", True)),
