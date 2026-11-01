@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -134,6 +135,22 @@ class Config:
         return self._raw
 
     _raw: dict = None  # type: ignore[assignment]
+
+
+def setup_stdio() -> None:
+    """UTF-8 в stdout/stderr.
+
+    Без этого на Windows-консолях (cp1251) любой русский вывод движка падает
+    с UnicodeEncodeError, и страж выглядит «сломанным». Вызывается из main().
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is None:  # подменённый поток (pytest, IDE)
+            continue
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
 
 
 def _kanban_db(board: str) -> Path:

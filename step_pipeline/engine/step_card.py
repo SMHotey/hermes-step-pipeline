@@ -25,6 +25,7 @@ import registry  # noqa: E402 - реестр планов
 
 
 def main(argv: list[str] | None = None) -> int:
+    config_mod.setup_stdio()
     ap = argparse.ArgumentParser(description="Следующий шаг плана → карточка канбана")
     ap.add_argument("--plan", help="номер плана (по умолчанию из pipeline.json)")
     ap.add_argument("--step", help="id шага (S3a); по умолчанию — следующий открытый")

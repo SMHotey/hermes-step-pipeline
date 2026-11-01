@@ -1011,6 +1011,7 @@ def tick(cfg: config_mod.Config, execute: bool = True) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    config_mod.setup_stdio()
     ap = argparse.ArgumentParser(description="Страж шага: шаг → ревью → следующий шаг")
     ap.add_argument("--plan", help="номер плана (по умолчанию из pipeline.json)")
     ap.add_argument("--plans", action="store_true",

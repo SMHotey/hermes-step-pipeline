@@ -147,6 +147,18 @@ def run_hermes(*args: str, timeout: int = 180) -> subprocess.CompletedProcess:
                           encoding="utf-8", errors="replace", timeout=timeout)
 
 
+def setup_stdio() -> None:
+    """UTF-8 в stdout/stderr плагина: Windows-консоль по умолчанию cp1251."""
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is None:
+            continue
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def slug(name: str) -> str:
     cleaned = "".join(ch if (ch.isascii() and (ch.isalnum() or ch in "-_")) else "-"
                       for ch in name.lower()).strip("-")

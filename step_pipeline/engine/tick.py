@@ -16,6 +16,18 @@ import sys
 from pathlib import Path
 
 
+def _setup_stdio() -> None:
+    """UTF-8 в stdout/stderr: cron-лог на Windows пишется в cp1251 и падает."""
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is None:
+            continue
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def find_gate() -> Path | None:
     candidates = []
     repo = os.environ.get("PIPELINE_REPO")
@@ -31,6 +43,7 @@ def find_gate() -> Path | None:
 
 
 def main() -> int:
+    _setup_stdio()
     gate = find_gate()
     if gate is None:
         print("pipeline_tick: gate.py не найден (задай PIPELINE_REPO или --workdir джобы)",

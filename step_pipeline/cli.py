@@ -336,6 +336,7 @@ def cmd_config(args) -> int:
 
 def run(args) -> int:
     """Обработчик, который вызывает `hermes pipeline ...`."""
+    proj.setup_stdio()
     handler = getattr(args, "handler", None)
     if handler is None:
         print("команды: setup | status | run | ui | doctor | notify-test | config")

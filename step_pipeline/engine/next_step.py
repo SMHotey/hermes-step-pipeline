@@ -325,6 +325,7 @@ def plans_overview(cfg: config_mod.Config) -> list[dict[str, Any]]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    config_mod.setup_stdio()
     parser = argparse.ArgumentParser(description="Контекст следующего шага плана")
     parser.add_argument("--plan", help="номер плана (по умолчанию из pipeline.json)")
     parser.add_argument("--step", help="принудительный шаг, например S3")

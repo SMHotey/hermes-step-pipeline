@@ -158,7 +158,20 @@ def check_prompt(text: str, reviewer_role: str = "reviewer",
     return results
 
 
+def _setup_stdio() -> None:
+    """UTF-8 в stdout/stderr: на Windows-консолях cp1251 русский текст падает."""
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is None:
+            continue
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _setup_stdio()
     parser = argparse.ArgumentParser(description="Гейт формы промта-постановки для агента")
     parser.add_argument("path", help="путь к файлу промта (docs/prompts/<файл>.md)")
     parser.add_argument("--quiet", action="store_true", help="печатать только нарушения и итог")
