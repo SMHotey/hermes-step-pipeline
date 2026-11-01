@@ -64,6 +64,9 @@ DEFAULTS: dict = {
         "token_env": "PIPELINE_TG_TOKEN",
         "chat_env": "PIPELINE_TG_CHAT",
         "prefix": "",
+        # Приём команд владельца из чата (getUpdates в тике). Включён там, где включены
+        # уведомления; `wait` — секунды длинного опроса в отдельной джобе.
+        "commands": {"enabled": True, "wait": 0},
     },
 }
 

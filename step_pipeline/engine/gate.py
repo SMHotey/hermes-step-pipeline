@@ -758,6 +758,204 @@ def notify(cfg: config_mod.Config, text: str) -> bool:
     return False
 
 
+# ───────────────────── команды владельцу (Telegram, вход) ─────────────────────
+
+TG_TEXT_LIMIT = 3900
+
+TG_HELP = (
+    "Команды конвейера:\n"
+    "/status — состояние: стоп-флаг и таблица планов\n"
+    "/plans — только таблица планов\n"
+    "/stop [причина] — остановиться после текущего шага\n"
+    "/resume — снять стоп-флаг\n"
+    "/hold S3 — шаг требует ручного допуска\n"
+    "/unhold S3 — снять ручной допуск\n"
+    "Работают только из чата, указанного в настройках."
+)
+
+
+def _tg_call(token: str, method: str, http_timeout: int = 20, **params) -> dict:
+    """Один вызов Bot API. Любой сбой — {"ok": False, "description": ...}, без исключений."""
+    body = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode()
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        with urllib.request.urlopen(url, data=body, timeout=http_timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+            return data if isinstance(data, dict) else {"ok": False, "description": "пустой ответ"}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:200]
+        return {"ok": False, "error_code": exc.code, "description": detail}
+    except (urllib.error.URLError, OSError) as exc:
+        return {"ok": False, "description": str(exc)[:200]}
+
+
+def tg_target(cfg: config_mod.Config) -> tuple[str, str] | None:
+    """Токен и чат из окружения (имена переменных — из pipeline.json)."""
+    token = os.environ.get(str(cfg.notify.get("token_env") or "PIPELINE_TG_TOKEN"))
+    chat = os.environ.get(str(cfg.notify.get("chat_env") or "PIPELINE_TG_CHAT"))
+    if not token or not chat:
+        return None
+    return str(token), str(chat)
+
+
+def commands_enabled(cfg: config_mod.Config) -> bool:
+    """Приём команд: по умолчанию включён там, где включены уведомления."""
+    commands = cfg.notify.get("commands")
+    if isinstance(commands, dict):
+        return bool(commands.get("enabled", True))
+    return bool(cfg.notify.get("enabled"))
+
+
+def _offset_path(cfg: config_mod.Config) -> Path:
+    return Path(cfg.state_dir) / "tg_offset.json"
+
+
+def _read_offset(path: Path) -> int:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return int(data.get("offset") or 0)
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return 0
+
+
+def _write_offset(path: Path, offset: int) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"offset": int(offset)}, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        print(f"[commands] offset не сохранён: {exc}", file=sys.stderr)
+
+
+def plans_of(cfg: config_mod.Config) -> list:
+    """Все ведомые планы; ошибки разбора не мешают ответить на команду."""
+    try:
+        return list(registry.driven_specs(cfg))
+    except Exception as exc:  # noqa: BLE001 - статус обязан отвечать
+        print(f"[commands] планы не прочитаны: {exc}", file=sys.stderr)
+        return []
+
+
+def tg_status(cfg: config_mod.Config) -> str:
+    """Короткая сводка для чата: стоп-флаг и таблица планов."""
+    lines = [f"Конвейер: {cfg.project} (борда {cfg.board})"]
+    stops = []
+    for spec in plans_of(cfg):
+        try:
+            p = resolve_paths(cfg, spec.id)
+        except Exception:  # noqa: BLE001
+            continue
+        stop = load_stop(p)
+        if stop:
+            kind = "владелец" if stop_kind(stop) == "owner" else "инцидент"
+            stops.append(f"план {spec.id} — стоп ({kind}, {stop.get('at', '')}): "
+                         f"{str(stop.get('reason', ''))[:200]}")
+    lines.append("\n".join(stops) if stops else "стоп-флагов нет")
+    lines.append("")
+    try:
+        lines.append(plans_table(cfg))
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"(таблица планов недоступна: {exc})")
+    return "\n".join(lines)
+
+
+def _plan_paths(cfg: config_mod.Config, plan: str | None = None) -> Paths:
+    """Пути плана; без --plan берётся план по умолчанию, иначе первый ведомый."""
+    target = plan or cfg.default_plan
+    if target is None:
+        specs = plans_of(cfg)
+        target = specs[0].id if specs else None
+    if target is None:
+        raise registry.PlanNotFound("нет ни одного плана с журналом")
+    return resolve_paths(cfg, target)
+
+
+def _hold_change(cfg: config_mod.Config, step: str, add: bool) -> str:
+    p = _plan_paths(cfg)
+    state = load_state(p)
+    hold = {str(item).upper() for item in (state.get("hold_steps") or [])}
+    key = step.strip().upper()
+    if not key:
+        return "укажи шаг: /hold S3"
+    hold.add(key) if add else hold.discard(key)
+    state["hold_steps"] = sorted(hold)
+    save_state(p, state)
+    return "шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—")
+
+
+def handle_command(cfg: config_mod.Config, text: str) -> str:
+    """Разобрать одну команду владельца и вернуть текст ответа."""
+    head, _, rest = (text or "").strip().partition(" ")
+    cmd = head.split("@", 1)[0].lower()
+    arg = rest.strip()
+    if cmd in ("/start", "/help"):
+        return TG_HELP
+    if cmd == "/status":
+        return tg_status(cfg)
+    if cmd == "/plans":
+        return plans_table(cfg)
+    if cmd == "/stop":
+        p = _plan_paths(cfg)
+        payload = write_stop(p, arg or "остановка владельцем из чата", "owner")
+        return f"⏸ стоп поставлен: {payload['reason']}"
+    if cmd == "/resume":
+        p = _plan_paths(cfg)
+        return "▶️ стоп снят, конвейер продолжит" if clear_stop(p) else "стоп-флага не было"
+    if cmd in ("/hold", "/unhold"):
+        return _hold_change(cfg, arg, add=cmd == "/hold")
+    return "не знаю такую команду. /help — список."
+
+
+def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) -> dict:
+    """Один опрос getUpdates: выполнить команды владельца и ответить в тот же чат.
+
+    Offset хранится в state_dir/tg_offset.json, поэтому повторный опрос не выполняет
+    команду дважды. Отвечаем только в настроенный чат; чужие сообщения игнорируются.
+    """
+    result = {"ok": False, "handled": 0, "ignored": 0, "reason": ""}
+    if not commands_enabled(cfg):
+        result["reason"] = "приём команд выключен (notify.commands.enabled)"
+        return result
+    target = tg_target(cfg)
+    if target is None:
+        result["reason"] = "нет токена/чата в окружении"
+        return result
+    token, chat = target
+    path = _offset_path(cfg)
+    offset = _read_offset(path)
+    data = _tg_call(token, "getUpdates", http_timeout=int(wait) + 20,
+                    offset=offset or None, limit=max_updates, timeout=int(wait))
+    if not data.get("ok"):
+        code = data.get("error_code")
+        result["reason"] = ("на боте стоит вебхук: getUpdates запрещён (409), сними его"
+                            if code == 409 else str(data.get("description") or "Telegram не ответил"))
+        print(f"[commands] опрос не удался: {result['reason']}", file=sys.stderr)
+        return result
+    newest = offset
+    for update in data.get("result") or []:
+        newest = max(newest, int(update.get("update_id") or 0) + 1)
+        message = update.get("message") or {}
+        text = str(message.get("text") or "")
+        sender_chat = str((message.get("chat") or {}).get("id") or "")
+        if not text.startswith("/"):
+            continue
+        if sender_chat != str(chat):
+            result["ignored"] += 1
+            continue
+        try:
+            answer = handle_command(cfg, text)
+        except Exception as exc:  # noqa: BLE001 - команда не должна ронять тик
+            answer = f"ошибка выполнения {text.split()[0]}: {exc}"
+        sent = _tg_call(token, "sendMessage", chat_id=chat, text=answer[:TG_TEXT_LIMIT],
+                        disable_web_page_preview="true")
+        if not sent.get("ok"):
+            print(f"[commands] ответ не доставлен: {sent.get('description')}", file=sys.stderr)
+        result["handled"] += 1
+    if newest > offset:
+        _write_offset(path, newest)
+    result["ok"] = True
+    return result
+
+
 def _evidence(p: Paths, verdict: dict) -> str:
     name = Path(verdict["path"]).name
     commit = f"коммит `{verdict['commit']}`" if verdict.get("commit") else "коммит не указан"
@@ -1037,6 +1235,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--resume", action="store_true", help="снять стоп-флаг")
     ap.add_argument("--hold", metavar="ШАГ", help="шаг требует ручного допуска владельца")
     ap.add_argument("--unhold", metavar="ШАГ", help="снять ручной допуск")
+    ap.add_argument("--commands", action="store_true",
+                    help="принять команды владельца из Telegram (getUpdates) и ответить в чат")
+    ap.add_argument("--commands-wait", type=int, default=0,
+                    help="секунды длинного опроса для --commands (0 — без ожидания)")
     args = ap.parse_args(argv)
 
     try:
@@ -1051,6 +1253,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(plans_table(cfg))
         return 0
+
+    if args.commands:
+        result = poll_commands(cfg, wait=args.commands_wait)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            tail = f" ({result['reason']})" if result.get("reason") else ""
+            extra = f", чужих проигнорировано: {result['ignored']}" if result.get("ignored") else ""
+            print(f"команд обработано: {result['handled']}{extra}{tail}")
+        return 0 if result.get("ok") or not commands_enabled(cfg) else 1
 
     try:
         p = resolve_paths(cfg, args.plan)

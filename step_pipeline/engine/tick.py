@@ -28,6 +28,39 @@ def _setup_stdio() -> None:
             pass
 
 
+def load_profile_env() -> None:
+    """Дочитать `.env` профиля Hermes и `PIPELINE_ENV`, если задан.
+
+    Зачем: cron шлюза запускает скрипт с `HERMES_HOME` профиля, но переменные из
+    `profiles/<профиль>/.env` в окружение не попадают (проверено 01.11.2026: переменные
+    уведомлений есть в CLI и отсутствуют в джобе). Без этого уведомления движка молчат.
+    Существующие значения не перетираются.
+    """
+    candidates = []
+    explicit = os.environ.get("PIPELINE_ENV")
+    if explicit:
+        candidates.append(Path(explicit))
+    candidates.append(Path(__file__).resolve().parents[1] / ".env")
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value:
+                os.environ.setdefault(key, value)
+
+
 def find_gate() -> Path | None:
     candidates = []
     repo = os.environ.get("PIPELINE_REPO")
@@ -44,6 +77,7 @@ def find_gate() -> Path | None:
 
 def main() -> int:
     _setup_stdio()
+    load_profile_env()
     gate = find_gate()
     if gate is None:
         print("pipeline_tick: gate.py не найден (задай PIPELINE_REPO или --workdir джобы)",

@@ -37,18 +37,158 @@ SKILL_CATEGORIES = {
 TOKEN_ENV = "STEP_PIPELINE_TELEGRAM_BOT_TOKEN"
 CHAT_ENV = "STEP_PIPELINE_TELEGRAM_CHAT_ID"
 TICK_SCRIPT = '''# -*- coding: utf-8 -*-
-"""Тик конвейера для cron: один шаг стража. Пустой вывод = конвейер ждёт."""
+"""Тик конвейера для cron: один шаг стража. Пустой вывод = конвейер ждёт.
+
+Свой разбор .env профиля: cron шлюза отдаёт HERMES_HOME, но не переменные из
+profiles/<профиль>/.env — без этого уведомления движка молчат.
+"""
 import os
 import runpy
 import sys
 from pathlib import Path
 
-root = Path(os.environ.get("PIPELINE_REPO") or Path.cwd())
-gate = root / ".pipeline" / "gate.py"
-if not gate.is_file():
-    raise SystemExit(0)
-sys.argv = [str(gate), "--run"]
-runpy.run_path(str(gate), run_name="__main__")
+
+def _setup_stdio():
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is None:
+            continue
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def load_profile_env():
+    paths = []
+    explicit = os.environ.get("PIPELINE_ENV")
+    if explicit:
+        paths.append(Path(explicit))
+    paths.append(Path(__file__).resolve().parents[1] / ".env")
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, _, value = line.partition("=")
+            value = value.strip().strip('"').strip("'")
+            if key.strip() and value:
+                os.environ.setdefault(key.strip(), value)
+
+
+def find_gate():
+    candidates = []
+    repo = os.environ.get("PIPELINE_REPO")
+    if repo:
+        candidates.append(Path(repo) / ".pipeline" / "gate.py")
+    candidates.append(Path.cwd() / ".pipeline" / "gate.py")
+    candidates.append(Path(__file__).resolve().parent / "gate.py")
+    candidates.append(Path(__file__).resolve().parents[1] / ".pipeline" / "gate.py")
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def main():
+    _setup_stdio()
+    load_profile_env()
+    gate = find_gate()
+    if gate is None:
+        return 0
+    sys.argv = [str(gate), "--run"]
+    runpy.run_path(str(gate), run_name="__main__")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+COMMANDS_SCRIPT = '''# -*- coding: utf-8 -*-
+"""Приём команд конвейера из Telegram: один getUpdates, ответ в тот же чат.
+
+Заводится отдельной cron-джобой раз в минуту: страж идёт раз в 10 минут, а команде
+владельца ждать десять минут незачем. Секунды длинного опроса — PIPELINE_COMMANDS_WAIT.
+"""
+import os
+import runpy
+import sys
+from pathlib import Path
+
+
+def _setup_stdio():
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is None:
+            continue
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def load_profile_env():
+    paths = []
+    explicit = os.environ.get("PIPELINE_ENV")
+    if explicit:
+        paths.append(Path(explicit))
+    paths.append(Path(__file__).resolve().parents[1] / ".env")
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, _, value = line.partition("=")
+            value = value.strip().strip('"').strip("'")
+            if key.strip() and value:
+                os.environ.setdefault(key.strip(), value)
+
+
+def find_gate():
+    candidates = []
+    repo = os.environ.get("PIPELINE_REPO")
+    if repo:
+        candidates.append(Path(repo) / ".pipeline" / "gate.py")
+    candidates.append(Path.cwd() / ".pipeline" / "gate.py")
+    candidates.append(Path(__file__).resolve().parent / "gate.py")
+    candidates.append(Path(__file__).resolve().parents[1] / ".pipeline" / "gate.py")
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def main():
+    _setup_stdio()
+    load_profile_env()
+    gate = find_gate()
+    if gate is None:
+        return 0
+    wait = os.environ.get("PIPELINE_COMMANDS_WAIT", "0")
+    sys.argv = [str(gate), "--commands", "--commands-wait", wait]
+    runpy.run_path(str(gate), run_name="__main__")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 
 
@@ -340,6 +480,44 @@ def cron_command(driver: str, project: Path) -> str:
             f'--no-agent --script pipeline_tick.py --deliver local --workdir "{project}"')
 
 
+COMMANDS_JOB = "План: бот команды (конвейер)"
+
+
+def ensure_commands_cron(driver: str, project: Path, log: Log, *, skip: bool,
+                         enabled: bool) -> None:
+    """Cron-джоба приёма команд бота: no-agent, раз в минуту.
+
+    Отдельно от стража: страж идёт раз в 10 минут, а `/status` и `/stop` столько ждать
+    нельзя. Модель не нужна — это один `getUpdates`.
+    """
+    if skip:
+        return
+    if not enabled:
+        log.warn("приём команд не заводил: уведомления выключены (--no-telegram)")
+        return
+    if COMMANDS_JOB in (proj.run_hermes("-p", driver, "cron", "list").stdout or ""):
+        log.ok("cron-джоба команд бота уже есть")
+        return
+    scripts = proj.profile_dir(driver) / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "pipeline_commands.py").write_text(COMMANDS_SCRIPT, encoding="utf-8")
+    res = proj.run_hermes("-p", driver, "cron", "create", "* * * * *",
+                          "--name", COMMANDS_JOB, "--no-agent",
+                          "--script", "pipeline_commands.py",
+                          "--deliver", "local",
+                          "--workdir", str(project))
+    if res.returncode == 0:
+        log.ok("cron-джоба команд бота создана (каждую минуту)")
+    else:
+        log.warn(f"cron команд: {(res.stderr or res.stdout or '').strip()[:300]}")
+        log.warn("завести вручную: " + commands_cron_command(driver, project))
+
+
+def commands_cron_command(driver: str, project: Path) -> str:
+    return (f'hermes -p {driver} cron create "* * * * *" --name "{COMMANDS_JOB}" '
+            f'--no-agent --script pipeline_commands.py --deliver local --workdir "{project}"')
+
+
 def _mask(token: str) -> str:
     return token[:8] + "…" + token[-4:] if len(token) > 14 else "***"
 
@@ -446,12 +624,17 @@ def run_setup(args) -> int:
         ensure_profiles(driver, prompter, reviewer, log)
     ensure_board(board, log)
     ensure_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)))
+    ensure_commands_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)),
+                         enabled=bool(chat))
 
-    trust = proj.run_hermes("-p", driver, "skills", "trust", str(project))
-    if trust.returncode == 0:
-        log.ok(f"проект в доверенных у {driver}")
-    else:
-        log.warn(f"skills trust: {(trust.stderr or trust.stdout or '').strip()[:200]}")
+    # Доверие проекту нужно каждой роли: без него воркер падает `Unknown skill(s)`,
+    # и карточка уходит в blocked по failure_limit. Ошибка одной роли не ломает мастер.
+    for role in dict.fromkeys((driver, prompter, reviewer)):
+        trust = proj.run_hermes("-p", role, "skills", "trust", str(project))
+        if trust.returncode == 0:
+            log.ok(f"проект в доверенных у {role}")
+        else:
+            log.warn(f"skills trust ({role}): {(trust.stderr or trust.stdout or '').strip()[:200]}")
 
     log.step("── Готово ──")
     log.step(f"  статус:  hermes pipeline status --project \"{project}\"")
