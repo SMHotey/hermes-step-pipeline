@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - запуск файлом при от�
     import telegram  # type: ignore
 
 ENGINE_FILES = ("__init__.py", "config.py", "registry.py", "next_step.py", "gate.py",
-                "step_card.py", "check_task_prompt.py", "tick.py")
+                "step_card.py", "check_task_prompt.py", "tick.py", "state_io.py")
 SKILL_CATEGORIES = {
     "pipeline-next-step": "software-development",
     "pipeline-prompter": "software-development",

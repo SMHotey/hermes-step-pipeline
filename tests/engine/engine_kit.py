@@ -19,7 +19,8 @@ ENGINE = KIT / "step_pipeline" / "engine"
 sys.path.insert(0, str(ENGINE))
 
 ENGINE_FILES = ("config.py", "registry.py", "next_step.py", "gate.py",
-                "step_card.py", "check_task_prompt.py", "tick.py", "__init__.py")
+                "step_card.py", "check_task_prompt.py", "tick.py", "__init__.py",
+                "state_io.py")
 
 PLAN = """# 1. Демо-план конвейера
 

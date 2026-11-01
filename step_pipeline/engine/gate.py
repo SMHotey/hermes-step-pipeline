@@ -56,6 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as config_mod  # noqa: E402 - модуль рядом
 import registry  # noqa: E402 - реестр планов
 import next_step  # noqa: E402 - сборщик контракта шага
+import state_io  # noqa: E402 - атомарная запись состояния и блокировка тика
 
 TERMINAL = {"done", "blocked", "crashed", "timed_out", "gave_up"}
 VERDICT_RE = re.compile(r"^#{0,4}\s*ВЕРДИКТ\s*:\s*(APPROVE|REQUEST_CHANGES)\s*$",
@@ -132,9 +133,7 @@ def load_state(p: Paths) -> dict:
 
 
 def save_state(p: Paths, state: dict) -> None:
-    path = Path(p.state_file)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    state_io.save_json(Path(p.state_file), state)
 
 
 def load_stop(p: Paths) -> dict | None:
@@ -150,9 +149,7 @@ def write_stop(p: Paths, reason: str, source: str, kind: str | None = None) -> d
     payload = {"reason": reason, "source": source,
                "kind": kind or ("owner" if source == "owner" else "incident"),
                "at": time.strftime("%d.%m.%Y %H:%M:%S")}
-    path = Path(p.stop_file)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    state_io.save_json(Path(p.stop_file), payload)
     return payload
 
 
@@ -267,7 +264,7 @@ def append_journal_row(p: Paths, step_id: str, title: str, commit: str, evidence
         lines[target] = row
     else:
         lines.insert(rows[-1] + 1, row)
-    path.write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+    state_io.atomic_write_text(path, "\n".join(lines) + ("\n" if text.endswith("\n") else ""))
     return True
 
 
@@ -820,8 +817,7 @@ def _read_offset(path: Path) -> int:
 
 def _write_offset(path: Path, offset: int) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"offset": int(offset)}, ensure_ascii=False), encoding="utf-8")
+        state_io.save_json(path, {"offset": int(offset)})
     except OSError as exc:
         print(f"[commands] offset не сохранён: {exc}", file=sys.stderr)
 
@@ -1270,44 +1266,78 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 2
 
-    if args.stop is not None:
-        payload = write_stop(p, args.stop or "остановка владельца", "owner")
-        notify(cfg, f"⏸ остановка после текущего шага: {payload['reason']}")
-        print(f"стоп-флаг поставлен: {p.stop_file} ({payload['reason']})")
-        return 0
-    if args.resume:
-        existed = clear_stop(p)
-        notify(cfg, "▶️ стоп снят, конвейер продолжит со следующего шага")
-        print("стоп-флаг снят" if existed else "стоп-флага не было")
-        return 0
-    if args.hold or args.unhold:
-        state = load_state(p)
-        hold = set(state.get("hold_steps") or [])
-        if args.hold:
-            hold.add(args.hold.upper())
-        else:
-            hold.discard(args.unhold.upper())
-        state["hold_steps"] = sorted(hold)
-        save_state(p, state)
-        print("шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—"))
-        return 0
-
-    if args.run and args.plan is None:
-        result = tick(cfg)
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+    owner_cmd = ("stop" if args.stop is not None
+                 else "resume" if args.resume
+                 else "hold" if (args.hold or args.unhold) else "")
+    if owner_cmd:
+        # Команды владельца меняют состояние и стоп-флаг (read-modify-write), поэтому
+        # берут ту же блокировку, что и тик: поверх живого тика команда не применяется.
+        lock = state_io.acquire(Path(cfg.state_dir), what=owner_cmd)
+        if lock is None:
+            who = state_io.holder(Path(cfg.state_dir)) or {}
+            print(f"тик уже идёт (pid {who.get('pid', '?')}, с {who.get('at', '?')}, "
+                  f"{who.get('what', '?')}) — команда {owner_cmd} не применена")
             return 0
-        acted = bool(result.get("applied") or result.get("retried"))
-        if not acted and not args.status:
+        try:
+            if args.stop is not None:
+                payload = write_stop(p, args.stop or "остановка владельца", "owner")
+                notify(cfg, f"⏸ остановка после текущего шага: {payload['reason']}")
+                print(f"стоп-флаг поставлен: {p.stop_file} ({payload['reason']})")
+                return 0
+            if args.resume:
+                existed = clear_stop(p)
+                notify(cfg, "▶️ стоп снят, конвейер продолжит со следующего шага")
+                print("стоп-флаг снят" if existed else "стоп-флага не было")
+                return 0
+            state = load_state(p)
+            hold = set(state.get("hold_steps") or [])
+            if args.hold:
+                hold.add(args.hold.upper())
+            else:
+                hold.discard(args.unhold.upper())
+            state["hold_steps"] = sorted(hold)
+            save_state(p, state)
+            print("шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—"))
             return 0
-        print(result["status"])
-        if result.get("applied"):
-            print(f"Выполнено [{result.get('plan_id')}]: {result['detail']}")
-        return 0
+        finally:
+            state_io.release(lock)
 
-    retried = retry_pending(p) if args.run else None
-    result = run_gate(p, execute=args.run)
-    result["pending_commit"] = retried
+    if args.run:
+        # Один лок на проект, не на план: tick() и retry_pending обслуживают все планы.
+        lock = state_io.acquire(Path(cfg.state_dir), what="run")
+        if lock is None:
+            who = state_io.holder(Path(cfg.state_dir)) or {}
+            detail = "тик уже идёт"
+            if args.json:
+                print(json.dumps({"locked": True, "applied": False, "detail": detail,
+                                  "decision": {"action": "locked", "reason": detail}},
+                                 ensure_ascii=False, indent=2))
+            else:
+                print(f"{detail} (pid {who.get('pid', '?')}, с {who.get('at', '?')}) — "
+                      f"второй тик ничего не делает")
+            return 0
+        try:
+            if args.plan is None:
+                result = tick(cfg)
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                    return 0
+                acted = bool(result.get("applied") or result.get("retried"))
+                if not acted and not args.status:
+                    return 0
+                print(result["status"])
+                if result.get("applied"):
+                    print(f"Выполнено [{result.get('plan_id')}]: {result['detail']}")
+                return 0
+            retried = retry_pending(p)
+            result = run_gate(p, execute=True)
+            result["pending_commit"] = retried
+        finally:
+            state_io.release(lock)
+    else:
+        retried = None
+        result = run_gate(p, execute=False)
+        result["pending_commit"] = retried
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
