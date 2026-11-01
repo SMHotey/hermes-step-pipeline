@@ -79,6 +79,34 @@ def test_broken_board_leaves_incident_stop_and_notifies(project: Path, hermes_st
     assert kept is not None and kept["reason"] == payload["reason"]
     assert "[notify]" not in again.stderr
 
+    # Стоп владельца инцидент не затирает: его снимает только владелец, а причина
+    # сбоя остаётся видимой (stderr для панели и уведомление).
+    stop_file = project / ".pipeline" / "state" / "plan_1_stop.json"
+    stop_file.parent.mkdir(parents=True, exist_ok=True)
+    stop_file.write_text(json.dumps({"reason": "остановка владельца", "source": "owner",
+                                     "kind": "owner"}, ensure_ascii=False), encoding="utf-8")
+    res = run_gate(project, "--run")
+    assert res.returncode == 1
+    owner = stop_payload(project)
+    assert owner is not None and owner["kind"] == "owner", res.stderr
+    assert owner["reason"] == "остановка владельца"
+    notices = [line for line in res.stderr.splitlines() if "[notify]" in line]
+    assert len(notices) == 1, res.stderr
+    assert "борда недоступна" in notices[0]
+    assert "ошибка: борда недоступна" in res.stderr
+
+    # Сбой чтения/записи стоп-флага не отменяет уведомление.
+    stop_file.unlink()
+    stop_file.mkdir()
+    broken = run_gate(project, "--run")
+    assert broken.returncode == 1
+    assert "Traceback (most recent call last)" not in broken.stderr
+    broken_notices = [line for line in broken.stderr.splitlines() if "[notify]" in line]
+    assert len(broken_notices) == 1, broken.stderr
+    assert "файл стоп-флага не читается" in broken_notices[0]
+    assert "ошибка: файл стоп-флага не читается" in broken.stderr
+    assert "стоп-флаг не записывается" in broken.stderr
+
 
 def test_broken_board_prints_no_traceback(project: Path, hermes_stub: Path) -> None:
     break_board()
@@ -127,6 +155,16 @@ def test_status_json_and_panel_show_reason(project: Path, hermes_stub: Path) -> 
 
 
 def test_broken_state_file_is_incident_not_traceback(project: Path, hermes_stub: Path) -> None:
+    # Борда читается, но пуста: колонки те же, что в запросе `read_cards`, карточек нет.
+    con = sqlite3.connect(hermes_stub)
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT,"
+                    " status TEXT, assignee TEXT, idempotency_key TEXT, completed_at INTEGER,"
+                    " result TEXT, last_failure_error TEXT, created_at INTEGER)")
+        con.commit()
+    finally:
+        con.close()
+    assert board_cards(hermes_stub) == []          # до прогона карточек нет
     state_file(project).parent.mkdir(parents=True, exist_ok=True)
     state_file(project).write_text('{"hold_steps": ["S1"]', encoding="utf-8")
     res = run_gate(project, "--run", "--plan", "1")

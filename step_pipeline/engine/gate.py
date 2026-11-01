@@ -146,7 +146,7 @@ def load_state(p: Paths) -> dict:
 def save_state(p: Paths, state: dict) -> None:
     try:
         state_io.save_json(Path(p.state_file), state)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, TypeError) as exc:
         raise GateError(f"состояние не записывается: {Path(p.state_file)}: {exc}",
                         plan_id=p.plan_id) from exc
 
@@ -170,7 +170,7 @@ def write_stop(p: Paths, reason: str, source: str, kind: str | None = None) -> d
                "at": time.strftime("%d.%m.%Y %H:%M:%S")}
     try:
         state_io.save_json(Path(p.stop_file), payload)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, TypeError) as exc:
         raise GateError(f"стоп-флаг не записывается: {Path(p.stop_file)}: {exc}",
                         plan_id=p.plan_id) from exc
     return payload
@@ -1260,17 +1260,30 @@ def incident(cfg: config_mod.Config, args: argparse.Namespace, exc: BaseExceptio
         plan_id = plan_id or registry.default_plan_id(cfg)
         p = resolve_paths(cfg, plan_id)
         plan_id = p.plan_id
-    except registry.PlanNotFound:
-        p = None                          # записывать некуда: план не распознан
-    if args.run and p is not None:
+    except Exception:  # noqa: BLE001 - путей нет: записывать некуда, причина остаётся в stderr
+        p = None
+    if args.run:
         # Стоп и уведомление — только для тика: чтение статуса состояние не меняет.
-        try:
-            current = load_stop(p) or {}
-            if current.get("reason") != reason:
+        current: dict = {}
+        if p is not None:
+            try:
+                current = load_stop(p) or {}
+            except Exception as stop_exc:  # noqa: BLE001 - сбой чтения не отменяет уведомление
+                print(f"ошибка: {stop_exc}", file=sys.stderr)
+        owner_stop = stop_kind(current) == "owner"
+        # Стоп владельца инцидент не перезаписывает (его снимает только владелец),
+        # поэтому о сбое сообщаем каждый тик: записать причину некуда.
+        fresh = owner_stop or current.get("reason") != reason
+        if fresh and p is not None and not owner_stop:
+            try:
                 write_stop(p, reason, "gate", kind="incident")
+            except Exception as stop_exc:  # noqa: BLE001 - уведомление от записи не зависит
+                print(f"ошибка: {stop_exc}", file=sys.stderr)
+        if fresh:
+            try:
                 notify(cfg, "⛔ сбой тика: " + reason)
-        except Exception:  # noqa: BLE001 - обработчик не должен давать второй трейсбек
-            pass
+            except Exception as notify_exc:  # noqa: BLE001 - обработчик не даёт второй трейсбек
+                print(f"ошибка: уведомление не отправлено: {notify_exc}", file=sys.stderr)
     print(f"ошибка: {reason}", file=sys.stderr)
     if args.json:
         print(json.dumps({"ok": False, "error": reason, "applied": False, "incident": True,
