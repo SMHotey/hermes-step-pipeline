@@ -272,7 +272,7 @@ def append_journal_row(p: Paths, step_id: str, title: str, commit: str, evidence
 
 
 def commit_and_push(p: Paths, files: list[str], message: str) -> tuple[bool, str]:
-    """Закоммитить ТОЛЬКО перечисленные файлы; чужие правки в дереве не блокируют коммит."""
+    """Закоммитить ТОЛЬКО перечисленные файлы; чужие правки в индексе остаются в индексе."""
     if not p.cfg.git_commit:
         return True, "(коммит выключен в pipeline.json)"
     status = _run(["git", "-c", "core.quotepath=off", "status", "--porcelain", "-z"], p.repo)
@@ -282,18 +282,31 @@ def commit_and_push(p: Paths, files: list[str], message: str) -> tuple[bool, str
     strangers = [d for d in dirty if d.replace("\\", "/") not in allowed]
     if strangers:
         print("[commit] в дереве чужие правки — не трогаю: " + ", ".join(strangers[:5]))
-    add = _run(["git", "add", *files], p.repo)
+    add = _run(["git", "add", "--", *files], p.repo)
     if add.returncode != 0:
         return False, f"git add: {add.stderr.strip()[:200]}"
-    commit = _run(["git", "commit", "-m", message], p.repo)
-    if commit.returncode != 0:
-        return False, f"git commit: {(commit.stderr or commit.stdout).strip()[:200]}"
-    if p.cfg.git_push:
-        push = _run(["git", "push"], p.repo, timeout=180)
-        if push.returncode != 0:
-            return False, f"git push: {(push.stderr or push.stdout).strip()[:200]}"
+    changed = [ln.strip() for ln in _run(
+        ["git", "diff", "--cached", "--name-only", "--", *files], p.repo).stdout.splitlines()
+        if ln.strip()]
     sha = _run(["git", "rev-parse", "--short", "HEAD"], p.repo).stdout.strip()
-    return True, sha
+    if changed:
+        commit = _run(["git", "commit", "-m", message, "--", *files], p.repo)
+        if commit.returncode != 0:
+            return False, f"git commit: {(commit.stderr or commit.stdout).strip()[:200]}"
+        detail = sha
+    else:
+        detail = f"нечего коммитить: своих изменений нет (HEAD {sha})"
+    if p.cfg.git_push:
+        upstream = _run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name",
+                         "@{upstream}"], p.repo)
+        if upstream.returncode != 0:
+            detail += " · пуш пропущен: у ветки нет upstream"
+        else:
+            push = _run(["git", "push"], p.repo, timeout=180)
+            if push.returncode != 0:
+                return False, f"git push: {(push.stderr or push.stdout).strip()[:200]}"
+            detail += " · пуш выполнен"
+    return True, detail
 
 
 # ───────────────────────────── доска ─────────────────────────────
