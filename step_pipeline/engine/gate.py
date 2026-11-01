@@ -86,6 +86,14 @@ class Paths:
         return self.cfg.step_regex
 
 
+class GateError(RuntimeError):
+    """Понятный сбой движка: текст уходит в стоп-флаг, уведомление и `--json`."""
+
+    def __init__(self, message: str, plan_id: str | None = None):
+        super().__init__(message)
+        self.plan_id = plan_id
+
+
 def resolve_paths(cfg: config_mod.Config, plan_id: str | None = None) -> Paths:
     """Пути выбранного плана. Неизвестный номер — честная ошибка реестра."""
     want = registry.normalize(plan_id or registry.default_plan_id(cfg))
@@ -125,23 +133,34 @@ def _python(p: Paths) -> str:
 # ───────────────────────────── состояние ─────────────────────────────
 
 def load_state(p: Paths) -> dict:
-    try:
-        data = json.loads(Path(p.state_file).read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    path = Path(p.state_file)
+    if not path.exists():                 # отсутствие файла — норма
         return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GateError(f"файл состояния не читается: {path}: {exc}", plan_id=p.plan_id) from exc
+    return data if isinstance(data, dict) else {}
 
 
 def save_state(p: Paths, state: dict) -> None:
-    state_io.save_json(Path(p.state_file), state)
+    try:
+        state_io.save_json(Path(p.state_file), state)
+    except (OSError, ValueError) as exc:
+        raise GateError(f"состояние не записывается: {Path(p.state_file)}: {exc}",
+                        plan_id=p.plan_id) from exc
 
 
 def load_stop(p: Paths) -> dict | None:
-    try:
-        data = json.loads(Path(p.stop_file).read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {"reason": str(data)}
-    except (OSError, json.JSONDecodeError):
+    path = Path(p.stop_file)
+    if not path.exists():                 # стоп-флага нет — норма
         return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GateError(f"файл стоп-флага не читается: {path}: {exc}",
+                        plan_id=p.plan_id) from exc
+    return data if isinstance(data, dict) else {"reason": str(data)}
 
 
 def write_stop(p: Paths, reason: str, source: str, kind: str | None = None) -> dict:
@@ -149,7 +168,11 @@ def write_stop(p: Paths, reason: str, source: str, kind: str | None = None) -> d
     payload = {"reason": reason, "source": source,
                "kind": kind or ("owner" if source == "owner" else "incident"),
                "at": time.strftime("%d.%m.%Y %H:%M:%S")}
-    state_io.save_json(Path(p.stop_file), payload)
+    try:
+        state_io.save_json(Path(p.stop_file), payload)
+    except (OSError, ValueError) as exc:
+        raise GateError(f"стоп-флаг не записывается: {Path(p.stop_file)}: {exc}",
+                        plan_id=p.plan_id) from exc
     return payload
 
 
@@ -313,18 +336,23 @@ def read_cards(p: Paths, key_prefix: str) -> list[dict]:
     db = Path(p.kanban_db)
     if not db.is_file():
         return []
-    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     try:
-        rows = con.execute(
-            """SELECT id, title, status, assignee, idempotency_key, completed_at,
-                      COALESCE(result,''), COALESCE(last_failure_error,'')
-               FROM tasks
-               WHERE idempotency_key LIKE ? AND status <> 'archived'
-               ORDER BY created_at ASC""",
-            (key_prefix + "%",),
-        ).fetchall()
-    finally:
-        con.close()
+        con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        try:
+            rows = con.execute(
+                """SELECT id, title, status, assignee, idempotency_key, completed_at,
+                          COALESCE(result,''), COALESCE(last_failure_error,'')
+                   FROM tasks
+                   WHERE idempotency_key LIKE ? AND status <> 'archived'
+                   ORDER BY created_at ASC""",
+                (key_prefix + "%",),
+            ).fetchall()
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError) as exc:
+        # Существующая база есть, а прочитать нельзя — это сбой, а не «карточек нет»:
+        # иначе тик молча теряет ход конвейера.
+        raise GateError(f"борда недоступна: {db}: {exc}", plan_id=p.plan_id) from exc
     return [{"id": r[0], "title": r[1], "status": r[2], "assignee": r[3], "key": r[4],
              "completed_at": int(r[5] or 0), "result": r[6], "error": r[7]} for r in rows]
 
@@ -1218,6 +1246,40 @@ def tick(cfg: config_mod.Config, execute: bool = True) -> dict:
             "status": "\n\n".join(statuses) or "планов с распознанным журналом не найдено"}
 
 
+def incident(cfg: config_mod.Config, args: argparse.Namespace, exc: BaseException) -> int:
+    """Сбой движка вместо трейсбека: инцидентный стоп, уведомление, `--json` и код 1."""
+    if isinstance(exc, GateError):
+        reason = str(exc)
+    else:
+        reason = f"сбой движка: {type(exc).__name__}: {exc}"
+    # Без времени и pid: по причине сравниваются повторы (тот же стоп — молчим).
+    reason = reason[:300]
+    plan_id = getattr(exc, "plan_id", None) or (args.plan or None)
+    p: Paths | None = None
+    try:
+        plan_id = plan_id or registry.default_plan_id(cfg)
+        p = resolve_paths(cfg, plan_id)
+        plan_id = p.plan_id
+    except registry.PlanNotFound:
+        p = None                          # записывать некуда: план не распознан
+    if args.run and p is not None:
+        # Стоп и уведомление — только для тика: чтение статуса состояние не меняет.
+        try:
+            current = load_stop(p) or {}
+            if current.get("reason") != reason:
+                write_stop(p, reason, "gate", kind="incident")
+                notify(cfg, "⛔ сбой тика: " + reason)
+        except Exception:  # noqa: BLE001 - обработчик не должен давать второй трейсбек
+            pass
+    print(f"ошибка: {reason}", file=sys.stderr)
+    if args.json:
+        print(json.dumps({"ok": False, "error": reason, "applied": False, "incident": True,
+                          "plan_id": plan_id,
+                          "decision": {"action": "incident", "reason": reason}},
+                         ensure_ascii=False, indent=2))
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     config_mod.setup_stdio()
     ap = argparse.ArgumentParser(description="Страж шага: шаг → ревью → следующий шаг")
@@ -1243,113 +1305,118 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 2
 
-    if args.plans:
-        if args.json:
-            print(json.dumps(plans_rows(cfg), ensure_ascii=False, indent=2))
-        else:
-            print(plans_table(cfg))
-        return 0
+    try:
+        if args.plans:
+            if args.json:
+                print(json.dumps(plans_rows(cfg), ensure_ascii=False, indent=2))
+            else:
+                print(plans_table(cfg))
+            return 0
 
-    if args.commands:
-        result = poll_commands(cfg, wait=args.commands_wait)
+        if args.commands:
+            result = poll_commands(cfg, wait=args.commands_wait)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                tail = f" ({result['reason']})" if result.get("reason") else ""
+                extra = f", чужих проигнорировано: {result['ignored']}" if result.get("ignored") else ""
+                print(f"команд обработано: {result['handled']}{extra}{tail}")
+            return 0 if result.get("ok") or not commands_enabled(cfg) else 1
+
+        try:
+            p = resolve_paths(cfg, args.plan)
+        except registry.PlanNotFound as exc:
+            print(f"ошибка: {exc}", file=sys.stderr)
+            return 2
+
+        owner_cmd = ("stop" if args.stop is not None
+                     else "resume" if args.resume
+                     else "hold" if (args.hold or args.unhold) else "")
+        if owner_cmd:
+            # Команды владельца меняют состояние и стоп-флаг (read-modify-write), поэтому
+            # берут ту же блокировку, что и тик: поверх живого тика команда не применяется.
+            lock = state_io.acquire(Path(cfg.state_dir), what=owner_cmd)
+            if lock is None:
+                who = state_io.holder(Path(cfg.state_dir)) or {}
+                print(f"тик уже идёт (pid {who.get('pid', '?')}, с {who.get('at', '?')}, "
+                      f"{who.get('what', '?')}) — команда {owner_cmd} не применена")
+                return 0
+            try:
+                if args.stop is not None:
+                    payload = write_stop(p, args.stop or "остановка владельца", "owner")
+                    notify(cfg, f"⏸ остановка после текущего шага: {payload['reason']}")
+                    print(f"стоп-флаг поставлен: {p.stop_file} ({payload['reason']})")
+                    return 0
+                if args.resume:
+                    existed = clear_stop(p)
+                    notify(cfg, "▶️ стоп снят, конвейер продолжит со следующего шага")
+                    print("стоп-флаг снят" if existed else "стоп-флага не было")
+                    return 0
+                state = load_state(p)
+                hold = set(state.get("hold_steps") or [])
+                if args.hold:
+                    hold.add(args.hold.upper())
+                else:
+                    hold.discard(args.unhold.upper())
+                state["hold_steps"] = sorted(hold)
+                save_state(p, state)
+                print("шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—"))
+                return 0
+            finally:
+                state_io.release(lock)
+
+        if args.run:
+            # Один лок на проект, не на план: tick() и retry_pending обслуживают все планы.
+            lock = state_io.acquire(Path(cfg.state_dir), what="run")
+            if lock is None:
+                who = state_io.holder(Path(cfg.state_dir)) or {}
+                detail = "тик уже идёт"
+                if args.json:
+                    print(json.dumps({"locked": True, "applied": False, "detail": detail,
+                                      "decision": {"action": "locked", "reason": detail}},
+                                     ensure_ascii=False, indent=2))
+                else:
+                    print(f"{detail} (pid {who.get('pid', '?')}, с {who.get('at', '?')}) — "
+                          f"второй тик ничего не делает")
+                return 0
+            try:
+                if args.plan is None:
+                    result = tick(cfg)
+                    if args.json:
+                        print(json.dumps(result, ensure_ascii=False, indent=2))
+                        return 0
+                    acted = bool(result.get("applied") or result.get("retried"))
+                    if not acted and not args.status:
+                        return 0
+                    print(result["status"])
+                    if result.get("applied"):
+                        print(f"Выполнено [{result.get('plan_id')}]: {result['detail']}")
+                    return 0
+                retried = retry_pending(p)
+                result = run_gate(p, execute=True)
+                result["pending_commit"] = retried
+            finally:
+                state_io.release(lock)
+        else:
+            retried = None
+            result = run_gate(p, execute=False)
+            result["pending_commit"] = retried
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
-        else:
-            tail = f" ({result['reason']})" if result.get("reason") else ""
-            extra = f", чужих проигнорировано: {result['ignored']}" if result.get("ignored") else ""
-            print(f"команд обработано: {result['handled']}{extra}{tail}")
-        return 0 if result.get("ok") or not commands_enabled(cfg) else 1
-
-    try:
-        p = resolve_paths(cfg, args.plan)
-    except registry.PlanNotFound as exc:
-        print(f"ошибка: {exc}", file=sys.stderr)
-        return 2
-
-    owner_cmd = ("stop" if args.stop is not None
-                 else "resume" if args.resume
-                 else "hold" if (args.hold or args.unhold) else "")
-    if owner_cmd:
-        # Команды владельца меняют состояние и стоп-флаг (read-modify-write), поэтому
-        # берут ту же блокировку, что и тик: поверх живого тика команда не применяется.
-        lock = state_io.acquire(Path(cfg.state_dir), what=owner_cmd)
-        if lock is None:
-            who = state_io.holder(Path(cfg.state_dir)) or {}
-            print(f"тик уже идёт (pid {who.get('pid', '?')}, с {who.get('at', '?')}, "
-                  f"{who.get('what', '?')}) — команда {owner_cmd} не применена")
             return 0
-        try:
-            if args.stop is not None:
-                payload = write_stop(p, args.stop or "остановка владельца", "owner")
-                notify(cfg, f"⏸ остановка после текущего шага: {payload['reason']}")
-                print(f"стоп-флаг поставлен: {p.stop_file} ({payload['reason']})")
-                return 0
-            if args.resume:
-                existed = clear_stop(p)
-                notify(cfg, "▶️ стоп снят, конвейер продолжит со следующего шага")
-                print("стоп-флаг снят" if existed else "стоп-флага не было")
-                return 0
-            state = load_state(p)
-            hold = set(state.get("hold_steps") or [])
-            if args.hold:
-                hold.add(args.hold.upper())
-            else:
-                hold.discard(args.unhold.upper())
-            state["hold_steps"] = sorted(hold)
-            save_state(p, state)
-            print("шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—"))
+        acted = args.run and (result["applied"] or retried)
+        if not acted and not args.status:
             return 0
-        finally:
-            state_io.release(lock)
-
-    if args.run:
-        # Один лок на проект, не на план: tick() и retry_pending обслуживают все планы.
-        lock = state_io.acquire(Path(cfg.state_dir), what="run")
-        if lock is None:
-            who = state_io.holder(Path(cfg.state_dir)) or {}
-            detail = "тик уже идёт"
-            if args.json:
-                print(json.dumps({"locked": True, "applied": False, "detail": detail,
-                                  "decision": {"action": "locked", "reason": detail}},
-                                 ensure_ascii=False, indent=2))
-            else:
-                print(f"{detail} (pid {who.get('pid', '?')}, с {who.get('at', '?')}) — "
-                      f"второй тик ничего не делает")
-            return 0
-        try:
-            if args.plan is None:
-                result = tick(cfg)
-                if args.json:
-                    print(json.dumps(result, ensure_ascii=False, indent=2))
-                    return 0
-                acted = bool(result.get("applied") or result.get("retried"))
-                if not acted and not args.status:
-                    return 0
-                print(result["status"])
-                if result.get("applied"):
-                    print(f"Выполнено [{result.get('plan_id')}]: {result['detail']}")
-                return 0
-            retried = retry_pending(p)
-            result = run_gate(p, execute=True)
-            result["pending_commit"] = retried
-        finally:
-            state_io.release(lock)
-    else:
-        retried = None
-        result = run_gate(p, execute=False)
-        result["pending_commit"] = retried
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(result["status"])
+        if retried:
+            print(f"Отложенный коммит: {retried['detail']}")
+        if args.run:
+            print(f"Выполнено: {result['applied']} — {result['detail']}")
         return 0
-    acted = args.run and (result["applied"] or retried)
-    if not acted and not args.status:
-        return 0
-    print(result["status"])
-    if retried:
-        print(f"Отложенный коммит: {retried['detail']}")
-    if args.run:
-        print(f"Выполнено: {result['applied']} — {result['detail']}")
-    return 0
+    except GateError as exc:
+        return incident(cfg, args, exc)
+    except Exception as exc:  # noqa: BLE001 - любой сбой тика = инцидент, а не трейсбек
+        return incident(cfg, args, exc)
 
 
 def repo_root() -> str:
