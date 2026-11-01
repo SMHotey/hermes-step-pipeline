@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""CLI плагина: `hermes pipeline setup|status|run|ui|doctor|notify-test|config`."""
+"""CLI плагина: `hermes pipeline setup|status|run|ui|doctor|notify-test|config|plan-mode`."""
 from __future__ import annotations
 
 import argparse
@@ -11,9 +11,11 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from . import plan_mode
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
 except ImportError:  # pragma: no cover - отладка файлом
+    import plan_mode  # type: ignore
     import project as proj  # type: ignore
     import setup_flow  # type: ignore
     import snapshot as snap  # type: ignore
@@ -83,6 +85,12 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     config.add_argument("--set", nargs=2, metavar=("КЛЮЧ", "ЗНАЧЕНИЕ"), default=None)
     config.set_defaults(handler=cmd_config)
 
+    planmode = sub.add_parser("plan-mode", help="режим планировщика: status | on | off")
+    planmode.add_argument("action", nargs="?", default="", help="status | on | off")
+    planmode.add_argument("--project", default="")
+    planmode.add_argument("--json", action="store_true")
+    planmode.set_defaults(handler=cmd_plan_mode)
+
 
 def _project(raw: str) -> Path:
     if raw:
@@ -92,6 +100,14 @@ def _project(raw: str) -> Path:
 
 def _dump(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+
+
+# Допустимые действия проверяются в обработчике, а не через `choices`: иначе argparse
+# печатает свою ошибку и свой код 2, а голый `plan-mode` (без действия) вообще не дошёл бы
+# до нашей подсказки. Один список — одно место, откуда берутся и проверка, и `usage`.
+PLAN_MODE_ACTIONS = ("status", "on", "off")
+PLAN_MODE_USAGE = ("usage: hermes pipeline plan-mode status|on|off "
+                   "[--project PATH] [--json]")
 
 
 def cmd_setup(args) -> int:
@@ -334,12 +350,63 @@ def cmd_config(args) -> int:
     return 0
 
 
+def cmd_plan_mode(args) -> int:
+    """Прочитать или переключить режим планировщика проекта.
+
+    Действие приходит позиционным аргументом без `choices`, поэтому проверка и подсказка
+    живут здесь, в одном месте: неизвестное действие — код 2, а не исключение. Исключение
+    `run()` превратил бы в `ошибка: ...` с кодом 1, смешав опечатку в команде со сбоем
+    записи состояния.
+    """
+    action = (getattr(args, "action", "") or "").strip().lower()
+    if action not in PLAN_MODE_ACTIONS:
+        print(PLAN_MODE_USAGE, file=sys.stderr)
+        return 2
+
+    project = _project(args.project)
+    path = plan_mode.state_file(project)
+    as_json = bool(getattr(args, "json", False))
+
+    if action == "status":
+        label = "on" if plan_mode.read_mode(project) else "off"
+        if as_json:
+            print(_dump({"mode": label, "file": str(path)}))
+        else:
+            print(f"Режим планировщика: {label}")
+            print(f"Файл состояния: {path}")
+        return 0
+
+    on = action == "on"
+    label = "on" if on else "off"
+    before = plan_mode.read_mode(project)
+    if before == on:
+        # Файл не трогаем: повторный вызов не должен перезаписывать `changed_at`, иначе
+        # дата последнего настоящего переключения теряется, а «изменилось» становится ложью.
+        if as_json:
+            print(_dump({"mode": label, "file": str(path), "changed": False}))
+        else:
+            state = "уже включён" if on else "уже выключен"
+            print(f"Режим планировщика: {label} (без изменений: {state})")
+            print(f"Файл состояния: {path}")
+        return 0
+
+    payload = plan_mode.write_mode(project, on)
+    if as_json:
+        print(_dump({"mode": label, "file": str(path), "changed": True,
+                     "changed_at": payload["changed_at"]}))
+    else:
+        was = "on" if before else "off"
+        print(f"Режим планировщика: {label} (было {was}) — действует со следующей сессии")
+        print(f"Файл состояния: {path}")
+    return 0
+
+
 def run(args) -> int:
     """Обработчик, который вызывает `hermes pipeline ...`."""
     proj.setup_stdio()
     handler = getattr(args, "handler", None)
     if handler is None:
-        print("команды: setup | status | run | ui | doctor | notify-test | config")
+        print("команды: setup | status | run | ui | doctor | notify-test | config | plan-mode")
         return 0
     try:
         return handler(args)
