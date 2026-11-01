@@ -1,0 +1,352 @@
+# -*- coding: utf-8 -*-
+"""CLI плагина: `hermes pipeline setup|status|run|ui|doctor|notify-test|config`."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import webbrowser
+from pathlib import Path
+from typing import Any
+
+try:
+    from . import project as proj
+    from . import setup_flow, snapshot as snap, telegram
+except ImportError:  # pragma: no cover - отладка файлом
+    import project as proj  # type: ignore
+    import setup_flow  # type: ignore
+    import snapshot as snap  # type: ignore
+    import telegram  # type: ignore
+
+
+def build_parser(sp: argparse.ArgumentParser) -> None:
+    """Вызывается загрузчиком плагинов с уже созданным subparser'ом `pipeline`."""
+    sub = sp.add_subparsers(dest="cmd")
+
+    setup = sub.add_parser("setup", help="установить конвейер в проект (спросит токен бота)")
+    setup.add_argument("--project", default=".", help="каталог проекта")
+    setup.add_argument("--board", default="", help="борда канбана")
+    setup.add_argument("--driver", default="", help="профиль исполнителя")
+    setup.add_argument("--prompter", default="", help="профиль постановщика")
+    setup.add_argument("--reviewer", default="", help="профиль ревьюера")
+    setup.add_argument("--telegram-token", default="", help="токен бота (без вопроса)")
+    setup.add_argument("--telegram-chat", default="", help="chat id (без вопроса)")
+    setup.add_argument("--no-telegram", action="store_true", help="не настраивать уведомления")
+    setup.add_argument("--no-test", action="store_true", help="не слать тестовое сообщение")
+    setup.add_argument("--no-profiles", action="store_true", help="не создавать профили ролей")
+    setup.add_argument("--no-cron", action="store_true", help="не заводить cron-джобу")
+    setup.add_argument("--yes", action="store_true", help="без вопросов, значения по умолчанию")
+    setup.add_argument("--force", action="store_true", help="перезаписать движок и pipeline.json")
+    setup.add_argument("--upgrade", action="store_true",
+                       help="обновить только движок в уже поставленном проекте")
+    setup.set_defaults(handler=cmd_setup)
+
+    status = sub.add_parser("status", help="состояние конвейера и решение стража")
+    status.add_argument("--project", default="")
+    status.add_argument("--plan", default="")
+    status.add_argument("--preview", action="store_true",
+                        help="читать проект без установки (движок плагина, только чтение)")
+    status.add_argument("--board", default="", help="борда для предпросмотра")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(handler=cmd_status)
+
+    run = sub.add_parser("run", help="один тик стража (создать карточку/закрыть шаг)")
+    run.add_argument("--project", default="")
+    run.add_argument("--plan", default="")
+    run.set_defaults(handler=cmd_run)
+
+    ui = sub.add_parser("ui", help="локальный UI с визуализацией конвейера")
+    ui.add_argument("--project", default="")
+    ui.add_argument("--port", type=int, default=0)
+    ui.add_argument("--host", default="127.0.0.1")
+    ui.add_argument("--no-open", action="store_true", help="не открывать браузер")
+    ui.add_argument("--detach", action="store_true",
+                    help="запустить в фоне и выйти (живёт после закрытия терминала)")
+    ui.add_argument("--stop", action="store_true", help="остановить фоновый UI")
+    ui.add_argument("--preview", action="store_true",
+                    help="показать проект без установки конвейера (только чтение)")
+    ui.add_argument("--board", default="", help="борда для предпросмотра")
+    ui.set_defaults(handler=cmd_ui)
+
+    doctor = sub.add_parser("doctor", help="проверить установку и окружение")
+    doctor.add_argument("--project", default="")
+    doctor.set_defaults(handler=cmd_doctor)
+
+    notify = sub.add_parser("notify-test", help="отправить тестовое сообщение в Telegram")
+    notify.add_argument("--project", default="")
+    notify.set_defaults(handler=cmd_notify_test)
+
+    config = sub.add_parser("config", help="прочитать/изменить pipeline.json")
+    config.add_argument("--project", default="")
+    config.add_argument("--get", default="", help="ключ через точку: paths.plans")
+    config.add_argument("--set", nargs=2, metavar=("КЛЮЧ", "ЗНАЧЕНИЕ"), default=None)
+    config.set_defaults(handler=cmd_config)
+
+
+def _project(raw: str) -> Path:
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return proj.find_project()
+
+
+def _dump(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+
+
+def cmd_setup(args) -> int:
+    return setup_flow.run_setup(args)
+
+
+def cmd_status(args) -> int:
+    project = _project(args.project)
+    data = snap.snapshot(project, args.plan or None,
+                         preview=bool(getattr(args, "preview", False)),
+                         board=getattr(args, "board", "") or None)
+    if args.json:
+        print(_dump(data))
+        return 0
+    print(render_status(data))
+    return 0
+
+
+def render_status(data: dict) -> str:
+    """Человеческий отчёт для терминала."""
+    lines = [f"Проект: {data.get('project')}  (борда {data.get('board')})"]
+    if data.get("preview"):
+        lines.append("Режим: ПРЕДПРОСМОТР — конвейер в проект не установлен, только чтение")
+    git = data.get("git") or {}
+    if git.get("head") and git.get("head") != "?":
+        dirty = git.get("dirty_count") or 0
+        lines.append(f"Git: {git.get('branch')} @ {git.get('head')} | "
+                     f"{'чисто' if not dirty else f'грязно файлов: {dirty}'}")
+    else:
+        lines.append("Git: не репозиторий (коммиты страж не делает)")
+    for plan in data.get("plans") or []:
+        stop = plan.get("stop") or {}
+        mark = f"  ⛔ {stop.get('kind')}: {stop.get('reason', '')}" if stop else ""
+        lines.append(f"План {plan.get('id')}: закрыто {plan.get('closed')}, "
+                     f"следующий {plan.get('next')}{mark}")
+    if not data.get("plans"):
+        lines.append("Планов нет: скопируй docs/templates/plan-template.md → "
+                     "docs/plans/1-<слаг>.md и заполни шаги с журналом.")
+    plan = data.get("plan") or {}
+    if plan.get("steps"):
+        closed = set(plan.get("closed") or [])
+        lines.append("")
+        lines.append(f"Шаги плана {plan.get('id')}:")
+        for step in plan["steps"]:
+            state = "ЗАКРЫТ" if step["id"] in closed else (
+                "→" if (plan.get("next") or {}).get("id") == step["id"] else "открыт")
+            lines.append(f"  {step['id']:<6} {state:<7} {step.get('days') or 0:>4} дн  "
+                         f"{step.get('owner') or '':<12} {step.get('title')}")
+    decision = data.get("decision") or {}
+    reason = decision.get("reason") or decision.get("step") or ""
+    lines.append("")
+    lines.append(f"Решение: {decision.get('action')} — {reason}")
+    if data.get("status"):
+        lines.append("")
+        lines.append(data["status"])
+    cards = data.get("cards") or []
+    if cards:
+        lines.append("")
+        lines.append("Карточки (последние):")
+        for card in cards[:8]:
+            lines.append(f"  {card.get('id'):<12} {card.get('status'):<10} "
+                         f"{(card.get('assignee') or ''):<12} {str(card.get('title'))[:70]}")
+    tg = data.get("telegram") or {}
+    lines.append("")
+    lines.append(f"Telegram: {'ВКЛ' if tg.get('enabled') else 'выкл'}"
+                 f"{'' if tg.get('token_set') else ' (токен не задан)'}"
+                 f"  чат: {tg.get('chat') or '—'}")
+    for error in data.get("errors") or []:
+        lines.append(f"! {error}")
+    return "\n".join(lines)
+
+
+def cmd_run(args) -> int:
+    project = _project(args.project)
+    extra = ["--plan", args.plan] if args.plan else []
+    res = proj.run_engine(project, "gate.py", "--run", *extra, timeout=600)
+    out = (res.stdout or "").strip()
+    print(out or "тик выполнен: конвейер ждёт (шаг в работе, ревью идёт или стоп-флаг)")
+    if res.returncode != 0:
+        print((res.stderr or "").strip(), file=sys.stderr)
+    return res.returncode
+
+
+def cmd_ui(args) -> int:
+    from . import ui_control, ui_server
+    project = _project(args.project)
+    port = args.port or int(proj.read_config(project).get("ui_port") or 8770)
+    preview = bool(getattr(args, "preview", False))
+    board = getattr(args, "board", "") or None
+    if getattr(args, "stop", False):
+        result = ui_control.stop(project)
+        print(result.get("detail") or result.get("error"), file=sys.stdout if result["ok"] else sys.stderr)
+        return 0 if result["ok"] else 1
+    if getattr(args, "detach", False):
+        result = ui_control.start(project, port, args.host, preview=preview, board=board)
+        if not result.get("ok"):
+            print(f"ошибка: {result.get('error')}", file=sys.stderr)
+            return 1
+        extra = " (уже был запущен)" if result.get("already") else ""
+        print(f"UI конвейера: {result['url']}{extra}")
+        print(f"остановить:  hermes pipeline ui --project \"{project}\" --stop")
+        return 0
+    url = ui_server.serve(project, host=args.host, port=port,
+                          open_browser=not args.no_open, preview=preview, board=board)
+    print(f"UI конвейера: {url}  (Ctrl+C — остановить)")
+    try:
+        while True:
+            import time
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\nUI остановлен")
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    project = _project(args.project)
+    problems: list[str] = []
+    notes: list[str] = []
+    cfg = proj.read_config(project)
+    notes.append(f"проект {project}")
+    notes.append(f"борда {cfg.get('board')}")
+    try:
+        proj.engine(project, "gate.py")
+        notes.append("движок .pipeline/gate.py на месте")
+    except proj.ProjectNotFound as exc:
+        problems.append(str(exc))
+    plans = sorted((project / "docs" / "plans").glob("*.md"))
+    notes.append(f"файлов планов: {len(plans)}")
+    engine_ver = setup_flow.engine_version(project)
+    plugin_ver = setup_flow.plugin_version()
+    if engine_ver and engine_ver != plugin_ver:
+        problems.append(f"движок {engine_ver} старее плагина {plugin_ver} — "
+                        f"hermes pipeline setup --upgrade")
+    elif engine_ver:
+        notes.append(f"версия движка: {engine_ver}")
+    elif (project / ".pipeline").is_dir():
+        notes.append("у движка нет маркера версии — поставь через setup")
+    if not plans:
+        notes.append("! ни одного плана — конвейеру нечего вести")
+    db = proj.board_db(project)
+    notes.append(f"борда БД: {db} ({'есть' if db.is_file() else 'НЕТ'})")
+    if not db.is_file():
+        problems.append("нет sqlite борды — карточки не создадутся (проверь --board)")
+    driver = (cfg.get("profiles") or {}).get("driver") or "default"
+    env_file = proj.profile_dir(driver) / ".env"
+    token = chat = ""
+    if env_file.is_file():
+        for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("STEP_PIPELINE_TELEGRAM_BOT_TOKEN="):
+                token = line.split("=", 1)[1]
+            elif line.startswith("STEP_PIPELINE_TELEGRAM_CHAT_ID="):
+                chat = line.split("=", 1)[1]
+    if token and chat:
+        try:
+            me = telegram.get_me(token)
+            notes.append(f"Telegram: @{me.get('username')} → {chat}")
+        except telegram.TelegramError as exc:
+            problems.append(f"Telegram: {exc}")
+    else:
+        notes.append("Telegram: не настроен")
+    cron = proj.run_hermes("-p", driver, "cron", "list")
+    marker = project / ".pipeline" / "cron.json"
+    job_name = "План: страж шага (конвейер)"
+    if marker.is_file():
+        try:
+            info = json.loads(marker.read_text(encoding="utf-8"))
+            job_name = info.get("name") or job_name
+            driver = info.get("driver") or driver
+        except (OSError, json.JSONDecodeError):
+            pass
+        if job_name in (cron.stdout or ""):
+            notes.append(f"cron-джоба стража: есть ({job_name}, профиль {driver})")
+        else:
+            problems.append(f"cron-джоба «{job_name}» не найдена у профиля {driver} — "
+                            f"конвейер не будет двигаться сам")
+    else:
+        problems.append("cron для этого проекта не заводился — "
+                        "конвейер работает только по кнопке «Тик»")
+    status = snap.snapshot(project)
+    decision = status.get("decision") or {}
+    notes.append(f"решение стража: {decision.get('action')} — {decision.get('reason')}")
+    print("Диагностика конвейера:")
+    for note in notes:
+        print(f"  · {note}")
+    for problem in problems:
+        print(f"  ✗ {problem}")
+    print("\nИТОГ:", "OK" if not problems else "ЕСТЬ ПРОБЛЕМЫ")
+    return 0 if not problems else 1
+
+
+def cmd_notify_test(args) -> int:
+    project = _project(args.project)
+    state = snap.telegram_state(project)
+    token = os.environ.get(state["token_env"], "")
+    if not token or not state["chat"]:
+        print("Telegram не настроен: нет токена или chat id", file=sys.stderr)
+        return 2
+    try:
+        telegram.send_message(token, state["chat"], "🧪 Тест уведомлений конвейера.")
+    except telegram.TelegramError as exc:
+        print(f"ошибка: {exc}", file=sys.stderr)
+        return 1
+    print("тестовое сообщение отправлено")
+    return 0
+
+
+def _get_path(data: dict, key: str) -> Any:
+    node: Any = data
+    for part in key.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
+def _set_path(data: dict, key: str, value: str) -> None:
+    parts = key.split(".")
+    node = data
+    for part in parts[:-1]:
+        node = node.setdefault(part, {})
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = value
+    node[parts[-1]] = parsed
+
+
+def cmd_config(args) -> int:
+    project = _project(args.project)
+    cfg = proj.read_config(project)
+    if args.set:
+        _set_path(cfg, args.set[0], args.set[1])
+        proj.write_config(project, cfg)
+        print(f"{args.set[0]} = {_get_path(cfg, args.set[0])}")
+        return 0
+    if args.get:
+        print(_dump(_get_path(cfg, args.get)))
+        return 0
+    print(_dump(cfg))
+    return 0
+
+
+def run(args) -> int:
+    """Обработчик, который вызывает `hermes pipeline ...`."""
+    handler = getattr(args, "handler", None)
+    if handler is None:
+        print("команды: setup | status | run | ui | doctor | notify-test | config")
+        return 0
+    try:
+        return handler(args)
+    except proj.ProjectNotFound as exc:
+        print(f"ошибка: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:                                     # noqa: BLE001
+        print(f"ошибка: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1

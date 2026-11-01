@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Конвейер шагов</title>
+<style>
+  :root {
+    --bg: #0c0f14; --panel: #141922; --panel-2: #1b2230; --line: #263042;
+    --text: #dbe4f0; --muted: #8492a8; --accent: #5eead4; --ok: #4ade80;
+    --warn: #fbbf24; --bad: #f87171; --run: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  a { color: var(--accent); }
+  header { display: flex; align-items: center; gap: 16px; padding: 14px 20px;
+           border-bottom: 1px solid var(--line); background: var(--panel); position: sticky;
+           top: 0; z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  .badge { padding: 3px 9px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line);
+           color: var(--muted); white-space: nowrap; }
+  .badge.on { color: #04121a; background: var(--accent); border-color: var(--accent); }
+  .badge.run { color: #041018; background: var(--run); border-color: var(--run); }
+  .badge.stop { color: #1b0b0b; background: var(--bad); border-color: var(--bad); }
+  .spacer { flex: 1; }
+  button { background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+           border-radius: 8px; padding: 7px 12px; cursor: pointer; font-size: 13px; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); color: #04121a; border-color: var(--accent);
+                   font-weight: 600; }
+  button.danger:hover { border-color: var(--bad); color: var(--bad); }
+  button:disabled { opacity: .45; cursor: default; }
+  main { display: grid; grid-template-columns: minmax(420px, 1.15fr) minmax(360px, .85fr);
+         gap: 16px; padding: 16px 20px 28px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+            padding: 14px 16px; }
+  section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+               color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
+  .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 10px 12px; position: relative; overflow: hidden; }
+  .stage:after { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+                 background: var(--line); }
+  .stage.done:after { background: var(--ok); }
+  .stage.run:after { background: var(--run); }
+  .stage.wait:after { background: var(--warn); }
+  .stage.bad:after { background: var(--bad); }
+  .stage b { display: block; font-size: 13px; margin-bottom: 2px; }
+  .stage span { color: var(--muted); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
+       text-transform: uppercase; letter-spacing: .06em; padding: 6px 8px;
+       border-bottom: 1px solid var(--line); }
+  td { padding: 7px 8px; border-bottom: 1px solid #1b2230; vertical-align: top; }
+  tr.current td { background: #17202c; }
+  tr.closed td { color: var(--muted); }
+  .pill { padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); }
+  .pill.ok { color: var(--ok); border-color: #1e4630; background: #10241a; }
+  .pill.run { color: var(--run); border-color: #1e3350; background: #0f1c2e; }
+  .pill.wait { color: var(--warn); border-color: #4a3b12; background: #241d09; }
+  .pill.bad { color: var(--bad); border-color: #4a1f1f; background: #241010; }
+  .plans { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .plan-chip { cursor: pointer; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line);
+               background: var(--panel-2); font-size: 12px; }
+  .plan-chip.active { border-color: var(--accent); color: var(--accent); }
+  .plan-chip .stop { color: var(--bad); }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px;
+        color: var(--muted); max-height: 260px; overflow: auto; }
+  .cards li, .journal li { list-style: none; }
+  ul { padding: 0; margin: 0; }
+  .card { padding: 7px 8px; border-bottom: 1px solid #1b2230; font-size: 12.5px; }
+  .card .row1 { display: flex; gap: 8px; align-items: baseline; }
+  .card .title { flex: 1; color: var(--text); }
+  .muted { color: var(--muted); }
+  .console { margin-top: 16px; }
+  .toast { position: fixed; right: 18px; bottom: 18px; background: var(--panel-2);
+           border: 1px solid var(--line); border-left: 3px solid var(--accent);
+           padding: 10px 14px; border-radius: 8px; max-width: 460px; font-size: 13px;
+           opacity: 0; transition: opacity .25s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .toast.bad { border-left-color: var(--bad); }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+           border-radius: 12px; padding: 18px 20px; width: min(560px, 92vw); }
+  dialog::backdrop { background: rgba(4, 7, 12, .7); }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input[type=text], input[type=password] { width: 100%; padding: 8px 10px; border-radius: 8px;
+      border: 1px solid var(--line); background: var(--bg); color: var(--text); font-size: 13px; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } .flow { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Конвейер шагов</h1>
+  <span class="badge mono" id="project">—</span>
+  <span class="badge mono" id="board">—</span>
+  <span class="badge" id="mode">…</span>
+  <span class="badge" id="telegram">telegram</span>
+  <span class="spacer"></span>
+  <button id="btn-tick" class="primary">Тик</button>
+  <button id="btn-stop" class="danger">Стоп</button>
+  <button id="btn-resume">Продолжить</button>
+  <button id="btn-settings">Настройки</button>
+</header>
+
+<main>
+  <div>
+    <section>
+      <h2>Поток текущего шага</h2>
+      <div class="flow" id="flow"></div>
+      <div class="plans" id="plans"></div>
+      <table>
+        <thead><tr><th>Шаг</th><th>Название</th><th>Дни</th><th>Исполнитель</th><th>Статус</th></tr></thead>
+        <tbody id="steps"><tr><td colspan="5" class="muted">загрузка…</td></tr></tbody>
+      </table>
+    </section>
+    <section class="console">
+      <h2>Что говорит страж</h2>
+      <pre id="status">—</pre>
+      <h2 style="margin-top:14px">Журнал плана</h2>
+      <ul class="journal" id="journal"><li class="muted">—</li></ul>
+    </section>
+  </div>
+  <div>
+    <section>
+      <h2>Карточки ролей</h2>
+      <ul class="cards" id="cards"><li class="muted">—</li></ul>
+    </section>
+    <section style="margin-top:16px">
+      <h2>Лог действий</h2>
+      <pre id="log">—</pre>
+    </section>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<dialog id="settings">
+  <h2 style="margin-top:0">Настройки конвейера</h2>
+  <form method="dialog" id="form-config">
+    <label>Борда</label><input type="text" name="board">
+    <label>Ведомые планы (через запятую, * — все)</label><input type="text" name="driven_plans">
+    <div class="row">
+      <div><label>Таймаут шага</label><input type="text" name="step"></div>
+      <div><label>Таймаут ревью</label><input type="text" name="review"></div>
+      <div><label>Таймаут постановки</label><input type="text" name="prompt"></div>
+    </div>
+    <label><input type="checkbox" name="require_prompt"> шаг без постановки не начинается</label>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button type="button" class="primary" id="save-config">Сохранить</button>
+      <button type="button" id="close-settings">Закрыть</button>
+    </div>
+  </form>
+  <hr style="border-color:var(--line);margin:18px 0">
+  <h2>Telegram</h2>
+  <label>Токен бота (хранится в .env профиля)</label>
+  <input type="password" id="tg-token" placeholder="оставь пустым, чтобы не менять">
+  <label>Chat id или @канал</label><input type="text" id="tg-chat">
+  <div style="display:flex;gap:10px;margin-top:12px">
+    <button type="button" class="primary" id="save-tg">Подключить</button>
+    <button type="button" id="test-tg">Тест</button>
+  </div>
+</dialog>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let currentPlan = null;
+let timer = null;
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (c) => (
+    {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+
+function toast(text, bad) {
+  const el = $("toast");
+  el.textContent = text;
+  el.className = "toast show" + (bad ? " bad" : "");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = "toast"; }, 5000);
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = {ok: false, error: "не JSON: " + res.status}; }
+  if (!res.ok && !data.error) data.error = "HTTP " + res.status;
+  return data;
+}
+
+function act(action, payload = {}) {
+  setBusy(true);
+  api("/api/action", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action, ...payload}),
+  }).then((data) => {
+    if (data.ok) toast(actionLabel(action) + ": готово");
+    else toast((data.error || data.stderr || "ошибка"), true);
+    return refresh();
+  }).catch((err) => toast(String(err), true))
+    .finally(() => setBusy(false));
+}
+
+function actionLabel(action) {
+  return {tick: "Тик", stop: "Стоп", resume: "Продолжить",
+          hold: "Допуск", unhold: "Снят допуск"}[action] || action;
+}
+
+function setBusy(busy) {
+  ["btn-tick", "btn-stop", "btn-resume"].forEach((id) => { $(id).disabled = busy; });
+}
+
+function stageOf(cards, planId, stepId) {
+  const prefix = `planloop:${planId}:${stepId}:`;
+  const mine = cards.filter((c) => String(c.idempotency_key || "").startsWith(prefix));
+  const by = (kind) => mine.filter((c) => String(c.idempotency_key || "").includes(":" + kind));
+  const prompt = by("prompt");
+  const step = by("step");
+  const review = by("review");
+  const fix = by("fix");
+  const pick = (list) => list[0] || null;
+  const stateOf = (card) => {
+    if (!card) return "wait";
+    if (card.status === "done") return "done";
+    if (["crashed", "timed_out", "blocked", "gave_up"].includes(card.status)) return "bad";
+    return "run";
+  };
+  return [
+    {title: "Постановка", hint: prompt.length ? (pick(prompt).status) : (step.length ? "выполнена" : "нужна"),
+     cls: step.length || prompt.some((c) => c.status === "done") ? "done" : stateOf(pick(prompt))},
+    {title: "Исполнение", hint: step.length ? pick(step).status : "ждёт", cls: stateOf(pick(step))},
+    {title: "Ревью", hint: review.length ? pick(review).status : "ждёт", cls: stateOf(pick(review))},
+    {title: "Журнал", hint: fix.length ? "правки" : "—", cls: review.some((c) => c.status === "done") ? "run" : "wait"},
+  ];
+}
+
+function render(data) {
+  $("project").textContent = data.project || "—";
+  $("board").textContent = "борда: " + (data.board || "—");
+  const decision = data.decision || {};
+  const stopped = (data.plans || []).some((p) => p.stop);
+  const mode = $("mode");
+  if (data.preview) {
+    mode.textContent = "ПРЕДПРОСМОТР";
+    mode.className = "badge stop";
+    ["btn-tick", "btn-stop", "btn-resume"].forEach((id) => { $(id).disabled = true; });
+    $("btn-tick").title = $("btn-stop").title = $("btn-resume").title =
+      "конвейер в проект не установлен — только чтение";
+  } else {
+    mode.textContent = stopped ? "СТОП" : (decision.action || "—");
+    mode.className = "badge " + (stopped ? "stop" : (["idle"].includes(decision.action) ? "" : "run"));
+  }
+  const tg = data.telegram || {};
+  const tgEl = $("telegram");
+  tgEl.textContent = "telegram " + (tg.enabled ? "вкл" : "выкл");
+  tgEl.className = "badge" + (tg.enabled ? " on" : "");
+
+  const plans = data.plans || [];
+  $("plans").innerHTML = plans.map((p) => `
+    <div class="plan-chip ${String(p.id) === String((data.plan || {}).id) ? "active" : ""}"
+         data-plan="${esc(p.id)}">
+      план ${esc(p.id)} · ${esc(p.closed)} закрыто · → ${esc(p.next)}
+      ${p.stop ? `<span class="stop">⛔ ${esc(p.stop.kind || "")}</span>` : ""}
+    </div>`).join("") || `<span class="muted">планов с журналом не найдено</span>`;
+  document.querySelectorAll(".plan-chip").forEach((chip) => {
+    chip.onclick = () => { currentPlan = chip.dataset.plan; refresh(); };
+  });
+
+  const plan = data.plan || {};
+  const closed = new Set(plan.closed || []);
+  const nextId = (plan.next || {}).id;
+  $("steps").innerHTML = (plan.steps || []).map((s) => `
+    <tr class="${s.id === nextId ? "current" : (closed.has(s.id) ? "closed" : "")}">
+      <td class="mono">${esc(s.id)}</td>
+      <td>${esc(s.title)}</td>
+      <td>${esc(s.days || "")}</td>
+      <td>${esc(s.owner || "")}</td>
+      <td>${closed.has(s.id) ? '<span class="pill ok">закрыт</span>'
+            : (s.id === nextId ? '<span class="pill run">сейчас</span>' : '<span class="pill">открыт</span>')}</td>
+    </tr>`).join("") || `<tr><td colspan="5" class="muted">${esc(plan.note || "шаги не распознаны")}</td></tr>`;
+
+  const stepId = nextId || (plan.steps || [])[0]?.id;
+  $("flow").innerHTML = (stepId ? stageOf(data.cards || [], plan.id, stepId) : []).map((s) => `
+    <div class="stage ${s.cls}"><b>${esc(s.title)}</b><span>${esc(s.hint)}</span></div>`).join("")
+    || `<div class="stage"><b>Нет шага</b><span>все закрыты или план не выбран</span></div>`;
+
+  $("status").textContent = [
+    `решение: ${decision.action || "—"} — ${decision.reason || ""}`,
+    data.status || "",
+    ...(data.errors || []).map((e) => "! " + e),
+  ].filter(Boolean).join("\n");
+
+  $("cards").innerHTML = (data.cards || []).map((c) => {
+    const cls = c.status === "done" ? "ok" : (["crashed", "blocked", "timed_out", "gave_up"].includes(c.status) ? "bad" : "run");
+    return `<li class="card"><div class="row1">
+      <span class="title">${esc(c.title)}</span>
+      <span class="pill ${cls}">${esc(c.status)}</span></div>
+      <div class="muted mono">${esc(c.assignee || "")} · ${esc(c.id)}</div></li>`;
+  }).join("") || `<li class="muted">карточек нет</li>`;
+
+  $("journal").innerHTML = (data.journal || []).map((row) => `
+    <li class="card"><div class="row1"><span class="title">${esc(row[1] || "")}</span>
+      <span class="pill ${String(row[row.length - 1] || "").toUpperCase().includes("ЗАКРЫТ") ? "ok" : "wait"}">
+      ${esc(row[row.length - 1] || "")}</span></div>
+      <div class="muted">${esc(row[0] || "")} · ${esc(row[2] || "")} · ${esc(row[3] || "")}</div></li>`)
+    .join("") || `<li class="muted">журнал пуст</li>`;
+
+  $("log").textContent = (data.log || []).join("\n—\n") || "—";
+}
+
+async function refresh() {
+  const query = currentPlan ? `?plan=${encodeURIComponent(currentPlan)}` : "";
+  const data = await api("/api/snapshot" + query);
+  if (!data.ok) { toast(data.error || "не удалось получить состояние", true); return; }
+  render(data);
+  if (!data.errors || !data.errors.length) {
+    // форма настроек заполняется один раз — не перетираем ввод пользователя
+    if (!window.__configLoaded) {
+      $("form-config").board.value = data.board || "";
+      $("form-config").driven_plans.value = (data.driven || []).join(", ");
+      const rt = data.runtimes || {};
+      $("form-config").step.value = rt.step || "";
+      $("form-config").review.value = rt.review || "";
+      $("form-config").prompt.value = rt.prompt || "";
+      $("form-config").require_prompt.checked = data.require_prompt !== false;
+      $("tg-chat").value = (data.telegram || {}).chat || "";
+      window.__configLoaded = true;
+    }
+  }
+}
+
+$("btn-tick").onclick = () => act("tick", currentPlan ? {plan: currentPlan} : {});
+$("btn-stop").onclick = () => {
+  const reason = prompt("Причина остановки (после текущего шага):", "остановка владельца");
+  if (reason !== null) act("stop", {reason});
+};
+$("btn-resume").onclick = () => act("resume");
+$("btn-settings").onclick = () => $("settings").showModal();
+$("close-settings").onclick = () => $("settings").close();
+$("save-config").onclick = () => {
+  const form = $("form-config");
+  act("save_config", {config: {
+    board: form.board.value.trim(),
+    driven_plans: form.driven_plans.value,
+    require_prompt: form.require_prompt.checked,
+    runtimes: {step: form.step.value.trim(), review: form.review.value.trim(),
+               prompt: form.prompt.value.trim()},
+  }}).then(() => { window.__configLoaded = false; });
+};
+$("save-tg").onclick = () => {
+  const token = $("tg-token").value.trim();
+  const chat = $("tg-chat").value.trim();
+  if (!token && !chat) { toast("нужны токен и chat id", true); return; }
+  act("save_telegram", {token, chat}).then(() => { $("tg-token").value = ""; });
+};
+$("test-tg").onclick = () => act("test_telegram");
+
+refresh();
+timer = setInterval(refresh, 5000);
+document.addEventListener("visibilitychange", () => {
+  clearInterval(timer);
+  if (!document.hidden) { refresh(); timer = setInterval(refresh, 5000); }
+});
+</script>
+</body>
+</html>

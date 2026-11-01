@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    name: pytest ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Зависимости
+        run: python -m pip install --upgrade pip pytest
+      - name: Тесты плагина и движка
+        run: python -m pytest -q
+      - name: Манифест плагина (если hermes установлен)
+        shell: bash
+        run: |
+          if command -v hermes >/dev/null 2>&1; then
+            hermes plugins validate step_pipeline
+          else
+            echo "hermes в CI не установлен — шаг пропущен (проверяется локально)"
+          fi

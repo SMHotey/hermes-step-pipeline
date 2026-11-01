@@ -1,0 +1,46 @@
+{
+  "project": "my-project",
+  "board": "myproject",
+  "profiles": {
+    "driver": "myproject",
+    "prompter": "prompter",
+    "reviewer": "reviewer"
+  },
+  "skills": {
+    "step": ["pipeline-next-step"],
+    "review": ["pipeline-reviewer"],
+    "prompt": ["pipeline-prompter", "agent-prompt-authoring"]
+  },
+  "paths": {
+    "plans": "docs/plans",
+    "reviews": "docs/reviews",
+    "prompts": "docs/prompts",
+    "state": ".pipeline/state"
+  },
+  "markers": {
+    "journal": "журнал",
+    "steps": "шаг"
+  },
+  "step_id_regex": "(?P<id>[A-Za-z]{1,4}\\d+[A-Za-z]?(?:-\\d+)?)",
+  "default_plan": null,
+  "driven_plans": ["*"],
+  "require_prompt": true,
+  "runtimes": {
+    "step": "3h",
+    "review": "150m",
+    "prompt": "45m"
+  },
+  "kanban": {
+    "tenant": "plan"
+  },
+  "git": {
+    "commit": true,
+    "push": true
+  },
+  "notify": {
+    "enabled": false,
+    "token_env": "PIPELINE_TG_TOKEN",
+    "chat_env": "PIPELINE_TG_CHAT",
+    "prefix": ""
+  }
+}

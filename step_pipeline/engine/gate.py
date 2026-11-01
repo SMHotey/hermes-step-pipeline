@@ -1,0 +1,1107 @@
+# -*- coding: utf-8 -*-
+"""Страж шага: конвейер «шаг → ревью → следующий шаг» без остановок.
+
+Разделение ролей, которое и есть смысл конструкции:
+    исполнитель  делает шаг и коммитит его;
+    промптер     заранее пишет постановку шага (без неё шаг не начинается);
+    ревьюер      выносит машиночитаемый вердикт по плану и коду;
+    страж (этот скрипт) исполняет вердикт: ставит карточки, пишет журнал, коммитит.
+
+Почему страж — скрипт, а не «сотрудник-агент»: решение «всё хорошо» — это вердикт
+(`<reviews_dir>/<план>-<шаг>.md`) плюс проверки. Агент на этом месте стоил бы
+модельного прогона и мог бы согласиться с собственной прозой.
+
+Состояния (по одному действию за тик, cron каждые 10 минут):
+
+    шага нет                  → карточка шага        (профиль исполнителя)
+    нет постановки шага       → карточка промптеру + инцидентный стоп
+    шаг done                  → карточка ревью       (профиль ревьюера)
+    вердикт APPROVE           → строка в журнал плана + коммит/пуш
+    вердикт REQUEST_CHANGES   → карточка правок (1-й раз), стоп + уведомление (2-й раз)
+    шаг упал/ревью упало      → стоп + уведомление
+
+Стоп-флаг блокирует ТОЛЬКО начало следующего шага: текущий шаг доводится до ревью и
+журнала (это и значит «остановка ПОСЛЕ выполнения шага»).
+
+Использование:
+    python .pipeline/gate.py --status            # что видно и что было бы сделано
+    python .pipeline/gate.py --plans             # таблица планов: шаг, закрыто, стоп
+    python .pipeline/gate.py --plan 3 --status   # состояние конкретного плана
+    python .pipeline/gate.py --run               # выполнить одно действие (режим cron)
+    python .pipeline/gate.py --stop "причина"    # остановиться после текущего шага
+    python .pipeline/gate.py --resume            # снять стоп
+    python .pipeline/gate.py --hold S3a          # шаг требует ручного допуска владельца
+    python .pipeline/gate.py --unhold S3a
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config as config_mod  # noqa: E402 - модуль рядом
+import registry  # noqa: E402 - реестр планов
+import next_step  # noqa: E402 - сборщик контракта шага
+
+TERMINAL = {"done", "blocked", "crashed", "timed_out", "gave_up"}
+VERDICT_RE = re.compile(r"^#{0,4}\s*ВЕРДИКТ\s*:\s*(APPROVE|REQUEST_CHANGES)\s*$",
+                        re.IGNORECASE | re.MULTILINE)
+COMMIT_RE = re.compile(r"коммит\S*\s*`([0-9a-f]{7,40})`", re.IGNORECASE)
+
+
+# ───────────────────────────── окружение ─────────────────────────────
+
+@dataclass
+class Paths:
+    """Все внешние точки, которые трогает страж (в тестах подменяются на временные)."""
+
+    cfg: config_mod.Config
+    repo: Path
+    plan_file: Path
+    review_dir: Path
+    kanban_db: Path
+    state_file: Path
+    stop_file: Path
+    plan_id: str
+    journal_heading: str
+    review_prefix: str
+
+    @property
+    def step_re(self) -> re.Pattern:
+        return self.cfg.step_regex
+
+
+def resolve_paths(cfg: config_mod.Config, plan_id: str | None = None) -> Paths:
+    """Пути выбранного плана. Неизвестный номер — честная ошибка реестра."""
+    want = registry.normalize(plan_id or registry.default_plan_id(cfg))
+    spec = registry.get(cfg, want)
+    return Paths(
+        cfg=cfg,
+        repo=cfg.repo,
+        plan_file=Path(spec.file),
+        review_dir=cfg.reviews_dir,
+        kanban_db=cfg.kanban_db,
+        state_file=Path(spec.state_file),
+        stop_file=Path(spec.stop_file),
+        plan_id=spec.id,
+        journal_heading=spec.journal_heading,
+        review_prefix=spec.review_prefix,
+    )
+
+
+def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 120) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, cwd=str(cwd or Path.cwd()), capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=timeout)
+
+
+def _hermes() -> str:
+    return shutil.which("hermes") or "hermes"
+
+
+def _python(p: Paths) -> str:
+    for cand in (Path(p.repo) / ".venv" / "Scripts" / "python.exe",
+                 Path(p.repo) / ".venv" / "bin" / "python",
+                 Path(p.repo) / "venv" / "Scripts" / "python.exe"):
+        if cand.is_file():
+            return str(cand)
+    return sys.executable
+
+
+# ───────────────────────────── состояние ─────────────────────────────
+
+def load_state(p: Paths) -> dict:
+    try:
+        data = json.loads(Path(p.state_file).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(p: Paths, state: dict) -> None:
+    path = Path(p.state_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_stop(p: Paths) -> dict | None:
+    try:
+        data = json.loads(Path(p.stop_file).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {"reason": str(data)}
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def write_stop(p: Paths, reason: str, source: str, kind: str | None = None) -> dict:
+    """`kind=owner` — снимает только владелец; `kind=incident` — страж снимает сам."""
+    payload = {"reason": reason, "source": source,
+               "kind": kind or ("owner" if source == "owner" else "incident"),
+               "at": time.strftime("%d.%m.%Y %H:%M:%S")}
+    path = Path(p.stop_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def clear_stop(p: Paths) -> bool:
+    path = Path(p.stop_file)
+    existed = path.is_file()
+    path.unlink(missing_ok=True)
+    return existed
+
+
+# ───────────────────────────── вердикт ─────────────────────────────
+
+def review_path(p: Paths, step_id: str) -> Path:
+    return Path(p.review_dir) / f"{p.review_prefix}-{step_id}.md"
+
+
+def verdict_of(p: Paths, step_id: str) -> dict | None:
+    """Разобрать отчёт ревьюера. None — отчёта нет; verdict=NONE/AMBIGUOUS — отчёт негоден."""
+    path = review_path(p, step_id)
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace")
+    found = [m.group(1).upper() for m in VERDICT_RE.finditer(text)]
+    unique = sorted(set(found))
+    if not found:
+        verdict = "NONE"
+    elif len(unique) == 1:
+        verdict = unique[0]
+    else:
+        verdict = "AMBIGUOUS"
+    commit = COMMIT_RE.search(text)
+    return {
+        "path": str(path),
+        "verdict": verdict,
+        "occurrences": len(found),
+        "sha": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+        "commit": commit.group(1) if commit else None,
+    }
+
+
+# ───────────────────────────── журнал плана ─────────────────────────────
+
+def _journal_rows(p: Paths) -> list[int]:
+    """Индексы строк таблицы журнала (после заголовка раздела своего плана)."""
+    lines = Path(p.plan_file).read_text(encoding="utf-8", errors="replace").splitlines()
+    marker = p.cfg.journal_marker
+    start = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#") and marker in stripped.lower():
+            start = i
+            break
+    if start is None:
+        return []
+    rows: list[int] = []
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if stripped.startswith("## "):
+            break
+        if stripped.startswith("|"):
+            rows.append(i)
+    return rows
+
+
+def journal_closed(p: Paths, step_id: str) -> bool:
+    """Закрыт ли шаг в журнале своего плана (идентификатор — по выражению плана)."""
+    path = Path(p.plan_file)
+    if not path.is_file():
+        return False
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for i in _journal_rows(p):
+        cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+        if len(cells) < 5:
+            continue
+        m = p.step_re.match(cells[1])
+        if not m or m.group("id").upper() != step_id.upper():
+            continue
+        if cells[-1].upper().startswith("ЗАКРЫТ"):
+            return True
+    return False
+
+
+def append_journal_row(p: Paths, step_id: str, title: str, commit: str, evidence: str) -> bool:
+    """Записать строку журнала. False — шаг уже закрыт (идемпотентно).
+
+    Если строка шага уже есть (шаблон плана заводит их со статусом «открыт»), она
+    ПЕРЕЗАПИСЫВАЕТСЯ, а не дублируется: два ряда на один шаг ломают чтение журнала.
+    """
+    path = Path(p.plan_file)
+    if not path.is_file():
+        raise SystemExit(f"нет файла плана: {path}")
+    if journal_closed(p, step_id):
+        return False
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    rows = _journal_rows(p)
+    if not rows:
+        raise SystemExit("в плане нет таблицы журнала — строка не добавлена")
+    date = time.strftime("%d.%m.%Y")
+    cells = [date, f"{step_id} ({title})", commit or "—", evidence or "ревью APPROVE", "ЗАКРЫТ"]
+    row = "| " + " | ".join(c.replace("|", "/").replace("\n", " ") for c in cells) + " |"
+    target = None
+    for i in rows:
+        row_cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+        if len(row_cells) < 2:
+            continue
+        m = p.step_re.match(row_cells[1])
+        if m and m.group("id").upper() == step_id.upper():
+            target = i
+            break
+    if target is not None:
+        lines[target] = row
+    else:
+        lines.insert(rows[-1] + 1, row)
+    path.write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+    return True
+
+
+def commit_and_push(p: Paths, files: list[str], message: str) -> tuple[bool, str]:
+    """Закоммитить ТОЛЬКО перечисленные файлы; чужие правки в дереве не блокируют коммит."""
+    if not p.cfg.git_commit:
+        return True, "(коммит выключен в pipeline.json)"
+    status = _run(["git", "-c", "core.quotepath=off", "status", "--porcelain", "-z"], p.repo)
+    entries = [e for e in status.stdout.split(chr(0)) if e.strip()]
+    dirty = [e[3:].strip() for e in entries]
+    allowed = {f.replace("\\", "/") for f in files}
+    strangers = [d for d in dirty if d.replace("\\", "/") not in allowed]
+    if strangers:
+        print("[commit] в дереве чужие правки — не трогаю: " + ", ".join(strangers[:5]))
+    add = _run(["git", "add", *files], p.repo)
+    if add.returncode != 0:
+        return False, f"git add: {add.stderr.strip()[:200]}"
+    commit = _run(["git", "commit", "-m", message], p.repo)
+    if commit.returncode != 0:
+        return False, f"git commit: {(commit.stderr or commit.stdout).strip()[:200]}"
+    if p.cfg.git_push:
+        push = _run(["git", "push"], p.repo, timeout=180)
+        if push.returncode != 0:
+            return False, f"git push: {(push.stderr or push.stdout).strip()[:200]}"
+    sha = _run(["git", "rev-parse", "--short", "HEAD"], p.repo).stdout.strip()
+    return True, sha
+
+
+# ───────────────────────────── доска ─────────────────────────────
+
+def read_cards(p: Paths, key_prefix: str) -> list[dict]:
+    db = Path(p.kanban_db)
+    if not db.is_file():
+        return []
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            """SELECT id, title, status, assignee, idempotency_key, completed_at,
+                      COALESCE(result,''), COALESCE(last_failure_error,'')
+               FROM tasks
+               WHERE idempotency_key LIKE ? AND status <> 'archived'
+               ORDER BY created_at ASC""",
+            (key_prefix + "%",),
+        ).fetchall()
+    finally:
+        con.close()
+    return [{"id": r[0], "title": r[1], "status": r[2], "assignee": r[3], "key": r[4],
+             "completed_at": int(r[5] or 0), "result": r[6], "error": r[7]} for r in rows]
+
+
+def card_of(cards: list[dict], kind: str) -> list[dict]:
+    """Карточки одного вида конвейера: `:<kind>` или `:<kind>:<номер>` в ключе."""
+    pattern = re.compile(rf":{kind}(:\d+)?$")
+    return [c for c in cards if pattern.search(c.get("key") or "")]
+
+
+# ───────────────────────────── тексты карточек ─────────────────────────────
+
+def _report_rel(p: Paths, step_id: str) -> str:
+    return p.cfg.rel(Path(p.review_dir) / f"{p.review_prefix}-{step_id}.md")
+
+
+def prompt_rel(p: Paths, step_id: str) -> str | None:
+    """Постановка шага: `<prompts_dir>/<дата>_<план>-<шаг>_prompt.md` (дата любая)."""
+    folder = Path(p.cfg.prompts_dir)
+    if not folder.is_dir():
+        return None
+    suffix = f"_{p.plan_id}-{step_id}_prompt.md"
+    matches = sorted(folder.glob(f"*{suffix}"))
+    if not matches:
+        return None
+    return p.cfg.rel(matches[-1])
+
+
+def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
+    plan_id = p.plan_id
+    plan_rel = p.cfg.rel(Path(p.plan_file))
+    lines = [f"ШАГ ПЛАНА {plan_id} {step['id']} — {step['title']}", ""]
+    if prompt:
+        lines += [f"ПОСТАНОВКА (прочитать ПЕРВОЙ, до кода): `{prompt}`", ""]
+    lines += [f"Цель: {step.get('goal', '')}", "", "Файлы (править/создавать):"]
+    lines += [f"- {f}" for f in step.get("files") or []]
+    lines += ["", "Гейты (запустить и показать фактический результат):"]
+    lines += [f"- {g}" for g in step.get("gates") or []]
+    lines += ["", f"Готово = {step.get('dod', '')}", "", "Что прочитать перед началом:"]
+    if prompt:
+        lines += [f"- {prompt} (постановка шага — границы, стоп-сигналы, формат отчёта)"]
+    lines += [f"- {r}" for r in step.get("read") or []]
+    if step.get("notes"):
+        lines += ["", f"Важно: {step['notes']}"]
+    lines += [
+        "",
+        "ЖЁСТКИЕ ПРАВИЛА",
+        "- Работать только по этому шагу, не расширять объём и не начинать следующий.",
+        "- Существующие тесты не удалять и не ослаблять; новые — happy path + границы + интеграция.",
+        "- Вывод команд ≤ 200 строк: `pytest -q --tb=line`, `git status --porcelain | head -30`,",
+        "  большой вывод — в файл и `grep` по нему (объём вывода = токены каждого хода).",
+        "- Не перечитывать уже прочитанный файл: адресно `grep`/`read_file offset`.",
+        "",
+        "ЗАВЕРШЕНИЕ (обязательно, иначе конвейер встанет)",
+        "1. Гейты зелёные — показать фактические цифры.",
+        "2. Коммит и пуш ТОЛЬКО файлов шага: `git add <файлы шага>` (НЕ `git add -A`: в дереве",
+        "   могут быть правки параллельной сессии), сообщение на русском, `git push`.",
+        "3. Закрыть карточку через kanban_complete: что сделано, прогоны с цифрами, sha коммита.",
+        "   Строку в журнал плана НЕ добавлять — её добавит страж после APPROVE ревьюера.",
+        "",
+        f"Контракт шага: `{plan_rel}` §{step['id']}.",
+    ]
+    return "\n".join(lines)
+
+
+def _step_assignee(p: Paths, step: dict) -> str:
+    """Профиль-исполнитель карточки: владелец шага, иначе драйвер из pipeline.json."""
+    owner = str(step.get("owner") or "").strip()
+    for token in re.split(r"[+,/]", owner):
+        token = token.strip().strip("`")
+        if re.fullmatch(r"[a-z][a-z0-9_-]{1,30}", token):
+            return token
+    return p.cfg.driver
+
+
+def prompt_order_body(p: Paths, step: dict) -> str:
+    """Тело карточки промптеру: заказ постановки, без которой шаг не начинается."""
+    plan_rel = p.cfg.rel(Path(p.plan_file))
+    step_id = step["id"]
+    files = ", ".join(f"`{f}`" for f in (step.get("files") or [])) or "—"
+    gates = "; ".join(f"`{g}`" for g in (step.get("gates") or [])) or "—"
+    return "\n".join([
+        f"ПОСТАНОВКА ШАГА {step_id} ПЛАНА {p.plan_id} — {step['title']}",
+        "",
+        f"Ты — роль `{p.cfg.prompter}`. Шаг не начинается, пока нет постановки.",
+        "Задача — написать постановку и довести гейт формы до PASS.",
+        "",
+        "КОНТРАКТ ШАГА (из сборщика шагов, не менять):",
+        f"- План и раздел: `{plan_rel}` §{step_id}",
+        f"- Цель: {step.get('goal', '')}",
+        f"- Файлы: {files}",
+        f"- Гейты: {gates}",
+        f"- Готово = {step.get('dod', '')}",
+        "",
+        "ЧТО СДЕЛАТЬ:",
+        f"1. Прочитать §{step_id} плана и фактическое состояние кода (файлы выше, `git log -3 -- <файлы>`).",
+        "2. Написать постановку по блокам шаблона (роль и цель; контекст с file:line; границы;",
+        "   задачи; как проверить; стоп-сигналы; формат отчёта; вопросы; ревью).",
+        "3. Раздел «Состояние на момент постановки»: что уже сделано, чего не хватает до «Готово =».",
+        "4. Гейт: `python .pipeline/check_task_prompt.py <файл>` → `ИТОГ: PASS`.",
+        "5. Коммит и пуш ТОЛЬКО файла постановки, затем kanban_complete: путь, результат гейта, sha.",
+        "",
+        "ЗАПРЕТЫ: не править код приложения, не запускать тесты и сборки, не менять план,",
+        "не коммитить чужие файлы (`git add` перечислением, не `-A`).",
+    ])
+
+
+def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
+                     prompt: str | None = None) -> str:
+    plan_id = p.plan_id
+    plan_rel = p.cfg.rel(Path(p.plan_file))
+    if prompt:
+        prompt_block = [
+            "СВЕРКА С ПОСТАНОВКОЙ (обязательный раздел отчёта)",
+            f"- Постановка шага: `{prompt}` — прочитать её целиком.",
+            "- Сверить итог по трём разрезам: «Что сделать» (каждый пункт — выполнен/нет, с file:line),",
+            "  «Границы» (запрещённое — проверить, что НЕ сделано), «Формат отчёта».",
+            "- Выполненное СВЕРХ постановки — находка (расширение объёма), а не плюс;",
+            "  расхождение постановки с планом/кодом — отдельная находка с указанием, что верно.",
+        ]
+    else:
+        prompt_block = [
+            "СВЕРКА С ПОСТАНОВКОЙ (обязательный раздел отчёта)",
+            "- Постановки шага в каталоге промтов НЕТ — зафиксировать это находкой",
+            "  («шаг исполнен без постановки») и ревьюить только по §шага плана.",
+        ]
+    return "\n".join([
+        f"РЕВЬЮ ШАГА {step['id']} плана {plan_id} — {step['title']} (круг {attempt})",
+        "",
+        f"Отчёт писать в: `{report_rel}` (перезаписать, если файл есть).",
+        "",
+        f"Источники — РОВНО два (роль `{p.cfg.reviewer}`): (1) раздел шага в плане",
+        f"`{plan_rel}` §{step['id']}; (2) код — `git show` коммита шага, сами файлы, тесты.",
+        "Отчёт исполнителя и его транскрипт — НЕ доказательство.",
+        "",
+        *prompt_block,
+        "",
+        "Гейты шага (прогнать САМОСТОЯТЕЛЬНО, свои цифры):",
+        *[f"- {g}" for g in step.get("gates") or []],
+        "",
+        f"Готово = {step.get('dod', '')}",
+        "",
+        "ОБЯЗАТЕЛЬНЫЙ ФОРМАТ ОТЧЁТА",
+        f"- Файл `{report_rel}` содержит РОВНО ОДНУ строку вердикта (заголовок допустим):",
+        "  `## ВЕРДИКТ: APPROVE` либо `## ВЕРДИКТ: REQUEST_CHANGES`.",
+        "  Две строки вердикта или цитата чужого вердикта = страж остановит конвейер (AMBIGUOUS).",
+        "- Первая строка блока «Объект ревью» — коммит шага в обратных кавычках:",
+        "  `Объект ревью: коммит \\`<sha>\\``. Без него стражу нечего сверять.",
+        "- Разбор каждого пункта «Готово =» с file:line, свои прогоны с цифрами, находки по",
+        "  классам (блокирующая/значимая/стилистическая).",
+        "",
+        "ЗАПРЕТЫ: не править код, не коммитить, не пушить, не запускать полный набор тестов,",
+        "не трогать данные приложения. Ревьюер выносит суждение — исправляет исполнитель.",
+        "",
+        "Закрыть карточку через kanban_complete: вердикт одной строкой + путь отчёта.",
+    ])
+
+
+def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -> str:
+    plan_rel = p.cfg.rel(Path(p.plan_file))
+    return "\n".join([
+        f"ПРАВКИ ПО РЕВЬЮ шага {step['id']} плана {p.plan_id} — {step['title']} (круг {round_no})",
+        "",
+        f"Ревьюер вернул REQUEST_CHANGES. Отчёт: `{report_rel}`.",
+        f"Контракт шага — `{plan_rel}` §{step['id']}, критерий: {step.get('dod', '')}",
+        "",
+        "ЧТО ДЕЛАТЬ",
+        "- Исправить БЛОКИРУЮЩИЕ находки полностью; значимые — по существу (не косметикой).",
+        "- Ничего не расширять за пределы шага; тесты не ослаблять и не удалять.",
+        "- Гейты шага перегнать и показать фактические цифры:",
+        *[f"  - {g}" for g in step.get("gates") or []],
+        "",
+        "ЗАВЕРШЕНИЕ",
+        "1. Коммит и пуш ТОЛЬКО файлов правок (`git add <файлы>`, НЕ `-A`), сообщение на русском.",
+        "2. kanban_complete: какие находки закрыты (по номерам), прогоны с цифрами, sha коммита.",
+        "   Журнал плана не трогать. Следующий круг ревью ставит страж.",
+        "",
+        "ВАЖНО: это последний автоматический круг правок. Второй REQUEST_CHANGES останавливает",
+        "конвейер и уходит владельцу — доведи находки до конца.",
+    ])
+
+
+# ───────────────────────────── решения ─────────────────────────────
+
+def collector(p: Paths, step: str | None = None) -> dict:
+    cmd = [_python(p), str(Path(__file__).resolve().parent / "next_step.py"),
+           "--plan", p.plan_id, "--json"]
+    if step:
+        cmd += ["--step", step]
+    res = _run(cmd, Path(p.repo), timeout=120)
+    if res.returncode != 0:
+        raise SystemExit(f"next_step.py упал: {(res.stderr or res.stdout)[-400:]}")
+    return json.loads(res.stdout)
+
+
+def build_ctx(p: Paths) -> dict:
+    state = load_state(p)
+    ctx: dict = {"state": state, "stop": load_stop(p), "hold": list(state.get("hold_steps") or [])}
+    ctx["plan_id"] = p.plan_id
+    ctx["review_prefix"] = p.review_prefix
+    try:
+        pkg = collector(p)
+    except SystemExit as exc:
+        ctx.update(next=None, collector_error=str(exc), cards=[], verdict=None,
+                   journal_closed=False, prev_closed=None, prev_verdict=None)
+        return ctx
+    step = pkg.get("next")
+    ctx["next"] = step
+    ctx["steps_total"] = int(pkg.get("steps_total") or 0)
+    ctx["no_steps"] = bool(pkg.get("steps_total") is not None and ctx["steps_total"] == 0)
+    ctx["note"] = pkg.get("note") or ""
+    ctx["closed"] = [s.upper() for s in (pkg.get("closed") or [])]
+    ctx["prev_closed"] = ctx["closed"][-1] if ctx["closed"] else None
+    ctx["prev_verdict"] = verdict_of(p, ctx["prev_closed"]) if ctx["prev_closed"] else None
+    ctx["verdict"] = verdict_of(p, step["id"]) if step else None
+    ctx["journal_closed"] = bool(step) and journal_closed(p, step["id"])
+    ctx["cards"] = read_cards(p, f"planloop:{p.plan_id}:{step['id']}:") if step else []
+    ctx["prev_cards"] = (read_cards(p, f"planloop:{p.plan_id}:{ctx['prev_closed']}:")
+                         if ctx.get("prev_closed") else [])
+    return ctx
+
+
+def stop_kind(stop: dict | None) -> str:
+    if not stop:
+        return ""
+    return stop.get("kind") or ("owner" if stop.get("source") == "owner" else "incident")
+
+
+def decide(ctx: dict) -> dict:
+    """Чистое решение по состоянию: одно действие (или ожидание). Без побочных эффектов.
+
+    Стоп-флаг владельца блокирует всё. Инцидентный флаг (его ставит сам страж) держит
+    конвейер, но снимается автоматически, как только причина исчезла.
+    """
+    stop = ctx.get("stop")
+    if stop and stop_kind(stop) == "owner":
+        return {"action": "idle", "reason": f"стоп-флаг владельца: {stop.get('reason', '')}"}
+    base = _decide_base(ctx)
+    if stop:
+        if base["action"] == "stop":
+            return {"action": "idle", "incident": True,
+                    "reason": f"инцидент ждёт устранения: {base.get('reason', '')}"}
+        return dict(base, clear_incident=True,
+                    reason=f"стоп-причина снята (было: {stop.get('reason', '')}); "
+                           f"дальше — {base['action']}")
+    return base
+
+
+def _decide_base(ctx: dict) -> dict:
+    """Решение без учёта стоп-флага."""
+    step = ctx.get("next")
+    if not step:
+        if ctx.get("collector_error"):
+            return {"action": "stop",
+                    "reason": f"сборщик шагов не работает: {ctx['collector_error'][:200]}"}
+        if ctx.get("no_steps"):
+            return {"action": "idle",
+                    "reason": f"у плана {ctx.get('plan_id')} не распознан раздел шагов — "
+                              f"конвейер его не ведёт"}
+        return {"action": "idle", "reason": "план закрыт — следующих шагов нет", "plan_done": True}
+    sid = step["id"]
+    prev, prev_verdict = ctx.get("prev_closed"), ctx.get("prev_verdict")
+    if prev and prev_verdict and prev_verdict["verdict"] == "REQUEST_CHANGES":
+        # Журнал закрыл шаг, а ревью говорит «нужны правки»: вперёд идти нельзя.
+        # Даём ОДИН автоматический повторный круг ревью.
+        prev_cards = ctx.get("prev_cards") or []
+        rereviews = [c for c in prev_cards if (c.get("key") or "").endswith(":rereview:1")]
+        prev_fix = card_of(prev_cards, "fix")
+        if not rereviews:
+            if prev_fix and prev_fix[-1]["status"] not in TERMINAL:
+                return {"action": "idle",
+                        "reason": f"правки шага {prev} в работе: карточка {prev_fix[-1]['id']} "
+                                  f"({prev_fix[-1]['status']})"}
+            if prev_fix and prev_fix[-1]["status"] != "done":
+                detail = (prev_fix[-1].get("error") or prev_fix[-1].get("result") or "")[:300]
+                return {"action": "stop", "step": sid,
+                        "reason": f"карточка правок {prev_fix[-1]['id']} в статусе "
+                                  f"{prev_fix[-1]['status']}: {detail}"}
+            prev_steps = card_of(prev_cards, "step")
+            parent = (prev_fix[-1]["id"] if prev_fix
+                      else (prev_steps[-1]["id"] if prev_steps else None))
+            return {"action": "create_rereview", "step": prev, "verdict": prev_verdict,
+                    "parent": parent,
+                    "reason": f"шаг {prev} закрыт при REQUEST_CHANGES — ставится повторное ревью"}
+        if rereviews[-1]["status"] not in TERMINAL:
+            return {"action": "idle",
+                    "reason": f"повторное ревью шага {prev} идёт: карточка {rereviews[-1]['id']}"}
+        return {"action": "stop", "step": sid,
+                "reason": f"повторное ревью шага {prev} снова REQUEST_CHANGES "
+                          f"({Path(prev_verdict['path']).name}) — нужно решение владельца"}
+    if sid.upper() in {str(h).upper() for h in (ctx.get("hold") or [])}:
+        return {"action": "idle", "reason": f"шаг {sid} в списке ручного допуска владельца"}
+
+    cards = ctx.get("cards") or []
+    steps = card_of(cards, "step")
+    if not steps:
+        return {"action": "create_step", "step": sid, "data": step}
+    last_step = steps[-1]
+    if last_step["status"] not in TERMINAL:
+        return {"action": "idle", "reason": f"шаг {sid} в работе: карточка {last_step['id']} "
+                                           f"({last_step['status']})"}
+    if last_step["status"] != "done":
+        detail = (last_step.get("error") or last_step.get("result") or "")[:300]
+        return {"action": "stop", "step": sid,
+                "reason": f"карточка шага {last_step['id']} в статусе {last_step['status']}: {detail}"}
+
+    fixes = card_of(cards, "fix")
+    attempt = len(fixes) + 1
+    this_fix = [c for c in fixes if (c.get("key") or "").endswith(f":fix:{attempt - 1}")]
+    reviews = [c for c in card_of(cards, "review")
+               if (c.get("key") or "").endswith(f":review:{attempt}")]
+    if not reviews:
+        if this_fix and this_fix[-1]["status"] not in TERMINAL:
+            return {"action": "idle",
+                    "reason": f"правки шага {sid} в работе: карточка {this_fix[-1]['id']} "
+                              f"({this_fix[-1]['status']})"}
+        if this_fix and this_fix[-1]["status"] != "done":
+            detail = (this_fix[-1].get("error") or this_fix[-1].get("result") or "")[:300]
+            return {"action": "stop", "step": sid,
+                    "reason": f"карточка правок {this_fix[-1]['id']} в статусе "
+                              f"{this_fix[-1]['status']}: {detail}"}
+        return {"action": "create_review", "step": sid, "data": step, "attempt": attempt,
+                "parent": this_fix[-1]["id"] if this_fix else last_step["id"]}
+    last_review = reviews[-1]
+    if last_review["status"] not in TERMINAL:
+        return {"action": "idle", "reason": f"ревью {sid} идёт: карточка {last_review['id']}"}
+    if last_review["status"] != "done":
+        detail = (last_review.get("error") or last_review.get("result") or "")[:300]
+        return {"action": "stop", "step": sid,
+                "reason": f"ревью {sid} упало ({last_review['status']}): {detail}"}
+
+    verdict = ctx.get("verdict")
+    if verdict is None:
+        prefix = ctx.get("review_prefix") or "?"
+        return {"action": "stop", "step": sid,
+                "reason": f"ревью {sid} закрыто, но отчёта {prefix}-{sid}.md нет"}
+    if verdict["verdict"] in ("NONE", "AMBIGUOUS"):
+        what = "строки вердикта нет" if verdict["verdict"] == "NONE" else "строк вердикта несколько"
+        return {"action": "stop", "step": sid,
+                "reason": f"вердикт {sid} не распознан ({what}): {Path(verdict['path']).name}"}
+    if verdict["verdict"] == "APPROVE":
+        return {"action": "close_step", "step": sid, "data": step, "verdict": verdict,
+                "journal_closed": ctx.get("journal_closed")}
+    if not fixes:
+        return {"action": "create_fix", "step": sid, "data": step, "round": 1,
+                "parent": last_review["id"]}
+    return {"action": "stop", "step": sid,
+            "reason": f"второй REQUEST_CHANGES по шагу {sid} — автоматический круг правок исчерпан"}
+
+
+def status_text(ctx: dict, decision: dict) -> str:
+    step = ctx.get("next") or {}
+    plan_id = ctx.get("plan_id") or "?"
+    lines = [
+        f"План {plan_id}: следующий открытый шаг — {step.get('id') or 'нет'} {step.get('title') or ''}",
+        f"Закрыто в журнале: {', '.join(ctx.get('closed') or []) or '—'}",
+        f"Карточек конвейера: {len(ctx.get('cards') or [])}",
+    ]
+    for c in ctx.get("cards") or []:
+        lines.append(f"  - {c['id']} {c['status']:<10} {c['key']}")
+    if ctx.get("verdict"):
+        v = ctx["verdict"]
+        lines.append(f"Вердикт: {v['verdict']} (строк: {v['occurrences']}, "
+                     f"коммит: {v['commit'] or '—'})")
+    else:
+        lines.append("Вердикт: отчёта нет")
+    if ctx.get("prev_verdict"):
+        lines.append(f"Прошлый закрытый шаг {ctx.get('prev_closed')}: "
+                     f"вердикт {ctx['prev_verdict']['verdict']}")
+    if ctx.get("stop"):
+        lines.append(f"СТОП-ФЛАГ: {ctx['stop'].get('reason')} (с {ctx['stop'].get('at')})")
+    lines.append(f"Решение: {decision['action']} — {decision.get('reason', '')}")
+    return "\n".join(lines)
+
+
+# ───────────────────────────── побочные действия ─────────────────────────────
+
+def _create_card(p: Paths, title: str, body: str, assignee: str, key: str,
+                 skills: tuple[str, ...], parent: str | None = None,
+                 max_runtime: str | None = None) -> str | None:
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as fh:
+        fh.write(body)
+        body_path = fh.name
+    cmd = [_hermes(), "kanban", "--board", p.cfg.board,
+           "create", title, "--body-file", body_path,
+           "--assignee", assignee, "--tenant", p.cfg.tenant,
+           "--workspace", f"dir:{Path(p.repo).as_posix()}",
+           "--idempotency-key", key,
+           "--max-runtime", max_runtime or p.cfg.step_runtime]
+    for skill in skills:
+        cmd += ["--skill", skill]
+    if parent:
+        cmd += ["--parent", parent]
+    res = _run(cmd, Path(p.repo), timeout=180)
+    out = (res.stdout or "") + (res.stderr or "")
+    m = re.search(r"t_[0-9a-f]{6,}", out)
+    if res.returncode != 0 and not m:
+        print(f"[card] не создано: {out.strip()[:300]}", file=sys.stderr)
+        return None
+    return m.group(0) if m else None
+
+
+def notify(cfg: config_mod.Config, text: str) -> bool:
+    """Уведомление владельцу. Выключено — печатаем (cron --deliver покажет в выводе)."""
+    prefix = str(cfg.notify.get("prefix") or "")
+    msg = f"{prefix}{text}" if prefix else text
+    if not cfg.notify.get("enabled"):
+        # stderr, не stdout: `--json` должен остаться чистым JSON для UI и инструментов
+        print(f"[notify] {msg}", file=sys.stderr)
+        return True
+    token = os.environ.get(str(cfg.notify.get("token_env") or "PIPELINE_TG_TOKEN"))
+    chat = os.environ.get(str(cfg.notify.get("chat_env") or "PIPELINE_TG_CHAT"))
+    if not token or not chat:
+        print(f"[notify] нет токена/чата, сообщение не отправлено: {msg}", file=sys.stderr)
+        return False
+    data = urllib.parse.urlencode({"chat_id": chat, "text": msg,
+                                   "disable_web_page_preview": "true"}).encode()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url, data=data, timeout=20) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+        except (urllib.error.URLError, OSError) as exc:
+            if attempt == 2:
+                print(f"[notify] не доставлено: {exc}", file=sys.stderr)
+        time.sleep(2)
+    return False
+
+
+def _evidence(p: Paths, verdict: dict) -> str:
+    name = Path(verdict["path"]).name
+    commit = f"коммит `{verdict['commit']}`" if verdict.get("commit") else "коммит не указан"
+    report = p.cfg.rel(Path(verdict["path"]))
+    return (f"ревью `{p.cfg.reviewer}` — APPROVE (`{report}`, {commit}); "
+            f"гейты шага прогнаны ревьюером самостоятельно")
+
+
+def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
+             notify_fn=None, commit_fn=commit_and_push, ctx: dict | None = None) -> dict:
+    """Один тик конвейера. Возвращает {decision, applied, detail}."""
+    ctx = ctx if ctx is not None else build_ctx(p)
+    say_raw = notify_fn or (lambda text: notify(p.cfg, text))
+    plan_id = p.plan_id
+    decision = decide(ctx)
+    cleared = ""
+    if execute and decision.get("clear_incident"):
+        ctx["stop"] = None
+        cleared = decision.get("reason", "")
+        clear_stop(p)
+        decision = decide(ctx)
+    result = {"plan_id": plan_id, "decision": decision, "applied": bool(cleared),
+              "detail": cleared, "incident_cleared": bool(cleared),
+              "status": status_text(ctx, decision)}
+    if not execute:
+        return result
+
+    def say(text: str) -> None:
+        say_raw(text)
+
+    if cleared:
+        say(f"✅ инцидент снят ({cleared}), конвейер продолжает")
+    state = ctx["state"]
+
+    def touch(action: str) -> None:
+        state["last_action"] = action
+        state["last_tick"] = time.strftime("%d.%m.%Y %H:%M:%S")
+        save_state(p, state)
+
+    action = decision["action"]
+    if action == "idle":
+        return result
+    if action == "create_step":
+        step = decision["data"]
+        prompt = prompt_rel(p, step["id"])
+        if prompt is None and p.cfg.require_prompt:
+            # Шаг без постановки не начинается: заказ промптеру + инцидентный стоп,
+            # который снимется сам, как только файл постановки появится.
+            order_key = f"planloop:{plan_id}:{step['id']}:prompt"
+            order_id = create_card(p, f"[постановка {plan_id} {step['id']}] {step['title']}",
+                                   prompt_order_body(p, step), p.cfg.prompter, order_key,
+                                   p.cfg.prompt_skills, max_runtime=p.cfg.prompt_runtime)
+            where = f"карточка {order_id}" if order_id else "карточку заказа создать не удалось"
+            reason = (f"нет постановки шага {step['id']}: заказана роли {p.cfg.prompter} ({where}); "
+                      f"ожидается {p.cfg.rel(Path(p.cfg.prompts_dir))}/<дата>_{plan_id}-{step['id']}"
+                      f"_prompt.md — шаг не начинаю")
+            current = load_stop(p) or {}
+            if current.get("reason") == reason:
+                result.update(applied=False, detail=reason)
+                return result
+            write_stop(p, reason, "gate", kind="incident")
+            result.update(applied=True, detail=reason)
+            touch("stop:no_prompt")
+            say("⛔ " + reason)
+            return result
+        key = f"planloop:{plan_id}:{step['id']}:step"
+        cid = create_card(p, f"[план {plan_id} {step['id']}] {step['title']}",
+                          step_card_body(p, step, prompt), _step_assignee(p, step), key,
+                          p.cfg.step_skills, max_runtime=p.cfg.step_runtime)
+        result.update(applied=bool(cid), detail=f"карточка шага: {cid}")
+        touch(f"create_step:{cid}")
+        if cid:
+            say(f"взял в работу шаг {step['id']} — {step['title']} (карточка {cid})")
+        else:
+            say(f"не смог создать карточку шага {step['id']} — проверь `hermes kanban ls`")
+        return result
+    if action == "create_review":
+        step, attempt = decision["data"], decision["attempt"]
+        key = f"planloop:{plan_id}:{step['id']}:review:{attempt}"
+        report_rel = _report_rel(p, step["id"])
+        cid = create_card(p, f"[ревью {plan_id} {step['id']} #{attempt}] {step['title']}",
+                          review_card_body(p, step, attempt, report_rel,
+                                           prompt_rel(p, step["id"])),
+                          p.cfg.reviewer, key, p.cfg.review_skills,
+                          parent=decision.get("parent"),
+                          max_runtime=p.cfg.review_runtime)
+        result.update(applied=bool(cid), detail=f"карточка ревью: {cid}")
+        touch(f"create_review:{cid}")
+        if cid:
+            say(f"шаг {step['id']} исполнен, отправлен на ревью (карточка {cid})")
+        else:
+            say(f"не смог поставить ревью шага {step['id']}")
+        return result
+    if action == "create_rereview":
+        prev_id = decision["step"]
+        try:
+            step_data = collector(p, prev_id).get("next") or {}
+        except SystemExit as exc:
+            reason = f"повторное ревью {prev_id} не поставить: {exc}"
+            write_stop(p, reason, "gate", kind="incident")
+            result.update(applied=True, detail=reason)
+            touch("stop:no_contract")
+            say("⛔ " + reason)
+            return result
+        key = f"planloop:{plan_id}:{prev_id}:rereview:1"
+        report_rel = _report_rel(p, prev_id)
+        cid = create_card(p, f"[ревью {plan_id} {prev_id} #2] {step_data.get('title', '')}",
+                          review_card_body(p, step_data, 2, report_rel,
+                                           prompt_rel(p, prev_id)),
+                          p.cfg.reviewer, key, p.cfg.review_skills,
+                          parent=decision.get("parent"), max_runtime=p.cfg.review_runtime)
+        result.update(applied=bool(cid), detail=f"повторное ревью {prev_id}: {cid}")
+        touch(f"create_rereview:{cid}")
+        if cid:
+            say(f"шаг {prev_id} закрыт в журнале, но ревью было REQUEST_CHANGES — "
+                f"ставлю повторное ревью (карточка {cid})")
+        else:
+            say(f"не смог поставить повторное ревью шага {prev_id}")
+        return result
+    if action == "create_fix":
+        step, round_no = decision["data"], decision["round"]
+        key = f"planloop:{plan_id}:{step['id']}:fix:{round_no}"
+        report_rel = _report_rel(p, step["id"])
+        cid = create_card(p, f"[правки {plan_id} {step['id']} #{round_no}] {step['title']}",
+                          fix_card_body(p, step, round_no, report_rel),
+                          _step_assignee(p, step), key, p.cfg.step_skills,
+                          parent=decision.get("parent"), max_runtime=p.cfg.step_runtime)
+        result.update(applied=bool(cid), detail=f"карточка правок: {cid}")
+        touch(f"create_fix:{cid}")
+        if cid:
+            say(f"ревью {step['id']}: REQUEST_CHANGES → правки в работе (карточка {cid}), "
+                f"это единственный автоматический круг")
+        else:
+            say(f"ревью {step['id']}: REQUEST_CHANGES, но карточку правок создать не удалось")
+        return result
+    if action == "close_step":
+        step, verdict = decision["data"], decision["verdict"]
+        commit = verdict.get("commit") or ""
+        if commit:
+            exists = _run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], Path(p.repo))
+            if exists.returncode != 0:
+                reason = (f"ревью {step['id']} APPROVE ссылается на несуществующий коммит "
+                          f"{commit} — конвейер остановлен")
+                write_stop(p, reason, "gate")
+                result.update(applied=True, detail=reason)
+                touch("stop:bad_commit")
+                say("⛔ " + reason)
+                return result
+        added = append_journal_row(p, step["id"], step["title"], commit, _evidence(p, verdict))
+        files = [p.cfg.rel(Path(p.plan_file)), _report_rel(p, step["id"])]
+        ok, detail = commit_fn(
+            p, files, f"docs(plan): закрыт шаг {step['id']} плана {plan_id} (ревью APPROVE)")
+        result.update(applied=ok, detail=f"журнал: {'добавлена строка' if added else 'уже был'}; "
+                                         f"коммит/пуш: {'ok ' + detail if ok else detail}")
+        touch(f"close_step:{step['id']}")
+        if ok:
+            say(f"✅ шаг {step['id']} закрыт (ревью APPROVE, коммит {detail}). "
+                f"Следующий шаг стартует автоматически")
+        else:
+            state["pending_commit"] = {"files": files, "step": step["id"], "reason": detail}
+            save_state(p, state)
+            say(f"шаг {step['id']} принят ревью, но коммит/пуш не выполнен: {detail}. "
+                f"Повторю сам, как только дерево освободится")
+        return result
+    if action == "stop":
+        reason = decision.get("reason", "")
+        previous = (ctx.get("stop") or {}).get("reason")
+        write_stop(p, reason, "gate", kind="incident")
+        result.update(applied=True, detail=reason)
+        touch("stop")
+        if previous != reason:
+            say("⛔ конвейер остановлен: " + reason
+                + chr(10) + "После устранения причины продолжится сам; снять принудительно:"
+                + " `python .pipeline/gate.py --resume`")
+        return result
+    return result
+
+
+def retry_pending(p: Paths, notify_fn=None) -> dict | None:
+    """Повторить отложенный коммит/пуш (дерево было занято чужой сессией)."""
+    state = load_state(p)
+    pending = state.get("pending_commit")
+    if not pending:
+        return None
+    ok, detail = commit_and_push(
+        p, pending["files"],
+        f"docs(plan): закрыт шаг {pending['step']} плана {p.plan_id} (ревью APPROVE)")
+    if ok:
+        state.pop("pending_commit", None)
+        save_state(p, state)
+        say = notify_fn or (lambda text: notify(p.cfg, text))
+        say(f"✅ отложенный коммит шага {pending['step']} выполнен: {detail}")
+        return {"applied": True, "detail": f"pending commit ok {detail}"}
+    return {"applied": False, "detail": f"pending commit всё ещё ждёт: {detail}"}
+
+
+# ───────────────────────────── CLI ─────────────────────────────
+
+def plans_rows(cfg: config_mod.Config) -> list[dict]:
+    """Машиночитаемая таблица планов (для UI и внешних вызовов)."""
+    driven = set(registry.driven_ids(cfg))
+    out: list[dict] = []
+    for spec in registry.specs(cfg):
+        p = resolve_paths(cfg, spec.id)
+        step_id = "—"
+        try:
+            step_id = (collector(p).get("next") or {}).get("id") or "—"
+        except SystemExit as exc:
+            print(f"[plans] план {spec.id}: сборщик шагов не работает: {exc}", file=sys.stderr)
+        stop = load_stop(p)
+        out.append({
+            "id": spec.id,
+            "file": cfg.rel(Path(spec.file)),
+            "driven": spec.id in driven,
+            "next": step_id,
+            "closed": len(registry.closed_steps(spec, cfg)),
+            "stop": ({**stop, "kind": stop_kind(stop)} if stop else None),
+        })
+    return out
+
+
+def plans_table(cfg: config_mod.Config) -> str:
+    """Таблица планов: ведётся ли, следующий шаг, сколько закрыто, стоп-флаг."""
+    rows: list[tuple[str, str, str, str, str]] = []
+    for row in plans_rows(cfg):
+        stop = row["stop"]
+        flag = (f"{stop['kind']}: {stop.get('reason', '')}" if stop else "—")
+        rows.append((row["id"], "да" if row["driven"] else "нет", str(row["next"]),
+                     str(row["closed"]), flag))
+    head = ("ПЛАН", "ВЕДЁТСЯ", "СЛЕДУЮЩИЙ ШАГ", "ЗАКРЫТО", "СТОП-ФЛАГ")
+    widths = [max(len(head[i]), *(len(r[i]) for r in rows)) if rows else len(head[i])
+              for i in range(5)]
+    lines = ["  ".join(head[i].ljust(widths[i]) for i in range(4)) + "  " + head[4]]
+    for row in rows:
+        lines.append("  ".join(row[i].ljust(widths[i]) for i in range(4)) + "  " + row[4])
+    if not rows:
+        lines.append("планов с распознанным журналом не найдено")
+    return "\n".join(lines)
+
+
+def tick(cfg: config_mod.Config, execute: bool = True) -> dict:
+    """Один тик по ВСЕМ ведомым планам: ровно одно действие — первый не-idle."""
+    statuses: list[str] = []
+    for spec in registry.driven_specs(cfg):
+        p = resolve_paths(cfg, spec.id)
+        retried = retry_pending(p) if execute else None
+        if retried and retried.get("applied"):
+            return {"plan_id": spec.id, "decision": {"action": "retry_pending"},
+                    "applied": True, "detail": retried.get("detail", ""),
+                    "incident_cleared": False, "retried": retried,
+                    "status": retried.get("detail", "")}
+        ctx = build_ctx(p)
+        decision = decide(ctx)
+        statuses.append(status_text(ctx, decision))
+        if decision["action"] == "idle":
+            continue
+        result = run_gate(p, execute=execute, ctx=ctx)
+        result["plan_id"] = spec.id
+        result["retried"] = retried
+        result["status"] = "\n\n".join(statuses)
+        return result
+    return {"plan_id": None, "decision": {"action": "idle", "reason": "во всех планах нет работы"},
+            "applied": False, "detail": "", "incident_cleared": False, "retried": None,
+            "status": "\n\n".join(statuses) or "планов с распознанным журналом не найдено"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Страж шага: шаг → ревью → следующий шаг")
+    ap.add_argument("--plan", help="номер плана (по умолчанию из pipeline.json)")
+    ap.add_argument("--plans", action="store_true",
+                    help="таблица планов: следующий шаг, закрыто, стоп-флаг")
+    ap.add_argument("--run", action="store_true", help="выполнить одно действие (режим cron)")
+    ap.add_argument("--status", action="store_true", help="только показать состояние и решение")
+    ap.add_argument("--json", action="store_true", help="машинный вывод")
+    ap.add_argument("--stop", metavar="ПРИЧИНА", help="остановиться после текущего шага")
+    ap.add_argument("--resume", action="store_true", help="снять стоп-флаг")
+    ap.add_argument("--hold", metavar="ШАГ", help="шаг требует ручного допуска владельца")
+    ap.add_argument("--unhold", metavar="ШАГ", help="снять ручной допуск")
+    args = ap.parse_args(argv)
+
+    try:
+        cfg = config_mod.load(repo_root())
+    except config_mod.ConfigError as exc:
+        print(f"ошибка: {exc}", file=sys.stderr)
+        return 2
+
+    if args.plans:
+        if args.json:
+            print(json.dumps(plans_rows(cfg), ensure_ascii=False, indent=2))
+        else:
+            print(plans_table(cfg))
+        return 0
+
+    try:
+        p = resolve_paths(cfg, args.plan)
+    except registry.PlanNotFound as exc:
+        print(f"ошибка: {exc}", file=sys.stderr)
+        return 2
+
+    if args.stop is not None:
+        payload = write_stop(p, args.stop or "остановка владельца", "owner")
+        notify(cfg, f"⏸ остановка после текущего шага: {payload['reason']}")
+        print(f"стоп-флаг поставлен: {p.stop_file} ({payload['reason']})")
+        return 0
+    if args.resume:
+        existed = clear_stop(p)
+        notify(cfg, "▶️ стоп снят, конвейер продолжит со следующего шага")
+        print("стоп-флаг снят" if existed else "стоп-флага не было")
+        return 0
+    if args.hold or args.unhold:
+        state = load_state(p)
+        hold = set(state.get("hold_steps") or [])
+        if args.hold:
+            hold.add(args.hold.upper())
+        else:
+            hold.discard(args.unhold.upper())
+        state["hold_steps"] = sorted(hold)
+        save_state(p, state)
+        print("шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—"))
+        return 0
+
+    if args.run and args.plan is None:
+        result = tick(cfg)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        acted = bool(result.get("applied") or result.get("retried"))
+        if not acted and not args.status:
+            return 0
+        print(result["status"])
+        if result.get("applied"):
+            print(f"Выполнено [{result.get('plan_id')}]: {result['detail']}")
+        return 0
+
+    retried = retry_pending(p) if args.run else None
+    result = run_gate(p, execute=args.run)
+    result["pending_commit"] = retried
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    acted = args.run and (result["applied"] or retried)
+    if not acted and not args.status:
+        return 0
+    print(result["status"])
+    if retried:
+        print(f"Отложенный коммит: {retried['detail']}")
+    if args.run:
+        print(f"Выполнено: {result['applied']} — {result['detail']}")
+    return 0
+
+
+def repo_root() -> str:
+    """Корень проекта: env PIPELINE_REPO (предпросмотр), иначе каталог над `.pipeline/`."""
+    env = os.environ.get("PIPELINE_REPO")
+    if env:
+        return str(Path(env).resolve())
+    return str(Path(__file__).resolve().parents[1])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
