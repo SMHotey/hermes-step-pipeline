@@ -89,7 +89,7 @@ def test_setup_is_idempotent_and_keeps_user_config(tmp_path: Path, fake_hermes):
     assert ignore.count(".pipeline/state/") == 1
 
 
-def test_setup_telegram_writes_env_and_enables_notify(tmp_path: Path, monkeypatch):
+def test_setup_telegram_writes_env_and_enables_notify(tmp_path: Path, monkeypatch, fake_hermes):
     target = tmp_path / "shop"
     target.mkdir()
     home = tmp_path / "hermes_home"
@@ -113,7 +113,7 @@ def test_setup_telegram_writes_env_and_enables_notify(tmp_path: Path, monkeypatc
     assert sent and "подключены" in sent[0][1]
 
 
-def test_bad_token_leaves_notifications_off(tmp_path: Path, monkeypatch):
+def test_bad_token_leaves_notifications_off(tmp_path: Path, monkeypatch, fake_hermes):
     target = tmp_path / "shop"
     target.mkdir()
     monkeypatch.setattr(setup_flow.proj, "profile_dir", lambda p: tmp_path / "h" / p)
