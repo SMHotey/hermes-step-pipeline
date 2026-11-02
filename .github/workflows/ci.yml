@@ -38,13 +38,25 @@ jobs:
 
   # Валидация манифеста — отдельный job: он не зависит от того, есть ли hermes в раннере
   # job tests, и падает, если валидация невозможна, вместо молчаливого «шаг пропущен».
+  # Composite action plugin-validate@v2026.9.24 не годится: он ставит hermes через
+  # `pip install git+...`, а setup.py в этом теге запрещает сборку колеса/сдиста
+  # («Building wheels or sdists for hermes-agent is not supported»). Рабочий поддерживаемый
+  # git-путь — editable-установка из копии репозитория; версия та же, что у владельца.
   manifest:
     name: Манифест плагина
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: hermes plugins validate step_pipeline
-        uses: NousResearch/hermes-agent/.github/actions/plugin-validate@v2026.9.24
+      - uses: actions/setup-python@v7
         with:
-          path: step_pipeline
-          hermes-ref: v2026.9.24
+          python-version: "3.11"
+      - name: Копия hermes-agent (тег v2026.9.24)
+        uses: actions/checkout@v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: v2026.9.24
+          path: .hermes-agent
+      - name: Установка hermes
+        run: python -m pip install -e ./.hermes-agent
+      - name: hermes plugins validate step_pipeline
+        run: python -m hermes_cli.main plugins validate step_pipeline
