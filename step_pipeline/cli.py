@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""CLI плагина: `hermes pipeline setup|status|run|ui|doctor|notify-test|config|plan-mode`."""
+"""CLI плагина: `hermes pipeline setup|status|run|ui|doctor|notify-test|config|plan|plan-mode`."""
 from __future__ import annotations
 
 import argparse
@@ -11,11 +11,13 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from . import plan_accept
     from . import plan_lint
     from . import plan_mode
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
 except ImportError:  # pragma: no cover - отладка файлом
+    import plan_accept  # type: ignore
     import plan_lint  # type: ignore
     import plan_mode  # type: ignore
     import project as proj  # type: ignore
@@ -98,6 +100,13 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     config.add_argument("--set", nargs=2, metavar=("КЛЮЧ", "ЗНАЧЕНИЕ"), default=None)
     config.set_defaults(handler=cmd_config)
 
+    plan = sub.add_parser("plan", help="черновики и утверждение планов: --list | --check | --accept")
+    plan.add_argument("--project", default="")
+    plan.add_argument("--list", action="store_true", help="черновики и утверждённые планы")
+    plan.add_argument("--check", default="", metavar="N|ПУТЬ", help="проверить черновик")
+    plan.add_argument("--accept", default="", metavar="N", help="утвердить план по номеру")
+    plan.set_defaults(handler=cmd_plan)
+
     planmode = sub.add_parser("plan-mode", help="режим планировщика: status | on | off")
     planmode.add_argument("action", nargs="?", default="", help="status | on | off")
     planmode.add_argument("--project", default="")
@@ -121,6 +130,8 @@ def _dump(data: Any) -> str:
 PLAN_MODE_ACTIONS = ("status", "on", "off")
 PLAN_MODE_USAGE = ("usage: hermes pipeline plan-mode status|on|off "
                    "[--project PATH] [--json]")
+PLAN_USAGE = ("usage: hermes pipeline plan --list | --check N|ПУТЬ | --accept N "
+              "[--project PATH]")
 
 
 def cmd_setup(args) -> int:
@@ -401,6 +412,83 @@ def cmd_config(args) -> int:
     return 0
 
 
+def cmd_plan(args) -> int:
+    """Черновики планов: ровно одно действие из `--list`, `--check`, `--accept`.
+
+    Проверка действий — здесь, а не через `choices`: у трёх действий разные значения, и
+    argparse с `choices` напечатал бы свою ошибку вместо подсказки с примером (так же
+    сделано для `plan-mode`).
+    """
+    chosen = sum(1 for value in (getattr(args, "list", False), getattr(args, "check", ""),
+                                getattr(args, "accept", "")) if value)
+    if chosen != 1:
+        print(PLAN_USAGE, file=sys.stderr)
+        return 2
+
+    project = _project(args.project)
+    if getattr(args, "list", False):
+        _print_plan_list(project)
+        return 0
+
+    target = getattr(args, "check", "")
+    if target:
+        try:
+            draft = plan_accept.find_draft(project, target)
+        except ValueError as exc:
+            print(f"ошибка: {exc}", file=sys.stderr)
+            return 1
+        errors = plan_accept.check_draft(project, draft)
+        for problem in errors:
+            print(f"  ✗ {problem}")
+        if errors:
+            print(f"ИТОГ: ошибок {len(errors)}")
+            return 1
+        print("ИТОГ: ошибок нет")
+        return 0
+
+    return plan_accept.accept(project, getattr(args, "accept", ""))
+
+
+def _rel(path: Path, project: Path) -> str:
+    """Путь относительно проекта в posix-виде (для заголовков каталогов)."""
+    try:
+        return Path(path).resolve().relative_to(Path(project).resolve()).as_posix()
+    except (ValueError, OSError):
+        return Path(path).as_posix()
+
+
+def _plan_rows(folder: Path) -> list[tuple[str, str]]:
+    """(номер, имя файла) по файлам каталога: номер из имени, файлы без номера — в конце."""
+    rows = [(plan_accept.plan_number(path.name) or "—", path.name)
+            for path in folder.glob("*.md")]
+    rows.sort(key=lambda row: (row[0] == "—", int(row[0]) if row[0].isdigit() else 0, row[1]))
+    return rows
+
+
+def _print_plan_list(project: Path) -> None:
+    """Два раздела: черновики из `drafts/` и утверждённые планы каталога планов."""
+    drafts = plan_accept.drafts_dir(project)
+    if not drafts.is_dir():
+        print(f"Черновики: нет (нет каталога {_rel(drafts, project)})")
+    else:
+        rows = _plan_rows(drafts)
+        if not rows:
+            print("Черновики: нет")
+        else:
+            print(f"Черновики ({_rel(drafts, project)}):")
+            for number, name in rows:
+                print(f"  {number}  {name}")
+
+    approved = plan_accept.plans_dir(project)
+    rows = _plan_rows(approved) if approved.is_dir() else []
+    if not rows:
+        print("Утверждённые планы: нет")
+    else:
+        print(f"Утверждённые планы ({_rel(approved, project)}):")
+        for number, name in rows:
+            print(f"  {number}  {name}")
+
+
 def cmd_plan_mode(args) -> int:
     """Прочитать или переключить режим планировщика проекта.
 
@@ -457,7 +545,7 @@ def run(args) -> int:
     proj.setup_stdio()
     handler = getattr(args, "handler", None)
     if handler is None:
-        print("команды: setup | status | run | ui | doctor | notify-test | config | plan-mode")
+        print("команды: setup | status | run | ui | doctor | notify-test | config | plan | plan-mode")
         return 0
     try:
         return handler(args)
