@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,7 @@ PLUGIN = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import helpers  # noqa: E402  (загружает плагин как пакет и регистрирует алиасы)
+import cli                                      # noqa: E402
 import project as proj                          # noqa: E402
 import setup_flow                               # noqa: E402
 
@@ -196,3 +198,97 @@ def test_cron_script_written(monkeypatch, tmp_path: Path):
     assert script.is_file()
     assert "gate.py" in script.read_text(encoding="utf-8")
     assert any("cron" in " ".join(c) for c in calls)
+
+
+def _trust_calls(calls: list[tuple]) -> list[tuple]:
+    return [call for call in calls if "trust" in call]
+
+
+def test_setup_trusts_all_three_profiles(tmp_path: Path, fake_hermes):
+    target = tmp_path / "shop"
+    target.mkdir()
+    code = setup_flow.run_setup(args(project=str(target), board="shop", driver="shop",
+                                     no_trust=False))
+    assert code == 0
+    calls = _trust_calls(fake_hermes)
+    assert [call[1] for call in calls] == ["shop", "prompter", "reviewer"]
+    for call in calls:
+        assert call == ("-p", call[1], "skills", "trust", str(target.resolve()))
+
+
+def test_upgrade_trusts_roles_from_config(tmp_path: Path, fake_hermes):
+    target = tmp_path / "shop"
+    target.mkdir()
+    assert setup_flow.run_setup(args(project=str(target), board="shop", driver="shop")) == 0
+    cfg_path = target / "pipeline.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["profiles"] = {"driver": "shop", "prompter": "pp", "reviewer": "rr"}
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    fake_hermes.clear()
+
+    assert setup_flow.run_setup(args(project=str(target), upgrade=True,
+                                     no_trust=False)) == 0
+    calls = _trust_calls(fake_hermes)
+    assert [call[1] for call in calls] == ["shop", "pp", "rr"]
+    for call in calls:
+        assert call == ("-p", call[1], "skills", "trust", str(target.resolve()))
+    again = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert again["profiles"] == {"driver": "shop", "prompter": "pp", "reviewer": "rr"}
+
+
+def _doctor_env(monkeypatch, project: Path, tmp_path: Path,
+                trust: dict[str, str]) -> None:
+    """Окружение `doctor` по образцу tests/test_plan_lint.py: без настоящего hermes."""
+    monkeypatch.setattr(cli.proj, "run_hermes", lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout="План: страж шага (конвейер)", stderr=""))
+    monkeypatch.setattr(cli.proj, "profile_dir", lambda name: tmp_path / "profiles" / name)
+    monkeypatch.setattr(cli.snap, "snapshot", lambda *a, **k: {})
+    db = tmp_path / "kanban.db"
+    db.write_text("", encoding="utf-8")
+    monkeypatch.setenv("PIPELINE_KANBAN_DB", str(db))
+    (project / ".pipeline" / "cron.json").write_text(
+        json.dumps({"driver": "demo", "name": "План: страж шага (конвейер)"}),
+        encoding="utf-8")
+    for name, text in trust.items():
+        path = tmp_path / "profiles" / name / "config.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+def test_doctor_reports_untrusted_roles_with_ready_command(project: Path, monkeypatch,
+                                                          capsys, tmp_path: Path):
+    _doctor_env(monkeypatch, project, tmp_path, {
+        "demo": "skills:\n  trusted_project_dirs:\n"
+                f"    - {project.resolve()}\n",
+    })
+
+    code = cli.cmd_doctor(argparse.Namespace(project=str(project), plan=""))
+    out = capsys.readouterr().out
+    assert code == 1
+    untrusted = [line for line in out.splitlines() if "не доверен этому профилю" in line]
+    assert len(untrusted) == 2
+    for role in ("prompter", "reviewer"):
+        command = f'hermes -p {role} skills trust "{project.resolve()}"'
+        assert any(command in line for line in untrusted)
+    assert not any("✗ план" in line for line in out.splitlines())
+
+
+def test_doctor_ok_when_all_roles_trust_project(project: Path, monkeypatch,
+                                                capsys, tmp_path: Path):
+    path = project.resolve()
+    _doctor_env(monkeypatch, project, tmp_path, {
+        # драйвер — блок-список, промптер — строчный список, ревьюер — чужой путь + наш
+        "demo": f"skills:\n  trusted_project_dirs:\n    - {path}\n",
+        "prompter": f'skills:\n  trusted_project_dirs: ["{path}"]\n',
+        "reviewer": "skills:\n  trusted_project_dirs:\n    - C:\\Other\\project\n"
+                    f"    - {path}\n",
+    })
+    (project / ".pipeline" / "VERSION").write_text(
+        setup_flow.plugin_version() + "\n", encoding="utf-8")
+
+    code = cli.cmd_doctor(argparse.Namespace(project=str(project), plan=""))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "ИТОГ: OK" in out
+    assert "доверен всем ролям" in out
+    assert "не доверен этому профилю" not in out

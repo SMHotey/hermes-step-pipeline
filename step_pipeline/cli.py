@@ -40,6 +40,8 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     setup.add_argument("--no-test", action="store_true", help="не слать тестовое сообщение")
     setup.add_argument("--no-profiles", action="store_true", help="не создавать профили ролей")
     setup.add_argument("--no-cron", action="store_true", help="не заводить cron-джобу")
+    setup.add_argument("--no-trust", action="store_true",
+                       help="не оформлять доверие проекту у профилей ролей")
     setup.add_argument("--yes", action="store_true", help="без вопросов, значения по умолчанию")
     setup.add_argument("--force", action="store_true", help="перезаписать движок и pipeline.json")
     setup.add_argument("--upgrade", action="store_true",
@@ -270,7 +272,15 @@ def cmd_doctor(args) -> int:
     notes.append(f"борда БД: {db} ({'есть' if db.is_file() else 'НЕТ'})")
     if not db.is_file():
         problems.append("нет sqlite борды — карточки не создадутся (проверь --board)")
-    driver = (cfg.get("profiles") or {}).get("driver") or "default"
+    roles = setup_flow.roles_from_config(cfg)
+    driver = roles[0]
+    # Доверие проверяем чтением конфига профиля: `skills trust` с путём ПИШЕТ в него.
+    untrusted = [role for role in roles if not setup_flow.is_project_trusted(role, project)]
+    for role in untrusted:
+        problems.append(f'доверие ({role}): проект не доверен этому профилю — '
+                        f'hermes -p {role} skills trust "{project}"')
+    if not untrusted:
+        notes.append(f"доверие: проект доверен всем ролям ({', '.join(roles)})")
     env_file = proj.profile_dir(driver) / ".env"
     token = chat = ""
     if env_file.is_file():

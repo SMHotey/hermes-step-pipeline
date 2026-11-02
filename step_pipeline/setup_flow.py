@@ -3,7 +3,8 @@
 
 Что делает: копирует движок и роли, пишет `pipeline.json`, создаёт профили-роли,
 заводит cron-джобу стража, спрашивает токен Telegram-бота и проверяет его живым
-запросом, ставит проект в доверенные. Повторный запуск идемпотентен.
+запросом, ставит проект в доверенные у всех профилей-ролей (драйвер, промптер,
+ревьюер). Повторный запуск идемпотентен.
 """
 from __future__ import annotations
 
@@ -341,8 +342,12 @@ def engine_version(project: Path) -> str:
         return ""
 
 
-def upgrade(project: Path, log: Log) -> int:
-    """Обновить движок в уже поставленном проекте, не трогая конфиг и роли."""
+def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
+    """Обновить движок в уже поставленном проекте, не трогая конфиг и роли.
+
+    Доверие проекту оформляется тем же ролям, что и при установке; `trust=False`
+    (флаг `--no-trust`) пропускает его и пишет предупреждение.
+    """
     if not (project / ".pipeline").is_dir():
         print(f"ошибка: конвейер не установлен в {project} — нужен `hermes pipeline setup`",
               file=sys.stderr)
@@ -358,7 +363,14 @@ def upgrade(project: Path, log: Log) -> int:
         log.ok(f"добавлена роль {item}")
     if not changed and not roles:
         log.ok(f"движок уже актуален ({now})")
-    log.step(f"── Движок: {was} → {now}. Конфиг, telegram и cron не тронуты ──")
+    if trust:
+        failed = trust_roles(roles_from_config(proj.read_config(project)), project, log)
+        tail = ("доверие ролям оформлено" if not failed
+                else f"доверие не оформлено у: {', '.join(failed)}")
+    else:
+        log.warn("доверие проекту не оформлялось (--no-trust)")
+        tail = "доверие ролям пропущено (--no-trust)"
+    log.step(f"── Движок: {was} → {now}. Конфиг, telegram и cron не тронуты; {tail} ──")
     return 0
 
 
@@ -453,6 +465,105 @@ def ensure_profiles(driver: str, prompter: str, reviewer: str, log: Log) -> None
                        ("kanban.default_assignee", driver)):
         proj.run_hermes("-p", driver, "config", "set", key, value)
     log.ok(f"настройки конвейера применены к {driver}/{prompter}/{reviewer}")
+
+
+#: Роли конвейера по умолчанию — те же, что у мастера установки.
+DEFAULT_ROLES = ("default", "prompter", "reviewer")
+
+
+def roles_from_config(cfg: dict[str, Any] | None) -> list[str]:
+    """Три роли конвейера из `pipeline.json`: драйвер → промптер → ревьюер.
+
+    Пустой или битый `profiles` даёт умолчания, дубликаты схлопываются.
+    """
+    profiles = (cfg or {}).get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+    roles = [profiles.get(key) or fallback
+             for key, fallback in zip(("driver", "prompter", "reviewer"), DEFAULT_ROLES)]
+    return list(dict.fromkeys(str(role) for role in roles if role))
+
+
+def trust_roles(roles, project: Path, log: Log) -> list[str]:
+    """Оформить доверие проекту у профилей-ролей; вернуть те, где не вышло.
+
+    Ошибка одной роли не ломает мастер: `skills trust` пишет в профиль, а не в проект.
+    """
+    failed: list[str] = []
+    for role in dict.fromkeys(roles):
+        trust = proj.run_hermes("-p", role, "skills", "trust", str(project))
+        if trust.returncode == 0:
+            log.ok(f"проект в доверенных у {role}")
+        else:
+            failed.append(role)
+            log.warn(f"skills trust ({role}): "
+                     f"{(trust.stderr or trust.stdout or '').strip()[:200]}")
+    return failed
+
+
+def _trust_value(raw: str) -> str:
+    """Значение из YAML-списка: без обрамляющих кавычек и хвостового комментария."""
+    value = raw.split(" #", 1)[0].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1].strip()
+    return value
+
+
+def _parse_trusted_dirs(text: str) -> list[str]:
+    """Разбор `trusted_project_dirs` из config.yaml без PyYAML.
+
+    Поддерживает обе живые формы: блок-список (`- путь` с отступом больше, чем у
+    ключа) и строчный список (`[a, b]`, `[]`). Чужие ключи не читаются, битый
+    файл даёт пустой список, а не исключение.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)trusted_project_dirs\s*:\s*(.*)$", line)
+        if not match:
+            continue
+        indent = len(match.group(1))
+        rest = match.group(2).strip()
+        if rest.startswith("["):
+            inner = rest[1:rest.rfind("]")] if "]" in rest else rest[1:]
+            return [value for value in (_trust_value(part) for part in inner.split(","))
+                    if value]
+        entries: list[str] = []
+        for follow in lines[index + 1:]:
+            if not follow.strip():
+                continue
+            item = re.match(r"^(\s*)-\s*(.*)$", follow)
+            if not item or len(item.group(1)) <= indent:
+                break
+            value = _trust_value(item.group(2))
+            if value:
+                entries.append(value)
+        return entries
+    return []
+
+
+def trusted_project_dirs(profile: str) -> list[str]:
+    """Пути, которым доверяет профиль (`skills.trusted_project_dirs` профиля)."""
+    path = proj.profile_dir(profile) / "config.yaml"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return _parse_trusted_dirs(text)
+
+
+def is_project_trusted(profile: str, project: Path) -> bool:
+    """Доверяет ли профиль проекту — сравнением путей, как у Hermes."""
+    try:
+        target = Path(project).expanduser().resolve()
+    except OSError:
+        return False
+    for entry in trusted_project_dirs(profile):
+        try:
+            if Path(entry).expanduser().resolve() == target:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def ensure_board(board: str, log: Log) -> bool:
@@ -619,7 +730,7 @@ def run_setup(args) -> int:
     force = bool(getattr(args, "force", False))
     if getattr(args, "upgrade", False):
         log.step(f"═══ Обновление движка → {project} ═══")
-        return upgrade(project, log)
+        return upgrade(project, log, trust=not bool(getattr(args, "no_trust", False)))
     log.step(f"═══ Конвейер шагов → {project} ═══")
 
     existing = proj.read_config(project) if (project / proj.MARKER).is_file() else {}
@@ -662,12 +773,10 @@ def run_setup(args) -> int:
 
     # Доверие проекту нужно каждой роли: без него воркер падает `Unknown skill(s)`,
     # и карточка уходит в blocked по failure_limit. Ошибка одной роли не ломает мастер.
-    for role in dict.fromkeys((driver, prompter, reviewer)):
-        trust = proj.run_hermes("-p", role, "skills", "trust", str(project))
-        if trust.returncode == 0:
-            log.ok(f"проект в доверенных у {role}")
-        else:
-            log.warn(f"skills trust ({role}): {(trust.stderr or trust.stdout or '').strip()[:200]}")
+    if getattr(args, "no_trust", False):
+        log.warn("доверие проекту не оформлялось (--no-trust)")
+    else:
+        trust_roles(roles_from_config(proj.read_config(project)), project, log)
 
     # Линтер только предупреждает: кривой план не должен ронять уже сделанную установку.
     log.step("── Проверка планов ──")
