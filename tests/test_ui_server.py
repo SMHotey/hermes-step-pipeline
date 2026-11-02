@@ -42,15 +42,22 @@ def get(url: str) -> tuple[int, dict]:
         return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
 
 
-def post(url: str, payload: dict) -> tuple[int, dict]:
+def post(url: str, payload: dict, headers: dict | None = None) -> tuple[int, dict]:
+    """POST действия панели: по умолчанию JSON, переданные заголовки перекрывают."""
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(f"{url}/api/action", data=data,
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json",
+                                              **(headers or {})})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
+
+
+def stop_file(server) -> Path:
+    """Файл стоп-флага плана 1: его появление значит, что действие выполнилось."""
+    return server["root"] / ".pipeline" / "state" / "plan_1_stop.json"
 
 
 def test_index_page(server):
@@ -141,3 +148,58 @@ def test_cards_and_journal_in_snapshot(server):
     keys = [c["idempotency_key"] for c in data["cards"]]
     assert any(k.endswith(":review:1") for k in keys)
     assert data["plan"]["steps"][0]["closed"] is False
+
+
+def test_post_with_text_plain_is_rejected(server):
+    status, data = post(server["url"], {"action": "stop", "reason": "csrf"},
+                        headers={"Content-Type": "text/plain"})
+    assert status == 415
+    assert data["ok"] is False
+    assert "application/json" in data["error"]
+    assert not stop_file(server).exists()                # действие не выполнилось
+    assert server["state"].tail() == []                   # движок не запускался
+
+
+def test_post_with_foreign_origin_is_rejected(server):
+    status, data = post(server["url"], {"action": "stop", "reason": "csrf"},
+                        headers={"Origin": "http://evil.example"})
+    assert status == 403
+    assert data["ok"] is False
+    assert not stop_file(server).exists()
+    assert server["state"].tail() == []
+
+
+def test_post_with_cross_site_fetch_site_is_rejected(server):
+    status, data = post(server["url"], {"action": "stop", "reason": "csrf"},
+                        headers={"Sec-Fetch-Site": "cross-site"})
+    assert status == 403
+    assert data["ok"] is False
+    assert not stop_file(server).exists()
+    assert server["state"].tail() == []
+
+
+def test_post_without_origin_works_like_curl(server):
+    status, data = post(server["url"], {"action": "stop", "reason": "curl"})
+    assert status == 200 and data["ok"]
+    assert stop_file(server).exists()
+    stop = json.loads(stop_file(server).read_text(encoding="utf-8"))
+    assert stop["kind"] == "owner"
+    assert stop["reason"] == "curl"
+
+
+def test_post_from_panel_origin_works(server):
+    status, data = post(server["url"], {"action": "stop", "reason": "панель"},
+                        headers={"Origin": server["url"], "Sec-Fetch-Site": "same-origin"})
+    assert status == 200 and data["ok"]
+    assert stop_file(server).exists()
+
+
+def test_security_headers_on_page(server):
+    with urllib.request.urlopen(server["url"] + "/", timeout=10) as response:
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        policy = response.headers["Content-Security-Policy"]
+    assert "default-src 'none'" in policy
+    assert "frame-ancestors 'none'" in policy
+    with urllib.request.urlopen(server["url"] + "/api/health", timeout=10) as response:
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+

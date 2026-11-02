@@ -30,6 +30,14 @@ except ImportError:  # pragma: no cover
 
 UI_FILE = Path(__file__).resolve().parent / "ui" / "index.html"
 CONFIG_KEYS = ("project", "board", "driven_plans", "require_prompt")
+CSP = ("default-src 'none'; script-src 'self' 'unsafe-inline'; "
+       "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+
+
+def _allowed_origins(port: int) -> set[str]:
+    """Источники, с которых панель вправе звать действия: только петля и свой порт."""
+    return {f"http://127.0.0.1:{port}", f"http://localhost:{port}", f"http://[::1]:{port}"}
 
 
 class State:
@@ -191,6 +199,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", CSP)
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionAbortedError, OSError):
@@ -202,6 +212,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _local_only(self) -> bool:
         return self.client_address[0] in ("127.0.0.1", "::1")
+
+    def _guard_post(self) -> bool:
+        """Пропустить только JSON-запрос из панели. False — ответ уже отправлен."""
+        kind = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if kind != "application/json":
+            self._json(415, {"ok": False, "error": "нужен Content-Type: application/json"})
+            return False
+        port = self.server.server_address[1]
+        origin = (self.headers.get("Origin") or "").strip().rstrip("/").lower()
+        if origin and origin not in _allowed_origins(port):
+            self._json(403, {"ok": False, "error": "запрос не из панели: чужой Origin"})
+            return False
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site and site not in ("same-origin", "none"):
+            self._json(403, {"ok": False, "error": "запрос не из панели: Sec-Fetch-Site"})
+            return False
+        return True
 
     # ── GET ──
     def do_GET(self) -> None:                                   # noqa: N802 - stdlib API
@@ -242,6 +269,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.split("?")[0] != "/api/action":
             self._json(404, {"ok": False, "error": "нет такого маршрута"})
+            return
+        if not self._guard_post():
             return
         length = int(self.headers.get("Content-Length") or 0)
         if length > 200_000:
