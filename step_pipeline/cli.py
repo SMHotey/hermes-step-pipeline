@@ -58,6 +58,8 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     run = sub.add_parser("run", help="один тик стража (создать карточку/закрыть шаг)")
     run.add_argument("--project", default="")
     run.add_argument("--plan", default="")
+    run.add_argument("--max-actions", type=int, default=None,
+                     help="сколько действий за тик (по умолчанию — из pipeline.json)")
     run.set_defaults(handler=cmd_run)
 
     ui = sub.add_parser("ui", help="локальный UI с визуализацией конвейера")
@@ -188,6 +190,9 @@ def render_status(data: dict) -> str:
 def cmd_run(args) -> int:
     project = _project(args.project)
     extra = ["--plan", args.plan] if args.plan else []
+    # Флаг не задан — движок берёт предел из pipeline.json проекта (D2).
+    if args.max_actions is not None:
+        extra += ["--max-actions", str(args.max_actions)]
     res = proj.run_engine(project, "gate.py", "--run", *extra, timeout=600)
     out = (res.stdout or "").strip()
     print(out or "тик выполнен: конвейер ждёт (шаг в работе, ревью идёт или стоп-флаг)")

@@ -26,6 +26,7 @@
   "default_plan": null,
   "driven_plans": ["*"],
   "require_prompt": true,
+  "max_actions": 1,
   "runtimes": {
     "step": "3h",
     "review": "150m",

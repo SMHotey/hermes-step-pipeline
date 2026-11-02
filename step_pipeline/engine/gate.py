@@ -11,7 +11,7 @@
 (`<reviews_dir>/<план>-<шаг>.md`) плюс проверки. Агент на этом месте стоил бы
 модельного прогона и мог бы согласиться с собственной прозой.
 
-Состояния (по одному действию за тик, cron каждые 10 минут):
+Состояния (до `max_actions` действий за тик, cron каждые 10 минут):
 
     шага нет                  → карточка шага        (профиль исполнителя)
     нет постановки шага       → карточка промптеру + инцидентный стоп
@@ -23,6 +23,16 @@
 Стоп-флаг блокирует ТОЛЬКО начало следующего шага: текущий шаг доводится до ревью и
 журнала (это и значит «остановка ПОСЛЕ выполнения шага»).
 
+Сколько действий делает тик, задаёт `max_actions` в `pipeline.json` проекта (умолчание 1 —
+прежнее поведение: ровно одно действие за тик), флаг `--max-actions N` перекрывает это
+значение на один запуск (cron берёт значение из файла). Состояние перечитывается перед
+каждым следующим действием, поэтому цепочка «ревью APPROVE → журнал → следующий шаг →
+заказ постановки» проезжается одним тиком. Инвариант предсказуемости: за тик шаг
+получает не больше ОДНОГО действия — иначе быстрый воркер успел бы закрыть карточку
+между действиями, и тик проскочил бы шаг целиком (исполнение и ревью сразу). Каждое
+применённое действие дописывается в состояние плана (`last_actions`, последние 20
+записей): истории тиков (план 2, S3) пока нет.
+
 Простой виден сам: `idle` пишет `waiting_since`/`waiting_reason`, ожидание дольше
 `notify.watchdog_hours` даёт одно напоминание на причину не чаще раза в час, а раз в
 сутки после `notify.digest_at` уходит сводка (закрыто, ждёт, стоп — по строке на план).
@@ -31,7 +41,9 @@
     python .pipeline/gate.py --status            # что видно и что было бы сделано
     python .pipeline/gate.py --plans             # таблица планов: шаг, закрыто, стоп
     python .pipeline/gate.py --plan 3 --status   # состояние конкретного плана
-    python .pipeline/gate.py --run               # выполнить одно действие (режим cron)
+    python .pipeline/gate.py --run               # тик: до max_actions действий (режим cron)
+    python .pipeline/gate.py --run --max-actions 3   # предел на один запуск
+    python .pipeline/gate.py --run --plan 3      # тик только по одному плану
     python .pipeline/gate.py --stop "причина"    # остановиться после текущего шага
     python .pipeline/gate.py --resume            # снять стоп
     python .pipeline/gate.py --hold S3a          # шаг требует ручного допуска владельца
@@ -104,6 +116,11 @@ TERMINAL = {"done", "blocked", "crashed", "timed_out", "gave_up"}
 VERDICT_RE = re.compile(r"^#{0,4}\s*ВЕРДИКТ\s*:\s*(APPROVE|REQUEST_CHANGES)\s*$",
                         re.IGNORECASE | re.MULTILINE)
 COMMIT_RE = re.compile(r"коммит\S*\s*`([0-9a-f]{7,40})`", re.IGNORECASE)
+
+# Предел действий за тик: ключ `max_actions` в pipeline.json проекта, умолчание 1 (D1).
+MAX_ACTIONS_DEFAULT = 1
+# Сколько записей о действиях держим в состоянии плана: истории тиков пока нет (D7).
+LAST_ACTIONS_KEPT = 20
 
 
 # ───────────────────────────── окружение ─────────────────────────────
@@ -851,6 +868,23 @@ def _positive(raw, default: float) -> float:
     return value if value > 0 else default
 
 
+def max_actions_of(cfg: config_mod.Config) -> int:
+    """Предел действий за тик из pipeline.json; нет ключа или значение битое — 1 (D1).
+
+    Ключ читается сырым словарём конфига (`cfg.state`, D3): типизированного поля в
+    `Config` нет, и шаг не выходит за свои файлы. Исключений не бросает — битый конфиг
+    не должен валить тик (сравни `_positive`).
+    """
+    raw = (cfg.state or {}).get("max_actions")
+    if raw is None or isinstance(raw, bool):
+        return MAX_ACTIONS_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return MAX_ACTIONS_DEFAULT
+    return value if value >= 1 else MAX_ACTIONS_DEFAULT
+
+
 def _digest_at(cfg: config_mod.Config) -> tuple[int, int]:
     """Час и минута сводки из notify.digest_at; битое значение — умолчание (D4)."""
     raw = str(cfg.notify.get("digest_at") or DIGEST_DEFAULT).strip()
@@ -1402,41 +1436,156 @@ def plans_table(cfg: config_mod.Config) -> str:
     return "\n".join(lines)
 
 
-def tick(cfg: config_mod.Config, execute: bool = True) -> dict:
-    """Один тик по ВСЕМ ведомым планам: ровно одно действие — первый не-idle.
+def _step_of(decision: dict) -> str:
+    """Идентификатор шага, которого касается решение (пустая строка — шага нет)."""
+    step = decision.get("step")
+    if not step:
+        data = decision.get("data")
+        step = data.get("id") if isinstance(data, dict) else None
+    return str(step).upper() if step else ""
 
-    Порядок: суточная сводка (сбой не валит тик), затем планы по очереди. Простаивающий
-    план состояние ожидания записывает, действием это не считается.
+
+def step_key(plan_id: str, decision: dict) -> str | None:
+    """Ключ шага, который трогает решение, вида `1:S1`; None — решение шага не называет.
+
+    Чистая функция: не зависит от путей и состояния, поэтому проверяется юнит-тестом.
+    Нужна инварианту «одно действие на шаг за тик» (D5): по ключу видно, что следующее
+    решение адресует шаг, который в этом тике уже получал действие.
     """
-    statuses: list[str] = []
+    step = _step_of(decision)
+    return f"{plan_id}:{step}" if step else None
+
+
+def remember_action(p: Paths, plan_id: str, decision: dict, detail: str) -> None:
+    """Дописать применённое действие в состояние плана (`last_actions`, D7).
+
+    Истории тиков пока нет (план 2, S3), поэтому пишем в состояние — атомарно, через
+    `load_state`/`save_state`. Чтение свежее: `run_gate` уже мог сохранить `pending_commit`,
+    и запись из устаревшего словаря стёрла бы его. `last_action`/`last_tick` из `touch()`
+    не трогаем: на `last_action` опирается сторож простоя.
+    """
+    state = load_state(p)
+    history = state.get("last_actions")
+    history = list(history) if isinstance(history, list) else []
+    history.append({"at": time.strftime("%d.%m.%Y %H:%M:%S"), "plan": plan_id,
+                    "action": str(decision.get("action") or ""), "step": _step_of(decision),
+                    "detail": str(detail or "")[:200]})
+    state["last_actions"] = history[-LAST_ACTIONS_KEPT:]
+    save_state(p, state)
+
+
+def tick(cfg: config_mod.Config, execute: bool = True,
+         max_actions: int | None = None) -> dict:
+    """Один тик по ВСЕМ ведомым планам: до `max_actions` действий, по одному на шаг.
+
+    Предел берётся из аргумента (флаг `--max-actions`), иначе из `max_actions` в
+    `pipeline.json` проекта, иначе 1 — прежнее поведение «ровно одно действие».
+
+    Порядок: суточная сводка (сбой не валит тик), затем обход планов. Перед каждым
+    следующим действием состояние перечитывается (`build_ctx`), поэтому цепочка
+    «журнал → следующий шаг → заказ постановки» проезжается одним тиком. Простаивающий
+    план записывает ожидание — действием это не считается, как и `retry_pending` (D5).
+
+    Тик заканчивается, когда: работы нет ни в одном плане; предел исчерпан; действие не
+    применилось; либо следующее действие адресует шаг, который в этом тике уже получал
+    действие (D5). Каждое применённое действие пишется в состояние плана.
+    """
+    limit = max_actions if isinstance(max_actions, int) and max_actions >= 1 \
+        else max_actions_of(cfg)
+    status_by_plan: dict[str, str] = {}
     if execute:
         try:
             send_digest(cfg)
         except Exception as exc:  # noqa: BLE001 - сводка не повод останавливать конвейер
             print(f"[digest] сводка не отправлена: {exc}", file=sys.stderr)
-    for spec in registry.driven_specs(cfg):
-        p = resolve_paths(cfg, spec.id)
-        retried = retry_pending(p) if execute else None
-        if retried and retried.get("applied"):
-            return {"plan_id": spec.id, "decision": {"action": "retry_pending"},
-                    "applied": True, "detail": retried.get("detail", ""),
-                    "incident_cleared": False, "retried": retried,
-                    "status": retried.get("detail", "")}
-        ctx = build_ctx(p)
-        decision = decide(ctx)
-        statuses.append(status_text(ctx, decision))
-        if decision["action"] == "idle":
-            if execute:
-                watch_idle(cfg, p, ctx, decision, lambda text: notify(cfg, text))
-            continue
-        result = run_gate(p, execute=execute, ctx=ctx)
-        result["plan_id"] = spec.id
-        result["retried"] = retried
-        result["status"] = "\n\n".join(statuses)
-        return result
-    return {"plan_id": None, "decision": {"action": "idle", "reason": "во всех планах нет работы"},
-            "applied": False, "detail": "", "incident_cleared": False, "retried": None,
-            "status": "\n\n".join(statuses) or "планов с распознанным журналом не найдено"}
+    actions: list[dict] = []
+    touched: set[str] = set()
+    retried_any: dict | None = None
+    cleared_any = False
+    no_work = "во всех планах нет работы"
+    last_decision: dict = {"action": "idle", "reason": no_work}
+    reason = no_work
+    pass_no = 0
+    while len(actions) < limit:
+        pass_no += 1
+        acted = False
+        finish = False
+        for spec in registry.driven_specs(cfg):
+            p = resolve_paths(cfg, spec.id)
+            if execute and pass_no == 1:
+                # Отложенный коммит повторяем один раз за тик: один план — одна попытка.
+                retried = retry_pending(p)
+                if retried is not None:
+                    retried_any = retried
+                if retried and retried.get("applied"):
+                    return {"plan_id": spec.id, "decision": {"action": "retry_pending"},
+                            "applied": True, "detail": retried.get("detail", ""),
+                            "incident_cleared": False, "retried": retried,
+                            "status": retried.get("detail", ""), "actions": [],
+                            "actions_count": 0, "reason": "выполнен отложенный коммит"}
+            ctx = build_ctx(p)
+            decision = decide(ctx)
+            status_by_plan[spec.id] = status_text(ctx, decision)
+            if decision["action"] == "idle":
+                if execute:
+                    watch_idle(cfg, p, ctx, decision, lambda text: notify(cfg, text))
+                continue
+            if not execute:
+                last_decision = decision
+                reason = "показ без исполнения: действие не применялось"
+                finish = True
+                break
+            key = step_key(spec.id, decision)
+            if key and key in touched:
+                # Инвариант D5: шаг за тик получает не больше одного действия.
+                last_decision = decision
+                reason = (f"шаг {key} уже получал действие в этом тике — "
+                          f"второй раз не трогаю")
+                finish = True
+                break
+            result = run_gate(p, execute=execute, ctx=ctx)
+            last_decision = result.get("decision") or decision
+            entry = {"plan": spec.id, "action": str(decision.get("action") or ""),
+                     "step": _step_of(decision), "applied": bool(result.get("applied")),
+                     "detail": str(result.get("detail") or "")}
+            actions.append(entry)
+            if key:
+                touched.add(key)
+            cleared_any = cleared_any or bool(result.get("incident_cleared"))
+            if entry["applied"]:
+                remember_action(p, spec.id, decision, entry["detail"])
+            if not entry["applied"]:
+                reason = (f"действие {entry['action']} не применилось: "
+                          f"{entry['detail'] or 'подробностей нет'} — второй попытки в этом тике нет")
+                finish = True
+                break
+            acted = True
+            if key is None:
+                reason = f"действие {entry['action']} шага не адресует — тик завершён"
+                finish = True
+            break                       # состояние перечитываем с начала обхода
+        if finish:
+            break
+        if not acted:
+            reason = no_work
+            break
+    else:
+        reason = f"предел действий за тик исчерпан (max_actions={limit})"
+
+    detail = "; ".join(f"{a['action']}: {a['detail']}" for a in actions if a["applied"])
+    return {
+        "plan_id": actions[-1]["plan"] if actions else None,
+        "decision": last_decision,
+        "applied": any(a["applied"] for a in actions),
+        "detail": detail,
+        "incident_cleared": cleared_any,
+        "retried": retried_any,
+        "status": ("\n\n".join(status_by_plan.values())
+                   or "планов с распознанным журналом не найдено"),
+        "actions": actions,
+        "actions_count": sum(1 for a in actions if a["applied"]),
+        "reason": reason,
+    }
 
 
 def incident(cfg: config_mod.Config, args: argparse.Namespace, exc: BaseException) -> int:
@@ -1492,7 +1641,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--plan", help="номер плана (по умолчанию из pipeline.json)")
     ap.add_argument("--plans", action="store_true",
                     help="таблица планов: следующий шаг, закрыто, стоп-флаг")
-    ap.add_argument("--run", action="store_true", help="выполнить одно действие (режим cron)")
+    ap.add_argument("--run", action="store_true",
+                    help="выполнить тик: до max_actions действий (режим cron)")
+    ap.add_argument("--max-actions", type=int, default=None,
+                    help="сколько действий за тик (по умолчанию — из pipeline.json)")
     ap.add_argument("--status", action="store_true", help="только показать состояние и решение")
     ap.add_argument("--json", action="store_true", help="машинный вывод")
     ap.add_argument("--stop", metavar="ПРИЧИНА", help="остановиться после текущего шага")
@@ -1510,6 +1662,9 @@ def main(argv: list[str] | None = None) -> int:
     except config_mod.ConfigError as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 2
+
+    # D2: флаг важнее файла; флаг задаёт предел на один запуск и в конфиг не пишется.
+    limit = args.max_actions if args.max_actions is not None else max_actions_of(cfg)
 
     if args.run:
         # Тик меняет план и коммитит: на разъехавшейся копии движка он не запускается.
@@ -1596,7 +1751,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             try:
                 if args.plan is None:
-                    result = tick(cfg)
+                    result = tick(cfg, max_actions=limit)
                     if args.json:
                         print(json.dumps(result, ensure_ascii=False, indent=2))
                         return 0
@@ -1609,6 +1764,10 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
                 retried = retry_pending(p)
                 result = run_gate(p, execute=True)
+                if result.get("applied") and (result.get("decision") or {}).get("action") != "idle":
+                    # Ветка одного плана — тоже тик: применённое действие попадает в состояние.
+                    remember_action(p, p.plan_id, result.get("decision") or {},
+                                    result.get("detail", ""))
                 result["pending_commit"] = retried
             finally:
                 state_io.release(lock)
