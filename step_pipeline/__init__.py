@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 from .cli import build_parser, run
+from .prompt_section import SECTION_ID, section_text, skill_gate
 from .tools import TOOLS
+
+SECTION_MAX_CHARS = 800
 
 
 def register(ctx) -> None:
-    """Точка входа плагина: CLI `hermes pipeline` + три модели-инструмента."""
+    """Точка входа плагина: CLI `hermes pipeline`, три модели-инструмента, режим планировщика."""
     ctx.register_cli_command(
         name="pipeline",
         help="Пошаговый конвейер: setup, status, run, ui, doctor, notify-test",
@@ -26,3 +29,8 @@ def register(ctx) -> None:
     for name, schema, handler, emoji in TOOLS:
         ctx.register_tool(name=name, toolset="step_pipeline", schema=schema,
                           handler=handler, emoji=emoji)
+    # Режим планировщика: текст в промт новой сессии и вето на скилл планирования.
+    # Содержимое — функция: состояние проекта читается в момент сборки промта,
+    # иначе переключение режима не доехало бы до сессии, начатой после него.
+    ctx.register_system_prompt_section(SECTION_ID, section_text, max_chars=SECTION_MAX_CHARS)
+    ctx.register_hook("pre_tool_call", skill_gate)

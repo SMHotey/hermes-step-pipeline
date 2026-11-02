@@ -12,6 +12,8 @@ provides_tools:
   - pipeline_status
   - pipeline_run
   - pipeline_control
+provides_hooks:
+  - pre_tool_call
 optional_env:
   - STEP_PIPELINE_TELEGRAM_BOT_TOKEN
   - STEP_PIPELINE_TELEGRAM_CHAT_ID
