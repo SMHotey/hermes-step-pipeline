@@ -18,9 +18,11 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from . import plan_lint
     from . import project as proj
     from . import telegram
 except ImportError:  # pragma: no cover - запуск файлом при отладке
+    import plan_lint  # type: ignore
     import project as proj  # type: ignore
     import telegram  # type: ignore
 
@@ -635,6 +637,16 @@ def run_setup(args) -> int:
             log.ok(f"проект в доверенных у {role}")
         else:
             log.warn(f"skills trust ({role}): {(trust.stderr or trust.stdout or '').strip()[:200]}")
+
+    # Линтер только предупреждает: кривой план не должен ронять уже сделанную установку.
+    log.step("── Проверка планов ──")
+    lint = plan_lint.lint_project(project)
+    if lint.problems:
+        log.warn(f"линтер планов: проблем {len(lint.problems)} — подробности: hermes pipeline doctor")
+        for problem in lint.problems[:10]:
+            log.warn(str(problem))
+    else:
+        log.ok(f"линтер планов: файлов {len(lint.files)}, проблем нет")
 
     log.step("── Готово ──")
     log.step(f"  статус:  hermes pipeline status --project \"{project}\"")

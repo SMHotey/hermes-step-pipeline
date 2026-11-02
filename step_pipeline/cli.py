@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from . import plan_lint
     from . import plan_mode
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
 except ImportError:  # pragma: no cover - отладка файлом
+    import plan_lint  # type: ignore
     import plan_mode  # type: ignore
     import project as proj  # type: ignore
     import setup_flow  # type: ignore
@@ -73,6 +75,9 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
 
     doctor = sub.add_parser("doctor", help="проверить установку и окружение")
     doctor.add_argument("--project", default="")
+    doctor.add_argument("--plan", default="",
+                        help="проверить только один план: номер или путь "
+                             "(пусто — все планы проекта)")
     doctor.set_defaults(handler=cmd_doctor)
 
     notify = sub.add_parser("notify-test", help="отправить тестовое сообщение в Telegram")
@@ -236,6 +241,15 @@ def cmd_doctor(args) -> int:
         problems.append(str(exc))
     plans = sorted((project / "docs" / "plans").glob("*.md"))
     notes.append(f"файлов планов: {len(plans)}")
+    # Линтер формата: неверный план должен быть виден до запуска, а не через сутки простоя.
+    lint = plan_lint.lint_project(project, getattr(args, "plan", "") or "")
+    if lint.problems:
+        for problem in lint.problems:
+            problems.append(f"план {problem}")
+    elif getattr(args, "plan", ""):
+        notes.append(f"планы: линтер проверил только план «{args.plan}», проблем нет")
+    else:
+        notes.append(f"планы: линтер — файлов {len(lint.files)}, проблем нет")
     engine_ver = setup_flow.engine_version(project)
     plugin_ver = setup_flow.plugin_version()
     if engine_ver and engine_ver != plugin_ver:
