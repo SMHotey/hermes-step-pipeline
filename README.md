@@ -115,6 +115,24 @@ UI слушает только localhost и не имеет авторизаци
 `hermes pipeline doctor --plan 1` (один план). Образец для копирования —
 `step_pipeline/templates/plan-template.md`.
 
+## Режим планировщика
+
+Режим включён по умолчанию: агент планирует по протоколу, а утверждает план владелец.
+
+```bash
+hermes pipeline plan-mode status   # «Режим планировщика: on|off»
+hermes pipeline plan-mode on|off   # включить/выключить (со следующей сессии)
+```
+
+Протокол роли `pipeline-plan-authoring`: проверить режим → уточнить только то, что меняет
+состав шагов или критерий приёмки (до пяти вопросов, у вариантов метка `(рекомендуется)`) →
+неясное — в блок «Допущения» → черновик в `<plans_dir>/drafts/` → линтер
+`hermes pipeline doctor --plan <путь>` → показать владельцу шаги и допущения → дождаться
+подтверждения. Из `drafts/` переносит только владелец (`hermes pipeline plan --accept`, S6);
+журнал агент не правит, план не коммитит. При выключенном режиме вето на скилл: «составь
+план» блокируется с подсказкой включения; тумблер «Режим планировщика» — в панели.
+Подробнее — [`docs/plans/4-planner.md`](docs/plans/4-planner.md).
+
 ## CLI
 
 ```bash
@@ -123,6 +141,7 @@ hermes pipeline status       # состояние + решение стража 
 hermes pipeline run          # один тик стража
 hermes pipeline ui           # локальный UI
 hermes pipeline doctor       # диагностика: движок, борда, cron, Telegram, планы
+hermes pipeline plan-mode status|on|off   # режим планировщика: проверка и переключение
 hermes pipeline notify-test  # тестовое сообщение в Telegram
 hermes pipeline config --get paths.plans
 hermes pipeline config --set runtimes.step 5h
