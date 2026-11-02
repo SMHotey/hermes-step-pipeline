@@ -71,82 +71,25 @@ SKILL_CATEGORIES = {
 }
 TOKEN_ENV = "STEP_PIPELINE_TELEGRAM_BOT_TOKEN"
 CHAT_ENV = "STEP_PIPELINE_TELEGRAM_CHAT_ID"
-TICK_SCRIPT = '''# -*- coding: utf-8 -*-
-"""Тик конвейера для cron: один шаг стража. Пустой вывод = конвейер ждёт.
-
-Свой разбор .env профиля: cron шлюза отдаёт HERMES_HOME, но не переменные из
-profiles/<профиль>/.env — без этого уведомления движка молчат.
-"""
-import os
-import runpy
-import sys
-from pathlib import Path
+#: Источник текста тик-скрипта — файл движка, а не рукописная копия. Копия разошлась
+#: с движком 03.11.2026 (sha256 c11840c3… против b7d98376…) и при отсутствии `gate.py`
+#: возвращала 0 молча: под cron джоба показывала `ok` при мёртвом конвейере. Прецедент
+#: двух разных копий движка при равном VERSION — 02.11.2026 (1-S17).
+TICK_SOURCE = proj.ENGINE_SRC / "tick.py"
+TICK_SCRIPT = TICK_SOURCE.read_text(encoding="utf-8")
 
 
-def _setup_stdio():
-    for stream in (sys.stdout, sys.stderr):
-        reconf = getattr(stream, "reconfigure", None)
-        if reconf is None:
-            continue
-        try:
-            reconf(encoding="utf-8", errors="replace")
-        except (ValueError, OSError):
-            pass
+def install_tick_script(driver: str) -> Path:
+    """Положить тик-скрипт движка в `profiles/<профиль>/scripts/` — байтами.
 
-
-def load_profile_env():
-    paths = []
-    explicit = os.environ.get("PIPELINE_ENV")
-    if explicit:
-        paths.append(Path(explicit))
-    paths.append(Path(__file__).resolve().parents[1] / ".env")
-    for path in paths:
-        if not path.is_file():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8-sig")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            if line.startswith("export "):
-                line = line[7:].lstrip()
-            key, _, value = line.partition("=")
-            value = value.strip().strip('"').strip("'")
-            if key.strip() and value:
-                os.environ.setdefault(key.strip(), value)
-
-
-def find_gate():
-    candidates = []
-    repo = os.environ.get("PIPELINE_REPO")
-    if repo:
-        candidates.append(Path(repo) / ".pipeline" / "gate.py")
-    candidates.append(Path.cwd() / ".pipeline" / "gate.py")
-    candidates.append(Path(__file__).resolve().parent / "gate.py")
-    candidates.append(Path(__file__).resolve().parents[1] / ".pipeline" / "gate.py")
-    for cand in candidates:
-        if cand.is_file():
-            return cand
-    return None
-
-
-def main():
-    _setup_stdio()
-    load_profile_env()
-    gate = find_gate()
-    if gate is None:
-        return 0
-    sys.argv = [str(gate), "--run"]
-    runpy.run_path(str(gate), run_name="__main__")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-'''
+    Байты, а не текст: `write_text` на Windows переводит строки в CRLF, и установленный
+    скрипт перестаёт быть побайтово равным файлу движка (инвариант шага — sha256).
+    """
+    scripts = proj.profile_dir(driver) / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    target = scripts / "pipeline_tick.py"
+    target.write_bytes(TICK_SOURCE.read_bytes())
+    return target
 
 COMMANDS_SCRIPT = '''# -*- coding: utf-8 -*-
 """Приём команд конвейера из Telegram: один getUpdates, ответ в тот же чат.
@@ -345,6 +288,22 @@ def engine_version(project: Path) -> str:
         return ""
 
 
+def refresh_tick_script(project: Path, log: Log) -> str:
+    """Обновить установленный тик-скрипт профиля драйвера, если cron заводили.
+
+    Признак заведённой джобы — метка `.pipeline/cron.json` (её пишет мастер). У проекта
+    с `--no-cron` файл в профиле не создаётся: писать владельцу в профиль там, где джобы
+    нет, — сюрприз, а не обновление.
+    """
+    if not (project / ".pipeline" / "cron.json").is_file():
+        log.ok("тик-скрипт профиля не обновлялся: проект без cron")
+        return "тик-скрипт профиля не обновлялся (проект без cron)"
+    driver = roles_from_config(proj.read_config(project))[0]
+    install_tick_script(driver)
+    log.ok(f"тик-скрипт профиля {driver}: обновлён")
+    return f"тик-скрипт профиля {driver} обновлён"
+
+
 def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
     """Обновить движок в уже поставленном проекте, не трогая конфиг и роли.
 
@@ -366,6 +325,7 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
         log.ok(f"добавлена роль {item}")
     if not changed and not roles:
         log.ok(f"движок уже актуален ({now})")
+    tick = refresh_tick_script(project, log)
     if trust:
         failed = trust_roles(roles_from_config(proj.read_config(project)), project, log)
         tail = ("доверие ролям оформлено" if not failed
@@ -373,7 +333,8 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
     else:
         log.warn("доверие проекту не оформлялось (--no-trust)")
         tail = "доверие ролям пропущено (--no-trust)"
-    log.step(f"── Движок: {was} → {now}. Конфиг, telegram и cron не тронуты; {tail} ──")
+    log.step(f"── Движок: {was} → {now}. Конфиг, telegram и cron-джоба не тронуты; "
+             f"{tick}; {tail} ──")
     return 0
 
 
@@ -688,19 +649,21 @@ def _write_cron_marker(project: Path, driver: str, name: str) -> None:
 
 
 def ensure_cron(driver: str, project: Path, log: Log, *, skip: bool) -> None:
-    """Cron-джоба стража: no-agent, каждые 10 минут, доставка local."""
+    """Cron-джоба стража: no-agent, каждые 10 минут, доставка local.
+
+    Тик-скрипт профиля пишется при каждом запуске мастера, в том числе когда джоба уже
+    есть: иначе джоба, заведённая со старой копией, остаётся с ней навсегда (1-S17).
+    """
     if skip:
         log.warn("cron не заводил (--no-cron)")
         return
+    install_tick_script(driver)
     name = "План: страж шага (конвейер)"
     listing = proj.run_hermes("-p", driver, "cron", "list")
     if name in (listing.stdout or ""):
-        log.ok("cron-джоба стража уже есть")
+        log.ok("cron-джоба стража уже есть (тик-скрипт обновлён)")
         _write_cron_marker(project, driver, name)
         return
-    scripts = proj.profile_dir(driver) / "scripts"
-    scripts.mkdir(parents=True, exist_ok=True)
-    (scripts / "pipeline_tick.py").write_text(TICK_SCRIPT, encoding="utf-8")
     res = proj.run_hermes("-p", driver, "cron", "create", "*/10 * * * *",
                           "--name", name, "--no-agent",
                           "--script", "pipeline_tick.py",

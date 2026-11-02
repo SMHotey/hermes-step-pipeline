@@ -2,13 +2,16 @@
 """Тик для cron: разбор .env профиля и поиск gate.py.
 
 Причина тестов: cron шлюза отдаёт HERMES_HOME профиля, но не переменные из его .env,
-поэтому без собственного разбора уведомления движка молчат (см. 1-S17).
+поэтому без собственного разбора уведомления движка молчат (см. 1-S17). Вторая половина
+файла — про установленный мастером скрипт: он обязан быть файлом движка, а не копией.
 """
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -17,6 +20,13 @@ import pytest
 from engine_kit import ENGINE
 
 TICK = ENGINE / "tick.py"
+
+#: Корень репозитория: плагин импортируется как пакет (как в test_engine_integrity.py:22-24).
+ROOT = ENGINE.parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from step_pipeline import setup_flow  # noqa: E402
 
 
 def load_tick(path: Path):
@@ -216,4 +226,150 @@ def test_engine_tick_parses_env_file(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("STEP_TEST_PLAIN", raising=False)
     module.load_profile_env()
     assert "STEP_TEST_PLAIN" not in os.environ
+
+
+# ─── Установленный мастером скрипт: источник, окружение джобы, обновление (1-S17) ───
+
+#: Переменные, которых у cron-джобы нет: маркеры профиля и переменные конвейера.
+_PROBE_DROP = ("STEP_PIPELINE_TELEGRAM_BOT_TOKEN", "STEP_PIPELINE_TELEGRAM_CHAT_ID",
+               "PIPELINE_REPO", "PIPELINE_ENV", "STEP_TEST_TOKEN", "STEP_TEST_CHAT")
+JOB_NAME = "План: страж шага (конвейер)"
+
+
+class _Result:
+    """Ответ поддельного `hermes`: только код возврата и stdout."""
+
+    def __init__(self, stdout: str = "") -> None:
+        self.returncode = 0
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def _stub_hermes(monkeypatch, *, stdout: str = "") -> list[tuple]:
+    """Подменить живой hermes: собрать вызовы, ничего не запускать."""
+    calls: list[tuple] = []
+
+    def run(*argv, timeout=180):
+        calls.append(argv)
+        return _Result(stdout)
+
+    monkeypatch.setattr(setup_flow.proj, "run_hermes", run)
+    return calls
+
+
+def _fake_profiles(monkeypatch, tmp_path: Path) -> Path:
+    """Каталог профилей в tmp: тест не должен писать в живой профиль."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(setup_flow.proj, "profile_dir", lambda p: home / "profiles" / p)
+    return home
+
+
+def _cron_env(**extra: str) -> dict[str, str]:
+    """Окружение как у cron-джобы: без переменных конвейера и маркеров профиля."""
+    env = {key: value for key, value in os.environ.items() if key not in _PROBE_DROP}
+    env.update(extra)
+    return env
+
+
+def test_installed_tick_is_engine_file(tmp_path: Path, monkeypatch):
+    """`ensure_cron` пишет ровно файл движка — байтами и текстом (D1, D2)."""
+    home = _fake_profiles(monkeypatch, tmp_path)
+    _stub_hermes(monkeypatch)
+    project = tmp_path / "shop"
+    project.mkdir()
+
+    setup_flow.ensure_cron("shop", project, setup_flow.Log(), skip=False)
+
+    installed = home / "profiles" / "shop" / "scripts" / "pipeline_tick.py"
+    assert installed.is_file()
+    assert installed.read_bytes() == TICK.read_bytes(), "установленный скрипт ≠ файл движка"
+    assert installed.read_text(encoding="utf-8") == setup_flow.TICK_SCRIPT
+
+
+def test_installed_tick_loads_profile_env_in_subprocess(tmp_path: Path):
+    """Установленный текст в субпроцессе: `--run` дошёл, `.env` профиля подхвачен."""
+    profile = tmp_path / "profiles" / "demo"
+    (profile / "scripts").mkdir(parents=True)
+    installed = profile / "scripts" / "pipeline_tick.py"
+    installed.write_bytes(setup_flow.TICK_SOURCE.read_bytes())
+    (profile / ".env").write_text("STEP_TEST_TOKEN=из-профиля\nSTEP_TEST_CHAT=77\n",
+                                  encoding="utf-8")
+    trace = tmp_path / "trace.txt"
+    project = tmp_path / "proj"
+    (project / ".pipeline").mkdir(parents=True)
+    (project / ".pipeline" / "gate.py").write_text(
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        f"trace = Path({str(trace)!r})\n"
+        "trace.write_text(' '.join(sys.argv[1:]) + '|' + os.environ.get('STEP_TEST_TOKEN', '')\n"
+        "                 + '|' + os.environ.get('STEP_TEST_CHAT', ''), encoding='utf-8')\n",
+        encoding="utf-8")
+
+    done = subprocess.run([sys.executable, str(installed)], cwd=str(project),
+                          env=_cron_env(HERMES_HOME=str(tmp_path / "hermes")),
+                          capture_output=True, text=True, encoding="utf-8", timeout=120)
+
+    assert done.returncode == 0, done.stderr
+    assert trace.read_text(encoding="utf-8") == "--run|из-профиля|77"
+
+
+def test_installed_tick_reports_missing_gate(tmp_path: Path):
+    """Нет `gate.py` — установленный скрипт называет причину и возвращает 1, а не 0 молча."""
+    lonely = tmp_path / "probe" / "scripts" / "pipeline_tick.py"
+    lonely.parent.mkdir(parents=True)
+    lonely.write_bytes(setup_flow.TICK_SOURCE.read_bytes())
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    done = subprocess.run([sys.executable, str(lonely)], cwd=str(empty), env=_cron_env(),
+                          capture_output=True, text=True, encoding="utf-8", timeout=120)
+
+    assert done.returncode == 1, "старая копия возвращала 0: под cron это «ok» на мёртвом конвейере"
+    assert "gate.py не найден" in done.stderr
+
+
+def test_existing_job_refreshes_installed_script(tmp_path: Path, monkeypatch):
+    """Джоба уже есть — скрипт всё равно обновляется, вторая джоба не создаётся (D3)."""
+    home = _fake_profiles(monkeypatch, tmp_path)
+    calls = _stub_hermes(monkeypatch, stdout=f"{JOB_NAME}   */10 * * * *   local")
+    scripts = home / "profiles" / "shop" / "scripts"
+    scripts.mkdir(parents=True)
+    installed = scripts / "pipeline_tick.py"
+    installed.write_text("# старая рукописная копия\n", encoding="utf-8")
+    project = tmp_path / "shop"
+    project.mkdir()
+    log = setup_flow.Log()
+
+    setup_flow.ensure_cron("shop", project, log, skip=False)
+
+    assert installed.read_bytes() == TICK.read_bytes()
+    assert not [call for call in calls if "create" in call], calls
+    assert any("тик-скрипт обновлён" in line for line in log.lines), log.lines
+
+
+def test_upgrade_refreshes_tick_script_when_cron_marker_exists(tmp_path: Path, monkeypatch):
+    """`upgrade` обновляет скрипт только у проекта с меткой cron, иначе не создаёт (D4)."""
+    home = _fake_profiles(monkeypatch, tmp_path)
+    _stub_hermes(monkeypatch)
+    project = tmp_path / "proj"
+    (project / ".pipeline").mkdir(parents=True)
+    (project / "pipeline.json").write_text(json.dumps({"profiles": {"driver": "demo"}}),
+                                           encoding="utf-8")
+    (project / ".pipeline" / "cron.json").write_text(json.dumps({"driver": "demo"}),
+                                                     encoding="utf-8")
+    log = setup_flow.Log()
+
+    assert setup_flow.upgrade(project, log, trust=False) == 0
+    installed = home / "profiles" / "demo" / "scripts" / "pipeline_tick.py"
+    assert installed.read_bytes() == TICK.read_bytes()
+
+    plain = tmp_path / "plain"
+    (plain / ".pipeline").mkdir(parents=True)
+    (plain / "pipeline.json").write_text(json.dumps({"profiles": {"driver": "demo"}}),
+                                         encoding="utf-8")
+    installed.unlink()
+
+    assert setup_flow.upgrade(plain, log, trust=False) == 0
+    assert not installed.exists(), "скрипт создан там, где cron не заводили"
+    assert any("не обновлялся" in line for line in log.lines), log.lines
 
