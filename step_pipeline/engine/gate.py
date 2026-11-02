@@ -23,6 +23,10 @@
 Стоп-флаг блокирует ТОЛЬКО начало следующего шага: текущий шаг доводится до ревью и
 журнала (это и значит «остановка ПОСЛЕ выполнения шага»).
 
+Простой виден сам: `idle` пишет `waiting_since`/`waiting_reason`, ожидание дольше
+`notify.watchdog_hours` даёт одно напоминание на причину не чаще раза в час, а раз в
+сутки после `notify.digest_at` уходит сводка (закрыто, ждёт, стоп — по строке на план).
+
 Использование:
     python .pipeline/gate.py --status            # что видно и что было бы сделано
     python .pipeline/gate.py --plans             # таблица планов: шаг, закрыто, стоп
@@ -760,6 +764,163 @@ def notify(cfg: config_mod.Config, text: str) -> bool:
     return False
 
 
+# ───────────────── сторож простоя и дневная сводка ─────────────────
+
+WATCHDOG_DEFAULT_HOURS = 3          # умолчание §S9, ключ notify.watchdog_hours
+WATCHDOG_NOTICE_GAP = 3600          # одно уведомление на причину — не чаще раза в час
+DIGEST_DEFAULT = "09:00"            # умолчание §S9, ключ notify.digest_at
+DIGEST_FILE = "digest.json"         # отметка «сводка за сутки отправлена» (как tg_offset.json)
+
+
+def _now() -> float:
+    """Текущее время (epoch). Единственное чтение часов в новом коде.
+
+    Отдельная функция, а не time.time() на месте: тесты подменяют gate._now, и без
+    единой точки подмены «сутки простоя» иначе не проверить.
+    """
+    return time.time()
+
+
+def _local_date(ts: float) -> str:
+    """Дата от переданного момента: формат журнала, 02.11.2026."""
+    return time.strftime("%d.%m.%Y", time.localtime(ts))
+
+
+def _local_stamp(ts: float) -> str:
+    """Момент для сообщения владельцу: 02.11.2026 03:00."""
+    return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts))
+
+
+def _ago(seconds: float) -> str:
+    """Длительность по-русски: «4 ч 10 мин», «4 ч», «45 мин», «меньше минуты»."""
+    total = max(0, int(seconds))
+    hours, minutes = total // 3600, total % 3600 // 60
+    if hours and minutes:
+        return f"{hours} ч {minutes} мин"
+    if hours:
+        return f"{hours} ч"
+    if minutes:
+        return f"{minutes} мин"
+    return "меньше минуты"
+
+
+def _positive(raw, default: float) -> float:
+    """Число из pipeline.json; битое или неположительное значение — умолчание (D4)."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _digest_at(cfg: config_mod.Config) -> tuple[int, int]:
+    """Час и минута сводки из notify.digest_at; битое значение — умолчание (D4)."""
+    raw = str(cfg.notify.get("digest_at") or DIGEST_DEFAULT).strip()
+    match = re.match(r"^(\d{1,2}):(\d{2})$", raw)
+    if not match:
+        match = re.match(r"^(\d{1,2}):(\d{2})$", DIGEST_DEFAULT)
+    hour, minute = int(match.group(1)), int(match.group(2))
+    return (hour, minute) if hour < 24 and minute < 60 else (9, 0)
+
+
+def watch_idle(cfg: config_mod.Config, p: Paths, ctx: dict, decision: dict,
+               say=None) -> dict:
+    """Простой: запомнить ожидание и разбудить владельца, если ждём дольше watchdog_hours.
+
+    waiting_since ставится один раз за полосу простоя и снимается первым же действием
+    (см. touch). Уведомление — одно на причину, не чаще раза в час (D6). Закрытый план
+    простоем не считается: там работы нет по определению (D10).
+    """
+    if decision.get("plan_done"):
+        return {"notice": False, "waiting_since": None}
+    state = ctx.get("state") or {}
+    now = _now()
+    reason = str(decision.get("reason") or "нет работы")
+    started = not isinstance(state.get("waiting_since"), (int, float))
+    since = float(now if started else state["waiting_since"])
+    changed = state.get("waiting_reason") != reason
+    state["waiting_since"] = since
+    state["waiting_reason"] = reason
+    hours = _positive(cfg.notify.get("watchdog_hours"), WATCHDOG_DEFAULT_HOURS)
+    notice_at = state.get("watchdog_notice_at")
+    gap_passed = (not isinstance(notice_at, (int, float))
+                  or now - float(notice_at) >= WATCHDOG_NOTICE_GAP)
+    notice = now - since >= hours * 3600 and (changed or gap_passed)
+    if notice:
+        text = (f"⏳ простой {_ago(now - since)}: {reason} "
+                f"(план {p.plan_id}, ждём с {_local_stamp(since)})")
+        (say or (lambda value: notify(cfg, value)))(text)
+        state["watchdog_notice_at"] = now
+        state["watchdog_notice_reason"] = reason
+    if started or changed or notice:
+        save_state(p, state)
+    return {"notice": notice, "waiting_since": since}
+
+
+def digest_rows(cfg: config_mod.Config) -> list[dict]:
+    """Строка сводки по каждому ведомому плану: закрыто за сутки, ожидание, стоп.
+
+    «Закрыто за сутки» — карточки шагов со completed_at в последних 24 часах (D8):
+    дата журнала хранится без времени и для суточного окна не годится.
+    """
+    now = _now()
+    rows: list[dict] = []
+    for spec in registry.driven_specs(cfg):
+        p = resolve_paths(cfg, spec.id)
+        state = load_state(p)
+        closed = 0
+        for card in read_cards(p, f"planloop:{spec.id}:"):
+            done_at = float(card.get("completed_at") or 0)
+            if (str(card.get("key") or "").endswith(":step")
+                    and card.get("status") == "done" and 0 <= now - done_at <= 86400):
+                closed += 1
+        rows.append({"id": spec.id, "closed": closed,
+                     "waiting_since": state.get("waiting_since"),
+                     "waiting_reason": state.get("waiting_reason"),
+                     "stop": load_stop(p)})
+    return rows
+
+
+def digest_text(cfg: config_mod.Config, rows: list[dict]) -> str:
+    """Текст суточной сводки: шапка, сколько закрыто, строка на план."""
+    now = _now()
+    lines = [f"📊 сводка за сутки, {_local_date(now)}",
+             f"закрыто за сутки: {sum(row['closed'] for row in rows)}"]
+    for row in rows:
+        waiting = "ничего"
+        if isinstance(row.get("waiting_since"), (int, float)):
+            waiting = (f"{row.get('waiting_reason') or 'ждём'} "
+                       f"({_ago(now - float(row['waiting_since']))})")
+        stop = "нет"
+        if row.get("stop"):
+            stop = f"{stop_kind(row['stop'])}: {row['stop'].get('reason', '')}"
+        lines.append(f"план {row['id']}: закрыто {row['closed']}, "
+                     f"ждёт — {waiting}, стоп — {stop}")
+    return "\n".join(lines)
+
+
+def send_digest(cfg: config_mod.Config, say=None) -> bool:
+    """Суточная сводка: одна на проект, после notify.digest_at, отметка в state_dir (D2, D7)."""
+    marker = Path(cfg.state_dir) / DIGEST_FILE
+    try:
+        sent = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        sent = {}
+    now = _now()
+    today = _local_date(now)
+    if isinstance(sent, dict) and sent.get("date") == today:
+        return False
+    local = time.localtime(now)
+    if (local.tm_hour, local.tm_min) < _digest_at(cfg):
+        return False
+    rows = digest_rows(cfg)
+    if not rows:                       # ведомых планов нет — сообщать нечего
+        return False
+    (say or (lambda value: notify(cfg, value)))(digest_text(cfg, rows))
+    state_io.save_json(marker, {"date": today, "at": _local_stamp(now)})
+    return True
+
+
 # ───────────────────── команды владельцу (Telegram, вход) ─────────────────────
 
 TG_TEXT_LIMIT = 3900
@@ -994,10 +1155,16 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
     def touch(action: str) -> None:
         state["last_action"] = action
         state["last_tick"] = time.strftime("%d.%m.%Y %H:%M:%S")
+        # Первое же действие снимает ожидание: сторож начинает отсчёт заново.
+        for key in ("waiting_since", "waiting_reason",
+                    "watchdog_notice_at", "watchdog_notice_reason"):
+            state.pop(key, None)
         save_state(p, state)
 
     action = decision["action"]
     if action == "idle":
+        # Простой виден только здесь (и в tick), поэтому и записывается здесь.
+        result["watch"] = watch_idle(p.cfg, p, ctx, decision, say)
         return result
     if action == "create_step":
         step = decision["data"]
@@ -1198,8 +1365,17 @@ def plans_table(cfg: config_mod.Config) -> str:
 
 
 def tick(cfg: config_mod.Config, execute: bool = True) -> dict:
-    """Один тик по ВСЕМ ведомым планам: ровно одно действие — первый не-idle."""
+    """Один тик по ВСЕМ ведомым планам: ровно одно действие — первый не-idle.
+
+    Порядок: суточная сводка (сбой не валит тик), затем планы по очереди. Простаивающий
+    план состояние ожидания записывает, действием это не считается.
+    """
     statuses: list[str] = []
+    if execute:
+        try:
+            send_digest(cfg)
+        except Exception as exc:  # noqa: BLE001 - сводка не повод останавливать конвейер
+            print(f"[digest] сводка не отправлена: {exc}", file=sys.stderr)
     for spec in registry.driven_specs(cfg):
         p = resolve_paths(cfg, spec.id)
         retried = retry_pending(p) if execute else None
@@ -1212,6 +1388,8 @@ def tick(cfg: config_mod.Config, execute: bool = True) -> dict:
         decision = decide(ctx)
         statuses.append(status_text(ctx, decision))
         if decision["action"] == "idle":
+            if execute:
+                watch_idle(cfg, p, ctx, decision, lambda text: notify(cfg, text))
             continue
         result = run_gate(p, execute=execute, ctx=ctx)
         result["plan_id"] = spec.id

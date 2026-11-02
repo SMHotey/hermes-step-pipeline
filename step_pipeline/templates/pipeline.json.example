@@ -41,6 +41,8 @@
     "enabled": false,
     "token_env": "PIPELINE_TG_TOKEN",
     "chat_env": "PIPELINE_TG_CHAT",
-    "prefix": ""
+    "prefix": "",
+    "watchdog_hours": 3,
+    "digest_at": "09:00"
   }
 }
