@@ -14,8 +14,11 @@ import hashlib
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -470,6 +473,22 @@ def ensure_profiles(driver: str, prompter: str, reviewer: str, log: Log) -> None
 #: Роли конвейера по умолчанию — те же, что у мастера установки.
 DEFAULT_ROLES = ("default", "prompter", "reviewer")
 
+#: Смоук установки: одна эхо-карточка на роль, один дедлайн на все три (S16).
+SMOKE_TIMEOUT = 300
+SMOKE_INTERVAL = 5.0
+SMOKE_RUNTIME = "10m"
+SMOKE_TITLE = "Смоук установки: роль {role} стартует"
+SMOKE_SKILL_KEYS = {"driver": "step", "prompter": "prompt", "reviewer": "review"}
+#: Навыки ролей по умолчанию — копия `DEFAULTS["skills"]` движка
+#: (`step_pipeline/engine/config.py:37-41`): импортировать движок из плагина нельзя.
+SMOKE_DEFAULT_SKILLS = {
+    "step": ("pipeline-next-step",),
+    "prompt": ("pipeline-prompter", "agent-prompt-authoring"),
+    "review": ("pipeline-reviewer",),
+}
+#: Терминальные статусы карточки — как у стража (`engine/gate.py:TERMINAL`).
+TERMINAL = {"done", "blocked", "crashed", "timed_out", "gave_up"}
+
 
 def roles_from_config(cfg: dict[str, Any] | None) -> list[str]:
     """Три роли конвейера из `pipeline.json`: драйвер → промптер → ревьюер.
@@ -566,6 +585,83 @@ def is_project_trusted(profile: str, project: Path) -> bool:
     return False
 
 
+def profile_provider(profile: str) -> str:
+    """Провайдер модели профиля: `model.provider` из его `config.yaml`.
+
+    Разбор без PyYAML — как у `_parse_trusted_dirs`: блок `model:` и в нём `provider:`
+    с отступом больше, чем у ключа верхнего уровня. Нет файла или ключа — пустая строка.
+    """
+    path = proj.profile_dir(profile) / "config.yaml"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)model\s*:\s*(.*)$", line)
+        if not match:
+            continue
+        indent = len(match.group(1))
+        rest = match.group(2).strip()
+        if rest.startswith("{"):
+            inline = re.search(r"provider\s*:\s*([^,}]+)", rest)
+            return _trust_value(inline.group(1)) if inline else ""
+        for follow in lines[index + 1:]:
+            if not follow.strip() or follow.lstrip().startswith("#"):
+                continue
+            if len(follow) - len(follow.lstrip()) <= indent:
+                break
+            item = re.match(r"^\s*provider\s*:\s*(.*)$", follow)
+            if item:
+                return _trust_value(item.group(1))
+        return ""
+    return ""
+
+
+def auth_entries(profile: str) -> dict[str, list[dict]]:
+    """`credential_pool` профиля: словарь «провайдер → записи» из его `auth.json`.
+
+    Нет файла, битый JSON, не тот тип — пустой словарь, без исключения.
+    """
+    path = proj.profile_dir(profile) / "auth.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return {}
+    pool = data.get("credential_pool") if isinstance(data, dict) else None
+    if not isinstance(pool, dict):
+        return {}
+    entries: dict[str, list[dict]] = {}
+    for name, items in pool.items():
+        if isinstance(items, list):
+            entries[str(name)] = [item for item in items if isinstance(item, dict)]
+    return entries
+
+
+def _is_saved_entry(entry: dict) -> bool:
+    """Запись сохранена в профиле, а не подтягивается из переменной окружения.
+
+    Правило Hermes (`agent/credential_pool.py`): источники `env:*` «пере-гидратируются
+    из окружения на каждой загрузке» и под демоном шлюза выпадают из ротации — именно
+    это дало инцидент 01.11.2026 (`No usable credentials found for provider`).
+    """
+    source = str(entry.get("source") or "")
+    if source.lower().startswith("env:"):
+        return False
+    return bool(entry.get("access_token") or entry.get("api_key"))
+
+
+def has_saved_credential(profile: str) -> tuple[bool, str]:
+    """Есть ли у профиля сохранённый ключ; второй элемент — провайдер из конфига."""
+    provider = profile_provider(profile)
+    pool = auth_entries(profile)
+    candidates = {provider: pool.get(provider, [])} if provider else pool
+    for items in candidates.values():
+        if any(_is_saved_entry(item) for item in items):
+            return True, provider
+    return False, provider
+
+
 def ensure_board(board: str, log: Log) -> bool:
     """Борда канбана существует: создать (`boards create`) и инициализировать БД."""
     listing = proj.run_hermes("kanban", "boards", "list")
@@ -659,6 +755,200 @@ def ensure_commands_cron(driver: str, project: Path, log: Log, *, skip: bool,
 def commands_cron_command(driver: str, project: Path) -> str:
     return (f'hermes -p {driver} cron create "* * * * *" --name "{COMMANDS_JOB}" '
             f'--no-agent --script pipeline_commands.py --deliver local --workdir "{project}"')
+
+
+def smoke_targets(cfg: dict[str, Any] | None,
+                  roles: list[str]) -> list[tuple[str, tuple[str, ...]]]:
+    """Пары «роль → навыки» для смоука в порядке ролей (драйвер, промптер, ревьюер).
+
+    Навыки берутся из `skills` конфига проекта — ровно те, с которыми страж заводит
+    карточку шага. Нет всей секции `skills` — умолчания движка; ключа нет или он пуст —
+    карточка без `--skill` (это не ошибка).
+    """
+    skills_cfg = (cfg or {}).get("skills")
+    has_section = isinstance(skills_cfg, dict)
+    if not has_section:
+        skills_cfg = {}
+    targets: list[tuple[str, tuple[str, ...]]] = []
+    for kind, role in zip(("driver", "prompter", "reviewer"), roles):
+        key = SMOKE_SKILL_KEYS[kind]
+        raw = (skills_cfg or {}).get(key)
+        values = tuple(str(item) for item in raw if item) if isinstance(raw, (list, tuple)) else ()
+        if not values and not has_section:
+            values = tuple(SMOKE_DEFAULT_SKILLS.get(key, ()))
+        targets.append((str(role), values))
+    return targets
+
+
+def smoke_key(role: str, stamp: str) -> str:
+    """Ключ идемпотентности смоук-карточки: свой на роль и запуск мастера."""
+    return f"smoke:{role}:{stamp}"
+
+
+def smoke_body(role: str) -> str:
+    """Тело карточки-эха: проверка старта воркера роли, больше ничего."""
+    return (f"Это проверка установки конвейера для роли `{role}`: воркер роли должен\n"
+            "запуститься сам и закрыть карточку.\n\n"
+            "Ничего не читать и не править. Единственное действие — закрыть карточку\n"
+            "через `kanban_complete` со сводкой `смоук OK`. Если закрыть нельзя —\n"
+            "`kanban_block` с причиной в одной строке.\n")
+
+
+def create_smoke_card(project, cfg: dict[str, Any] | None, role: str,
+                      skills: tuple[str, ...], stamp: str, log: Log | None = None) -> str | None:
+    """Завести смоук-карточку роли — тем же вызовом, что и карточку шага у стража.
+
+    `--workspace dir:ПРОЕКТ` обязателен: навыки ролей лежат в проекте, на `scratch`
+    воркер упадёт `Unknown skill(s)` и смоук даст ложный провал.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as fh:
+        fh.write(smoke_body(role))
+        body_path = fh.name
+    board = str((cfg or {}).get("board") or "default")
+    tenant = str(((cfg or {}).get("kanban") or {}).get("tenant") or "plan")
+    cmd = ("kanban", "--board", board, "create", SMOKE_TITLE.format(role=role),
+           "--body-file", body_path, "--assignee", role, "--tenant", tenant,
+           "--workspace", f"dir:{Path(project).as_posix()}",
+           "--idempotency-key", smoke_key(role, stamp), "--max-runtime", SMOKE_RUNTIME)
+    for skill in skills:
+        cmd += ("--skill", skill)
+    try:
+        res = proj.run_hermes(*cmd)
+    finally:
+        try:
+            Path(body_path).unlink()
+        except OSError:
+            pass
+    out = (res.stdout or "") + (res.stderr or "")
+    found = re.search(r"t_[0-9a-f]{6,}", out)
+    if res.returncode != 0 and not found:
+        message = f"смоук ({role}): карточка не создана — {out.strip()[:200]}"
+        if log is not None:
+            log.warn(message)
+        else:  # pragma: no cover - вызов без лога только из отладки
+            print(message, file=sys.stderr)
+        return None
+    return found.group(0) if found else None
+
+
+def smoke_card_state(project, key: str) -> dict:
+    """Состояние карточки по ключу идемпотентности — только чтение борды.
+
+    Причина провала: `last_failure_error`, затем `result`, затем payload последнего
+    события. Таблицы `task_events` может не быть (урезанные схемы) — тогда пусто.
+    """
+    db = proj.board_db(project)
+    if not db.is_file():
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return {}
+    try:
+        try:
+            row = con.execute(
+                "SELECT id, status, COALESCE(result,''), COALESCE(last_failure_error,'')"
+                " FROM tasks WHERE idempotency_key = ? AND status <> 'archived'"
+                " ORDER BY created_at DESC", (key,)).fetchone()
+        except sqlite3.Error:
+            return {}
+        if not row:
+            return {}
+        state = {"id": row[0], "status": row[1] or "", "result": row[2], "error": row[3]}
+        payload = ""
+        try:
+            event = con.execute("SELECT payload FROM task_events WHERE task_id = ?"
+                                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                                (row[0],)).fetchone()
+            payload = str(event[0] or "") if event else ""
+        except sqlite3.Error:
+            payload = ""
+        state["event"] = payload
+        return state
+    finally:
+        con.close()
+
+
+def wait_smoke_card(project, key: str, timeout: float = SMOKE_TIMEOUT,
+                    interval: float = SMOKE_INTERVAL, sleep=time.sleep,
+                    clock=time.monotonic) -> dict:
+    """Дождаться терминального статуса карточки; флаг `timed_out` в ответе.
+
+    `sleep` и `clock` — параметры, чтобы тест проверял дедлайн без настоящего ожидания.
+    """
+    deadline = clock() + max(0.0, float(timeout))
+    while True:
+        state = smoke_card_state(project, key)
+        if str(state.get("status") or "") in TERMINAL:
+            state["timed_out"] = False
+            return state
+        now = clock()
+        if now >= deadline:
+            state["timed_out"] = True
+            return state
+        sleep(min(float(interval) or SMOKE_INTERVAL, deadline - now))
+
+
+def smoke_cause(state: dict) -> str:
+    """Первая непустая причина провала из полей карточки (без `worker_output`)."""
+    for field in ("error", "result", "event"):
+        value = str(state.get(field) or "").strip()
+        if value:
+            return value[:300]
+    return ""
+
+
+def smoke_repair(cause: str, role: str, project, card_id: str) -> str:
+    """Готовая команда починки по тексту причины (таблица D8 постановки)."""
+    text = (cause or "").lower()
+    if "unknown skill" in text:
+        return f'hermes -p {role} skills trust "{project}" && hermes pipeline setup --upgrade'
+    if "no usable credentials found" in text or "missing_api_key" in text:
+        provider = profile_provider(role)
+        if provider:
+            return f"hermes -p {role} auth add {provider} --type api-key"
+        return f"hermes -p {role} auth list"
+    if "gateway" in text or not text:
+        return f"hermes gateway status, затем hermes kanban show {card_id}"
+    return f"hermes kanban show {card_id}"
+
+
+def run_smoke(project, cfg: dict[str, Any] | None, roles: list[str], log: Log,
+              timeout: float = SMOKE_TIMEOUT) -> tuple[int, int]:
+    """Пробный запуск ролей: карточка-эхо на роль и ожидание закрытия.
+
+    Один дедлайн на все три карточки: они заводятся подряд, ожидание общее.
+    Возвращает (сколько закрылось, сколько всего).
+    """
+    log.step("── Смоук ролей ──")
+    stamp = time.strftime("%Y%m%d%H%M%S") + f"-{os.getpid()}"
+    cards: list[tuple[str, str, str]] = []
+    for role, skills in smoke_targets(cfg, roles):
+        key = smoke_key(role, stamp)
+        cards.append((role, create_smoke_card(project, cfg, role, skills, stamp, log) or "?", key))
+    if not cards:
+        log.warn("смоук: ролей нет, проверять нечего")
+        return 0, 0
+    started = time.monotonic()
+    deadline = started + max(0.0, float(timeout))
+    ok_count = 0
+    for role, card_id, key in cards:
+        if card_id == "?":
+            # Карточку не завели — ждать нечего, иначе одна ошибка съест весь дедлайн.
+            state = {"status": "не создана", "result": "", "error": "",
+                     "event": "", "timed_out": False}
+        else:
+            state = wait_smoke_card(project, key, deadline - time.monotonic())
+        elapsed = int(round(time.monotonic() - started))
+        status = str(state.get("status") or "") or "нет карточки"
+        if status == "done":
+            ok_count += 1
+            log.ok(f"{role}: карточка {card_id} — done")
+            continue
+        cause = smoke_cause(state) or ("дедлайн истёк" if state.get("timed_out") else "причина не названа")
+        log.warn(f"{role}: карточка {card_id} — {status} за {elapsed} с: {cause}")
+        log.step(f"  починка: {smoke_repair(cause, role, project, card_id)}")
+    return ok_count, len(cards)
 
 
 def _mask(token: str) -> str:
@@ -773,10 +1063,11 @@ def run_setup(args) -> int:
 
     # Доверие проекту нужно каждой роли: без него воркер падает `Unknown skill(s)`,
     # и карточка уходит в blocked по failure_limit. Ошибка одной роли не ломает мастер.
+    roles = roles_from_config(proj.read_config(project))
     if getattr(args, "no_trust", False):
         log.warn("доверие проекту не оформлялось (--no-trust)")
     else:
-        trust_roles(roles_from_config(proj.read_config(project)), project, log)
+        trust_roles(roles, project, log)
 
     # Линтер только предупреждает: кривой план не должен ронять уже сделанную установку.
     log.step("── Проверка планов ──")
@@ -788,9 +1079,30 @@ def run_setup(args) -> int:
     else:
         log.ok(f"линтер планов: файлов {len(lint.files)}, проблем нет")
 
+    # Смоук: установка не «зелёная» на веру — пробная карточка на каждую роль.
+    # Пропуск только там, где проверять нечего: профили и cron в этом запуске не
+    # настраивались, либо владелец выключил проверку флагом.
+    smoke: tuple[int, int] | None = None
+    if getattr(args, "no_smoke", False):
+        log.warn("смоук ролей пропущен (--no-smoke)")
+    elif getattr(args, "no_profiles", False) or getattr(args, "no_cron", False):
+        log.warn("смоук ролей пропущен: профили и cron в этом запуске не настраивались")
+    else:
+        timeout = int(getattr(args, "smoke_timeout", 0) or SMOKE_TIMEOUT)
+        smoke = run_smoke(project, proj.read_config(project), roles, log, timeout)
+
     log.step("── Готово ──")
+    if smoke is None:
+        log.step("  смоук: не выполнялся — старт ролей не проверен")
+    elif smoke[0] == smoke[1]:
+        log.step(f"  смоук: роли стартуют ({smoke[0]} из {smoke[1]})")
+    else:
+        log.step(f"  смоук: {smoke[0]} из {smoke[1]} — "
+                 f"конвейер не заработает, пока не починено")
     log.step(f"  статус:  hermes pipeline status --project \"{project}\"")
     log.step(f"  UI:      hermes pipeline ui --project \"{project}\"")
     log.step(f"  план:    скопировать templates/plan-template.md → docs/plans/1-<слаг>.md")
     log.step(f"  тик:     python .pipeline/gate.py --status   (в каталоге проекта)")
+    if smoke is not None and smoke[0] < smoke[1]:
+        return 3
     return 0

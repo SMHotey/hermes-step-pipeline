@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,7 +25,8 @@ import setup_flow                               # noqa: E402
 def args(**kw) -> argparse.Namespace:
     base = dict(project="", board="", driver="", prompter="", reviewer="",
                 telegram_token="", telegram_chat="", no_telegram=True, no_test=True,
-                no_profiles=True, no_cron=True, no_trust=True, yes=True, force=False)
+                no_profiles=True, no_cron=True, no_trust=True, yes=True, force=False,
+                no_smoke=True, smoke_timeout=0)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -236,9 +239,18 @@ def test_upgrade_trusts_roles_from_config(tmp_path: Path, fake_hermes):
     assert again["profiles"] == {"driver": "shop", "prompter": "pp", "reviewer": "rr"}
 
 
+SAVED_CREDENTIAL = {"source": "manual", "access_token": "сохранённый-секрет"}
+ENV_CREDENTIAL = {"source": "env:OPENCODE_GO_API_KEY", "secret_fingerprint": "abc"}
+
+
 def _doctor_env(monkeypatch, project: Path, tmp_path: Path,
-                trust: dict[str, str]) -> None:
-    """Окружение `doctor` по образцу tests/test_plan_lint.py: без настоящего hermes."""
+                trust: dict[str, str],
+                entries: dict[str, list[dict]] | None = None) -> None:
+    """Окружение `doctor` по образцу tests/test_plan_lint.py: без настоящего hermes.
+
+    `entries` — записи `credential_pool` по роли; по умолчанию у всех трёх ролей ключ
+    сохранён в профиле (`manual`), как на живой машине 03.11.2026.
+    """
     monkeypatch.setattr(cli.proj, "run_hermes", lambda *a, **k: SimpleNamespace(
         returncode=0, stdout="План: страж шага (конвейер)", stderr=""))
     monkeypatch.setattr(cli.proj, "profile_dir", lambda name: tmp_path / "profiles" / name)
@@ -253,6 +265,13 @@ def _doctor_env(monkeypatch, project: Path, tmp_path: Path,
         path = tmp_path / "profiles" / name / "config.yaml"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
+    for name in ("demo", "prompter", "reviewer"):
+        path = tmp_path / "profiles" / name / "auth.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "version": 1,
+            "credential_pool": {"opencode-go": (entries or {}).get(name, [SAVED_CREDENTIAL])},
+        }), encoding="utf-8")
 
 
 def test_doctor_reports_untrusted_roles_with_ready_command(project: Path, monkeypatch,
@@ -292,3 +311,180 @@ def test_doctor_ok_when_all_roles_trust_project(project: Path, monkeypatch,
     assert "ИТОГ: OK" in out
     assert "доверен всем ролям" in out
     assert "не доверен этому профилю" not in out
+
+
+# ───────────────────── смоук установки и проверка сохранённого ключа (S16) ─────────────────────
+
+
+def _role_config(project: Path, provider: str = "opencode-go") -> str:
+    return (f"model:\n  provider: {provider}\n"
+            f"skills:\n  trusted_project_dirs:\n    - {project.resolve()}\n")
+
+
+def test_doctor_reports_missing_saved_credential(project: Path, monkeypatch,
+                                                 capsys, tmp_path: Path):
+    """Ключ только из окружения (`env:`) — проблема с готовой командой починки."""
+    _doctor_env(monkeypatch, project, tmp_path,
+                {role: _role_config(project) for role in ("demo", "prompter", "reviewer")},
+                entries={role: [ENV_CREDENTIAL] for role in ("demo", "prompter", "reviewer")})
+
+    code = cli.cmd_doctor(argparse.Namespace(project=str(project), plan=""))
+    out = capsys.readouterr().out
+    assert code == 1
+    for role in ("demo", "prompter", "reviewer"):
+        command = f"hermes -p {role} auth add opencode-go --type api-key"
+        assert any("нет сохранённого ключа" in line and command in line
+                   for line in out.splitlines())
+    assert not any("✗ план" in line for line in out.splitlines())
+    assert "сохранённый-секрет" not in out
+
+
+def test_doctor_ok_when_roles_have_saved_credentials(project: Path, monkeypatch,
+                                                     capsys, tmp_path: Path):
+    """Запись `manual` с непустым секретом у всех трёх ролей — зелёный итог."""
+    _doctor_env(monkeypatch, project, tmp_path,
+                {role: _role_config(project) for role in ("demo", "prompter", "reviewer")})
+    (project / ".pipeline" / "VERSION").write_text(
+        setup_flow.plugin_version() + "\n", encoding="utf-8")
+
+    code = cli.cmd_doctor(argparse.Namespace(project=str(project), plan=""))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "ИТОГ: OK" in out
+    assert "ключи: сохранённый ключ провайдера есть у всех ролей" in out
+    assert "сохранённый-секрет" not in out
+
+
+def _smoke_env(monkeypatch, tmp_path: Path, statuses: dict[str, str],
+               errors: dict[str, str] | None = None) -> tuple[list[tuple], Path]:
+    """Поддельный `hermes`: смоук-карточка сразу ложится в sqlite с нужным статусом."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(setup_flow.proj, "profile_dir",
+                        lambda name: home / "profiles" / name)
+    db = tmp_path / "kanban.db"
+    monkeypatch.setenv("PIPELINE_KANBAN_DB", str(db))
+    calls: list[tuple] = []
+    counter = {"n": 0}
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def run(*argv, timeout=180):
+        calls.append(argv)
+        if "--idempotency-key" not in argv:
+            return Result()
+        counter["n"] += 1
+        card_id = f"t_{counter['n']:08d}"
+        role = argv[argv.index("--assignee") + 1]
+        status = statuses.get(role, "done")
+        con = sqlite3.connect(db)
+        try:
+            con.executescript(helpers.KANBAN_SCHEMA)
+            con.execute(
+                "INSERT OR REPLACE INTO tasks (id, title, status, assignee, idempotency_key,"
+                " completed_at, result, last_failure_error, created_at, tenant, workspace,"
+                " max_runtime) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (card_id, argv[4], status, role, argv[argv.index("--idempotency-key") + 1],
+                 None, "смоук OK" if status == "done" else "",
+                 (errors or {}).get(role, ""), int(time.time()), "plan",
+                 argv[argv.index("--workspace") + 1], argv[argv.index("--max-runtime") + 1]))
+            con.commit()
+        finally:
+            con.close()
+        return Result(stdout=card_id)
+
+    monkeypatch.setattr(proj, "run_hermes", run)
+    return calls, db
+
+
+def test_setup_smoke_creates_card_for_each_role(tmp_path: Path, monkeypatch, capsys):
+    target = tmp_path / "shop"
+    target.mkdir()
+    calls, _db = _smoke_env(monkeypatch, tmp_path, {})
+    code = setup_flow.run_setup(args(project=str(target), board="shopboard", driver="shop",
+                                     no_profiles=False, no_cron=False, no_smoke=False))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "роли стартуют (3 из 3)" in out
+
+    creates = [call for call in calls if "--idempotency-key" in call]
+    assert len(creates) == 3
+    cfg = json.loads((target / "pipeline.json").read_text(encoding="utf-8"))
+    expected = {"shop": cfg["skills"]["step"], "prompter": cfg["skills"]["prompt"],
+                "reviewer": cfg["skills"]["review"]}
+    roles = [call[call.index("--assignee") + 1] for call in creates]
+    assert roles == ["shop", "prompter", "reviewer"]
+    for call in creates:
+        role = call[call.index("--assignee") + 1]
+        assert call[call.index("--workspace") + 1] == f"dir:{Path(target).as_posix()}"
+        assert call[call.index("--idempotency-key") + 1].startswith(f"smoke:{role}:")
+        assert call[call.index("--max-runtime") + 1] == setup_flow.SMOKE_RUNTIME
+        skills = [call[index + 1] for index, token in enumerate(call) if token == "--skill"]
+        assert skills == expected[role]
+        assert call[call.index("--board") + 1] == "shopboard"
+
+
+def test_setup_smoke_failure_prints_cause_and_repair(tmp_path: Path, monkeypatch, capsys):
+    target = tmp_path / "shop"
+    target.mkdir()
+    _smoke_env(monkeypatch, tmp_path,
+               {"shop": "done", "prompter": "blocked", "reviewer": "done"},
+               {"prompter": "Unknown skill(s): pipeline-prompter"})
+    code = setup_flow.run_setup(args(project=str(target), board="shopboard", driver="shop",
+                                     no_profiles=False, no_cron=False, no_smoke=False))
+    out = capsys.readouterr().out
+    assert code == 3
+    assert "смоук: 2 из 3" in out
+    assert "Unknown skill(s): pipeline-prompter" in out
+    assert f'починка: hermes -p prompter skills trust "{target.resolve()}"' in out
+
+
+def test_setup_smoke_skipped_by_flag_or_without_profiles(tmp_path: Path,
+                                                         monkeypatch, capsys):
+    for name, extra, reason in (
+        ("no-smoke", {"no_smoke": True, "no_profiles": False, "no_cron": False},
+         "смоук ролей пропущен (--no-smoke)"),
+        ("no-profiles", {"no_smoke": False, "no_profiles": True, "no_cron": False},
+         "профили и cron в этом запуске не настраивались"),
+    ):
+        base = tmp_path / name
+        base.mkdir()
+        target = base / "shop"
+        target.mkdir()
+        calls, _db = _smoke_env(monkeypatch, base, {})
+        code = setup_flow.run_setup(args(project=str(target), board="shopboard",
+                                         driver="shop", **extra))
+        out = capsys.readouterr().out
+        assert code == 0
+        assert reason in out
+        assert not [call for call in calls if "--idempotency-key" in call]
+
+
+def test_wait_smoke_card_times_out(tmp_path: Path, monkeypatch):
+    db = tmp_path / "kanban.db"
+    monkeypatch.setenv("PIPELINE_KANBAN_DB", str(db))
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(helpers.KANBAN_SCHEMA)
+        con.execute("INSERT INTO tasks (id, status, idempotency_key)"
+                    " VALUES ('t_00000009', 'running', 'smoke:prompter:1')")
+        con.commit()
+    finally:
+        con.close()
+
+    ticks = {"now": 0.0}
+
+    def clock() -> float:
+        return ticks["now"]
+
+    def sleep(seconds: float) -> None:
+        ticks["now"] += seconds
+
+    state = setup_flow.wait_smoke_card(tmp_path, "smoke:prompter:1", 12, 5,
+                                       sleep=sleep, clock=clock)
+    assert state["timed_out"] is True
+    assert state["status"] == "running"
+    assert ticks["now"] == 12

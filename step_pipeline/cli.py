@@ -42,6 +42,10 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     setup.add_argument("--no-cron", action="store_true", help="не заводить cron-джобу")
     setup.add_argument("--no-trust", action="store_true",
                        help="не оформлять доверие проекту у профилей ролей")
+    setup.add_argument("--no-smoke", action="store_true",
+                       help="не проверять старт ролей пробной карточкой")
+    setup.add_argument("--smoke-timeout", type=int, default=0,
+                       help="сколько секунд ждать смоук ролей (0 — умолчание)")
     setup.add_argument("--yes", action="store_true", help="без вопросов, значения по умолчанию")
     setup.add_argument("--force", action="store_true", help="перезаписать движок и pipeline.json")
     setup.add_argument("--upgrade", action="store_true",
@@ -281,6 +285,24 @@ def cmd_doctor(args) -> int:
                         f'hermes -p {role} skills trust "{project}"')
     if not untrusted:
         notes.append(f"доверие: проект доверен всем ролям ({', '.join(roles)})")
+    # Ключ должен быть сохранён в профиле: под демоном шлюза запись `env:*` выпадает
+    # из ротации (`No usable credentials found for provider`), а в интерактивной
+    # сессии та же запись работает — зелёная установка с мёртвым конвейером.
+    no_key: list[tuple[str, str]] = []
+    for role in roles:
+        saved, provider = setup_flow.has_saved_credential(role)
+        if not saved:
+            no_key.append((role, provider))
+    for role, provider in no_key:
+        if provider:
+            problems.append(f"ключ ({role}): в профиле нет сохранённого ключа провайдера "
+                            f"{provider} — hermes -p {role} auth add {provider} --type api-key")
+        else:
+            problems.append(f"ключ ({role}): в профиле нет сохранённого ключа — "
+                            f"провайдер не определён, hermes -p {role} auth list")
+    if not no_key:
+        notes.append(f"ключи: сохранённый ключ провайдера есть у всех ролей "
+                     f"({', '.join(roles)})")
     env_file = proj.profile_dir(driver) / ".env"
     token = chat = ""
     if env_file.is_file():
