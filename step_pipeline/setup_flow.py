@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -28,6 +29,34 @@ except ImportError:  # pragma: no cover - запуск файлом при от�
 
 ENGINE_FILES = ("__init__.py", "config.py", "registry.py", "next_step.py", "gate.py",
                 "step_card.py", "check_task_prompt.py", "tick.py", "state_io.py")
+#: Маркер целостности: хеш содержимого движка, а не только номер версии.
+#: Без него копия в проекте может молча разойтись с плагином при равном VERSION
+#: (прецедент 02.11.2026: 527 строк разницы в gate.py при 0.2.0 у обоих).
+ENGINE_MARKER = "ENGINE.sha256"
+
+
+def engine_digest(base) -> str:
+    """sha256 по всем .py движка: имя + байты, стабильный порядок."""
+    import hashlib as _hashlib
+    from pathlib import Path as _Path
+
+    digest = _hashlib.sha256()
+    for path in sorted(_Path(base).glob("*.py")):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def write_engine_marker(project) -> str:
+    """Записать маркер целостности движка в `<проект>/.pipeline/ENGINE.sha256`."""
+    from pathlib import Path as _Path
+
+    base = _Path(project) / ".pipeline"
+    digest = engine_digest(base)
+    (base / ENGINE_MARKER).write_text("sha256:" + digest, encoding="utf-8")
+    return digest
 SKILL_CATEGORIES = {
     "pipeline-next-step": "software-development",
     "pipeline-prompter": "software-development",
@@ -322,6 +351,7 @@ def upgrade(project: Path, log: Log) -> int:
     changed = copy_engine(project, force=False)
     roles = copy_roles(project)
     now = write_engine_version(project)
+    write_engine_marker(project)
     for item in changed:
         log.ok(f"обновлён {item}")
     for item in roles:
@@ -607,6 +637,7 @@ def run_setup(args) -> int:
     for item in copy_engine(project, force):
         log.ok(f"{item}")
     log.ok(f"версия движка: {write_engine_version(project)}")
+    log.ok(f"маркер целостности: {write_engine_marker(project)[:12]}")
     for item in copy_roles(project):
         log.ok(f"{item}")
     for item in ensure_dirs(project):

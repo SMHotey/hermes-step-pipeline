@@ -4,3 +4,4 @@ __pycache__/
 .pipeline/state/
 # состояние и секреты конвейера
 .pipeline/.env
+.venv/

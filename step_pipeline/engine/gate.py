@@ -62,6 +62,44 @@ import registry  # noqa: E402 - реестр планов
 import next_step  # noqa: E402 - сборщик контракта шага
 import state_io  # noqa: E402 - атомарная запись состояния и блокировка тика
 
+# ──────────────────── целостность движка ────────────────────
+# Проект работает на КОПИИ движка в `.pipeline/`. Если движок правили в плагине,
+# а копию не обновили, на одном плане оказываются две разные логики с одинаковым
+# номером версии (прецедент 02.11.2026: gate.py 1364 строки в проекте против 1599
+# в плагине, оба 0.2.0). Маркер ENGINE.sha256 пишется при установке/обновлении,
+# тик сверяет его и отказывается работать при расхождении.
+ENGINE_MARKER = "ENGINE.sha256"
+
+
+def engine_digest(base: Path) -> str:
+    """sha256 по содержимому всех .py движка: имя + байты, порядок стабилен."""
+    digest = hashlib.sha256()
+    for path in sorted(Path(base).glob("*.py")):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def verify_engine_integrity(base: Path) -> tuple[bool, str]:
+    """Сверить движок с маркером. Маркера нет — легаси-установка, не мешаем."""
+    marker = Path(base) / ENGINE_MARKER
+    if not marker.is_file():
+        return True, "маркер целостности отсутствует (легаси-установка)"
+    try:
+        text = marker.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return False, f"маркер не читается: {exc}"
+    expected = text.split()[0].removeprefix("sha256:") if text else ""
+    actual = engine_digest(base)
+    if not expected:
+        return False, "маркер пуст"
+    if actual != expected:
+        return False, (f"движок изменён после установки: {actual[:12]} != {expected[:12]}")
+    return True, "движок соответствует маркеру"
+
+
 TERMINAL = {"done", "blocked", "crashed", "timed_out", "gave_up"}
 VERDICT_RE = re.compile(r"^#{0,4}\s*ВЕРДИКТ\s*:\s*(APPROVE|REQUEST_CHANGES)\s*$",
                         re.IGNORECASE | re.MULTILINE)
@@ -1472,6 +1510,15 @@ def main(argv: list[str] | None = None) -> int:
     except config_mod.ConfigError as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 2
+
+    if args.run:
+        # Тик меняет план и коммитит: на разъехавшейся копии движка он не запускается.
+        ok, why = verify_engine_integrity(Path(__file__).resolve().parent)
+        if not ok:
+            print(f"тик остановлен: {why}", file=sys.stderr)
+            print("обновите движок проекта: hermes pipeline setup --upgrade --project <путь>",
+                  file=sys.stderr)
+            return 3
 
     try:
         if args.plans:
