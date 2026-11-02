@@ -51,9 +51,9 @@ def _alive(pid: int) -> bool:
         return False
     try:
         if os.name == "nt":
-            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                                 capture_output=True, text=True, timeout=10)
-            return str(pid) in (out.stdout or "")
+            out = proj.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                           timeout=10, text=False)
+            return str(pid).encode("ascii") in (out.stdout or b"")
         os.kill(pid, 0)
         return True
     except (OSError, subprocess.SubprocessError):
@@ -119,7 +119,7 @@ def stop(project: Path) -> dict:
         return {"ok": True, "detail": f"процесс {pid} уже не работал, метка удалена"}
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=20)
+            proj.run(["taskkill", "/PID", str(pid), "/F"], timeout=20)
         else:
             os.kill(pid, 15)
     except (OSError, subprocess.SubprocessError) as exc:

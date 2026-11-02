@@ -82,14 +82,26 @@ def python_exe(project: Path) -> str:
     return sys.executable
 
 
+def run(cmd: list[str], *, cwd: str | Path | None = None, timeout: int = 180,
+        env: dict[str, str] | None = None, text: bool = True) -> subprocess.CompletedProcess:
+    """Запустить внешнюю команду: по умолчанию UTF-8 с errors="replace".
+
+    text=False — байтовый вывод: нужен там, где содержимое не текст (tasklist).
+    """
+    kwargs: dict[str, Any] = {"cwd": str(cwd) if cwd else None, "capture_output": True,
+                              "timeout": timeout, "env": env}
+    if text:
+        kwargs.update(text=True, encoding="utf-8", errors="replace")
+    return subprocess.run(cmd, **kwargs)
+
+
 def run_engine(project: Path, name: str, *args: str, timeout: int = 180,
                engine_dir: Path | None = None,
                extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Запустить модуль движка проекта и вернуть результат процесса."""
     cmd = [python_exe(project), str(engine(project, name, engine_dir)), *args]
     env = {**os.environ, "PIPELINE_REPO": str(project), **(extra_env or {})}
-    return subprocess.run(cmd, cwd=str(project), capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout, env=env)
+    return run(cmd, cwd=project, timeout=timeout, env=env)
 
 
 def engine_json(project: Path, name: str, *args: str, timeout: int = 180,
@@ -143,8 +155,7 @@ def hermes_bin() -> str:
 
 
 def run_hermes(*args: str, timeout: int = 180) -> subprocess.CompletedProcess:
-    return subprocess.run([hermes_bin(), *args], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
+    return run([hermes_bin(), *args], timeout=timeout)
 
 
 def setup_stdio() -> None:
