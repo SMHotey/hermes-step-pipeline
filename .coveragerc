@@ -1,0 +1,20 @@
+# Замер покрытия: ветки не считаем (см. отчёт шага — сознательно вне объёма).
+# include, а не source: e2e-тесты запускают gate.py из временного проекта, и под
+# source = step_pipeline эти копии в замер не попадали бы вовсе (цифра «22 %» — артефакт).
+[run]
+parallel = True
+include =
+    **/step_pipeline/*.py
+    **/step_pipeline/engine/*.py
+    **/.pipeline/*.py
+
+[paths]
+# Копия движка в проекте (`<временный проект>/.pipeline/gate.py`) — тот же файл, что
+# step_pipeline/engine/gate.py; без этого правила combine оставляет её отдельной строкой.
+engine =
+    step_pipeline/engine/
+    **/.pipeline/
+
+[report]
+show_missing = True
+fail_under = 75

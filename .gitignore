@@ -5,3 +5,6 @@ __pycache__/
 # состояние и секреты конвейера
 .pipeline/.env
 .venv/
+.coverage
+.coverage.*
+htmlcov/
