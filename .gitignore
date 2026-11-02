@@ -1,9 +1,15 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-.pipeline/state/
-# состояние и секреты конвейера
-.pipeline/.env
+
+# вендоренная копия движка, состояние и секреты конвейера
+.pipeline/
+# копии ролей, которые ставит `hermes pipeline setup`
+.hermes/
+# шаблоны плана и промта — тоже артефакт установки
+docs/templates/
+
+.idea/
 .venv/
 .coverage
 .coverage.*

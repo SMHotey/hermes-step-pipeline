@@ -1,6 +1,7 @@
 {
   "project": "my-project",
   "board": "myproject",
+  "ui_port": 8770,
   "profiles": {
     "driver": "myproject",
     "prompter": "prompter",

@@ -1,0 +1,56 @@
+{
+  "project": "hermes-step-pipeline",
+  "board": "step-pipeline",
+  "ui_port": 8770,
+  "profiles": {
+    "driver": "pipeline",
+    "prompter": "prompter",
+    "reviewer": "reviewer"
+  },
+  "skills": {
+    "step": [
+      "pipeline-next-step"
+    ],
+    "review": [
+      "pipeline-reviewer"
+    ],
+    "prompt": [
+      "pipeline-prompter",
+      "agent-prompt-authoring"
+    ]
+  },
+  "paths": {
+    "plans": "docs/plans",
+    "reviews": "docs/reviews",
+    "prompts": "docs/prompts",
+    "state": ".pipeline/state"
+  },
+  "markers": {
+    "journal": "журнал",
+    "steps": "шаг"
+  },
+  "step_id_regex": "(?P<id>[A-Za-z]{1,4}\\d+[A-Za-z]?(?:-\\d+)?)",
+  "default_plan": null,
+  "driven_plans": [
+    "1"
+  ],
+  "require_prompt": true,
+  "runtimes": {
+    "step": "3h",
+    "review": "150m",
+    "prompt": "45m"
+  },
+  "kanban": {
+    "tenant": "plan"
+  },
+  "git": {
+    "commit": true,
+    "push": true
+  },
+  "notify": {
+    "enabled": true,
+    "token_env": "STEP_PIPELINE_TELEGRAM_BOT_TOKEN",
+    "chat_env": "STEP_PIPELINE_TELEGRAM_CHAT_ID",
+    "prefix": ""
+  }
+}

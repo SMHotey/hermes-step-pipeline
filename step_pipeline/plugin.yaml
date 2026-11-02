@@ -1,5 +1,5 @@
-name: step-pipeline
-version: 0.3.0
+name: step_pipeline
+version: 0.4.0
 description: "Пошаговый конвейер агентов: план → постановка промптером → исполнение → независимое ревью → следующий шаг. Даёт CLI `hermes pipeline`, локальный UI с визуализацией и уведомления в Telegram."
 author: malik
 license: MIT
@@ -16,14 +16,6 @@ optional_env:
   - STEP_PIPELINE_TELEGRAM_BOT_TOKEN
   - STEP_PIPELINE_TELEGRAM_CHAT_ID
 config_schema:
-  project_root:
-    type: str
-    description: "Корень проекта с конвейером (пусто — искать вверх от текущего каталога по pipeline.json)"
-    default: ""
-  ui_port:
-    type: integer
-    description: "Порт локального UI (по умолчанию 8770)"
-    default: 8770
   telegram_bot_token:
     type: secret
     env: STEP_PIPELINE_TELEGRAM_BOT_TOKEN

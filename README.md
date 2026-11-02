@@ -1,4 +1,4 @@
-# step-pipeline — конвейер шагов как плагин Hermes
+# step_pipeline — конвейер шагов как плагин Hermes
 
 Плагин превращает работу «по плану» в непрерывный конвейер: план → постановка
 промптером → исполнение агентом → независимое ревью → журнал → следующий шаг.
@@ -24,8 +24,11 @@ hermes pipeline setup
 
 ```bash
 hermes plugins install SMHotey/hermes-step-pipeline
-hermes plugins update step-pipeline          # обновление
+hermes plugins update step_pipeline           # обновление
 ```
+
+Имя плагина — `step_pipeline` (из `plugin.yaml`): каталог установки и все подкоманды
+`hermes plugins` используют одно и то же имя.
 
 Версия плагина — semver в `plugin.yaml` и теги `vX.Y.Z`; что менялось — `CHANGELOG.md`.
 Движок в проектах помечен `.pipeline/VERSION`: `hermes pipeline setup --upgrade`
@@ -64,6 +67,16 @@ hermes pipeline ui --port 8899 --no-open
 
 `--detach` пишет PID в `.pipeline/ui.json` и лог в `.pipeline/ui.log`; повторный запуск
 на том же порту просто вернёт адрес.
+
+Порт по умолчанию — 8770. Он переопределяется ключом `ui_port` в `pipeline.json`
+проекта (он есть в шаблоне, который пишет мастер установки) или флагом `--port`;
+флаг сильнее конфига. Порт живёт в конфиге проекта, а не в конфиге плагина: каждый
+проект может поднять свой UI рядом.
+
+```bash
+hermes pipeline config --set ui_port 8899   # записать порт в pipeline.json проекта
+hermes pipeline config --get ui_port        # проверить
+```
 
 ### Предпросмотр без установки
 
@@ -160,6 +173,7 @@ tests/
   engine/            тесты движка как отдельного слоя (реестр, разбор плана, страж)
 .github/workflows/   CI: pytest на ubuntu+windows, py3.11/3.13, валидация манифеста
 CHANGELOG.md         что менялось и почему (semver)
+LICENSE              текст лицензии MIT
 ```
 
 Движок правится ТОЛЬКО здесь, в `step_pipeline/engine/`; в проектах-потребителях
@@ -174,3 +188,8 @@ hermes plugins remove step_pipeline
 
 Движок в проекте остаётся рабочим сам по себе (`python .pipeline/gate.py --run`),
 роли — обычные скиллы проекта.
+
+## Лицензия
+
+MIT — текст целиком в файле [`LICENSE`](LICENSE). Плагин можно использовать, менять
+и распространять свободно, сохраняя строку копирайта; гарантий автор не даёт.
