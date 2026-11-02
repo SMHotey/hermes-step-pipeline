@@ -24,6 +24,8 @@
   .badge.on { color: #04121a; background: var(--accent); border-color: var(--accent); }
   .badge.run { color: #041018; background: var(--run); border-color: var(--run); }
   .badge.stop { color: #1b0b0b; background: var(--bad); border-color: var(--bad); }
+  .plan-mode { display: flex; align-items: center; gap: 6px; font-size: 12px;
+               color: var(--muted); }
   .spacer { flex: 1; }
   button { background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
            border-radius: 8px; padding: 7px 12px; cursor: pointer; font-size: 13px; }
@@ -99,6 +101,10 @@
   <span class="badge mono" id="board">—</span>
   <span class="badge" id="mode">…</span>
   <span class="badge" id="telegram">telegram</span>
+  <label class="plan-mode" title="действует со следующей сессии">
+    <input type="checkbox" id="plan-mode"> Режим планировщика
+  </label>
+  <span class="muted" id="plan-mode-hint">действует со следующей сессии</span>
   <span class="spacer"></span>
   <button id="btn-tick" class="primary">Тик</button>
   <button id="btn-stop" class="danger">Стоп</button>
@@ -167,6 +173,9 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
+// Метка панели уходит на оба POST-маршрута: тумблер требует её сегодня, действия — когда её
+// потребуют отдельным шагом, без правки страницы.
+const PANEL_HEADERS = {"Content-Type": "application/json", "X-Pipeline-Panel": "1"};
 let currentPlan = null;
 let timer = null;
 
@@ -195,7 +204,7 @@ function act(action, payload = {}) {
   setBusy(true);
   api("/api/action", {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
+    headers: PANEL_HEADERS,
     body: JSON.stringify({action, ...payload}),
   }).then((data) => {
     if (data.ok) toast(actionLabel(action) + ": готово");
@@ -258,6 +267,13 @@ function render(data) {
   const tgEl = $("telegram");
   tgEl.textContent = "telegram " + (tg.enabled ? "вкл" : "выкл");
   tgEl.className = "badge" + (tg.enabled ? " on" : "");
+
+  // Отсутствие поля в старом снимке читается как «включён»: умолчание режима — тоже «включён».
+  const pm = $("plan-mode");
+  pm.checked = data.plan_mode !== false;
+  pm.disabled = !!data.preview;
+  $("plan-mode-hint").textContent = data.preview
+    ? "предпросмотр только читает" : "действует со следующей сессии";
 
   const plans = data.plans || [];
   $("plans").innerHTML = plans.map((p) => `
@@ -358,6 +374,24 @@ $("save-tg").onclick = () => {
   act("save_telegram", {token, chat}).then(() => { $("tg-token").value = ""; });
 };
 $("test-tg").onclick = () => act("test_telegram");
+$("plan-mode").onchange = (event) => {
+  // Одно идемпотентное действие: ни второй кнопки, ни подтверждения.
+  const pm = $("plan-mode");
+  const on = event.target.checked;
+  pm.disabled = true;
+  api("/api/plan-mode", {method: "POST", headers: PANEL_HEADERS, body: JSON.stringify({on})})
+    .then((data) => {
+      if (data.ok) {
+        toast("Режим планировщика: " + (on ? "on" : "off") + " — действует со следующей сессии");
+      } else {
+        toast(data.error || "не удалось переключить режим", true);
+        pm.checked = !on;
+      }
+      return refresh();
+    })
+    .catch((err) => { toast(String(err), true); pm.checked = !on; return refresh(); })
+    .finally(() => { pm.disabled = false; });
+};
 
 refresh();
 timer = setInterval(refresh, 5000);

@@ -6,6 +6,7 @@
     GET  /api/snapshot     JSON состояния: планы, шаги, карточки, журнал, решение
     POST /api/action       действия: tick, stop, resume, hold, unhold,
                            save_config, save_telegram, test_telegram
+    POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
 Слушает только localhost: это операторский инструмент владельца, без авторизации.
 """
 from __future__ import annotations
@@ -20,9 +21,11 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from . import plan_mode
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
 except ImportError:  # pragma: no cover
+    import plan_mode  # type: ignore
     import project as proj  # type: ignore
     import setup_flow  # type: ignore
     import snapshot as snap  # type: ignore
@@ -33,6 +36,11 @@ CONFIG_KEYS = ("project", "board", "driven_plans", "require_prompt")
 CSP = ("default-src 'none'; script-src 'self' 'unsafe-inline'; "
        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
        "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+# Метка панели вместо токена: кастомный заголовок требует preflight, которого этот
+# stdlib-сервер не отвечает, поэтому кросс-доменный POST его не пришлёт (чужой локальный
+# процесс метку подделает — от него защищает шаг 1-S7, здесь такой цели нет).
+PANEL_HEADER = "X-Pipeline-Panel"
+PANEL_HEADER_VALUE = "1"
 
 
 def _allowed_origins(port: int) -> set[str]:
@@ -173,6 +181,24 @@ def act_test_telegram(state: State, payload: dict) -> dict:
     return {"ok": True}
 
 
+def set_plan_mode(state: State, on: bool) -> dict:
+    """Переключить режим планировщика проекта и вернуть ту же форму, что JSON CLI S2.
+
+    Повтор с тем же значением файл не пишет: иначе `changed_at` переписывался бы на каждом
+    клике тумблера, и «когда режим менялся» перестало бы быть правдой.
+    """
+    path = plan_mode.state_file(state.project)
+    label = "on" if on else "off"
+    before = plan_mode.read_mode(state.project)
+    if before == on:
+        return {"ok": True, "mode": label, "file": str(path), "changed": False}
+    payload = plan_mode.write_mode(state.project, on)
+    state.note(f"режим планировщика: {label} (было {'on' if before else 'off'}) — "
+               f"со следующей сессии")
+    return {"ok": True, "mode": label, "file": str(path), "changed": True,
+            "changed_at": payload["changed_at"]}
+
+
 ACTIONS = {
     "tick": act_tick,
     "stop": act_stop,
@@ -213,8 +239,12 @@ class Handler(BaseHTTPRequestHandler):
     def _local_only(self) -> bool:
         return self.client_address[0] in ("127.0.0.1", "::1")
 
-    def _guard_post(self) -> bool:
-        """Пропустить только JSON-запрос из панели. False — ответ уже отправлен."""
+    def _guard_post(self, panel_header: bool = False) -> bool:
+        """Пропустить только JSON-запрос из панели. False — ответ уже отправлен.
+
+        `panel_header=True` дополнительно требует метку панели: её ставит только сама
+        страница, поэтому запрос чужой страницы сюда не пройдёт.
+        """
         kind = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if kind != "application/json":
             self._json(415, {"ok": False, "error": "нужен Content-Type: application/json"})
@@ -228,7 +258,24 @@ class Handler(BaseHTTPRequestHandler):
         if site and site not in ("same-origin", "none"):
             self._json(403, {"ok": False, "error": "запрос не из панели: Sec-Fetch-Site"})
             return False
+        if panel_header and (self.headers.get(PANEL_HEADER) or "").strip() != PANEL_HEADER_VALUE:
+            self._json(403, {"ok": False,
+                             "error": "запрос не из панели: нет заголовка X-Pipeline-Panel"})
+            return False
         return True
+
+    def _read_json_body(self) -> dict | None:
+        """Прочитать тело POST. None — ответ с ошибкой уже отправлен."""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 200_000:
+            self._json(413, {"ok": False, "error": "слишком большое тело"})
+            return None
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError) as exc:
+            self._json(400, {"ok": False, "error": f"кривой JSON: {exc}"})
+            return None
+        return payload if isinstance(payload, dict) else {}
 
     # ── GET ──
     def do_GET(self) -> None:                                   # noqa: N802 - stdlib API
@@ -254,6 +301,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
                 return
             data["log"] = self.state.tail()
+            data["plan_mode"] = plan_mode.read_mode(self.state.project)
             data["ok"] = True
             self._json(200, data)
             return
@@ -267,19 +315,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self._local_only():
             self._json(403, {"ok": False, "error": "только localhost"})
             return
-        if self.path.split("?")[0] != "/api/action":
+        path = self.path.split("?")[0]
+        if path == "/api/plan-mode":
+            self._post_plan_mode()
+            return
+        if path != "/api/action":
             self._json(404, {"ok": False, "error": "нет такого маршрута"})
             return
         if not self._guard_post():
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > 200_000:
-            self._json(413, {"ok": False, "error": "слишком большое тело"})
-            return
-        try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-        except (ValueError, UnicodeDecodeError) as exc:
-            self._json(400, {"ok": False, "error": f"кривой JSON: {exc}"})
+        payload = self._read_json_body()
+        if payload is None:
             return
         action = str(payload.get("action") or "").strip()
         handler = ACTIONS.get(action)
@@ -297,6 +343,29 @@ class Handler(BaseHTTPRequestHandler):
             return
         result.setdefault("action", action)
         self._json(200 if result.get("ok") else 400, result)
+
+    def _post_plan_mode(self) -> None:
+        """Переключить режим планировщика: одно идемпотентное действие, без второго «применить»."""
+        # Отказ предпросмотра не зависит от заголовков и тела: сначала «только чтение».
+        if getattr(self.state, "preview", False):
+            self._json(403, {"ok": False,
+                             "error": "предпросмотр только читает: переключение режима недоступно"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        on = payload.get("on")
+        if not isinstance(on, bool):
+            self._json(400, {"ok": False, "error": "нужно поле on: true или false"})
+            return
+        try:
+            result = set_plan_mode(self.state, on)
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        self._json(200, result)
 
 
 def make_server(project: Path, host: str = "127.0.0.1", port: int = 8770,
