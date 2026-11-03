@@ -129,6 +129,10 @@ COMMIT_RE = re.compile(r"коммит\S*\s*`([0-9a-f]{7,40})`", re.IGNORECASE)
 MAX_ACTIONS_DEFAULT = 1
 # Сколько записей о действиях держим в состоянии плана: истории тиков пока нет (D7).
 LAST_ACTIONS_KEPT = 20
+# Комментарий с находками в карточке правок: автор, предел длины и сколько находок берём.
+COMMENT_AUTHOR = "страж"
+COMMENT_MAX_LEN = 4000
+FINDINGS_LIMIT = 5
 
 
 # ───────────────────────────── окружение ─────────────────────────────
@@ -582,6 +586,34 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -> str:
     ])
 
 
+def fix_comment_body(p: Paths, step: dict, round_no: int, report_rel: str,
+                     review_card_id: str | None) -> str:
+    """Комментарий к карточке правок: находки ревьюера там, где идёт работа (S2)."""
+    report = Path(p.repo) / report_rel
+    lines = [
+        f"ПРАВКИ ПО РЕВЬЮ: шаг {step['id']} плана {p.plan_id} — {step['title']} "
+        f"(круг {round_no})",
+        f"Отчёт ревью: {report_rel}",
+        f"Карточка ревью: {review_card_id or '—'}",
+        "",
+    ]
+    blocking = _blocking_findings(report, FINDINGS_LIMIT)
+    if blocking:
+        lines.append("Блокирующие находки — закрыть полностью, ответить на каждую:")
+        lines += [f"{num}. {finding}" for num, finding in enumerate(blocking, 1)]
+    else:
+        others = _review_findings(report, 3)
+        if others:
+            lines.append("Блокирующих находок с пометкой в отчёте нет — замечания из отчёта:")
+            lines += [f"{num}. {finding}" for num, finding in enumerate(others, 1)]
+        else:
+            lines.append("Отчёт без пунктов: разбирать целиком.")
+    lines += ["",
+              "Ответ на находку — комментарий в этой карточке по её номеру; "
+              "отчёт ревью не переписывать."]
+    return "\n".join(lines)[:COMMENT_MAX_LEN]
+
+
 # ───────────────────────────── решения ─────────────────────────────
 
 def collector(p: Paths, step: str | None = None) -> dict:
@@ -794,6 +826,27 @@ def _decide_base(ctx: dict) -> dict:
     return {"action": "stop", "step": sid, "reason": reason, "details": chr(10).join(details)}
 
 
+def _report_items(text: str) -> list[tuple[str, bool]]:
+    """Пункты списков отчёта: нормализованный текст и «идёт под разделом про блокирующие»."""
+    items: list[tuple[str, bool]] = []
+    under_blocking = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("|"):
+            continue
+        if line.startswith("#"):
+            # Заголовок переключает флаг: подраздел «Блокирующие» — да, любой другой — нет.
+            under_blocking = "блокирующ" in line.lower()
+            continue
+        if line[:2] in ("- ", "* ") or (line[:1].isdigit() and line[1:3] in (". ", ") ")):
+            item = line[2:].strip() if line[:2] in ("- ", "* ") else line[3:].strip()
+            item = (item.replace("`", "").replace("**", "").replace("__", "")
+                    .strip(" .;"))
+            if len(item) >= 12:
+                items.append((item, under_blocking))
+    return items
+
+
 def _review_findings(path: Path, limit: int = 5) -> list[str]:
     """Выжимка замечаний из отчёта ревью: пункты списков без воды."""
     try:
@@ -801,16 +854,28 @@ def _review_findings(path: Path, limit: int = 5) -> list[str]:
     except OSError:
         return []
     items: list[str] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or line.startswith("|"):
+    for item, _ in _report_items(text):
+        short = item[:180]
+        if short not in items:
+            items.append(short)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _blocking_findings(path: Path, limit: int = 5) -> list[str]:
+    """Блокирующие находки отчёта: метка в самом пункте ИЛИ подраздел «Блокирующие»."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    items: list[str] = []
+    for item, under_blocking in _report_items(text):
+        if not under_blocking and "блокирующ" not in item.lower():
             continue
-        if line[:2] in ("- ", "* ") or (line[:1].isdigit() and line[1:3] in (". ", ") ")):
-            item = line[2:].strip() if line[:2] in ("- ", "* ") else line[3:].strip()
-            item = (item.replace("`", "").replace("**", "").replace("__", "")
-                    .strip(" .;"))
-            if len(item) >= 12 and item not in items:
-                items.append(item[:180])
+        short = item[:180]
+        if short not in items:
+            items.append(short)
         if len(items) >= limit:
             break
     return items
@@ -888,6 +953,30 @@ def status_text(ctx: dict, decision: dict) -> str:
 
 
 # ───────────────────────────── побочные действия ─────────────────────────────
+
+def _comment(p: Paths, card_id: str, text: str) -> bool:
+    """Комментарий в карточку борды. Отказ — предупреждение `[comment]`, не исключение (S2)."""
+    # Тело уходит одной строкой: обёртка CLI `.cmd` на Windows режет командную строку по
+    # переводу строки и молча теряет хвост, а тела из файла у `comment` нет. Пункты
+    # разделяются «; » — содержание и адреса находок сохраняются полностью.
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    text = "; ".join(line for line in lines if line)
+    if not card_id or not text:
+        return False
+    cmd = [_hermes(), "kanban", "--board", p.cfg.board, "comment", card_id, text,
+           "--author", COMMENT_AUTHOR, "--max-len", str(COMMENT_MAX_LEN)]
+    try:
+        res = _run(cmd, Path(p.repo), timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Нет `hermes` в PATH или команда не ответила: карточка уже создана, тик живёт.
+        print(f"[comment] не отправлен в {card_id}: {str(exc)[:300]}", file=sys.stderr)
+        return False
+    if res.returncode != 0:
+        out = ((res.stdout or "") + (res.stderr or "")).strip()
+        print(f"[comment] не отправлен в {card_id}: {out[:300]}", file=sys.stderr)
+        return False
+    return True
+
 
 def _create_card(p: Paths, title: str, body: str, assignee: str, key: str,
                  skills: tuple[str, ...], parent: str | None = None,
@@ -1642,6 +1731,10 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             msg.append(f"  подробно: {report_rel}")
             msg.append(f"  карточка правок {cid}")
             say(chr(10).join(msg))
+            # Находки — в саму карточку правок: отказ комментария не меняет result и не
+            # рвёт тик (в `tick` ложный `applied` обрывает цепочку действий).
+            _comment(p, cid, fix_comment_body(p, step, round_no, report_rel,
+                                              decision.get("parent")))
         else:
             say(f"ревью {step['id']}: REQUEST_CHANGES, но карточку правок создать не удалось")
         return result
