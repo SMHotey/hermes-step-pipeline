@@ -221,7 +221,7 @@ def test_ask_agent_runs_oneshot_session_per_chat(cfg, monkeypatch):
         stdout = "ответ агента"
         stderr = ""
 
-    def fake_run(cmd, cwd=None, timeout=0):
+    def fake_run(cmd, cwd=None, timeout=0, env=None):
         seen["cmd"] = cmd
         return Done()
 
@@ -246,3 +246,30 @@ def test_clean_agent_output_keeps_plain_text():
 def test_clean_agent_output_drops_resume_notice():
     raw = "ответ" + chr(10) + "↻ Resumed session 20261103_1 (1 user message)"
     assert gate.clean_agent_output(raw) == "ответ"
+
+
+def test_split_message_respects_limit():
+    parts = gate.split_message("x" * 8000, limit=3500)
+    assert len(parts) == 3 and all(len(x) <= 3500 for x in parts)
+
+
+def test_split_message_keeps_lines_together():
+    text = chr(10).join(["строка"] * 1000)
+    parts = gate.split_message(text, limit=3500)
+    assert all(len(x) <= 3500 for x in parts) and len(parts) > 1
+
+
+def test_ask_agent_uses_cli_mode(cfg, monkeypatch):
+    seen = {}
+
+    class Done:
+        stdout = "ответ"
+        stderr = ""
+
+    def fake_run(cmd, cwd=None, timeout=0, env=None):
+        seen["cmd"], seen["env"] = cmd, env or {}
+        return Done()
+
+    monkeypatch.setattr(gate, "_run", fake_run)
+    gate.ask_agent(cfg, "привет", CHAT)
+    assert "--cli" in seen["cmd"] and seen["env"].get("NO_COLOR") == "1"

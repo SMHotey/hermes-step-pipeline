@@ -181,9 +181,10 @@ def resolve_paths(cfg: config_mod.Config, plan_id: str | None = None) -> Paths:
     )
 
 
-def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 120) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 120,
+         env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=str(cwd or Path.cwd()), capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
+                          encoding="utf-8", errors="replace", timeout=timeout, env=env)
 
 
 def _hermes() -> str:
@@ -1361,15 +1362,39 @@ def clean_agent_output(text: str) -> str:
     return chr(10).join(lines).strip()
 
 
+
+
+def split_message(text: str, limit: int = 3500) -> list[str]:
+    """Режет длинный ответ по строкам под лимит Telegram (без разрыва слов, если можно)."""
+    chunks: list[str] = []
+    current = ""
+    for line in (text or "").splitlines():
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = (current + chr(10) + line) if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
 def ask_agent(cfg: config_mod.Config, text: str, chat: str, timeout: int = 240) -> str:
     """Свободный текст владельца — в диалог с агентом профиля, сессия на чат."""
     dialog = cfg.notify.get("dialog")
     if isinstance(dialog, dict) and dialog.get("enabled") is False:
         return "диалог выключен (notify.dialog.enabled)"
-    cmd = [_hermes(), "-p", str(cfg.driver), "chat", "-q", text, "--oneshot", "-Q",
+    cmd = [_hermes(), "-p", str(cfg.driver), "chat", "-q", text, "--oneshot", "-Q", "--cli",
            "--continue", f"tg-{chat}", "--create-if-missing"]
     try:
-        res = _run(cmd, None, timeout=timeout)
+        env = dict(os.environ, NO_COLOR="1", TERM="dumb", CLICOLOR="0")
+        res = _run(cmd, None, timeout=timeout, env=env)
     except Exception as exc:  # noqa: BLE001 - диалог не должен ронять опрос
         return f"агент недоступен: {exc}"
     out = clean_agent_output((res.stdout or "") + (res.stderr or ""))
@@ -1416,10 +1441,12 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
             continue
         if not text.startswith("/"):
             answer = ask_agent(cfg, text, chat)
-            sent = _tg_call(token, "sendMessage", chat_id=chat, text=answer[:TG_TEXT_LIMIT],
-                            disable_web_page_preview="true")
-            if not sent.get("ok"):
-                print(f"[commands] ответ не доставлен: {sent.get('description')}", file=sys.stderr)
+            for chunk in split_message(answer):
+                sent = _tg_call(token, "sendMessage", chat_id=chat, text=chunk,
+                                disable_web_page_preview="true")
+                if not sent.get("ok"):
+                    print(f"[commands] ответ не доставлен: {sent.get('description')}", file=sys.stderr)
+                    break
             result["handled"] += 1
             continue
         try:
