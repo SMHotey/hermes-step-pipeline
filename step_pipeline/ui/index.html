@@ -177,6 +177,7 @@
   <nav class="tabs">
     <button class="tab active" data-tab="overview" id="tab-btn-overview">Обзор</button>
     <button class="tab" data-tab="step" id="tab-btn-step">Шаг</button>
+    <button class="tab" data-tab="setup" id="tab-btn-setup">Установка</button>
   </nav>
 
   <div class="tab-panel active" id="tab-overview">
@@ -280,6 +281,39 @@
         <section>
           <h2>Карточки шага и правок</h2>
           <ul id="step-cards"><li class="muted">—</li></ul>
+        </section>
+      </div>
+    </div>
+  </div>
+  <!-- Мастер установки (план 3 S4): шаги вызывают существующие функции setup_flow. -->
+  <div class="tab-panel" id="tab-setup">
+    <div class="cols">
+      <div>
+        <section>
+          <h2>Установка конвейера</h2>
+          <div class="muted" id="setup-note">проверяю состояние…</div>
+          <ul class="cards" id="setup-steps"><li class="muted">загрузка…</li></ul>
+          <div class="muted mono" id="setup-next">—</div>
+        </section>
+      </div>
+      <div>
+        <section>
+          <h2>Значения и лог шага</h2>
+          <label for="setup-board">Борда канбана</label>
+          <input type="text" id="setup-board">
+          <div class="row">
+            <div><label for="setup-driver">Исполнитель</label>
+                 <input type="text" id="setup-driver"></div>
+            <div><label for="setup-prompter">Постановщик</label>
+                 <input type="text" id="setup-prompter"></div>
+            <div><label for="setup-reviewer">Ревьюер</label>
+                 <input type="text" id="setup-reviewer"></div>
+          </div>
+          <label for="setup-token">Токен бота — уходит в .env профиля, обратно не возвращается</label>
+          <input type="password" id="setup-token" placeholder="оставь пустым, чтобы не менять">
+          <label for="setup-chat">Chat id или @канал</label>
+          <input type="text" id="setup-chat">
+          <pre id="setup-log">—</pre>
         </section>
       </div>
     </div>
@@ -473,6 +507,7 @@ function showTab(name) {
     panel.classList.toggle("active", panel.id === "tab-" + name);
   });
   if (name === "step") loadStep();
+  if (name === "setup") loadSetup();
 }
 
 function fillStepPicker() {
@@ -616,6 +651,87 @@ function renderStep(data) {
   });
 }
 
+// ── мастер установки (план 3 S4): шаг → существующая функция setup_flow, вывод как лог ──
+const setupState = {steps: [], next: null, errors: {}};
+
+async function loadSetup() {
+  const data = await api("/api/setup");
+  if (!data.ok) {
+    $("setup-note").textContent = data.error || "мастер недоступен";
+    return;
+  }
+  setupState.steps = data.steps || [];
+  setupState.next = data.next || null;
+  if (!window.__setupLoaded) {
+    // Значения формы заполняются один раз: мастер не перетирает ввод владельца.
+    // Токена в ответе нет вовсе — только признак, что он уже лежит в .env.
+    const values = data.values || {};
+    [["setup-board", "board"], ["setup-driver", "driver"],
+     ["setup-prompter", "prompter"], ["setup-reviewer", "reviewer"],
+     ["setup-chat", "telegram_chat"]].forEach(([id, key]) => {
+      if (values[key]) $(id).value = values[key];
+    });
+    window.__setupLoaded = true;
+  }
+  renderSetup(data);
+}
+
+function renderSetup(data) {
+  const values = data.values || {};
+  // Состояние мастера — по фактам на диске, а не по порядку шагов: `next` называет,
+  // с какого шага продолжать после отказа.
+  $("setup-note").textContent = data.enabled === false
+    ? "предпросмотр: мастер скрыт, ничего не пишется"
+    : (values.engine_version
+        ? `движок ${values.engine_version} · плагин ${values.plugin_version}`
+        : "конвейер в этот проект ещё не поставлен");
+  $("setup-next").textContent = data.next
+    ? "следующий шаг: " + data.next
+    : "шаги настройки пройдены — остались проверки";
+  $("setup-steps").innerHTML = (data.steps || []).map((step) => {
+    const bad = setupState.errors[step.id];
+    const cls = bad ? "bad" : (step.done ? "ok" : "wait");
+    const label = bad ? "ошибка" : (step.done ? "готово" : "нужно");
+    const action = step.id === "checks" || step.done ? "Проверить" : "Выполнить";
+    return `<li class="step-card">
+      <div class="row1"><span class="title">${esc(step.title)}</span>
+        <span class="pill ${cls}">${esc(label)}</span></div>
+      <div class="muted">${esc(step.hint || "")}</div>
+      ${bad ? `<div class="clip bad">${esc(bad)}</div>` : ""}
+      <button data-setup-step="${esc(step.id)}">${esc(action)}</button>
+    </li>`;
+  }).join("") || `<li class="muted">шагов нет</li>`;
+  document.querySelectorAll("[data-setup-step]").forEach((button) => {
+    button.onclick = () => runSetupStep(button.dataset.setupStep);
+  });
+}
+
+async function runSetupStep(step) {
+  const values = {
+    board: $("setup-board").value.trim(),
+    driver: $("setup-driver").value.trim(),
+    prompter: $("setup-prompter").value.trim(),
+    reviewer: $("setup-reviewer").value.trim(),
+    token: $("setup-token").value.trim(),
+    chat: $("setup-chat").value.trim(),
+  };
+  $("setup-log").textContent = "выполняется…";
+  const data = await api("/api/setup", {
+    method: "POST",
+    headers: PANEL_HEADERS,
+    body: JSON.stringify({step, values}),
+  });
+  // Токен живёт только в поле формы: сервер его не возвращает, поле гасится сразу.
+  $("setup-token").value = "";
+  setupState.errors[step] = data.ok ? "" : (data.error || "шаг не выполнен");
+  $("setup-log").textContent = (data.log || []).join("\n") || data.error || "—";
+  if (data.ok) toast("Установка: " + step + " — готово");
+  else toast(data.error || "шаг не выполнен", true);
+  etag = null;
+  await loadSetup();
+  refresh();
+}
+
 function render(data) {
   $("project").textContent = data.project || "—";
   $("board").textContent = "борда: " + (data.board || "—");
@@ -656,6 +772,11 @@ function render(data) {
   pm.disabled = !!data.preview;
   $("plan-mode-hint").textContent = data.preview
     ? "предпросмотр только читает" : "действует со следующей сессии";
+
+  // Мастер установки в предпросмотре скрыт: он пишет в проект и в .env профилей.
+  const setupTab = $("tab-btn-setup");
+  if (setupTab) setupTab.hidden = !!data.preview;
+  if (data.preview && $("tab-setup").classList.contains("active")) showTab("overview");
 
   renderOverview(data);
 

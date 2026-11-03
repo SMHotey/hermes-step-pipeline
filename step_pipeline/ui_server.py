@@ -9,6 +9,10 @@
     GET  /api/step         экран шага: контракт из плана, постановка, отчёт ревью,
                            `git show` коммита шага, карточки шага (?plan=<N>&id=<S>)
     GET  /api/file         текст файла проекта, только внутри корня (?path=<...>)
+    GET  /api/setup        мастер установки: шаги, следующий шаг, значения формы (без токена)
+    POST /api/setup        один шаг мастера: {"step": ..., "values": {...}},
+                           заголовок X-Pipeline-Panel; токен уходит в .env профиля
+                           и обратно в браузер не возвращается
     POST /api/action       действия: tick, stop, resume, hold, unhold,
                            save_config, save_telegram, test_telegram
     POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
@@ -108,6 +112,17 @@ def _if_none_match(header: str | None) -> str:
     if value.startswith("W/"):
         value = value[2:].strip()
     return value.strip('"').strip()
+
+
+def _redact(text: str, secret: str) -> str:
+    """Убрать секрет из текста: токен не попадает ни в ответ API, ни в лог панели (D6).
+
+    Заменяется полное вхождение; строк с частью токена мастер не печатает вовсе —
+    поэтому маски в его логе нет (в отличие от `setup_flow._mask`).
+    """
+    if not secret:
+        return text
+    return text.replace(secret, "***")
 
 
 class State:
@@ -480,6 +495,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/file":
             self._get_file()
             return
+        if path == "/api/setup":
+            self._get_setup()
+            return
         if path == "/api/health":
             self._json(200, {"ok": True, "root": str(self.state.project),
                                    "version": plugin_version(), "ui_sha": ui_sha()})
@@ -532,6 +550,76 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(200, {"ok": True, **data})
 
+    # ── мастер установки (план 3 S4) ──
+    def _get_setup(self) -> None:
+        """Состояние мастера: шаги, следующий и значения формы без секретов (D6)."""
+        if not self._local_only():
+            self._json(403, {"ok": False, "error": "только localhost"})
+            return
+        try:
+            data = setup_flow.setup_status(self.state.project)
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        preview = bool(getattr(self.state, "preview", False))
+        self._json(200, {"ok": True, "preview": preview, "enabled": not preview,
+                         "project": str(self.state.project),
+                         "steps": data["steps"], "next": data["next"],
+                         "values": data["values"]})
+
+    def _drain_body(self) -> None:
+        """Дочитать тело POST перед отказом: иначе клиент видит RST вместо ответа."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        if 0 < length <= 200_000:
+            try:
+                self.rfile.read(length)
+            except OSError:
+                pass
+
+    def _post_setup(self) -> None:
+        """Один шаг мастера. Токен из формы уходит в `.env` и обратно не возвращается."""
+        if getattr(self.state, "preview", False):
+            self._drain_body()
+            self._json(403, {"ok": False,
+                             "error": "предпросмотр только читает: мастер установки недоступен"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        step = str(payload.get("step") or "").strip()
+        if step not in setup_flow.SETUP_STEPS:
+            allowed = ", ".join(setup_flow.SETUP_STEPS)
+            self._json(400, {"ok": False, "step": step,
+                             "error": f"неизвестный шаг: {step or '—'}; "
+                                      f"допустимые: {allowed}"})
+            return
+        raw_values = payload.get("values")
+        values = raw_values if isinstance(raw_values, dict) else {}
+        token = str(values.get("token") or "")
+        try:
+            result = setup_flow.run_setup_step(self.state.project, step, values)
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "step": step,
+                             "error": _redact(f"{type(exc).__name__}: {exc}", token)})
+            return
+        # Секрет вычищается из всего, что уходит наружу: и в ответ, и в лог панели.
+        log = [_redact(str(line), token) for line in result.get("log") or []]
+        error = _redact(str(result.get("error") or ""), token)
+        self.state.note(_redact(f"мастер: шаг {step}\n" + "\n".join(log), token))
+        if result.get("ok"):
+            snap.clear_cache()      # шаг пишет на диск: прежний снимок больше не верен
+        body = {"ok": bool(result.get("ok")), "step": step,
+                "already": bool(result.get("already")), "next": result.get("next"),
+                "log": log}
+        if error:
+            body["error"] = error
+        self._json(200 if body["ok"] else 400, body)
+
     # ── POST ──
     def do_POST(self) -> None:                                  # noqa: N802 - stdlib API
         if not self._local_only():
@@ -540,6 +628,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/api/plan-mode":
             self._post_plan_mode()
+            return
+        if path == "/api/setup":
+            self._post_setup()
             return
         if path != "/api/action":
             self._json(404, {"ok": False, "error": "нет такого маршрута"})

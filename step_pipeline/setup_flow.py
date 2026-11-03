@@ -176,14 +176,20 @@ if __name__ == "__main__":
 
 
 class Log:
-    """Печать шагов мастера: ровно одна строка на действие."""
+    """Печать шагов мастера: ровно одна строка на действие.
 
-    def __init__(self) -> None:
+    `quiet=True` — строки копятся в `lines`, но не печатаются: мастер в панели отдаёт
+    их в ответ API, а не в stdout сервера. Умолчание прежнее — `run_setup` печатает.
+    """
+
+    def __init__(self, quiet: bool = False) -> None:
         self.lines: list[str] = []
+        self.quiet = quiet
 
     def step(self, text: str) -> None:
         self.lines.append(text)
-        print(text, flush=True)
+        if not self.quiet:
+            print(text, flush=True)
 
     def ok(self, text: str) -> None:
         self.step(f"  ✓ {text}")
@@ -1224,3 +1230,336 @@ def run_setup(args) -> int:
     if smoke is not None and smoke[0] < smoke[1]:
         return 3
     return 0
+
+
+# ── Мастер установки в панели (план 3 S4) ────────────────────────────────────
+# D2: состояние мастера считается по фактам на диске, курсора нет. Поэтому повторный
+# проход идемпотентен, а отказ на середине не оставляет «полушагов»: шаг либо выполнен,
+# либо его факт не выполнен, и владелец видит, с какого шага продолжить (`next`).
+# D5: код шагов один на CLI и панель — здесь вызываются те же функции, что у run_setup.
+# D8: шаг делает только свой предмет. В частности шаг «проект» не выключает уже
+# включённые уведомления: Telegram — отдельный шаг, и молча гасить его нельзя.
+
+#: Порядок шагов мастера. `next` — первый шаг, чей факт не выполнен.
+SETUP_STEPS = ("project", "board", "profiles", "telegram", "cron", "checks")
+
+SETUP_TITLES = {
+    "project": "Проект",
+    "board": "Борда",
+    "profiles": "Профили ролей",
+    "telegram": "Telegram",
+    "cron": "Cron",
+    "checks": "Проверки",
+}
+
+SETUP_HINTS = {
+    "project": "нужны pipeline.json, .pipeline/gate.py и роли в .hermes/skills",
+    "board": "нужна база борды канбана",
+    "profiles": "проект должен быть доверенным у всех трёх профилей-ролей",
+    "telegram": "нужны включённые уведомления и токен с chat id в .env драйвера",
+    "cron": "нужна cron-джоба стража (метка .pipeline/cron.json)",
+    "checks": "отчёт: линтер планов, версии, доверие, борда, cron, Telegram",
+}
+
+
+def env_values(profile: str) -> dict[str, str]:
+    """Переменные из `.env` профиля: без комментариев, кавычек и пустых значений.
+
+    Свой разбор, а не `load_profile_env`: тот пишет в `os.environ` процесса панели,
+    а мастеру нужны значения профиля, не подмена окружения сервера.
+    """
+    path = env_path(profile)
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        if raw.startswith("export "):
+            raw = raw[len("export "):].lstrip()
+        key, _, value = raw.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if key.strip() and value:
+            values[key.strip()] = value
+    return values
+
+
+def setup_defaults(project: Path) -> dict[str, str]:
+    """Значения формы мастера по умолчанию: конфиг проекта важнее свежих догадок."""
+    project = Path(project).expanduser().resolve()
+    existing = proj.read_config(project) if (project / proj.MARKER).is_file() else {}
+    profiles = existing.get("profiles") or {}
+    return {
+        "board": existing.get("board") or proj.slug(project.name),
+        "driver": profiles.get("driver") or os.environ.get("HERMES_PROFILE") or "default",
+        "prompter": profiles.get("prompter") or "prompter",
+        "reviewer": profiles.get("reviewer") or "reviewer",
+    }
+
+
+def _project_fact(project: Path) -> bool:
+    """Конвейер в проекте есть: конфиг и движок на месте."""
+    return (project / proj.MARKER).is_file() and (project / ".pipeline" / "gate.py").is_file()
+
+
+def _board_fact(project: Path) -> bool:
+    """База борды существует — её же ищет движок."""
+    return proj.board_db(project).is_file()
+
+
+def _profiles_fact(project: Path, cfg: dict[str, Any]) -> bool:
+    """Проект доверен всем ролям конфига: без этого воркер падает `Unknown skill(s)`."""
+    roles = roles_from_config(cfg)
+    return bool(roles) and all(is_project_trusted(role, project) for role in roles)
+
+
+def _telegram_fact(cfg: dict[str, Any]) -> bool:
+    """Уведомления включены и в `.env` драйвера есть токен с chat id."""
+    notify = cfg.get("notify") or {}
+    if not notify.get("enabled"):
+        return False
+    env = env_values(roles_from_config(cfg)[0])
+    token_env = str(notify.get("token_env") or TOKEN_ENV)
+    chat_env = str(notify.get("chat_env") or CHAT_ENV)
+    return bool(env.get(token_env)) and bool(env.get(chat_env))
+
+
+def _cron_fact(project: Path, cfg: dict[str, Any]) -> bool:
+    """Cron-джоба стража заведена мастером: метка помнит драйвера и workdir."""
+    try:
+        marker = json.loads((project / ".pipeline" / "cron.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(marker, dict) and marker.get("driver") == roles_from_config(cfg)[0]
+
+
+def _step_done(project: Path, step: str, cfg: dict[str, Any]) -> bool:
+    """Выполнен ли шаг — по факту на диске. `checks` — отчёт, его факта нет (D4)."""
+    if step == "project":
+        return _project_fact(project)
+    if step == "board":
+        return _board_fact(project)
+    if step == "profiles":
+        return _profiles_fact(project, cfg)
+    if step == "telegram":
+        return _telegram_fact(cfg)
+    if step == "cron":
+        return _cron_fact(project, cfg)
+    return False
+
+
+def setup_status(project: Path) -> dict[str, Any]:
+    """Состояние мастера: шаги с фактами, `next` и значения формы без секретов (D6).
+
+    `next` считается по `SETUP_STEPS` без терминального `checks`: проверки ничего не
+    настраивают, иначе следующий шаг никогда не стал бы пустым (D2).
+    """
+    project = Path(project).expanduser().resolve()
+    cfg = proj.read_config(project) if (project / proj.MARKER).is_file() else {}
+    steps = [{"id": step, "title": SETUP_TITLES[step], "hint": SETUP_HINTS[step],
+              "done": _step_done(project, step, cfg)} for step in SETUP_STEPS]
+    next_step = next((item["id"] for item in steps
+                      if item["id"] != "checks" and not item["done"]), None)
+    driver = roles_from_config(cfg)[0]
+    env = env_values(driver)
+    values = {
+        **setup_defaults(project),
+        "engine_version": engine_version(project),
+        "plugin_version": plugin_version(),
+        "telegram_token_set": bool(env.get(TOKEN_ENV)),
+        "telegram_chat": str(env.get(CHAT_ENV) or ""),
+    }
+    return {"steps": steps, "next": next_step, "values": values}
+
+
+def _setup_error(log: Log, fallback: str) -> str:
+    """Текст отказа шага: последнее предупреждение лога, иначе общая фраза."""
+    for line in reversed(log.lines):
+        if line.strip().startswith("!"):
+            return line.strip()[1:].strip()
+    return fallback
+
+
+def run_setup_step(project: Path, step: str, values: dict[str, Any] | None = None,
+                   log: Log | None = None) -> dict[str, Any]:
+    """Выполнить один шаг мастера: `ok`, `already`, `next`, `log`, `error`.
+
+    Шаг идемпотентен: повторный проход по выполненному шагу говорит «уже настроено»,
+    но остаётся безвредным (D5). `next` пересчитывается по фактам после шага, а не по
+    порядку, — поэтому отказ на середине честно указывает, с какого шага продолжать.
+    Исключений наружу не бросает: падение подшага — красный шаг с текстом ошибки в логе
+    и в `error`, проект остаётся в состоянии после уже выполненных подшагов.
+    """
+    project = Path(project).expanduser().resolve()
+    step = str(step or "").strip()
+    given = {key: str(value).strip() for key, value in (values or {}).items()
+             if value is not None}
+    # Печатать в stdout сервера нечего: лог шага уходит в ответ API, поэтому Log тихий.
+    log = log if log is not None else Log(quiet=True)
+
+    if step not in SETUP_STEPS:
+        return {"ok": False, "step": step, "already": False, "log": log.lines,
+                "next": setup_status(project)["next"],
+                "error": f"неизвестный шаг мастера: {step}"}
+
+    cfg = proj.read_config(project) if (project / proj.MARKER).is_file() else {}
+    already = _step_done(project, step, cfg)
+    log.step(f"{SETUP_TITLES[step]}: "
+             + ("уже настроено — проверяю заново" if already else "выполняется"))
+    try:
+        ok, error = _perform_step(project, step, cfg, given, log)
+    except Exception as exc:                                # noqa: BLE001 - наружу не бросаем
+        log.warn(f"шаг упал: {type(exc).__name__}: {exc}")
+        ok, error = False, f"{type(exc).__name__}: {exc}"
+    return {"ok": ok, "step": step, "already": already, "log": log.lines,
+            "next": setup_status(project)["next"], "error": error}
+
+
+def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str, str],
+                  log: Log) -> tuple[bool, str]:
+    """Тело шага: `(ok, error)`.
+
+    Красный шаг — только три случая (`D` постановки §4.1): `ensure_board` вернул False,
+    отказ Telegram на токене или чате, исключение. Предупреждения профилей, доверия и
+    cron шаг красным не делают — ровно как в CLI.
+    """
+    defaults = setup_defaults(project)
+    profiles = cfg.get("profiles") or {}
+    board = given.get("board") or cfg.get("board") or defaults["board"]
+    driver = given.get("driver") or profiles.get("driver") or defaults["driver"]
+    prompter = given.get("prompter") or profiles.get("prompter") or defaults["prompter"]
+    reviewer = given.get("reviewer") or profiles.get("reviewer") or defaults["reviewer"]
+
+    if step == "project":
+        # D8: только предмет шага. Уведомления не выключаем, борду не создаём,
+        # профили не трогаем — у них свои шаги и свои отказы.
+        copied = copy_engine(project, False)
+        log.ok(f"движок: файлов {len(ENGINE_FILES)}, версия {write_engine_version(project)}"
+               + (f" (обновлено {len(copied)})" if copied else " — уже на месте"))
+        log.ok(f"маркер целостности: {write_engine_marker(project)[:12]}")
+        sync = copy_roles(project)
+        for item in sync.added:
+            log.ok(f"добавлена роль {item}")
+        for item in ensure_dirs(project):
+            log.ok(f"{item}")
+        log.ok(".gitignore: "
+               + ("дополнен" if ensure_gitignore(project) else "уже содержит записи"))
+        fresh = build_config(project, board, driver, prompter, reviewer, cfg)
+        notify = dict(fresh.get("notify") or {})
+        notify.setdefault("enabled", bool((cfg.get("notify") or {}).get("enabled")))
+        fresh["notify"] = notify
+        proj.write_config(project, fresh)
+        log.ok(f"{proj.MARKER}: записан (борда {board}, роли: {driver}, {prompter}, "
+               f"{reviewer}; уведомления {'вкл' if notify.get('enabled') else 'выкл'})")
+        return True, ""
+
+    if step == "board":
+        if not ensure_board(board, log):
+            return False, _setup_error(log, f"борда {board} не создана")
+        log.ok(f"борда {board} готова")
+        return True, ""
+
+    if step == "profiles":
+        ensure_profiles(driver, prompter, reviewer, log)
+        # Неудача доверия одной роли не красит шаг: факт `profiles` останется невыполнен,
+        # `next` укажет на этот же шаг, и владелец повторит его после починки профиля.
+        trust_roles([driver, prompter, reviewer], project, log)
+        return True, ""
+
+    if step == "telegram":
+        return _setup_step_telegram(project, cfg, driver, given, log)
+
+    if step == "cron":
+        ensure_cron(driver, project, log, skip=False)
+        enabled = bool((proj.read_config(project).get("notify") or {}).get("enabled"))
+        ensure_commands_cron(driver, project, log, skip=False, enabled=enabled)
+        return True, ""
+
+    # checks: ничего не меняет — только считает и рассказывает (D10).
+    _setup_checks(project, proj.read_config(project), log)
+    return True, ""
+
+
+def _setup_step_telegram(project: Path, cfg: dict[str, Any], driver: str,
+                         given: dict[str, str], log: Log) -> tuple[bool, str]:
+    """Шаг Telegram: токен и chat id в `.env` профиля, обратно в браузер не возвращаются.
+
+    D6: токен не попадает ни в ответ API, ни в лог — поэтому здесь нет даже маски
+    (`_mask` показывает часть). D9: пустой токен — не отказ, уведомления остаются как
+    были; красный только отказ Telegram на присланном токене или чате.
+    """
+    token = given.get("token") or ""
+    chat = given.get("chat") or ""
+    notify = dict(cfg.get("notify") or {})
+    token_env = str(notify.get("token_env") or TOKEN_ENV)
+    chat_env = str(notify.get("chat_env") or CHAT_ENV)
+    if not token:
+        env = env_values(driver)
+        if env.get(token_env):
+            log.ok(f"токен уже лежит в .env профиля {driver} — Telegram не перенастраивался")
+        else:
+            log.warn("Telegram пропущен: уведомления выключены")
+        log.ok("уведомления " + ("включены" if notify.get("enabled") else "выключены"))
+        return True, ""
+    if not chat:
+        log.warn("токен принят, но не указан chat id — уведомления некуда слать")
+        return False, "нужен chat id (chat id или @канал)"
+    try:
+        me = telegram.get_me(token)
+        telegram.validate_chat(token, chat)
+    except telegram.TelegramError as exc:
+        log.warn(f"токен или чат не приняты: {exc}")
+        return False, str(exc) or "Telegram не принял токен или чат"
+    log.ok(f"бот @{me.get('username', '?')} на связи")
+    path = write_env(driver, {token_env: token, chat_env: chat, OWNER_ENV: chat})
+    log.ok(f"токен и чат записаны в {path}")
+    notify["enabled"] = True
+    notify["token_env"] = token_env
+    notify["chat_env"] = chat_env
+    notify.setdefault("owner_env", OWNER_ENV)
+    cfg = dict(cfg)
+    cfg["notify"] = notify
+    proj.write_config(project, cfg)
+    log.ok("уведомления включены")
+    return True, ""
+
+
+def _setup_checks(project: Path, cfg: dict[str, Any], log: Log) -> None:
+    """Отчёт проверок в конце мастера: версия движка, доверие, борда, cron, линтер."""
+    version = plugin_version()
+    have = engine_version(project)
+    if not have:
+        log.warn("движок: маркера .pipeline/VERSION нет — установка не завершена")
+    elif have != version:
+        log.warn(f"движок проекта {have}, плагина {version} — "
+                 "обнови: hermes pipeline setup --upgrade")
+    else:
+        log.ok(f"движок {have}: версия совпадает с плагином")
+    roles = roles_from_config(cfg)
+    untrusted = [role for role in roles if not is_project_trusted(role, project)]
+    if untrusted:
+        log.warn(f"проект не доверен профилям: {', '.join(untrusted)}")
+    else:
+        log.ok(f"проект доверен всем ролям: {', '.join(roles)}")
+    if _board_fact(project):
+        log.ok(f"борда: база {proj.board_db(project).name} на месте")
+    else:
+        log.warn(f"борда: базы нет ({proj.board_db(project)})")
+    if _cron_fact(project, cfg):
+        log.ok("cron: джоба стража заведена")
+    else:
+        log.warn("cron: метки .pipeline/cron.json нет — страж сам не запустится")
+    log.ok("telegram: " + ("включён" if _telegram_fact(cfg) else "выключен"))
+    lint = plan_lint.lint_project(project)
+    if lint.problems:
+        log.warn(f"линтер планов: проблем {len(lint.problems)} — "
+                 "подробности: hermes pipeline doctor")
+        for problem in lint.problems[:10]:
+            log.warn(str(problem))
+    else:
+        log.ok(f"линтер планов: файлов {len(lint.files)}, проблем нет")
