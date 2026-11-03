@@ -4,6 +4,8 @@
 Маршруты:
     GET  /                 одностраничный интерфейс (ui/index.html)
     GET  /api/snapshot     JSON состояния: планы, шаги, карточки, журнал, решение
+                           (отдаёт ETag и 304 при неизменённом снимке)
+    GET  /api/events       поток событий (Server-Sent Events): снимок сразу и на изменение
     POST /api/action       действия: tick, stop, resume, hold, unhold,
                            save_config, save_telegram, test_telegram
     POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
@@ -11,9 +13,11 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
+import time
 import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,11 +45,34 @@ CSP = ("default-src 'none'; script-src 'self' 'unsafe-inline'; "
 # процесс метку подделает — от него защищает шаг 1-S7, здесь такой цели нет).
 PANEL_HEADER = "X-Pipeline-Panel"
 PANEL_HEADER_VALUE = "1"
+# Поток событий: опрос отпечатка, пинг и потолок жизни соединения. Короткая жизнь — это
+# норма: клиент (EventSource) переподключается сам, вечных держателей не заводим.
+EVENTS_POLL = 0.5
+EVENTS_PING_SECONDS = 10
+EVENTS_MAX_SECONDS = 25
 
 
 def _allowed_origins(port: int) -> set[str]:
     """Источники, с которых панель вправе звать действия: только петля и свой порт."""
     return {f"http://127.0.0.1:{port}", f"http://localhost:{port}", f"http://[::1]:{port}"}
+
+
+def _json_bytes(payload: dict) -> bytes:
+    """Байтовое тело JSON: по нему же считается ETag, поэтому сериализация одна."""
+    return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+
+
+def _etag(body: bytes) -> str:
+    """ETag тела: sha256, первые 32 hex в кавычках (браузеру нужны кавычки)."""
+    return '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+
+
+def _if_none_match(header: str | None) -> str:
+    """Нормализовать `If-None-Match`: без пробелов, `W/` и кавычек."""
+    value = (header or "").strip()
+    if value.startswith("W/"):
+        value = value[2:].strip()
+    return value.strip('"').strip()
 
 
 class State:
@@ -219,14 +246,18 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     # ── ответы ──
-    def _send(self, code: int, body: bytes, kind: str = "application/json; charset=utf-8") -> None:
+    def _send(self, code: int, body: bytes, kind: str = "application/json; charset=utf-8",
+              extra: dict[str, str] | None = None,
+              cache_control: str = "no-store") -> None:
         try:
             self.send_response(code)
             self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache_control)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Security-Policy", CSP)
+            for name, value in (extra or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionAbortedError, OSError):
@@ -234,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
     def _json(self, code: int, payload: dict) -> None:
-        self._send(code, json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
+        self._send(code, _json_bytes(payload))
 
     def _local_only(self) -> bool:
         return self.client_address[0] in ("127.0.0.1", "::1")
@@ -277,6 +308,76 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return payload if isinstance(payload, dict) else {}
 
+    # ── снимок и поток событий ──
+    def _plan_param(self) -> str | None:
+        """Параметр `plan=` из строки запроса (нет параметра — None)."""
+        plan = None
+        if "?" in self.path:
+            query = self.path.split("?", 1)[1]
+            for part in query.split("&"):
+                if part.startswith("plan="):
+                    plan = part.split("=", 1)[1] or None
+        return plan
+
+    def _snapshot_body(self, plan: str | None) -> bytes:
+        """Тело ответа `/api/snapshot`: снимок + журнал сервера + режим планировщика + ok."""
+        data = snap.snapshot(self.state.project, plan, preview=self.state.preview,
+                             board=self.state.board)
+        data["log"] = self.state.tail()
+        data["plan_mode"] = plan_mode.read_mode(self.state.project)
+        data["ok"] = True
+        return _json_bytes(data)
+
+    def _event_frame(self, body: bytes) -> None:
+        """Один кадр SSE: имя события `snapshot` и JSON в строке `data:`."""
+        self.wfile.write(b"event: snapshot\ndata: " + body + b"\n\n")
+        self.wfile.flush()
+
+    def _events(self, plan: str | None) -> None:
+        """Поток событий: первый кадр сразу, дальше — по изменению отпечатка.
+
+        Живёт не дольше EVENTS_MAX_SECONDS и закрывается: переподключение — забота
+        EventSource. Любая сетевая ошибка (вкладку закрыли) — норма, а не сбой сервера.
+        """
+        if not self._local_only():
+            self._json(403, {"ok": False, "error": "только localhost"})
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        try:
+            stamp = snap.fingerprint(self.state.project, plan, self.state.preview,
+                                     self.state.board)
+            self._event_frame(self._snapshot_body(plan))
+            started = last_ping = time.monotonic()
+            while time.monotonic() - started < EVENTS_MAX_SECONDS:
+                time.sleep(EVENTS_POLL)
+                now = time.monotonic()
+                current = snap.fingerprint(self.state.project, plan, self.state.preview,
+                                           self.state.board)
+                if current != stamp:
+                    stamp = current
+                    self._event_frame(self._snapshot_body(plan))
+                    last_ping = now
+                elif now - last_ping >= EVENTS_PING_SECONDS:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    last_ping = now
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        except Exception:                                       # noqa: BLE001
+            # pytest.ini считает необработанное исключение в потоке ошибкой теста: ошибку
+            # сборки тоже глушим — поток просто закрывается, клиент переподключится.
+            return
+        finally:
+            self.close_connection = True
+
     # ── GET ──
     def do_GET(self) -> None:                                   # noqa: N802 - stdlib API
         path = self.path.split("?")[0]
@@ -288,22 +389,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, body, "text/html; charset=utf-8")
             return
         if path == "/api/snapshot":
-            plan = None
-            if "?" in self.path:
-                query = self.path.split("?", 1)[1]
-                for part in query.split("&"):
-                    if part.startswith("plan="):
-                        plan = part.split("=", 1)[1] or None
             try:
-                data = snap.snapshot(self.state.project, plan,
-                                     preview=self.state.preview, board=self.state.board)
+                body = self._snapshot_body(self._plan_param())
             except Exception as exc:                            # noqa: BLE001
                 self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
                 return
-            data["log"] = self.state.tail()
-            data["plan_mode"] = plan_mode.read_mode(self.state.project)
-            data["ok"] = True
-            self._json(200, data)
+            tag = _etag(body)
+            # no-cache вместо no-store: иначе браузер не перепроверяет и ETag мёртв.
+            if _if_none_match(self.headers.get("If-None-Match")) == tag.strip('"'):
+                self._send(304, b"", extra={"ETag": tag}, cache_control="no-cache")
+                return
+            self._send(200, body, extra={"ETag": tag}, cache_control="no-cache")
+            return
+        if path == "/api/events":
+            self._events(self._plan_param())
             return
         if path == "/api/health":
             self._json(200, {"ok": True, "root": str(self.state.project)})
@@ -342,6 +441,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             return
         result.setdefault("action", action)
+        # Действие могло записать на диск: кэш снимка сбрасываем, чтобы ответ и следующий
+        # запрос не отдавали состояние «до».
+        snap.clear_cache()
         self._json(200 if result.get("ok") else 400, result)
 
     def _post_plan_mode(self) -> None:

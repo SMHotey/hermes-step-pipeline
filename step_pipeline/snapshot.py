@@ -7,11 +7,18 @@
     next_step.py --json        шаги плана, контракт следующего, git
     kanban db (sqlite, ro)     карточки ролей
     файл плана                 хвост журнала
+
+Снимок кэшируется в памяти процесса на CACHE_TTL секунд и инвалидируется отпечатком —
+только `stat` (mtime_ns + size) файлов плана, каталога состояния и базы борды, плюс сам
+`pipeline.json`. Содержимое файлов отпечаток не читает: это дешёвая проверка «менялось ли
+что-то», а не второй проход по данным.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +36,13 @@ STAGE_LABELS = {"create_step": "заказ постановки", "create_review
 ACTION_LABELS = {"create_step": "шаг", "create_prompt": "постановка", "create_review": "ревью",
                  "create_fix": "правки", "create_rereview": "ревью", "close_step": "журнал",
                  "idle": "ждёт", "stop": "стоп", "retry_pending": "довыкладка"}
+
+CACHE_TTL = 2.5          # секунд: снимок не старше этого отдаётся из памяти
+CACHE_LIMIT = 8          # ключей: проект × план × предпросмотр × борда
+
+# Кэш процесса: ключ → (время сборки по monotonic, отпечаток источников, снимок).
+_CACHE: dict[tuple, tuple[float, tuple, dict]] = {}
+_CACHE_LOCK = threading.RLock()
 
 
 def _ro(path: Path) -> sqlite3.Connection | None:
@@ -109,14 +123,55 @@ def telegram_state(project: Path) -> dict:
     }
 
 
-def snapshot(project: Path | str | None = None, plan: str | None = None,
-             preview: bool = False, board: str | None = None) -> dict:
-    """Полный снимок: конфиг, планы, шаги, карточки, журнал, решение стража.
+def _stat_entry(label: str, path: Path) -> tuple:
+    """Тройка отпечатка для пути: (метка, mtime_ns, size); нет пути — нули."""
+    try:
+        st = path.stat()
+        return (label, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (label, 0, 0)
 
-    *preview* — читать проект, в котором конвейер не установлен: движок берётся из
-    плагина, конфиг — умолчания (борду можно задать явно). Ничего не пишется.
+
+def fingerprint(root: Path, plan: str | None = None, preview: bool = False,
+                board: str | None = None) -> tuple:
+    """Отпечаток источников снимка: только `stat`, без чтения содержимого.
+
+    Входят `pipeline.json`, все `*.md` каталога планов, файлы каталога состояния, файл
+    борды и сам ключ кэша (проект, план, предпросмотр, борда) — чтобы отпечатки разных
+    планов одного проекта не совпали. Результат отсортирован: порядок обхода не влияет.
     """
-    root = Path(project).resolve() if project else proj.find_project()
+    root = Path(root)
+    cfg = proj.read_config(root)
+    entries: list[tuple] = [_stat_entry("config", root / "pipeline.json")]
+    plans_dir = root / ((cfg.get("paths") or {}).get("plans") or "docs/plans")
+    try:
+        plan_files = sorted(plans_dir.glob("*.md"))
+    except OSError:
+        plan_files = []
+    entries.extend(_stat_entry("plan:" + path.name, path) for path in plan_files)
+    try:
+        state_files = sorted(path for path in proj.state_dir(root).glob("*") if path.is_file())
+    except OSError:
+        state_files = []
+    entries.extend(_stat_entry("state:" + path.name, path) for path in state_files)
+    entries.append(_stat_entry("board", proj.board_db(root, board)))
+    entries.extend([
+        ("key:root", str(root), 0),
+        ("key:plan", str(plan or ""), 0),
+        ("key:preview", str(bool(preview)), 0),
+        ("key:board", str(board or ""), 0),
+    ])
+    return tuple(sorted(entries))
+
+
+def clear_cache() -> None:
+    """Очистить кэш снимков: тестам для изоляции, действиям — как страховка после записи."""
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | None) -> dict:
+    """Собрать снимок с нуля: три запуска движка, борда и хвост журнала."""
     cfg = proj.read_config(root)
     engine_dir = proj.ENGINE_SRC if preview else None
     extra_env = {"PIPELINE_ASSUME_DEFAULTS": "1"} if preview else {}
@@ -181,6 +236,36 @@ def snapshot(project: Path | str | None = None, plan: str | None = None,
     out["stage"] = ACTION_LABELS.get(decision.get("action") or "", decision.get("action") or "")
     out["stop"] = any((p.get("stop") for p in out["plans"]))
     return out
+
+
+def snapshot(project: Path | str | None = None, plan: str | None = None,
+             preview: bool = False, board: str | None = None) -> dict:
+    """Полный снимок: конфиг, планы, шаги, карточки, журнал, решение стража.
+
+    *preview* — читать проект, в котором конвейер не установлен: движок берётся из
+    плагина, конфиг — умолчания (борду можно задать явно). Ничего не пишется.
+
+    Ответ кэшируется по ключу (проект, план, предпросмотр, борда) на CACHE_TTL секунд и
+    сбрасывается, как только изменился отпечаток источников. Сборка идёт под замком с
+    двойной проверкой: два одновременных запроса не запускают движок дважды. Наружу
+    отдаётся мелкая копия — вызывающий дописывает `log`/`plan_mode`/`ok`, кэш не мутирует.
+    """
+    root = Path(project).resolve() if project else proj.find_project()
+    key = (str(root), str(plan or ""), bool(preview), str(board or ""))
+    stamp = fingerprint(root, plan, preview, board)
+    with _CACHE_LOCK:
+        cached = _CACHE.get(key)
+        if cached is not None:
+            built, cached_stamp, value = cached
+            if cached_stamp == stamp and time.monotonic() - built <= CACHE_TTL:
+                return dict(value)
+        result = _build_snapshot(root, plan, preview, board)
+        _CACHE[key] = (time.monotonic(), stamp, result)
+        if len(_CACHE) > CACHE_LIMIT:
+            extra = len(_CACHE) - CACHE_LIMIT
+            for stale in sorted(_CACHE, key=lambda item: _CACHE[item][0])[:extra]:
+                _CACHE.pop(stale, None)
+        return dict(result)
 
 
 if __name__ == "__main__":  # ручная проверка: python -m plugin.snapshot <проект>

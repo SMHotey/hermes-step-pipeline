@@ -178,6 +178,8 @@ const $ = (id) => document.getElementById(id);
 const PANEL_HEADERS = {"Content-Type": "application/json", "X-Pipeline-Panel": "1"};
 let currentPlan = null;
 let timer = null;
+let etag = null;      // ETag последнего полученного снимка: с ним идёт If-None-Match
+let stream = null;    // EventSource: поток событий с сервера
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => (
@@ -209,6 +211,9 @@ function act(action, payload = {}) {
   }).then((data) => {
     if (data.ok) toast(actionLabel(action) + ": готово");
     else toast((data.error || data.stderr || "ошибка"), true);
+    // Снимок после действия нужен свежий и целиком: старый ETag больше не годится.
+    etag = null;
+    startEvents();
     return refresh();
   }).catch((err) => toast(String(err), true))
     .finally(() => setBusy(false));
@@ -283,7 +288,7 @@ function render(data) {
       ${p.stop ? `<span class="stop">⛔ ${esc(p.stop.kind || "")}</span>` : ""}
     </div>`).join("") || `<span class="muted">планов с журналом не найдено</span>`;
   document.querySelectorAll(".plan-chip").forEach((chip) => {
-    chip.onclick = () => { currentPlan = chip.dataset.plan; refresh(); };
+    chip.onclick = () => { currentPlan = chip.dataset.plan; startEvents(); refresh(); };
   });
 
   const plan = data.plan || {};
@@ -330,8 +335,18 @@ function render(data) {
 
 async function refresh() {
   const query = currentPlan ? `?plan=${encodeURIComponent(currentPlan)}` : "";
-  const data = await api("/api/snapshot" + query);
+  // Прямой fetch, а не api(): нужны заголовок ETag и код 304 — на неизменённый снимок
+  // сервер не отдаёт тело и не запускает движок.
+  let res;
+  try {
+    res = await fetch("/api/snapshot" + query, {headers: etag ? {"If-None-Match": etag} : {}});
+  } catch (err) { toast(String(err), true); return; }
+  if (res.status === 304) return;
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = {ok: false, error: "не JSON: " + res.status}; }
+  if (!res.ok && !data.error) data.error = "HTTP " + res.status;
   if (!data.ok) { toast(data.error || "не удалось получить состояние", true); return; }
+  etag = res.headers.get("ETag") || etag;
   render(data);
   if (!data.errors || !data.errors.length) {
     // форма настроек заполняется один раз — не перетираем ввод пользователя
@@ -347,6 +362,24 @@ async function refresh() {
       window.__configLoaded = true;
     }
   }
+}
+
+function startEvents() {
+  // Поток зависит от плана: при его смене старый закрываем и открываем новый.
+  if (stream) { stream.close(); stream = null; }
+  const query = currentPlan ? `?plan=${encodeURIComponent(currentPlan)}` : "";
+  stream = new EventSource("/api/events" + query);
+  const onFrame = (event) => {
+    let data = null;
+    try { data = JSON.parse(event.data); } catch (e) { return; }
+    etag = null;   // следующий refresh обязан получить тело целиком, а не 304
+    render(data);
+  };
+  // Сервер шлёт кадры с именем события snapshot — их ловит addEventListener;
+  // onmessage оставлен на случай кадра без имени.
+  stream.addEventListener("snapshot", onFrame);
+  stream.onmessage = onFrame;
+  stream.onerror = () => {};   // переподключение делает браузер, резервный опрос работает
 }
 
 $("btn-tick").onclick = () => act("tick", currentPlan ? {plan: currentPlan} : {});
@@ -394,10 +427,11 @@ $("plan-mode").onchange = (event) => {
 };
 
 refresh();
-timer = setInterval(refresh, 5000);
+startEvents();
+timer = setInterval(refresh, 30000);
 document.addEventListener("visibilitychange", () => {
   clearInterval(timer);
-  if (!document.hidden) { refresh(); timer = setInterval(refresh, 5000); }
+  if (!document.hidden) { startEvents(); refresh(); timer = setInterval(refresh, 30000); }
 });
 </script>
 </body>

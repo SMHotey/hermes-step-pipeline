@@ -6,6 +6,7 @@ import json
 import sqlite3
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -16,7 +17,17 @@ PLUGIN = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from helpers import install_project, run_gate, stub_cards, complete_card  # noqa: E402
+import project  # noqa: E402
+import snapshot  # noqa: E402
 import ui_server  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def clean_cache():
+    """Кэш снимка — состояние процесса: между тестами его обнуляем."""
+    snapshot.clear_cache()
+    yield
+    snapshot.clear_cache()
 
 
 @pytest.fixture()
@@ -58,6 +69,104 @@ def post(url: str, payload: dict, headers: dict | None = None) -> tuple[int, dic
 def stop_file(server) -> Path:
     """Файл стоп-флага плана 1: его появление значит, что действие выполнилось."""
     return server["root"] / ".pipeline" / "state" / "plan_1_stop.json"
+
+
+def engine_counter(monkeypatch) -> list:
+    """Счётчик запусков движка: `project.run_engine` — единственная точка всех запусков."""
+    calls: list = []
+    original = project.run_engine
+
+    def counting(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(project, "run_engine", counting)
+    return calls
+
+
+def get_raw(url: str, headers: dict | None = None) -> tuple[int, dict, bytes]:
+    """GET с заголовками: 304 приходит HTTPError'ом с пустым телом. Заголовки — в нижнем регистре."""
+    request = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read()
+
+
+def open_events(url: str, timeout: float = 30.0) -> dict:
+    """Открыть поток событий в потоке-демоне и копить разобранные кадры (строки `data:`).
+
+    Тайм-аут сокета длинный: сервер молчит между кадрами (пинг раз в 10 с), а терпение
+    теста задаёт `wait_frames`, а не чтение.
+    """
+    frames: list[dict] = []
+    headers: dict = {}
+    errors: list[BaseException] = []
+    holder: dict = {}
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def worker() -> None:
+        try:
+            response = urllib.request.urlopen(url, timeout=timeout)
+            holder["response"] = response
+            headers.update({k.lower(): v for k, v in response.headers.items()})
+            for raw in response:
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if line.startswith("data:"):
+                    with lock:
+                        frames.append(json.loads(line[5:].strip()))
+                if stop.is_set():
+                    break
+        except BaseException as exc:            # noqa: BLE001 — поток не должен ронять прогон
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker, daemon=True, name="sse-reader")
+    thread.start()
+    return {"frames": frames, "headers": headers, "errors": errors, "stop": stop,
+            "thread": thread, "lock": lock, "holder": holder}
+
+
+def wait_frames(event: dict, count: int, limit: float = 5.0) -> list[dict]:
+    """Дождаться count кадров: опрос списка с шагом 0.1 с и жёстким пределом."""
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        with event["lock"]:
+            if len(event["frames"]) >= count:
+                return list(event["frames"])
+        time.sleep(0.1)
+    with event["lock"]:
+        return list(event["frames"])
+
+
+def wait_event_frame(event: dict, predicate, limit: float = 15.0):
+    """Дождаться кадра (кроме первого), который удовлетворяет предикату. None — не дождались.
+
+    Пересборка снимка — три запуска движка, поэтому между изменением на диске и кадром
+    проходит несколько секунд; промежуточные изменения дают лишние кадры, поэтому ждём
+    именно нужный, а не «второй по счёту».
+    """
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        with event["lock"]:
+            frames = list(event["frames"])
+        for frame in frames[1:]:
+            if predicate(frame):
+                return frame
+        time.sleep(0.1)
+    return None
+
+
+def close_events(event: dict) -> None:
+    """Закрыть читателя и соединение: обработчик сервера получит закрытый сокет и выйдет."""
+    event["stop"].set()
+    response = event["holder"].get("response")
+    if response is not None:
+        try:
+            response.close()
+        except OSError:
+            pass
 
 
 def test_index_page(server):
@@ -202,4 +311,127 @@ def test_security_headers_on_page(server):
     assert "frame-ancestors 'none'" in policy
     with urllib.request.urlopen(server["url"] + "/api/health", timeout=10) as response:
         assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+# ── кэш снимка, ETag/304 и поток событий (план 3 S1) ──
+
+def test_snapshot_cache_skips_engine_when_nothing_changed(server, monkeypatch):
+    calls = engine_counter(monkeypatch)
+    url = server["url"] + "/api/snapshot?plan=1"
+    status, first = get(url)
+    assert status == 200 and first["ok"]
+    assert len(calls) == 3                      # планы + решение + шаги
+    status, second = get(url)
+    assert status == 200 and second["ok"]
+    assert len(calls) == 3                      # второй запрос собран из кэша
+    assert [p["id"] for p in second["plans"]] == [p["id"] for p in first["plans"]]
+    assert second["plan"]["id"] == first["plan"]["id"]
+    assert second["decision"] == first["decision"]
+
+
+def test_snapshot_cache_rebuilds_after_state_change(server, monkeypatch):
+    calls = engine_counter(monkeypatch)
+    url = server["url"] + "/api/snapshot?plan=1"
+    assert get(url)[0] == 200
+    assert len(calls) == 3
+    stop = server["root"] / ".pipeline" / "state" / "plan_1_stop.json"
+    stop.write_text(json.dumps({"kind": "owner", "reason": "тест"}, ensure_ascii=False),
+                    encoding="utf-8")
+    status, data = get(url)
+    assert status == 200
+    assert data["stop"] is True
+    assert len(calls) == 6                      # инвалидация отпечатком, а не по TTL
+
+
+def test_snapshot_cache_rebuilds_after_plan_edit(server, monkeypatch):
+    calls = engine_counter(monkeypatch)
+    url = server["url"] + "/api/snapshot?plan=1"
+    assert get(url)[0] == 200
+    assert len(calls) == 3
+    plan_file = server["root"] / "docs" / "plans" / "1-demo.md"
+    text = plan_file.read_text(encoding="utf-8")
+    edited = text.replace("| — | S1 | — | — | открыт |",
+                          "| 03.11.2026 | S1 (Таблица счетов) | abc1234 | ревью APPROVE | ЗАКРЫТ |")
+    assert edited != text
+    plan_file.write_text(edited, encoding="utf-8")
+    status, data = get(url)
+    assert status == 200
+    assert data["plan"]["closed"] == ["S1"]
+    assert data["plan"]["next"]["id"] == "S2"
+    assert len(calls) == 6
+
+
+def test_snapshot_etag_and_304_do_not_touch_engine(server, monkeypatch):
+    calls = engine_counter(monkeypatch)
+    url = server["url"] + "/api/snapshot?plan=1"
+    status, headers, body = get_raw(url)
+    assert status == 200
+    tag = headers["etag"]
+    assert tag and tag.startswith('"') and tag.endswith('"')
+    assert body
+    assert headers["cache-control"] == "no-cache"
+    assert len(calls) == 3
+    status, headers, body = get_raw(url, {"If-None-Match": tag})
+    assert status == 304
+    assert body == b""
+    assert headers["etag"] == tag
+    assert len(calls) == 3                      # 304 движок не запускает
+
+
+def test_events_stream_first_frame_is_snapshot(server):
+    event = open_events(server["url"] + "/api/events?plan=1")
+    try:
+        # Холодный поток — это одна полная сборка снимка (три запуска движка: 5–6 с на этой
+        # машине, под нагрузкой прогона дольше), поэтому первый кадр ждём до 20 с. Ждать
+        # очередного опроса из страницы при этом не надо — его и нет.
+        frames = wait_frames(event, 1, limit=20.0)
+        assert frames, f"первый кадр не пришёл: {event['errors']}"
+        assert event["headers"]["content-type"].startswith("text/event-stream")
+        first = frames[0]
+        assert first["ok"] is True
+        assert [p["id"] for p in first["plans"]] == ["1"]
+        assert first["plan"]["next"]["id"] == "S1"
+    finally:
+        close_events(event)
+
+
+def test_events_stream_pushes_on_change(server, monkeypatch):
+    calls = engine_counter(monkeypatch)
+    event = open_events(server["url"] + "/api/events?plan=1")
+    try:
+        assert wait_frames(event, 1, limit=20.0), f"первый кадр не пришёл: {event['errors']}"
+        (server["root"] / ".pipeline" / "state" / "plan_1_stop.json").write_text(
+            json.dumps({"kind": "owner", "reason": "тест"}, ensure_ascii=False),
+            encoding="utf-8")
+        frames = wait_frames(event, 2, limit=15.0)
+        assert len(frames) >= 2, f"кадр на изменение не пришёл: {event['errors']}"
+        pushed = wait_event_frame(event, lambda frame: frame["stop"] is True, limit=15.0)
+        assert pushed is not None, f"кадр со стоп-флагом не пришёл: {event['errors']}"
+        assert len(calls) == 6                  # ровно одна пересборка, без опроса из страницы
+    finally:
+        close_events(event)
+
+
+def test_tick_pushes_event_with_new_card(server):
+    event = open_events(server["url"] + "/api/events?plan=1")
+    try:
+        assert wait_frames(event, 1, limit=20.0), f"первый кадр не пришёл: {event['errors']}"
+        status, data = post(server["url"], {"action": "tick", "plan": "1"})
+        assert status == 200 and data["ok"]
+        frames = wait_frames(event, 2, limit=15.0)
+        assert len(frames) >= 2, f"кадр после Тика не пришёл: {event['errors']}"
+        pushed = wait_event_frame(
+            event, lambda frame: "planloop:1:S1:prompt" in
+            [c["idempotency_key"] for c in frame["cards"]], limit=20.0)
+        assert pushed is not None, f"кадр с новой карточкой не пришёл: {event['errors']}"
+    finally:
+        close_events(event)
+
+
+def test_index_subscribes_to_events_and_slow_poll():
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    assert "EventSource" in html
+    assert "/api/events" in html
+    assert "setInterval(refresh, 30000)" in html
+    assert "setInterval(refresh, 5000)" not in html
 
