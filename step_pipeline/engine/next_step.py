@@ -48,6 +48,10 @@ class Step:
     dod: str
     read: list[str]
     notes: str = ""
+    # Риск шага из пункта «Риск: high|low|normal» (нет пункта — normal) и признак
+    # «Авто: да»: контракт шага, по которому страж решает про ручной допуск.
+    risk: str = "normal"
+    auto: bool = False
 
 
 # Маркер пункта ВЕРХНЕГО уровня: строка с отступом — продолжение предыдущего пункта.
@@ -60,11 +64,29 @@ _OWNER_LINE_RE = re.compile(r"^(?:исполнитель|owner)\s*[=:]\s*`?([a-z
                             re.IGNORECASE)
 # Пункты, которые НЕ годятся в «цель шага».
 _GOAL_SKIP_LABELS = ("файл", "тест", "гейт", "готово", "замер", "доказательств",
-                     "запрет", "важно", "исполнитель", "owner", "чита")
+                     "запрет", "важно", "исполнитель", "owner", "чита",
+                     "риск", "авто")
 
 
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _risk_of(text: str) -> str:
+    """Риск шага из значения пункта «Риск: …».
+
+    Нераспознанная пометка (пусто, опечатка, русское слово) считается `high`:
+    ошибка в плане не должна делать опасный шаг безопасным (D2). «По умолчанию
+    normal» относится только к отсутствию пункта — его разбирает `_step_from_section`.
+    """
+    token = (_norm(text).split() or [""])[0].lower().strip(".,;:()«»\"'")
+    return token if token in ("low", "normal", "high") else "high"
+
+
+def _yes(text: str) -> bool:
+    """Пункт «Авто: да» — признак зафиксированной договорённости, не отмена риска."""
+    token = (_norm(text).split() or [""])[0].lower().strip(".,;:()«»\"'")
+    return token in ("да", "yes", "true", "1")
 
 
 def section_blocks(lines: list[str]) -> list[tuple[str, str, str]]:
@@ -152,6 +174,8 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
     gates: list[str] = []
     dod = ""
     notes: list[str] = []
+    risk = "normal"
+    auto = False
     for label, text, full in blocks:
         if label.startswith("файл"):
             files += [t for t in _backticks(text) if _looks_like_path(t)]
@@ -159,6 +183,10 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
             gates.append(text)
         elif label.startswith(("важно", "примечани", "ограничени")):
             notes.append(text)
+        elif label.startswith("риск"):
+            risk = _risk_of(text)
+        elif label.startswith("авто"):
+            auto = _yes(text)
         if not owner and label.startswith(("исполнитель", "owner")):
             m = _OWNER_LINE_RE.match(text) or _OWNER_RE.search(text)
             if m:
@@ -169,7 +197,8 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
                 dod = ready.group("rest").strip()
     return Step(id=sid, epoch="", title=title, days=days, owner=owner, goal=goal,
                 files=files, gates=gates, dod=dod,
-                read=[f"{cfg.rel(plan_file)} §{sid}"], notes=" ".join(notes))
+                read=[f"{cfg.rel(plan_file)} §{sid}"], notes=" ".join(notes),
+                risk=risk, auto=auto)
 
 
 def plan_steps(cfg: config_mod.Config, plan_file: Path) -> list[Step]:

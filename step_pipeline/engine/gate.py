@@ -596,9 +596,14 @@ def collector(p: Paths, step: str | None = None) -> dict:
 
 def build_ctx(p: Paths) -> dict:
     state = load_state(p)
-    ctx: dict = {"state": state, "stop": load_stop(p), "hold": list(state.get("hold_steps") or [])}
+    ctx: dict = {"state": state, "stop": load_stop(p), "hold": list(state.get("hold_steps") or []),
+                 # Шаги, допуск по которым владелец уже снимал: автоматический риск-hold
+                 # по ним не ставится повторно (D4).
+                 "released": list(state.get("hold_released") or [])}
     ctx["plan_id"] = p.plan_id
     ctx["review_prefix"] = p.review_prefix
+    # Файл плана: причина hold обязана ссылаться на раздел плана, а у `decide` нет `Paths`.
+    ctx["plan_file"] = p.cfg.rel(Path(p.plan_file))
     # Утверждение считаем ДО сборщика: при его сбое решение всё равно должно знать,
     # что план не утверждён.
     approval = registry.approval_status(p.cfg, p.spec)
@@ -708,6 +713,18 @@ def _decide_base(ctx: dict) -> dict:
     cards = ctx.get("cards") or []
     steps = card_of(cards, "step")
     if not steps:
+        # Рискованный шаг не получает НИ ОДНОЙ карточки (включая заказ постановки),
+        # пока владелец не допустил: проверка стоит внутри «карточки шага ещё нет»,
+        # иначе уже начатый шаг застрял бы на hold и не дошёл до ревью (D5).
+        risk = str(step.get("risk") or "normal").lower()
+        held = {str(h).upper() for h in (ctx.get("hold") or [])}
+        released = {str(r).upper() for r in (ctx.get("released") or [])}
+        if risk == "high" and sid.upper() not in held and sid.upper() not in released:
+            where = ctx.get("plan_file") or f"план {ctx.get('plan_id') or '?'}"
+            return {"action": "hold_risk", "step": sid, "data": step, "risk": risk,
+                    "reason": (f"шаг {sid} помечен «Риск: high» — нужен допуск владельца; "
+                               f"раздел плана: `{where}` §{sid}; снять: "
+                               f"`python .pipeline/gate.py --unhold {sid}`")}
         return {"action": "create_step", "step": sid, "data": step}
     last_step = steps[-1]
     if last_step["status"] not in TERMINAL:
@@ -772,6 +789,10 @@ def status_text(ctx: dict, decision: dict) -> str:
     ]
     for c in ctx.get("cards") or []:
         lines.append(f"  - {c['id']} {c['status']:<10} {c['key']}")
+    # Риск и ручной допуск видны всегда: по ним владелец решает, снимать ли hold.
+    hold = [str(h).upper() for h in (ctx.get("hold") or [])]
+    lines.append(f"Ручной допуск (hold): {', '.join(hold) or '—'}")
+    lines.append(f"Риск шага: {step.get('risk') or 'normal'}")
     if ctx.get("verdict"):
         v = ctx["verdict"]
         lines.append(f"Вердикт: {v['verdict']} (строк: {v['occurrences']}, "
@@ -1197,11 +1218,19 @@ def _hold_change(cfg: config_mod.Config, step: str, add: bool) -> str:
     p = _plan_paths(cfg)
     state = load_state(p)
     hold = {str(item).upper() for item in (state.get("hold_steps") or [])}
+    released = {str(item).upper() for item in (state.get("hold_released") or [])}
     key = step.strip().upper()
     if not key:
         return "укажи шаг: /hold S3"
-    hold.add(key) if add else hold.discard(key)
+    if add:
+        hold.add(key)
+    else:
+        hold.discard(key)
+        # Снятие допуска из чата — то же действие владельца, что `--unhold`: без отметки
+        # риск-hold вернулся бы на следующем тике (D4).
+        released.add(key)
     state["hold_steps"] = sorted(hold)
+    state["hold_released"] = sorted(released)
     save_state(p, state)
     return "шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—")
 
@@ -1337,6 +1366,19 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             result["watch"] = {"notice": False, "waiting_since": None}
             return result
         result["watch"] = watch_idle(p.cfg, p, ctx, decision, say)
+        return result
+    if action == "hold_risk":
+        step = decision["data"]
+        hold = {str(item).upper() for item in (state.get("hold_steps") or [])}
+        hold.add(str(step["id"]).upper())
+        state["hold_steps"] = sorted(hold)
+        # Это ДЕЙСТВИЕ, а не простой: при нескольких действиях за тик (max_actions > 1)
+        # hold ставится первым и не теряется. `touch` сохраняет ТОТ ЖЕ словарь состояния,
+        # поэтому запись hold_steps уходит на диск вместе с отметкой о тике.
+        touch(f"hold_risk:{step['id']}")
+        reason = decision.get("reason", "")
+        say("⏸ " + reason)
+        result.update(applied=True, detail=reason)
         return result
     if action == "create_step":
         step = decision["data"]
@@ -1501,16 +1543,22 @@ def plans_rows(cfg: config_mod.Config) -> list[dict]:
     for spec in registry.specs(cfg):
         p = resolve_paths(cfg, spec.id)
         step_id = "—"
+        risk = ""
         try:
-            step_id = (collector(p).get("next") or {}).get("id") or "—"
+            nxt = collector(p).get("next") or {}
+            step_id = nxt.get("id") or "—"
+            risk = str(nxt.get("risk") or "normal")
         except SystemExit as exc:
             print(f"[plans] план {spec.id}: сборщик шагов не работает: {exc}", file=sys.stderr)
         stop = load_stop(p)
+        hold = sorted({str(h).upper() for h in (load_state(p).get("hold_steps") or [])})
         out.append({
             "id": spec.id,
             "file": cfg.rel(Path(spec.file)),
             "driven": spec.id in driven,
             "next": step_id,
+            "risk": risk,
+            "hold": hold,
             "closed": len(registry.closed_steps(spec, cfg)),
             "stop": ({**stop, "kind": stop_kind(stop)} if stop else None),
         })
@@ -1522,7 +1570,12 @@ def plans_table(cfg: config_mod.Config) -> str:
     rows: list[tuple[str, str, str, str, str]] = []
     for row in plans_rows(cfg):
         stop = row["stop"]
-        flag = (f"{stop['kind']}: {stop.get('reason', '')}" if stop else "—")
+        if stop:
+            flag = f"{stop['kind']}: {stop.get('reason', '')}"
+        elif row["hold"]:
+            flag = "hold: " + ", ".join(row["hold"])
+        else:
+            flag = "—"
         rows.append((row["id"], "да" if row["driven"] else "нет", str(row["next"]),
                      str(row["closed"]), flag))
     head = ("ПЛАН", "ВЕДЁТСЯ", "СЛЕДУЮЩИЙ ШАГ", "ЗАКРЫТО", "СТОП-ФЛАГ")
@@ -1826,12 +1879,17 @@ def main(argv: list[str] | None = None) -> int:
                     print("стоп-флаг снят" if existed else "стоп-флага не было")
                     return 0
                 state = load_state(p)
-                hold = set(state.get("hold_steps") or [])
+                hold = {str(item).upper() for item in (state.get("hold_steps") or [])}
+                released = {str(item).upper() for item in (state.get("hold_released") or [])}
                 if args.hold:
                     hold.add(args.hold.upper())
                 else:
                     hold.discard(args.unhold.upper())
+                    # Отметка владельца: автоматический риск-hold по этому шагу больше
+                    # не ставится, иначе снять допуск было бы невозможно (D4).
+                    released.add(args.unhold.upper())
                 state["hold_steps"] = sorted(hold)
+                state["hold_released"] = sorted(released)
                 save_state(p, state)
                 print("шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—"))
                 return 0
