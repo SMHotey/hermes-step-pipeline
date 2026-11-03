@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from helpers import PLAN  # noqa: E402
+from helpers import PLAN, install_project  # noqa: E402
 import cli  # noqa: E402
 import snapshot  # noqa: E402
 import ui_server  # noqa: E402
@@ -97,3 +97,74 @@ def test_preview_ui_blocks_actions(tmp_path: Path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+SECOND_PLAN = """# 2. Второй план
+
+## Шаги
+
+### S1. Первый шаг (1 дн)
+
+- Файл: `app/a.py`
+- Тесты/гейты: `pytest tests/test_a.py -q` → 2 passed
+- Готово = файл `app/a.py` есть
+
+### S2. Второй шаг (1 дн)
+
+- Файл: `app/b.py`
+- Тесты/гейты: `pytest tests/test_b.py -q` → 1 passed
+- Готово = файл `app/b.py` есть
+
+## Журнал выполнения
+
+| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |
+|---|---|---|---|---|
+| 01.11.2026 | S1 (Первый шаг) | abc1234 | ревью APPROVE | ЗАКРЫТ |
+"""
+
+
+def test_overview_announces_tick_and_blocks_it_on_stop(tmp_path: Path):
+    """Обзор называет действие Тика с причиной и гасит кнопку при стоп-флаге (шаг 3-S2)."""
+    root = install_project(tmp_path / "overview", board="overview-board")
+    (root / "docs" / "plans" / "2-second.md").write_text(SECOND_PLAN, encoding="utf-8")
+    snapshot.clear_cache()
+
+    view = snapshot.snapshot(root, plan="1")["overview"]
+    action = view["next_action"]
+    assert action["label"] == "Тик: заказ постановки S1"
+    assert "нет постановки шага S1" in action["reason"]
+    assert action["disabled"] is False and action["why"] == ""
+    assert view["state"]["prompt"] == {"exists": False, "file": ""}
+    assert view["state"]["fix_rounds"] == 0
+    assert view["state"]["risk"] == "normal"
+    # Прогресс: у открытого плана число шагов из пакета, у соседнего — из запуска движка
+    # по изменению файла плана (в `gate.py --plans` этого числа нет, а свой парсер плана
+    # в плагине не заводится).
+    by_id = {row["id"]: row for row in view["progress"]}
+    assert (by_id["1"]["closed"], by_id["1"]["total"]) == (0, 2)
+    assert (by_id["2"]["closed"], by_id["2"]["total"]) == (1, 2)
+
+    stop = root / ".pipeline" / "state" / "plan_1_stop.json"
+    stop.write_text(json.dumps({"kind": "owner", "reason": "проверка владельца",
+                                "at": "03.11.2026 10:00"}, ensure_ascii=False), encoding="utf-8")
+    snapshot.clear_cache()
+
+    blocked = snapshot.snapshot(root, plan="1")["overview"]["next_action"]
+    assert blocked["disabled"] is True
+    assert "стоп-флаг владельца" in blocked["why"]
+    assert "проверка владельца" in blocked["why"]
+
+    # Предпросмотр гасит кнопку тем же полем снимка, а не догадкой страницы.
+    bare = tmp_path / "bare-overview"
+    (bare / "docs" / "plans").mkdir(parents=True)
+    (bare / "docs" / "plans" / "7-real.md").write_text(PLAN_TEXT, encoding="utf-8")
+    snapshot.clear_cache()
+    preview_action = snapshot.snapshot(bare, preview=True)["overview"]["next_action"]
+    assert preview_action["disabled"] is True
+    assert "предпросмотр" in preview_action["why"]
+
+    html = (Path(__file__).resolve().parents[1] / "step_pipeline" / "ui" / "index.html").read_text(
+        encoding="utf-8")
+    for anchor in ('id="next-action"', 'id="next-label"', 'id="next-why"',
+                   'id="progress"', 'id="state-rows"', "renderOverview(data)"):
+        assert anchor in html

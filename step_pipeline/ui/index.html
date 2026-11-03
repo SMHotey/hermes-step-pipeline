@@ -91,6 +91,23 @@
       border: 1px solid var(--line); background: var(--bg); color: var(--text); font-size: 13px; }
   .row { display: flex; gap: 10px; }
   .row > div { flex: 1; }
+  .next-action { border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 12px;
+                 background: var(--panel-2); }
+  .next-action.bad { border-left-color: var(--bad); }
+  .next-label { font-size: 18px; font-weight: 600; letter-spacing: .2px; }
+  .next-reason { margin-top: 4px; font-size: 13px; }
+  .next-why { margin-top: 6px; font-size: 12.5px; color: var(--bad); }
+  .progress-row { margin: 10px 0; }
+  .progress-head { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px;
+                   flex-wrap: wrap; }
+  .bar { height: 6px; margin-top: 5px; border-radius: 999px; overflow: hidden;
+         background: var(--panel-2); border: 1px solid var(--line); }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .kv-list { display: grid; gap: 5px; font-size: 12.5px; }
+  .kv { display: flex; gap: 10px; }
+  .kv > span { color: var(--muted); min-width: 150px; }
+  .kv > b { font-weight: 500; }
+  .hidden { display: none; }
   @media (max-width: 980px) { main { grid-template-columns: 1fr; } .flow { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -114,7 +131,19 @@
 
 <main>
   <div>
-    <section>
+    <section id="overview">
+      <h2>Следующее действие</h2>
+      <div class="next-action" id="next-action">
+        <div class="next-label" id="next-label">Тик</div>
+        <div class="next-reason" id="next-reason">…</div>
+        <div class="next-why hidden" id="next-why"></div>
+      </div>
+      <h2 style="margin-top:16px">Прогресс планов</h2>
+      <div id="progress"><span class="muted">—</span></div>
+      <h2 style="margin-top:16px">Состояние шага</h2>
+      <div class="kv-list" id="state-rows"><div class="kv muted">—</div></div>
+    </section>
+    <section style="margin-top:16px">
       <h2>Поток текущего шага</h2>
       <div class="flow" id="flow"></div>
       <div class="plans" id="plans"></div>
@@ -180,6 +209,7 @@ let currentPlan = null;
 let timer = null;
 let etag = null;      // ETag последнего полученного снимка: с ним идёт If-None-Match
 let stream = null;    // EventSource: поток событий с сервера
+let panelBusy = false; // идёт действие: кнопки гасятся до ответа сервера
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => (
@@ -225,6 +255,7 @@ function actionLabel(action) {
 }
 
 function setBusy(busy) {
+  panelBusy = busy;
   ["btn-tick", "btn-stop", "btn-resume"].forEach((id) => { $(id).disabled = busy; });
 }
 
@@ -250,6 +281,77 @@ function stageOf(cards, planId, stepId) {
     {title: "Ревью", hint: review.length ? pick(review).status : "ждёт", cls: stateOf(pick(review))},
     {title: "Журнал", hint: fix.length ? "правки" : "—", cls: review.some((c) => c.status === "done") ? "run" : "wait"},
   ];
+}
+
+function stamp(ts) {
+  // Время карточки борды — секунды epoch; показываем коротко, без секунд.
+  if (!ts) return "";
+  const date = new Date(Number(ts) * 1000);
+  return date.toLocaleDateString("ru-RU", {day: "2-digit", month: "2-digit"}) + " " +
+         date.toLocaleTimeString("ru-RU", {hour: "2-digit", minute: "2-digit"});
+}
+
+function age(ts) {
+  if (!ts) return "";
+  const sec = Math.max(0, Math.round(Date.now() / 1000 - Number(ts)));
+  if (sec < 60) return sec + " с";
+  if (sec < 3600) return Math.round(sec / 60) + " мин";
+  if (sec < 86400) return Math.round(sec / 3600) + " ч " + Math.round((sec % 3600) / 60) + " мин";
+  return Math.round(sec / 86400) + " дн";
+}
+
+function renderOverview(data) {
+  // Блок «что сделает Тик» целиком из снимка: страница ничего не додумывает и не
+  // повторяет правила стража. Критичных проблем из проверок (S5) в снимке нет —
+  // бейдж не рисуем, пустышка хуже её отсутствия.
+  const ov = data.overview || {};
+  const act = ov.next_action || {};
+  $("next-action").className = "next-action" + (act.disabled ? " bad" : "");
+  $("next-label").textContent = act.label || "Тик";
+  $("next-reason").textContent = act.reason || "страж причину не сообщил";
+  const why = $("next-why");
+  why.textContent = act.why || "";
+  why.className = "next-why" + (act.why ? "" : " hidden");
+
+  const tick = $("btn-tick");
+  tick.textContent = act.label || "Тик";
+  tick.disabled = !!act.disabled || panelBusy;
+  tick.title = act.why || "";
+
+  const rows = (ov.progress || []).filter((p) => p.driven);
+  $("progress").innerHTML = rows.map((p) => {
+    const total = Number(p.total || 0);
+    const closed = Number(p.closed || 0);
+    const width = total > 0 ? Math.min(100, Math.round(closed * 100 / total)) : 0;
+    const nums = total > 0 ? `${closed} из ${total}` : `${closed} закрыто`;
+    const next = p.next && p.next !== "—" ? `<span class="pill run">→ ${esc(p.next)}</span>`
+                                           : `<span class="pill ok">закрыт</span>`;
+    const hold = (p.hold || []).length
+      ? `<span class="pill wait">допуск: ${esc((p.hold || []).join(", "))}</span>` : "";
+    const stop = p.stop ? `<span class="pill bad">стоп: ${esc(p.stop.kind || "")}</span>` : "";
+    return `<div class="progress-row">
+      <div class="progress-head"><b>план ${esc(p.id)}</b>
+        <span class="muted">${esc(nums)}</span>${next}${hold}${stop}</div>
+      <div class="bar"><i style="width:${width}%"></i></div></div>`;
+  }).join("") || `<span class="muted">ведомых планов нет</span>`;
+
+  const st = ov.state || null;
+  const prompt = (st || {}).prompt || {};
+  let hangs = "—";
+  if (st && st.status === "done" && st.completed) {
+    hangs = `закрыто ${stamp(st.completed)}`;
+  } else if (st && st.since) {
+    hangs = `${st.status || "—"} · ${age(st.since)} (с ${stamp(st.since)})`;
+  }
+  const kv = [
+    ["шаг", st ? `${st.step} · ${st.title || ""}` : "—"],
+    ["висит в состоянии", hangs],
+    ["кругов правок", st ? String(st.fix_rounds ?? 0) : "—"],
+    ["постановка", prompt.exists ? "есть · " + prompt.file : "нет"],
+    ["риск шага", st && st.risk ? st.risk : "—"],
+  ];
+  $("state-rows").innerHTML = kv.map(([k, v]) =>
+    `<div class="kv"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("");
 }
 
 function render(data) {
@@ -279,6 +381,8 @@ function render(data) {
   pm.disabled = !!data.preview;
   $("plan-mode-hint").textContent = data.preview
     ? "предпросмотр только читает" : "действует со следующей сессии";
+
+  renderOverview(data);
 
   const plans = data.plans || [];
   $("plans").innerHTML = plans.map((p) => `
