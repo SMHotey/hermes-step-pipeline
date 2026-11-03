@@ -99,6 +99,27 @@ def test_details_prefer_reviewer_recommendations(tmp_path):
     assert details.index("откатить строку") < details.index("Что делать")
     assert "правка файла из списка" not in details.split("Рекомендации")[1]
 
+def test_step_summary_prefers_goal_sentence():
+    step = dict(STEP, goal="Страж не ставит карточку рискованному шагу без допуска. Детали ниже.",
+                dod="Готово, когда high не получает карточку")
+    assert gate._step_summary(step) == "Страж не ставит карточку рискованному шагу без допуска."
+
+
+def test_step_summary_falls_back_to_dod_and_title():
+    step = dict(STEP, goal="", dod="Готово, когда шаг закрыт")
+    assert gate._step_summary(step).startswith("Готово, когда шаг закрыт")
+    assert gate._step_summary({"title": "Таблица счетов"}) == "Таблица счетов"
+
+
+def test_review_findings_strip_markdown(tmp_path):
+    lines = ["## Замечания", "", "- **блокирующая** правка файла из Запрещено",
+             "- `hold_risk` убран из snapshot.py вручную"]
+    report = tmp_path / "r.md"
+    report.write_text(chr(10).join(lines), encoding="utf-8")
+    items = gate._review_findings(report, 5)
+    assert items[0] == "блокирующая правка файла из Запрещено"
+    assert "`" not in items[1]
+
 def test_review_findings_skips_short_and_markup(tmp_path):
     lines = ["# Заголовок", "- мало",
              "- это осмысленное замечание по коду", "| a | b |",

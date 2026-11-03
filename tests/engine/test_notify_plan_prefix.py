@@ -24,3 +24,4 @@ def test_step_message_has_plan_id(project: Path, hermes_stub: Path) -> None:
     out = (res.stdout or "") + (res.stderr or "")
     assert res.returncode == 0, out
     assert "план 1, шаг S1" in out, out
+    assert "что делаем:" in out, out

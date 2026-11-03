@@ -719,6 +719,7 @@ def _decide_base(ctx: dict) -> dict:
         risk = str(step.get("risk") or "normal").lower()
         held = {str(h).upper() for h in (ctx.get("hold") or [])}
         released = {str(r).upper() for r in (ctx.get("released") or [])}
+        # ANCHOR:hold_risk_decision — стабильная ссылка для спеки и ревью
         if risk == "high" and sid.upper() not in held and sid.upper() not in released:
             where = ctx.get("plan_file") or f"план {ctx.get('plan_id') or '?'}"
             return {"action": "hold_risk", "step": sid, "data": step, "risk": risk,
@@ -805,7 +806,8 @@ def _review_findings(path: Path, limit: int = 5) -> list[str]:
             continue
         if line[:2] in ("- ", "* ") or (line[:1].isdigit() and line[1:3] in (". ", ") ")):
             item = line[2:].strip() if line[:2] in ("- ", "* ") else line[3:].strip()
-            item = item.replace("`", "").strip(" .;")
+            item = (item.replace("`", "").replace("**", "").replace("__", "")
+                    .strip(" .;"))
             if len(item) >= 12 and item not in items:
                 items.append(item[:180])
         if len(items) >= limit:
@@ -838,6 +840,21 @@ def _review_recommendations(path: Path, limit: int = 3) -> list[str]:
             break
     return picked
 
+
+def _step_summary(step: dict, limit: int = 260) -> str:
+    """Суть шага одной фразой: цель, а если её нет — критерий готовности."""
+    def norm(text: str) -> str:
+        return " ".join(str(text or "").replace("`", "").split())
+
+    for source in ("goal", "dod"):
+        text = norm(step.get(source))
+        if not text:
+            continue
+        cut = text.find(". ")
+        if 0 < cut < limit:
+            return text[:cut + 1]
+        return text[:limit].rstrip(" ,;") + ("…" if len(text) > limit else "")
+    return norm(step.get("title"))[:limit]
 
 def status_text(ctx: dict, decision: dict) -> str:
     step = ctx.get("next") or {}
@@ -1428,6 +1445,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             return result
         result["watch"] = watch_idle(p.cfg, p, ctx, decision, say)
         return result
+    # ANCHOR:hold_risk_action — стабильная ссылка для спеки и ревью
     if action == "hold_risk":
         step = decision["data"]
         hold = {str(item).upper() for item in (state.get("hold_steps") or [])}
@@ -1471,7 +1489,14 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         result.update(applied=bool(cid), detail=f"карточка шага: {cid}")
         touch(f"create_step:{cid}")
         if cid:
-            say(f"план {plan_id}, шаг {step['id']} взят в работу — {step['title']} (карточка {cid})")
+            summary = _step_summary(step)
+            lines = [f"план {plan_id}, шаг {step['id']} взят в работу — {step['title']}",
+                     f"  что делаем: {summary}"]
+            dod = " ".join(str(step.get("dod") or "").split())
+            if dod and dod[:60] != summary[:60]:
+                lines.append(f"  готово, когда: {dod[:240]}")
+            lines.append(f"  карточка {cid}")
+            say(chr(10).join(lines))
         else:
             say(f"не смог создать карточку шага {step['id']} — проверь `hermes kanban ls`")
         return result
@@ -1529,8 +1554,17 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         result.update(applied=bool(cid), detail=f"карточка правок: {cid}")
         touch(f"create_fix:{cid}")
         if cid:
-            say(f"план {plan_id}, ревью {step['id']}: REQUEST_CHANGES → правки в работе (карточка {cid}), "
-                f"это единственный автоматический круг")
+            findings = _review_findings(Path(p.repo) / report_rel, 3)
+            msg = [f"план {plan_id}, ревью {step['id']}: нужны правки, это единственный "
+                   f"автоматический круг"]
+            if findings:
+                msg.append("  что нашёл ревьюер:")
+                msg += [f"  - {f}" for f in findings]
+            else:
+                msg.append("  замечания в отчёте — разбор ниже")
+            msg.append(f"  подробно: {report_rel}")
+            msg.append(f"  карточка правок {cid}")
+            say(chr(10).join(msg))
         else:
             say(f"ревью {step['id']}: REQUEST_CHANGES, но карточку правок создать не удалось")
         return result

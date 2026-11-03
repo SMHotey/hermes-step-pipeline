@@ -164,6 +164,7 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
     for label, text, _full in blocks:
         if len(text) < 15 or (label and label.startswith(_GOAL_SKIP_LABELS)):
             continue
+        # ANCHOR:критерий — стабильная ссылка для спеки и ревью
         if text.lower().startswith("готово"):
             continue
         cut = re.search(r"\s\d+\.\s", text)
@@ -177,10 +178,13 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
     risk = "normal"
     auto = False
     for label, text, full in blocks:
+        # ANCHOR:файлы — стабильная ссылка для спеки и ревью
         if label.startswith("файл"):
             files += [t for t in _backticks(text) if _looks_like_path(t)]
+        # ANCHOR:гейты — стабильная ссылка для спеки и ревью
         elif label.startswith(("тест", "гейт", "проверк")):
             gates.append(text)
+        # ANCHOR:заметки — стабильная ссылка для спеки и ревью
         elif label.startswith(("важно", "примечани", "ограничени")):
             notes.append(text)
         elif label.startswith("риск"):
