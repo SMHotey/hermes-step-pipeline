@@ -1075,6 +1075,18 @@ def setup_telegram(project: Path, driver: str, args, log: Log) -> str | None:
         log.warn(f"токен не принят: {exc}")
         return None
     log.ok(f"бот @{me.get('username', '?')} на связи")
+    # Вебхук на боте занимает getUpdates: команды из чата получали бы 409. Предупреждаем
+    # заранее, в мастере, а не молчаливым отказом стража (D8).
+    try:
+        hook = telegram.get_webhook_info(token)
+        hook_url = str((hook or {}).get("url") or "").strip()
+        if hook_url:
+            log.warn(f"на боте стоит вебхук {hook_url}: команды из чата работать не будут"
+                     " (getUpdates → 409)")
+            log.warn("снять вебхук: https://api.telegram.org/botTOKEN/deleteWebhook, "
+                     "затем python .pipeline/gate.py --commands-reset")
+    except telegram.TelegramError as exc:
+        log.warn(f"вебхук проверить не удалось: {exc}")
 
     chat = (getattr(args, "telegram_chat", "") or os.environ.get(CHAT_ENV) or "")
     if not chat:

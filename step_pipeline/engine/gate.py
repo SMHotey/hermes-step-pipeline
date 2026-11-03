@@ -66,6 +66,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -1293,12 +1294,14 @@ TG_TEXT_LIMIT = 3900
 
 TG_HELP = (
     "Команды конвейера:\n"
-    "/status — состояние: стоп-флаг и таблица планов\n"
+    "/status — состояние: решение стража, стоп-флаг и таблица планов\n"
     "/plans — только таблица планов\n"
     "/stop [причина] — остановиться после текущего шага\n"
     "/resume — снять стоп-флаг\n"
     "/hold S3 — шаг требует ручного допуска\n"
     "/unhold S3 — снять ручной допуск\n"
+    "/reset — начать диалог с агентом заново\n"
+    "Свободный текст без «/» уходит агенту: он ответит в этот же чат.\n"
     "Работают только из чата, указанного в настройках."
 )
 
@@ -1354,6 +1357,197 @@ def _write_offset(path: Path, offset: int) -> None:
         print(f"[commands] offset не сохранён: {exc}", file=sys.stderr)
 
 
+# ───────────────────────── диалог с агентом (S4) ─────────────────────────
+
+DIALOG_STATE_NAME = "tg_dialog.json"
+COMMANDS_OFF_NAME = "tg_commands_off.json"
+
+# Умолчания берутся из `notify.dialog` (config.py), чтобы числа шага жили в одном месте:
+# сюда попадает только запасной вариант для конфига, собранного до S4 (ключа `dialog` там
+# ещё нет), и `DEFAULTS` остаётся единственным источником значений.
+DIALOG_DEFAULTS = {
+    "enabled": True,
+    "max_turns": 8,
+    "run_budget": 200,
+    "timeout": 240,
+    "session_max_messages": 40,
+    "session_max_tokens": 120000,
+    "tokens_per_char": 0.34,
+    "toolsets": "web,file,skills,todo,memory,session_search",
+}
+
+
+def _as_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def dialog_settings(cfg: config_mod.Config) -> dict:
+    """Числа диалога: умолчания D3 поверх `notify.dialog`; мусор в конфиге не ломает."""
+    raw = cfg.notify.get("dialog") if isinstance(cfg.notify, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    defaults = DIALOG_DEFAULTS
+    return {
+        "enabled": raw.get("enabled", defaults["enabled"]) is not False,
+        "max_turns": _as_int(raw.get("max_turns"), defaults["max_turns"]),
+        "run_budget": _as_int(raw.get("run_budget"), defaults["run_budget"]),
+        "timeout": _as_int(raw.get("timeout"), defaults["timeout"]),
+        "session_max_messages": _as_int(raw.get("session_max_messages"),
+                                        defaults["session_max_messages"]),
+        "session_max_tokens": _as_int(raw.get("session_max_tokens"),
+                                      defaults["session_max_tokens"]),
+        "tokens_per_char": _as_float(raw.get("tokens_per_char"), defaults["tokens_per_char"]),
+        "toolsets": str(raw.get("toolsets") or defaults["toolsets"]),
+    }
+
+
+def _dialog_path(cfg: config_mod.Config) -> Path:
+    return Path(cfg.state_dir) / DIALOG_STATE_NAME
+
+
+def _read_dialogs(cfg: config_mod.Config) -> dict:
+    try:
+        data = json.loads(_dialog_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_dialogs(cfg: config_mod.Config, data: dict) -> None:
+    try:
+        state_io.save_json(_dialog_path(cfg), data)
+    except OSError as exc:
+        print(f"[commands] состояние диалога не сохранено: {exc}", file=sys.stderr)
+
+
+def _estimate_tokens(text: str, per_char: float) -> int:
+    """Оценка токенов по символам (D6): ceil(len * tokens_per_char)."""
+    return int(math.ceil(max(0, len(text or "")) * max(0.0, per_char)))
+
+
+def _dialog_item(dialogs: dict, key: str) -> dict:
+    """Запись диалога как словарь: испорченное значение не ломает разбор."""
+    item = dialogs.get(key) if isinstance(dialogs, dict) else None
+    return dict(item) if isinstance(item, dict) else {}
+
+
+def dialog_session(cfg: config_mod.Config, chat: str, text: str = "") -> dict:
+    """Сессия диалога чата; при исчерпании даты/сообщений/токенов — следующая (D6).
+
+    Имя сессии `tg-<chat>-<дата>-<N>`: `--continue` получает именно его, поэтому после
+    ротации агент начинает чистый диалог. Токены проецируются вместе с текущим вопросом —
+    иначе вопрос-простыня уходил бы в сессию, которая по счёту уже переполнена.
+    """
+    settings = dialog_settings(cfg)
+    today = time.strftime("%Y%m%d")
+    dialogs = _read_dialogs(cfg)
+    key = str(chat)
+    item = _dialog_item(dialogs, key)
+    serial = _as_int(item.get("serial"), 0)
+    messages = _as_int(item.get("messages"), 0)
+    tokens = _as_int(item.get("tokens"), 0)
+    date = str(item.get("date") or "")
+    fresh = serial < 1
+    rotated = False
+    if fresh:
+        serial, messages, tokens, date = 1, 0, 0, today
+    else:
+        projected = tokens + _estimate_tokens(text, settings["tokens_per_char"])
+        rotated = (date != today
+                   or messages + 2 > settings["session_max_messages"]
+                   or projected >= settings["session_max_tokens"])
+        if rotated:
+            serial, messages, tokens, date = serial + 1, 0, 0, today
+    session = {"chat": key, "date": date, "serial": serial, "messages": messages,
+               "tokens": tokens, "name": f"tg-{key}-{date}-{serial}",
+               "started": str(item.get("started") or "")}
+    if fresh or rotated or session["started"] != item.get("started"):
+        session["started"] = time.strftime("%d.%m.%Y %H:%M:%S")
+        dialogs[key] = dict(session)
+        _save_dialogs(cfg, dialogs)
+    return session
+
+
+def save_dialog_session(cfg: config_mod.Config, session: dict) -> None:
+    """Сохранить счётчики сессии (сообщения и токены) после ответа агента."""
+    dialogs = _read_dialogs(cfg)
+    dialogs[str(session.get("chat") or "")] = dict(session)
+    _save_dialogs(cfg, dialogs)
+
+
+def reset_dialog(cfg: config_mod.Config, chat: str) -> str:
+    """`/reset`: следующая реплика начнёт новую сессию (serial + 1)."""
+    today = time.strftime("%Y%m%d")
+    dialogs = _read_dialogs(cfg)
+    key = str(chat)
+    serial = _as_int(_dialog_item(dialogs, key).get("serial"), 0) + 1
+    dialogs[key] = {"chat": key, "date": today, "serial": serial, "messages": 0,
+                    "tokens": 0, "name": f"tg-{key}-{today}-{serial}",
+                    "started": time.strftime("%d.%m.%Y %H:%M:%S")}
+    _save_dialogs(cfg, dialogs)
+    return "диалог сброшен: следующий вопрос начнёт новую сессию"
+
+
+def _only_dialog_chat(cfg: config_mod.Config) -> str:
+    """Единственный чат в состоянии диалога — для вызова `/reset` без chat."""
+    dialogs = _read_dialogs(cfg)
+    return str(next(iter(dialogs))) if len(dialogs) == 1 else ""
+
+
+# ─────────────── запрет приёма команд после 409 (вебхук/второй поллер) ───────────────
+
+def _commands_off_path(cfg: config_mod.Config) -> Path:
+    return Path(cfg.state_dir) / COMMANDS_OFF_NAME
+
+
+def commands_off(cfg: config_mod.Config) -> dict:
+    """Причина, по которой приём команд выключен (пусто — приём включён)."""
+    try:
+        data = json.loads(_commands_off_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def clear_commands_off(cfg: config_mod.Config) -> bool:
+    """Снять маркер «приём команд выключен» (`--commands-reset`). True — снят сейчас."""
+    path = _commands_off_path(cfg)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        print(f"[commands] маркер не снят: {exc}", file=sys.stderr)
+        return False
+
+
+def _log_chat(cfg: config_mod.Config, action: str, detail: str,
+              started: float | None = None) -> None:
+    """Действие из чата — строкой в историю тиков (S3). Сбой записи ответ не ломает."""
+    try:
+        plan_id = _plan_paths(cfg).plan_id
+    except Exception:  # noqa: BLE001 - истории нужен план, но ответ владельцу важнее
+        plan_id = ""
+    duration = 0.0 if started is None else max(0.0, time.monotonic() - started)
+    try:
+        append_history(cfg, {"ts": time.time(), "at": time.strftime("%d.%m.%Y %H:%M:%S"),
+                             "plan": plan_id, "step": "", "action": action,
+                             "duration_s": round(duration, 3),
+                             "detail": str(detail or "")[:200], "commit": ""})
+    except OSError as exc:
+        print(f"[commands] история не записана: {exc}", file=sys.stderr)
+
+
 def plans_of(cfg: config_mod.Config) -> list:
     """Все ведомые планы; ошибки разбора не мешают ответить на команду."""
     try:
@@ -1383,6 +1577,15 @@ def tg_status(cfg: config_mod.Config) -> str:
         lines.append(plans_table(cfg))
     except Exception as exc:  # noqa: BLE001
         lines.append(f"(таблица планов недоступна: {exc})")
+    # Решение стража — то, что конвейер сделает дальше; `execute=False` на диск не пишет.
+    try:
+        p = _plan_paths(cfg)
+        dec = (run_gate(p, execute=False) or {}).get("decision") or {}
+        lines.append("")
+        lines.append(f"Решение стража (план {p.plan_id}): {dec.get('action') or '—'} — "
+                     f"{str(dec.get('reason') or '')[:200]}")
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - статус обязан отвечать
+        lines.append(f"решение стража недоступно: {exc}")
     return "\n".join(lines)
 
 
@@ -1418,8 +1621,12 @@ def _hold_change(cfg: config_mod.Config, step: str, add: bool) -> str:
     return "шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—")
 
 
-def handle_command(cfg: config_mod.Config, text: str) -> str:
-    """Разобрать одну команду владельца и вернуть текст ответа."""
+def handle_command(cfg: config_mod.Config, text: str, chat: str | None = None) -> str:
+    """Разобрать одну команду владельца и вернуть текст ответа.
+
+    `chat` нужен только `/reset` (диалог живёт на чат); вызов без него работает на
+    единственном чате из состояния, а если его нет — новая сессия начнётся и так.
+    """
     head, _, rest = (text or "").strip().partition(" ")
     cmd = head.split("@", 1)[0].lower()
     arg = rest.strip()
@@ -1438,6 +1645,11 @@ def handle_command(cfg: config_mod.Config, text: str) -> str:
         return "▶️ стоп снят, конвейер продолжит" if clear_stop(p) else "стоп-флага не было"
     if cmd in ("/hold", "/unhold"):
         return _hold_change(cfg, arg, add=cmd == "/hold")
+    if cmd == "/reset":
+        target = str(chat or _only_dialog_chat(cfg))
+        if not target:
+            return "диалог сброшен: следующий вопрос начнёт новую сессию"
+        return reset_dialog(cfg, target)
     return "не знаю такую команду. /help — список."
 
 
@@ -1455,14 +1667,21 @@ def owner_ids(cfg: config_mod.Config) -> set[str]:
 
 ANSI_RE = re.compile(chr(27) + r"\[[0-9;?]*[A-Za-z]")
 
+# Служебные строки одноразового ответа (`--cli --oneshot`): шапка профиля, строки сессии,
+# отчёты о вызовах инструментов. D4: такой строки в чате быть не должно.
+SERVICE_PREFIXES = (
+    "session_id:", "Session", "Hermes Agent", "Provider:", "Model:", "Mode:", "Toolsets:",
+    "Workspace:", "Resumed session", "↻", "⟳", "⚙", "🔧", "🛠", "📄", "🧠", "⎿", "↳",
+    "┌", "┐", "└", "┘", "│", "├", "┤", "─",
+)
+
 
 def clean_agent_output(text: str) -> str:
     """Ответ агента без служебных строк, CR и ANSI-цветов — чтобы чат читался."""
     raw = (text or "").replace(chr(13) + chr(10), chr(10)).replace(chr(13), chr(10))
     clean = ANSI_RE.sub("", raw)
     lines = [line for line in clean.splitlines()
-             if not line.strip().startswith(("session_id:", "Session:", "↻", "⟳"))
-             and "Resumed session" not in line]
+             if not line.strip().startswith(SERVICE_PREFIXES)]
     return chr(10).join(lines).strip()
 
 
@@ -1489,32 +1708,78 @@ def split_message(text: str, limit: int = 3500) -> list[str]:
         chunks.append(current)
     return chunks or [""]
 
-def ask_agent(cfg: config_mod.Config, text: str, chat: str, timeout: int = 240) -> str:
-    """Свободный текст владельца — в диалог с агентом профиля, сессия на чат."""
-    dialog = cfg.notify.get("dialog")
-    if isinstance(dialog, dict) and dialog.get("enabled") is False:
+def _timeout_answer(exc: subprocess.TimeoutExpired) -> str:
+    """Человеческий ответ на срез по времени (D5): без имени команды и цифр таймаута.
+
+    Частичный вывод из исключения сохраняется: если агент успел что-то сказать, владелец
+    это увидит, а не пустоту.
+    """
+    parts = []
+    for chunk in (getattr(exc, "output", None), getattr(exc, "stderr", None)):
+        if not chunk:
+            continue
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode("utf-8", "replace")
+        parts.append(str(chunk))
+    partial = clean_agent_output(chr(10).join(parts))[:500]
+    head = ("не успел ответить за отведённое время (notify.dialog.timeout): диалог разросся."
+            " Начать заново — /reset")
+    return f"{head} что успел сказать: {partial}" if partial else head
+
+
+def ask_agent(cfg: config_mod.Config, text: str, chat: str,
+              timeout: int | None = None) -> str:
+    """Свободный текст владельца — в диалог с агентом профиля, сессия на чат.
+
+    Потолки D3 держат ответ в тех же секундах, что и срез процесса: `--max-turns` и
+    `--run-budget` не дают агенту уйти в проект, `-t` снимает terminal/execute_code/
+    pipeline_run. `-Q` не ставится: частичный вывод нужен при срезе (D5).
+    """
+    settings = dialog_settings(cfg)
+    if not settings["enabled"]:
         return "диалог выключен (notify.dialog.enabled)"
-    cmd = [_hermes(), "-p", str(cfg.driver), "chat", "-q", text, "--oneshot", "-Q", "--cli",
-           "--continue", f"tg-{chat}", "--create-if-missing"]
+    limit = _as_int(timeout, settings["timeout"])
+    session = dialog_session(cfg, str(chat), text)
+    cmd = [_hermes(), "-p", str(cfg.driver), "chat", "-q", text, "--oneshot", "--cli",
+           "--continue", session["name"], "--create-if-missing",
+           "--max-turns", str(settings["max_turns"]),
+           "--run-budget", str(settings["run_budget"]),
+           "-t", settings["toolsets"]]
+    env = dict(os.environ, NO_COLOR="1", TERM="dumb", CLICOLOR="0")
     try:
-        env = dict(os.environ, NO_COLOR="1", TERM="dumb", CLICOLOR="0")
-        res = _run(cmd, None, timeout=timeout, env=env)
-    except Exception as exc:  # noqa: BLE001 - диалог не должен ронять опрос
-        return f"агент недоступен: {exc}"
+        res = _run(cmd, None, timeout=limit, env=env)
+    except subprocess.TimeoutExpired as exc:
+        return _timeout_answer(exc)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return (f"агент не ответил: сбой запуска ({type(exc).__name__}). "
+                "/reset — начать диалог заново.")
     out = clean_agent_output((res.stdout or "") + (res.stderr or ""))
     if not out:
-        return "агент не ответил (пустой ответ)"
+        return "агент не ответил (пустой ответ). /reset — начать диалог заново."
+    session["messages"] = _as_int(session.get("messages"), 0) + 2
+    session["tokens"] = _as_int(session.get("tokens"), 0) + _estimate_tokens(
+        text + out, settings["tokens_per_char"])
+    save_dialog_session(cfg, session)
     return out[: TG_TEXT_LIMIT - 100]
+
 
 def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) -> dict:
     """Один опрос getUpdates: выполнить команды владельца и ответить в тот же чат.
 
     Offset хранится в state_dir/tg_offset.json, поэтому повторный опрос не выполняет
     команду дважды. Отвечаем только в настроенный чат; чужие сообщения игнорируются.
+    Ответ 409 (вебхук или второй поллер) выключает приём команд одной записью маркера:
+    предупреждение уходит один раз, дальше функция выходит до запроса в сеть.
     """
-    result = {"ok": False, "handled": 0, "ignored": 0, "reason": ""}
+    result = {"ok": False, "handled": 0, "ignored": 0, "reason": "", "disabled": False}
     if not commands_enabled(cfg):
         result["reason"] = "приём команд выключен (notify.commands.enabled)"
+        return result
+    off = commands_off(cfg)
+    if off:
+        result["disabled"] = True
+        result["reason"] = (f"приём команд выключен до устранения: {off.get('reason', '')} "
+                            "(снять: --commands-reset)")
         return result
     target = tg_target(cfg)
     if target is None:
@@ -1527,8 +1792,20 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
                     offset=offset or None, limit=max_updates, timeout=int(wait))
     if not data.get("ok"):
         code = data.get("error_code")
-        result["reason"] = ("на боте стоит вебхук: getUpdates запрещён (409), сними его"
-                            if code == 409 else str(data.get("description") or "Telegram не ответил"))
+        if code == 409:
+            reason = ("на боте стоит вебхук или второй поллер: getUpdates запрещён (409); "
+                      "приём команд выключен до перезапуска")
+            result.update(disabled=True, reason=reason)
+            try:
+                state_io.save_json(_commands_off_path(cfg), {
+                    "at": time.strftime("%d.%m.%Y %H:%M:%S"), "reason": reason})
+            except OSError as exc:
+                print(f"[commands] маркер не записан: {exc}", file=sys.stderr)
+            notify(cfg, "⛔ " + reason
+                   + ". Снять вебхук и выполнить: python .pipeline/gate.py --commands-reset")
+            _log_chat(cfg, "tg_conflict", reason)
+            return result
+        result["reason"] = str(data.get("description") or "Telegram не ответил")
         print(f"[commands] опрос не удался: {result['reason']}", file=sys.stderr)
         return result
     newest = offset
@@ -1543,6 +1820,7 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
             result["ignored"] += 1
             print(f"[commands] чужой отправитель {sender_id or '?'} — игнор", file=sys.stderr)
             continue
+        started = time.monotonic()
         if not text.startswith("/"):
             answer = ask_agent(cfg, text, chat)
             for chunk in split_message(answer):
@@ -1551,16 +1829,18 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
                 if not sent.get("ok"):
                     print(f"[commands] ответ не доставлен: {sent.get('description')}", file=sys.stderr)
                     break
+            _log_chat(cfg, "tg_dialog", text, started)
             result["handled"] += 1
             continue
         try:
-            answer = handle_command(cfg, text)
+            answer = handle_command(cfg, text, chat)
         except Exception as exc:  # noqa: BLE001 - команда не должна ронять тик
             answer = f"ошибка выполнения {text.split()[0]}: {exc}"
         sent = _tg_call(token, "sendMessage", chat_id=chat, text=answer[:TG_TEXT_LIMIT],
                         disable_web_page_preview="true")
         if not sent.get("ok"):
             print(f"[commands] ответ не доставлен: {sent.get('description')}", file=sys.stderr)
+        _log_chat(cfg, "tg_command", text, started)
         result["handled"] += 1
     if newest > offset:
         _write_offset(path, newest)
@@ -2266,6 +2546,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="принять команды владельца из Telegram (getUpdates) и ответить в чат")
     ap.add_argument("--commands-wait", type=int, default=0,
                     help="секунды длинного опроса для --commands (0 — без ожидания)")
+    ap.add_argument("--commands-reset", action="store_true",
+                    help="снять маркер «приём команд выключен» (после 409 от вебхука)")
     args = ap.parse_args(argv)
 
     try:
@@ -2294,6 +2576,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(plans_table(cfg))
             return 0
 
+        if args.commands_reset:
+            cleared = clear_commands_off(cfg)
+            print("приём команд снова включён" if cleared
+                  else "приём команд не был выключен")
+            return 0
+
         if args.commands:
             result = poll_commands(cfg, wait=args.commands_wait)
             if args.json:
@@ -2302,7 +2590,10 @@ def main(argv: list[str] | None = None) -> int:
                 tail = f" ({result['reason']})" if result.get("reason") else ""
                 extra = f", чужих проигнорировано: {result['ignored']}" if result.get("ignored") else ""
                 print(f"команд обработано: {result['handled']}{extra}{tail}")
-            return 0 if result.get("ok") or not commands_enabled(cfg) else 1
+            # Выключенный приём команд — не сбой джобы: иначе cron будет слать ошибки,
+            # пока владелец не снимет вебхук или не включит команды обратно.
+            return 0 if (result.get("ok") or result.get("disabled")
+                         or not commands_enabled(cfg)) else 1
 
         try:
             p = resolve_paths(cfg, args.plan)

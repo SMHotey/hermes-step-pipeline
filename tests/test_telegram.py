@@ -2,9 +2,11 @@
 """Telegram Bot API: проверка токена, отправка, поиск чата — на локальном фейковом сервере."""
 from __future__ import annotations
 
+import io
 import json
 import sys
 import threading
+import urllib.error
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +43,8 @@ class FakeBot(BaseHTTPRequestHandler):
                 {"update_id": 7, "message": {"chat": {"id": 4242}, "text": "/start"}}]})
         if method == "getChat":
             return self._json(200, {"ok": True, "result": {"id": params.get("chat_id")}})
+        if method == "getWebhookInfo":
+            return self._json(200, {"ok": True, "result": {"url": ""}})
         if method == "sendMessage":
             return self._json(200, {"ok": True, "result": {"message_id": 1}})
         return self._json(404, {"ok": False, "description": "not found"})
@@ -100,6 +104,82 @@ def test_validate_chat(bot):
 
 def test_detect_chat(bot):
     assert telegram.detect_chat("good", wait_seconds=5) == "4242"
+
+
+def test_get_webhook_info(bot):
+    assert telegram.get_webhook_info("good") == {"url": ""}
+    assert bot.sent[-1]["method"] == "getWebhookInfo"
+
+
+def _response(payload: dict):
+    """Подделка ответа urlopen: читается как контекстный менеджер и отдаёт JSON."""
+
+    class Response:
+        def read(self):
+            return json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    return Response()
+
+
+def test_call_retries_network_failure(monkeypatch):
+    """TLS handshake timeout — не повод терять команду: три попытки с паузами (D9)."""
+    attempts: list[object] = []
+    pauses: list[float] = []
+
+    def fake_urlopen(request, timeout=20):
+        attempts.append(request)
+        if len(attempts) < 3:
+            raise urllib.error.URLError("TLS handshake timeout")
+        return _response({"ok": True, "result": {"id": 1}})
+
+    monkeypatch.setattr(telegram.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(telegram.time, "sleep", lambda value: pauses.append(value))
+
+    assert telegram.get_me("good")["id"] == 1
+    assert len(attempts) == 3
+    assert pauses == [0.5, 1.0]
+
+
+def test_call_does_not_retry_bad_token(monkeypatch):
+    """401 — окончательный отказ: повтор не нужен и не делается."""
+    calls: list[object] = []
+
+    def fake_urlopen(request, timeout=20):
+        calls.append(request)
+        raise urllib.error.HTTPError("https://bot.invalid/botgood/getMe", 401,
+                                     "Unauthorized", {},
+                                     io.BytesIO(json.dumps({"ok": False,
+                                                            "description": "Unauthorized"}).encode()))
+
+    monkeypatch.setattr(telegram.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(telegram.time, "sleep", lambda _value: pytest.fail("повтор не нужен"))
+
+    with pytest.raises(telegram.TelegramError, match="Unauthorized"):
+        telegram.get_me("good")
+    assert len(calls) == 1
+
+
+def test_detect_chat_survives_transient_error(monkeypatch):
+    """Сетевой отказ одного опроса не обрывает ловлю chat id (D9)."""
+    calls: list[str] = []
+
+    def fake(token, method, http_timeout=15, **params):
+        calls.append(method)
+        if len(calls) == 1:
+            raise telegram.TelegramError("сеть недоступна: TLS handshake timeout")
+        return [{"update_id": 7, "message": {"chat": {"id": 4242}, "text": "/start"}}]
+
+    monkeypatch.setattr(telegram, "_call", fake)
+    monkeypatch.setattr(telegram.time, "sleep", lambda _value: None)
+
+    assert telegram.detect_chat("good", wait_seconds=10) == "4242"
+    assert calls == ["getUpdates", "getUpdates"]
 
 
 def test_detect_chat_timeout(monkeypatch, bot):

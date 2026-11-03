@@ -102,6 +102,7 @@ def test_setup_telegram_writes_env_and_enables_notify(tmp_path: Path, monkeypatc
 
     sent: list[tuple] = []
     monkeypatch.setattr(setup_flow.telegram, "get_me", lambda token: {"username": "demo_bot"})
+    monkeypatch.setattr(setup_flow.telegram, "get_webhook_info", lambda token: {"url": ""})
     monkeypatch.setattr(setup_flow.telegram, "validate_chat", lambda token, chat: {"id": chat})
     monkeypatch.setattr(setup_flow.telegram, "send_message",
                         lambda token, chat, text: sent.append((chat, text)) or True)
@@ -116,6 +117,22 @@ def test_setup_telegram_writes_env_and_enables_notify(tmp_path: Path, monkeypatc
     cfg = json.loads((target / "pipeline.json").read_text(encoding="utf-8"))
     assert cfg["notify"]["enabled"] is True
     assert sent and "подключены" in sent[0][1]
+
+
+def test_setup_warns_about_webhook(tmp_path: Path, monkeypatch, capsys, fake_hermes):
+    """Вебхук на боте занимает getUpdates: мастер предупреждает заранее (D8, S4)."""
+    target = tmp_path / "shop"
+    target.mkdir()
+    monkeypatch.setattr(setup_flow.proj, "profile_dir", lambda p: tmp_path / "h" / p)
+    monkeypatch.setattr(setup_flow.telegram, "get_me", lambda token: {"username": "demo_bot"})
+    monkeypatch.setattr(setup_flow.telegram, "get_webhook_info",
+                        lambda token: {"url": "https://example.test/hook"})
+
+    setup_flow.run_setup(args(project=str(target), board="shop", driver="shop",
+                              no_telegram=False, telegram_token="123:ABC",
+                              telegram_chat="42", no_test=True))
+    out = capsys.readouterr().out
+    assert "вебхук" in out and "getUpdates → 409" in out
 
 
 def test_bad_token_leaves_notifications_off(tmp_path: Path, monkeypatch, fake_hermes):

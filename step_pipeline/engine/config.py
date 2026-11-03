@@ -71,6 +71,19 @@ DEFAULTS: dict = {
         # Приём команд владельца из чата (getUpdates в тике). Включён там, где включены
         # уведомления; `wait` — секунды длинного опроса в отдельной джобе.
         "commands": {"enabled": True, "wait": 0},
+        # Диалог со свободным текстом (S4): потолки держат ответ в 240 секундах и не дают
+        # агенту превратить вопрос в прогон тестов. toolsets — список через запятую для
+        # `hermes chat -t`; terminal/execute_code/pipeline_run в нём быть не должно.
+        "dialog": {
+            "enabled": True,
+            "max_turns": 8,
+            "run_budget": 200,
+            "timeout": 240,
+            "session_max_messages": 40,
+            "session_max_tokens": 120000,
+            "tokens_per_char": 0.34,
+            "toolsets": "web,file,skills,todo,memory,session_search",
+        },
     },
 }
 
