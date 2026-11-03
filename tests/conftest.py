@@ -22,6 +22,20 @@ def project(tmp_path: Path) -> Path:
     return install_project(tmp_path / "project")
 
 
+@pytest.fixture(autouse=True)
+def isolated_hermes_home(tmp_path: Path, monkeypatch) -> Path:
+    """Тесты не трогают настоящий HERMES_HOME.
+
+    Причина: `setup --upgrade` убирает из `plugins/` копии плагина с прежним именем
+    (`quarantine_stale_plugins`), а `ensure_plugin_enabled` зовёт `hermes plugins enable`.
+    Без изоляции прогон тестов переставлял бы плагины разработчика.
+    """
+    home = tmp_path / "hermes-home"
+    (home / "plugins").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
 @pytest.fixture()
 def hermes_stub(tmp_path: Path, monkeypatch) -> Path:
     """Поддельный `hermes` в PATH: карточки пишутся в sqlite, борда не трогается."""

@@ -878,3 +878,64 @@ def test_index_has_step_screen_markup():
                    "stepPairLoaded", "hold.allowed !== false"):
         assert anchor in html
 
+
+def test_health_reports_version_and_ui_sha(server):
+    """Панель должна знать, какую версию и какую страницу ей отдал сервер."""
+    base = server["url"]
+    with urllib.request.urlopen(base + "/api/health", timeout=5) as res:
+        data = json.loads(res.read().decode("utf-8"))
+    assert data["ok"] is True
+    assert data["version"] and data["version"] != "0"
+    assert data["ui_sha"] == ui_server.ui_sha()
+    assert len(data["ui_sha"]) == 12
+
+
+def test_busy_port_is_reported_not_silently_reused(tmp_path, hermes_stub):
+    """Двойная привязка на Windows: старый UI отвечает, новый молчит — это ловим."""
+    root = install_project(tmp_path / "busy-project", board="busyboard")
+    httpd = ui_server.make_server(root, port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    try:
+        assert ui_server.busy_version(host, port) == ui_server.plugin_version()
+        with pytest.raises(RuntimeError) as err:
+            ui_server.serve(root, host=host, port=port, open_browser=False)
+        assert "занят" in str(err.value)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_busy_version_none_on_free_port():
+    """Свободный порт — не ошибка: проверка не должна мешать запуску."""
+    assert ui_server.busy_version("127.0.0.1", 9) is None
+
+
+def test_snapshot_carries_ui_version(server):
+    """Версия и отпечаток страницы — в самом снимке: панель читает их из любого кадра."""
+    code, data = get(server["url"] + "/api/snapshot")
+    assert code == 200
+    assert data["version"] == ui_server.plugin_version()
+    assert data["ui_sha"] == ui_server.ui_sha()
+
+
+def test_events_frame_carries_ui_version(server):
+    """SSE-кадр собирается тем же путём: иначе версия «?» на живой панели."""
+    url = server["url"] + "/api/events"
+    with urllib.request.urlopen(url, timeout=10) as res:
+        buf: list[str] = []
+        while len(buf) < 200:
+            line = res.readline().decode("utf-8", "replace")
+            if not line:
+                break
+            buf.append(line)
+            if line.strip() == "":
+                break
+    chunk = "".join(buf)
+    frame = None
+    for ln in chunk.splitlines():
+        if ln.startswith("data: "):
+            frame = json.loads(ln[6:])
+            break
+    assert frame is not None, chunk[:300]
+    assert frame["version"] == ui_server.plugin_version()

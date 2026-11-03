@@ -237,8 +237,13 @@ def cmd_ui(args) -> int:
         print(f"UI конвейера: {result['url']}{extra}")
         print(f"остановить:  hermes pipeline ui --project \"{project}\" --stop")
         return 0
-    url = ui_server.serve(project, host=args.host, port=port,
-                          open_browser=not args.no_open, preview=preview, board=board)
+    try:
+        url = ui_server.serve(project, host=args.host, port=port,
+                              open_browser=not args.no_open, preview=preview,
+                              board=board)
+    except RuntimeError as exc:
+        print(f"ошибка: {exc}", file=sys.stderr)
+        return 1
     print(f"UI конвейера: {url}  (Ctrl+C — остановить)")
     try:
         while True:

@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import webbrowser
@@ -27,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
+import urllib.request
 
 try:
     from . import plan_mode
@@ -40,6 +42,35 @@ except ImportError:  # pragma: no cover
     import telegram  # type: ignore
 
 UI_FILE = Path(__file__).resolve().parent / "ui" / "index.html"
+
+def plugin_version() -> str:
+    """Версия плагина из plugin.yaml — панель показывает, что именно отдаёт сервер."""
+    try:
+        text = (Path(__file__).resolve().parent / "plugin.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return "0"
+    match = re.search(r"(?m)^version:\s*['\"]?([^'\"\s]+)", text)
+    return match.group(1) if match else "0"
+
+
+def ui_sha() -> str:
+    """Отпечаток отдаваемой страницы: отличает свежий UI от старой копии плагина."""
+    try:
+        return hashlib.sha256(UI_FILE.read_bytes()).hexdigest()[:12]
+    except OSError:
+        return ""
+
+
+def busy_version(host: str, port: int, timeout: float = 0.5) -> str | None:
+    """Кто уже отвечает на порту: версия UI или None, если порт свободен."""
+    url = f"http://{host}:{port}/api/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as res:
+            data = json.loads(res.read().decode("utf-8", "replace"))
+    except Exception:                                        # noqa: BLE001
+        return None
+    return str(data.get("version") or "?")
+
 CONFIG_KEYS = ("project", "board", "driven_plans", "require_prompt")
 CSP = ("default-src 'none'; script-src 'self' 'unsafe-inline'; "
        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
@@ -343,6 +374,17 @@ class Handler(BaseHTTPRequestHandler):
             value = default
         return max(1, min(value, 5000))
 
+    def _snapshot_with_version(self, plan: str | None) -> bytes:
+        """Снимок + версия UI: панель показывает, что именно ей отдал сервер."""
+        body = self._snapshot_body(plan)
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except ValueError:
+            return body
+        data["version"] = plugin_version()
+        data["ui_sha"] = ui_sha()
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+
     def _snapshot_body(self, plan: str | None) -> bytes:
         """Тело ответа `/api/snapshot`: снимок + журнал сервера + режим планировщика + ok."""
         data = snap.snapshot(self.state.project, plan, preview=self.state.preview,
@@ -378,7 +420,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             stamp = snap.fingerprint(self.state.project, plan, self.state.preview,
                                      self.state.board)
-            self._event_frame(self._snapshot_body(plan))
+            self._event_frame(self._snapshot_with_version(plan))
             started = last_ping = time.monotonic()
             while time.monotonic() - started < EVENTS_MAX_SECONDS:
                 time.sleep(EVENTS_POLL)
@@ -387,7 +429,7 @@ class Handler(BaseHTTPRequestHandler):
                                            self.state.board)
                 if current != stamp:
                     stamp = current
-                    self._event_frame(self._snapshot_body(plan))
+                    self._event_frame(self._snapshot_with_version(plan))
                     last_ping = now
                 elif now - last_ping >= EVENTS_PING_SECONDS:
                     self.wfile.write(b": ping\n\n")
@@ -414,7 +456,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/snapshot":
             try:
-                body = self._snapshot_body(self._plan_param())
+                body = self._snapshot_with_version(self._plan_param())
             except Exception as exc:                            # noqa: BLE001
                 self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
                 return
@@ -435,7 +477,8 @@ class Handler(BaseHTTPRequestHandler):
             self._get_file()
             return
         if path == "/api/health":
-            self._json(200, {"ok": True, "root": str(self.state.project)})
+            self._json(200, {"ok": True, "root": str(self.state.project),
+                                   "version": plugin_version(), "ui_sha": ui_sha()})
             return
         self._json(404, {"ok": False, "error": "нет такого маршрута"})
 
@@ -558,6 +601,12 @@ def serve(project: Path, host: str = "127.0.0.1", port: int = 8770,
           open_browser: bool = True, preview: bool = False,
           board: str | None = None) -> str:
     """Запустить UI в фоновом потоке и вернуть URL."""
+    busy = busy_version(host, port)
+    if busy:
+        # Windows разрешает двум процессам слушать один порт (SO_REUSEADDR), поэтому
+        # старый сервер продолжает отвечать, а новый молча простаивает.
+        raise RuntimeError(f"порт {port} занят другим UI конвейера (версия {busy}); "
+                           f"останови его: hermes pipeline ui --stop, или задай --port")
     server = make_server(project, host, port, preview=preview, board=board)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="pipeline-ui")
     thread.start()

@@ -32,8 +32,10 @@ hermes plugins update step_pipeline           # обновление
 
 Версия плагина — semver в `plugin.yaml` и теги `vX.Y.Z`; что менялось — `CHANGELOG.md`.
 Движок в проектах помечен `.pipeline/VERSION`: `hermes pipeline setup --upgrade`
-обновляет его, не трогая `pipeline.json`, роли и cron. `hermes pipeline doctor`
-ругается, если движок в проекте отстал от плагина.
+приводит его и роли `.hermes/skills/` к версии плагина, не трогая `pipeline.json` и cron.
+Прежняя копия обновлённой роли уезжает в `.pipeline/roles-backup/` — правка проекта
+не пропадает молча. `hermes pipeline doctor` ругается, если движок в проекте отстал
+от плагина.
 
 ## Что спросит мастер `hermes pipeline setup`
 

@@ -178,6 +178,56 @@ def test_engine_copy_updates_changed_file(tmp_path: Path, fake_hermes):
     assert "Страж шага" in gate.read_text(encoding="utf-8")
 
 
+def test_upgrade_refreshes_changed_role_and_keeps_backup(tmp_path: Path, fake_hermes,
+                                                         monkeypatch):
+    """Правка `step_pipeline/roles/` доезжает до поставленного проекта, старая не пропадает."""
+    monkeypatch.setattr(setup_flow, "ensure_plugin_enabled", lambda profile, log: "пропущено")
+    target = tmp_path / "shop"
+    target.mkdir()
+    setup_flow.run_setup(args(project=str(target), board="shop"))
+    role_dir = target / ".hermes" / "skills" / "software-development" / "pipeline-reviewer"
+    role = role_dir / "SKILL.md"
+    role.write_text("старая версия роли\n", encoding="utf-8")
+    (role_dir / "лишний.md").write_text("файл, которого нет в плагине\n", encoding="utf-8")
+
+    assert setup_flow.run_setup(args(project=str(target), upgrade=True)) == 0
+
+    plugin_role = proj.ROLES_SRC / "pipeline-reviewer" / "SKILL.md"
+    assert role.read_text(encoding="utf-8") == plugin_role.read_text(encoding="utf-8")
+    assert not (role_dir / "лишний.md").exists(), "роль — вендоренная копия: лишнее уходит"
+    backups = list((target / ".pipeline" / "roles-backup").glob("pipeline-reviewer-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "SKILL.md").read_text(encoding="utf-8") == "старая версия роли\n"
+
+
+def test_upgrade_leaves_fresh_roles_alone(tmp_path: Path, fake_hermes, monkeypatch, capsys):
+    """Второй upgrade ничего не переписывает и не плодит бэкапы."""
+    monkeypatch.setattr(setup_flow, "ensure_plugin_enabled", lambda profile, log: "пропущено")
+    target = tmp_path / "shop"
+    target.mkdir()
+    setup_flow.run_setup(args(project=str(target), board="shop"))
+    capsys.readouterr()
+    assert setup_flow.run_setup(args(project=str(target), upgrade=True)) == 0
+    out = capsys.readouterr().out
+    assert "обновлена роль" not in out
+    assert "движок и роли уже актуальны" in out
+    assert not (target / ".pipeline" / "roles-backup").exists()
+
+
+def test_setup_refreshes_roles_only_with_force(tmp_path: Path, fake_hermes):
+    """Повторный `setup` без `--force` оставляет правку проекта в роли."""
+    target = tmp_path / "shop"
+    target.mkdir()
+    setup_flow.run_setup(args(project=str(target), board="shop"))
+    role = (target / ".hermes" / "skills" / "software-development" /
+            "pipeline-reviewer" / "SKILL.md")
+    role.write_text("проектная правка\n", encoding="utf-8")
+    setup_flow.run_setup(args(project=str(target), board="shop"))
+    assert role.read_text(encoding="utf-8") == "проектная правка\n"
+    setup_flow.run_setup(args(project=str(target), board="shop", force=True))
+    assert role.read_text(encoding="utf-8") != "проектная правка\n"
+
+
 def test_cron_script_written(monkeypatch, tmp_path: Path):
     home = tmp_path / "home"
     monkeypatch.setattr(setup_flow.proj, "profile_dir", lambda p: home / "profiles" / p)

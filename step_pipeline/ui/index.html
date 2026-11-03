@@ -159,6 +159,7 @@
   <h1>Конвейер шагов</h1>
   <span class="badge mono" id="project">—</span>
   <span class="badge mono" id="board">—</span>
+  <span class="badge mono" id="ui-ver" title="версия движка и отпечаток страницы">—</span>
   <span class="badge" id="mode">…</span>
   <span class="badge" id="telegram">telegram</span>
   <label class="plan-mode" title="действует со следующей сессии">
@@ -618,6 +619,19 @@ function renderStep(data) {
 function render(data) {
   $("project").textContent = data.project || "—";
   $("board").textContent = "борда: " + (data.board || "—");
+  if ($("ui-ver")) $("ui-ver").textContent = "движок " + (data.version || "?")
+    + " · ui " + (data.ui_sha || "?");
+  // Первый снимок: план не выбран — берём текущий план сервера, иначе первый, у которого
+  // есть следующий шаг. Иначе экран «Шаг» открывается пустым («шаг не выбран»).
+  if (!currentPlan) {
+    const candidate = (data.plan && data.plan.id)
+      || ((data.plans || []).find((p) => p.next && p.next !== "—") || {}).id;
+    if (candidate) {
+      currentPlan = String(candidate);
+      etag = null;
+      setTimeout(refresh, 0);
+    }
+  }
   const decision = data.decision || {};
   const stopped = (data.plans || []).some((p) => p.stop);
   const mode = $("mode");

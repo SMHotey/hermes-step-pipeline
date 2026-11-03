@@ -14,11 +14,13 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import sqlite3
 import stat
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,8 @@ ENGINE_FILES = ("__init__.py", "config.py", "registry.py", "next_step.py", "gate
 #: Без него копия в проекте может молча разойтись с плагином при равном VERSION
 #: (прецедент 02.11.2026: 527 строк разницы в gate.py при 0.2.0 у обоих).
 ENGINE_MARKER = "ENGINE.sha256"
+#: Куда `setup --upgrade` складывает прежнюю копию роли перед перезаписью.
+ROLES_BACKUP = ".pipeline/roles-backup"
 
 
 def engine_digest(base) -> str:
@@ -289,6 +293,86 @@ def engine_version(project: Path) -> str:
         return ""
 
 
+def hermes_home() -> Path:
+    """Корень Hermes: HERMES_HOME, иначе LOCALAPPDATA/hermes, иначе ~/.hermes."""
+    env = os.environ.get("HERMES_HOME")
+    if env:
+        return Path(env)
+    local = os.environ.get("LOCALAPPDATA")
+    if local and (Path(local) / "hermes").is_dir():
+        return Path(local) / "hermes"
+    return Path.home() / ".hermes"
+
+
+def _plugin_roots() -> list[Path]:
+    home = hermes_home()
+    roots = [home / "plugins"]
+    roots += sorted((home / "profiles").glob("*/plugins"))
+    return [root for root in roots if root.is_dir()]
+
+
+def quarantine_stale_plugins(log: Log) -> list[str]:
+    """Убрать из plugins/ копии нашего плагина с прежним именем.
+
+    Hermes грузит плагин по имени из манифеста, поэтому лежащая рядом старая копия
+    (`step-pipeline`, `step_pipeline.bak-*`) перекрывает свежую: панель отдаёт старую
+    страницу, а `hermes pipeline` может не найтись вовсе.
+    """
+    home = hermes_home()
+    moved: list[str] = []
+    for root in _plugin_roots():
+        scope = "global" if root.parent == home else root.parent.name
+        for sub in sorted(root.iterdir()):
+            manifest = sub / "plugin.yaml"
+            if not sub.is_dir() or not manifest.is_file():
+                continue
+            try:
+                text = manifest.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            found = re.search(r"(?m)^name:\s*([^\s]+)", text)
+            name = found.group(1) if found else ""
+            if name.replace("-", "_") != "step_pipeline":
+                continue
+            if sub.name == "step_pipeline" and name == "step_pipeline":
+                continue
+            dest = home / "plugin-backups" / scope / sub.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                dest = dest.with_name(dest.name + "-2")
+            try:
+                shutil.move(str(sub), str(dest))
+            except OSError as exc:
+                log.warn(f"старую копию плагина не удалось убрать: {sub.name} ({exc})")
+                continue
+            moved.append(f"{scope}/{sub.name}")
+            log.warn(f"старая копия плагина убрана из plugins/: {sub.name} → plugin-backups/{scope}/")
+    return moved
+
+
+def ensure_plugin_enabled(profile: str, log: Log) -> str:
+    """Включить текущий id плагина в профиле и проверить, что команда `pipeline` есть."""
+    hermes = shutil.which("hermes") or "hermes"
+    try:
+        res = subprocess.run([hermes, "-p", profile, "plugins", "enable", "step_pipeline"],
+                             capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warn(f"плагин не включён автоматически: {exc}")
+        return f"включение плагина не удалось ({exc})"
+    out = ((res.stdout or "") + (res.stderr or "")).strip()
+    if res.returncode != 0:
+        log.warn(f"`plugins enable step_pipeline` вернул {res.returncode}: {out}")
+        return "плагин не включён"
+    check = subprocess.run([hermes, "-p", profile, "pipeline", "--help"],
+                           capture_output=True, text=True, timeout=120)
+    if check.returncode != 0:
+        log.warn("команда `hermes pipeline` не отвечает после включения плагина — "
+                 "перезапусти сессию профиля")
+        return "плагин включён, команда проверится в новой сессии"
+    log.ok(f"плагин step_pipeline включён в профиле {profile}")
+    return "плагин включён и команда отвечает"
+
+
 def refresh_tick_script(project: Path, log: Log) -> str:
     """Обновить установленный тик-скрипт профиля драйвера, если cron заводили.
 
@@ -306,8 +390,10 @@ def refresh_tick_script(project: Path, log: Log) -> str:
 
 
 def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
-    """Обновить движок в уже поставленном проекте, не трогая конфиг и роли.
+    """Обновить движок и роли в уже поставленном проекте, не трогая конфиг.
 
+    Роли синхронизируются с плагином (прежняя версия уходит в `.pipeline/roles-backup/`):
+    иначе правки `step_pipeline/roles/` до поставленного проекта не доезжают вовсе.
     Доверие проекту оформляется тем же ролям, что и при установке; `trust=False`
     (флаг `--no-trust`) пропускает его и пишет предупреждение.
     """
@@ -317,15 +403,20 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
         return 2
     was = engine_version(project) or "?"
     changed = copy_engine(project, force=False)
-    roles = copy_roles(project)
+    roles = copy_roles(project, refresh=True)
     now = write_engine_version(project)
     write_engine_marker(project)
     for item in changed:
         log.ok(f"обновлён {item}")
-    for item in roles:
+    for item in roles.added:
         log.ok(f"добавлена роль {item}")
-    if not changed and not roles:
-        log.ok(f"движок уже актуален ({now})")
+    for item in roles.refreshed:
+        log.ok(f"обновлена роль {item} (прежняя версия: {roles.backups[item]})")
+    if not changed and not roles.added and not roles.refreshed:
+        log.ok(f"движок и роли уже актуальны ({now})")
+    quarantine_stale_plugins(log)
+    driver = roles_from_config(proj.read_config(project))[0]
+    plugin_state = ensure_plugin_enabled(driver, log)
     tick = refresh_tick_script(project, log)
     if trust:
         failed = trust_roles(roles_from_config(proj.read_config(project)), project, log)
@@ -334,25 +425,62 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
     else:
         log.warn("доверие проекту не оформлялось (--no-trust)")
         tail = "доверие ролям пропущено (--no-trust)"
-    log.step(f"── Движок: {was} → {now}. Конфиг, telegram и cron-джоба не тронуты; "
-             f"{tick}; {tail} ──")
+    log.step(f"── Движок: {was} → {now}, роли: {len(roles.refreshed)} обновлено. "
+             f"Конфиг, telegram и cron-джоба не тронуты; {tick}; {tail} ──")
     return 0
 
 
-def copy_roles(project: Path) -> list[str]:
-    """Роли в `.hermes/skills/<категория>/<имя>` — только если ещё нет."""
-    copied: list[str] = []
+@dataclass
+class RolesSync:
+    """Итог синхронизации ролей проекта: добавленные, перезаписанные и где их бэкап."""
+
+    added: list[str] = field(default_factory=list)
+    refreshed: list[str] = field(default_factory=list)
+    backups: dict[str, str] = field(default_factory=dict)
+
+
+def _role_files(root: Path) -> dict[str, bytes]:
+    """Файлы роли без байткода: относительный путь → содержимое."""
+    files: dict[str, bytes] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        files[path.relative_to(root).as_posix()] = path.read_bytes()
+    return files
+
+
+def copy_roles(project: Path, *, refresh: bool = False) -> RolesSync:
+    """Роли в `.hermes/skills/<категория>/<имя>`.
+
+    Без `refresh` копируются только недостающие: повторный `setup` не переписывает
+    поставленное. С `refresh` (так делает `setup --upgrade`) роль приводится к версии
+    плагина, а прежняя копия уезжает в `.pipeline/roles-backup/<роль>-<время>/` —
+    правка проекта не пропадает молча. Причина: улучшения ролей живут в
+    `step_pipeline/roles/`, `.hermes/` в проекте — вендоренная копия; до 0.6.0 она
+    не обновлялась никогда, и правки роли не доезжали до уже поставленных проектов.
+    """
+    result = RolesSync()
     for name, category in SKILL_CATEGORIES.items():
         src = proj.ROLES_SRC / name
         if not src.is_dir():
             continue
+        rel = f".hermes/skills/{category}/{name}"
         dest = project / ".hermes" / "skills" / category / name
-        if dest.exists():
+        if not dest.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__"))
+            result.added.append(rel)
             continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dest)
-        copied.append(f".hermes/skills/{category}/{name}")
-    return copied
+        if not refresh or _role_files(dest) == _role_files(src):
+            continue
+        backup = project / ROLES_BACKUP / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(dest, backup, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.rmtree(dest)
+        shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__"))
+        result.refreshed.append(rel)
+        result.backups[rel] = backup.relative_to(project).as_posix()
+    return result
 
 
 def ensure_dirs(project: Path) -> list[str]:
@@ -371,7 +499,7 @@ def ensure_dirs(project: Path) -> list[str]:
 
 def ensure_gitignore(project: Path) -> bool:
     path = project / ".gitignore"
-    entries = (".pipeline/state/", ".pipeline/.env")
+    entries = (".pipeline/state/", ".pipeline/.env", ROLES_BACKUP + "/")
     text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
     missing = [e for e in entries if e not in text.splitlines()]
     if not missing:
@@ -1014,8 +1142,11 @@ def run_setup(args) -> int:
         log.ok(f"{item}")
     log.ok(f"версия движка: {write_engine_version(project)}")
     log.ok(f"маркер целостности: {write_engine_marker(project)[:12]}")
-    for item in copy_roles(project):
-        log.ok(f"{item}")
+    roles_sync = copy_roles(project, refresh=force)
+    for item in roles_sync.added:
+        log.ok(f"добавлена роль {item}")
+    for item in roles_sync.refreshed:
+        log.ok(f"обновлена роль {item} (прежняя версия: {roles_sync.backups[item]})")
     for item in ensure_dirs(project):
         log.ok(f"{item}")
     log.ok(".gitignore: " + ("дополнен" if ensure_gitignore(project) else "уже содержит записи"))

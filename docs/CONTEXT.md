@@ -126,8 +126,12 @@ hermes pipeline doctor  --project <путь>
   задвоенный якорь валит прогон).
 - **Улучшения ролей живут в `step_pipeline/roles/`, а не в `.hermes/`.** `.hermes/` в
   `.gitignore` — правка там не доезжает до других проектов и не попадает в коммит.
+  Доезжает она через `setup --upgrade`: роль приводится к версии плагина, прежняя копия
+  уходит в `.pipeline/roles-backup/` (с 0.6.0; до этого роли копировались только при
+  первой установке и правки в проектах не обновлялись никогда).
   Тесты-сторожа: `test_reviewer_skill_requires_recommendations_section`,
-  `test_prompter_skill_writes_prompt_in_chunks`.
+  `test_prompter_skill_writes_prompt_in_chunks`,
+  `test_upgrade_refreshes_changed_role_and_keeps_backup`.
 - **`hermes` в PATH не гарантирован.** Тесты не должны звать настоящий бинарник:
   подделывать `proj.run_hermes` (иначе CI на ubuntu падает `FileNotFoundError: 'hermes'`).
 - **Windows-консоль cp1251.** Любой русский вывод движка падал `UnicodeEncodeError`,
