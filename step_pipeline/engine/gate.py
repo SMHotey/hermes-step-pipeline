@@ -1336,6 +1336,34 @@ def handle_command(cfg: config_mod.Config, text: str) -> str:
     return "не знаю такую команду. /help — список."
 
 
+def owner_ids(cfg: config_mod.Config) -> set[str]:
+    """Кто имеет право управлять ботом: только владелец (или несколько, через запятую)."""
+    env_name = str(cfg.notify.get("owner_env") or "STEP_PIPELINE_TELEGRAM_OWNER_ID")
+    raw = (os.environ.get(env_name) or "").replace(";", ",")
+    ids = {part.strip() for part in raw.split(",") if part.strip()}
+    if not ids:
+        chat = os.environ.get(str(cfg.notify.get("chat_env") or "PIPELINE_TG_CHAT"))
+        if chat:
+            ids = {str(chat)}
+    return ids
+
+
+def ask_agent(cfg: config_mod.Config, text: str, chat: str, timeout: int = 240) -> str:
+    """Свободный текст владельца — в диалог с агентом профиля, сессия на чат."""
+    dialog = cfg.notify.get("dialog")
+    if isinstance(dialog, dict) and dialog.get("enabled") is False:
+        return "диалог выключен (notify.dialog.enabled)"
+    cmd = [_hermes(), "-p", str(cfg.driver), "chat", "-q", text, "--oneshot",
+           "--continue", f"tg-{chat}", "--create-if-missing"]
+    try:
+        res = _run(cmd, None, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - диалог не должен ронять опрос
+        return f"агент недоступен: {exc}"
+    out = ((res.stdout or "") + (res.stderr or "")).strip()
+    if not out:
+        return "агент не ответил (пустой ответ)"
+    return out[: TG_TEXT_LIMIT - 100]
+
 def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) -> dict:
     """Один опрос getUpdates: выполнить команды владельца и ответить в тот же чат.
 
@@ -1367,10 +1395,19 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
         message = update.get("message") or {}
         text = str(message.get("text") or "")
         sender_chat = str((message.get("chat") or {}).get("id") or "")
-        if not text.startswith("/"):
-            continue
-        if sender_chat != str(chat):
+        sender_id = str((message.get("from") or {}).get("id") or "")
+        allowed = owner_ids(cfg)
+        if sender_chat != str(chat) or (allowed and sender_id and sender_id not in allowed):
             result["ignored"] += 1
+            print(f"[commands] чужой отправитель {sender_id or '?'} — игнор", file=sys.stderr)
+            continue
+        if not text.startswith("/"):
+            answer = ask_agent(cfg, text, chat)
+            sent = _tg_call(token, "sendMessage", chat_id=chat, text=answer[:TG_TEXT_LIMIT],
+                            disable_web_page_preview="true")
+            if not sent.get("ok"):
+                print(f"[commands] ответ не доставлен: {sent.get('description')}", file=sys.stderr)
+            result["handled"] += 1
             continue
         try:
             answer = handle_command(cfg, text)

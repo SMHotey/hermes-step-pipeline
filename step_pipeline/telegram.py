@@ -86,3 +86,22 @@ def detect_chat(token: str, wait_seconds: int = 60, poll_every: float = 2.0) -> 
             return key
         time.sleep(poll_every)
     raise TelegramError("не увидел ни одного сообщения боту — напиши боту /start и повтори")
+
+
+def detect_chat_and_owner(token: str, wait_seconds: int = 60,
+                          poll_every: float = 2.0) -> tuple[str, str]:
+    """Chat id и user id владельца по последнему сообщению боту (getUpdates)."""
+    deadline = time.time() + max(5, wait_seconds)
+    offset = 0
+    while time.time() < deadline:
+        updates = _call(token, "getUpdates", http_timeout=15, limit=20, offset=offset or None)
+        for update in updates if isinstance(updates, list) else []:
+            offset = max(offset, int(update.get("update_id", 0)) + 1)
+            message = update.get("message") or update.get("edited_message") or {}
+            chat_id = (message.get("chat") or {}).get("id")
+            user_id = (message.get("from") or {}).get("id")
+            if chat_id is None:
+                continue
+            return str(chat_id), str(user_id or "")
+        time.sleep(poll_every)
+    raise TelegramError("сообщений боту нет: напиши боту /start и повтори")

@@ -46,8 +46,11 @@ class FakeTG:
         return [p.get("text", "") for m, p in self.calls if m == "sendMessage"]
 
 
-def update(text: str, chat: str = CHAT, uid: int = 1) -> dict:
-    return {"update_id": uid, "message": {"text": text, "chat": {"id": chat}}}
+def update(text: str, chat: str = CHAT, uid: int = 1, user: int | None = None) -> dict:
+    msg = {"text": text, "chat": {"id": chat}}
+    if user is not None:
+        msg["from"] = {"id": user}
+    return {"update_id": uid, "message": msg}
 
 
 def test_help_lists_commands(cfg):
@@ -189,3 +192,40 @@ def test_poll_can_be_disabled(cfg, project: Path, monkeypatch):
     assert result["handled"] == 0
     assert "выключен" in result["reason"]
     assert fake.calls == []
+
+
+def test_free_text_goes_to_agent(cfg, monkeypatch):
+    tg = FakeTG([update("что там с планом?", uid=21, user=555000111)])
+    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_OWNER_ID", CHAT)
+    monkeypatch.setattr(gate, "_tg_call", tg)
+    monkeypatch.setattr(gate, "ask_agent",
+                        lambda _cfg, text, _chat, timeout=240: "ответ: " + text)
+    res = gate.poll_commands(cfg, wait=0)
+    assert res["handled"] == 1
+    assert tg.answers() == ["ответ: что там с планом?"]
+
+
+def test_foreign_user_is_ignored(cfg, monkeypatch):
+    tg = FakeTG([update("/status", uid=22, user=999)])
+    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_OWNER_ID", CHAT)
+    monkeypatch.setattr(gate, "_tg_call", tg)
+    res = gate.poll_commands(cfg, wait=0)
+    assert res["handled"] == 0 and res["ignored"] == 1
+    assert tg.answers() == []
+
+
+def test_ask_agent_runs_oneshot_session_per_chat(cfg, monkeypatch):
+    seen = {}
+
+    class Done:
+        stdout = "ответ агента"
+        stderr = ""
+
+    def fake_run(cmd, cwd=None, timeout=0):
+        seen["cmd"] = cmd
+        return Done()
+
+    monkeypatch.setattr(gate, "_run", fake_run)
+    assert gate.ask_agent(cfg, "привет", CHAT) == "ответ агента"
+    assert "chat" in seen["cmd"] and "--oneshot" in seen["cmd"]
+    assert f"tg-{CHAT}" in seen["cmd"]

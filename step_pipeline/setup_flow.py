@@ -71,6 +71,7 @@ SKILL_CATEGORIES = {
 }
 TOKEN_ENV = "STEP_PIPELINE_TELEGRAM_BOT_TOKEN"
 CHAT_ENV = "STEP_PIPELINE_TELEGRAM_CHAT_ID"
+OWNER_ENV = "STEP_PIPELINE_TELEGRAM_OWNER_ID"
 #: Источник текста тик-скрипта — файл движка, а не рукописная копия. Копия разошлась
 #: с движком 03.11.2026 (sha256 c11840c3… против b7d98376…) и при отсутствии `gate.py`
 #: возвращала 0 молча: под cron джоба показывала `ok` при мёртвом конвейере. Прецедент
@@ -395,7 +396,8 @@ def build_config(project: Path, board: str, driver: str, prompter: str, reviewer
     cfg["board"] = board
     cfg["profiles"] = {"driver": driver, "prompter": prompter, "reviewer": reviewer}
     notify = dict(cfg.get("notify") or {})
-    notify.update({"token_env": TOKEN_ENV, "chat_env": CHAT_ENV})
+    notify.update({"token_env": TOKEN_ENV, "chat_env": CHAT_ENV,
+               "owner_env": OWNER_ENV, "dialog": {"enabled": True}})
     cfg["notify"] = notify
     return cfg
 
@@ -923,6 +925,12 @@ def setup_telegram(project: Path, driver: str, args, log: Log) -> str | None:
     if getattr(args, "no_telegram", False):
         log.warn("уведомления в Telegram отключены (--no-telegram)")
         return None
+    if not getattr(args, "telegram_token", "") and not os.environ.get(TOKEN_ENV):
+        log.step("── Telegram (необязательно) ──")
+        if not _ask_bool("  Подключить бота для уведомлений и диалога?", True,
+                         yes=getattr(args, "yes", False)):
+            log.warn("работаем без бота: уведомлений и команд не будет")
+            return None
     token = (getattr(args, "telegram_token", "") or os.environ.get(TOKEN_ENV)
              or os.environ.get("TELEGRAM_BOT_TOKEN") or "")
     if not token:
@@ -948,7 +956,7 @@ def setup_telegram(project: Path, driver: str, args, log: Log) -> str | None:
         if _ask_bool("  Напиши боту /start и нажми Enter, чтобы поймать chat id?", True,
                      yes=getattr(args, "yes", False)):
             try:
-                chat = telegram.detect_chat(token, wait_seconds=60)
+                chat, owner = telegram.detect_chat_and_owner(token, wait_seconds=60)
                 log.ok(f"чат найден: {chat}")
             except telegram.TelegramError as exc:
                 log.warn(str(exc))
@@ -961,7 +969,11 @@ def setup_telegram(project: Path, driver: str, args, log: Log) -> str | None:
         log.warn(f"чат не подтверждён: {exc} (проверь chat id и что бот добавлен в чат)")
         return None
 
-    path = write_env(driver, {TOKEN_ENV: token, CHAT_ENV: chat})
+    owner = locals().get("owner") or ""
+    if not owner:
+        owner = _ask("  Твой Telegram user id (Enter — только ты из чата)",
+                     default=str(chat), yes=getattr(args, "yes", False))
+    path = write_env(driver, {TOKEN_ENV: token, CHAT_ENV: chat, OWNER_ENV: owner})
     log.ok(f"токен и чат записаны в {path} ({_mask(token)})")
     if not getattr(args, "no_test", False):
         try:
