@@ -169,3 +169,9 @@ def detect_chat_and_owner(token: str, wait_seconds: int = 60,
     if last is not None:
         raise TelegramError(str(last))
     raise TelegramError("сообщений боту нет: напиши боту /start и повтори")
+
+
+def test_message(prefix: str = "") -> str:
+    """Текст тестового сообщения: префикс проекта, если задан в pipeline.json."""
+    base = "🧪 Тест уведомлений конвейера."
+    return f"{prefix}{base}" if prefix else base

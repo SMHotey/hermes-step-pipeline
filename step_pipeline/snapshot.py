@@ -165,6 +165,7 @@ def telegram_state(project: Path) -> dict:
         "chat": os.environ.get(chat_env) or "",
         "token_env": token_env,
         "chat_env": chat_env,
+        "prefix": str(notify.get("prefix") or ""),
     }
 
 

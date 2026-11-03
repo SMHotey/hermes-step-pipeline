@@ -373,7 +373,7 @@ def cmd_notify_test(args) -> int:
         print("Telegram не настроен: нет токена или chat id", file=sys.stderr)
         return 2
     try:
-        telegram.send_message(token, state["chat"], "🧪 Тест уведомлений конвейера.")
+        telegram.send_message(token, state["chat"], telegram.test_message(str(state.get("prefix") or "")))
     except telegram.TelegramError as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 1
