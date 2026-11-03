@@ -19,6 +19,14 @@
     вердикт APPROVE           → строка в журнал плана + коммит/пуш
     вердикт REQUEST_CHANGES   → карточка правок (1-й раз), стоп + уведомление (2-й раз)
     шаг упал/ревью упало      → стоп + уведомление
+    план не утверждён         → карточки нет: причина в выводе, одно уведомление владельцу
+    план изменён после утв.   → то же: sha256 файла не совпал с записью утверждения
+    план уже идёт             → унаследованная запись (`inherited`) и работа продолжается
+
+Утверждение плана сверяется перед любой карточкой: запись `plan_<НОМЕР>_approval.json`
+в каталоге состояния плюс пересчёт sha256 файла плана. Исключение — план, который уже
+идёт (есть файл состояния или закрытые шаги журнала): ему страж пишет унаследованную
+запись и ведёт дальше, иначе шаг перекрыл бы дорогу сам себе.
 
 Стоп-флаг блокирует ТОЛЬКО начало следующего шага: текущий шаг доводится до ревью и
 журнала (это и значит «остановка ПОСЛЕ выполнения шага»).
@@ -139,6 +147,7 @@ class Paths:
     plan_id: str
     journal_heading: str
     review_prefix: str
+    spec: registry.PlanSpec
 
     @property
     def step_re(self) -> re.Pattern:
@@ -168,6 +177,7 @@ def resolve_paths(cfg: config_mod.Config, plan_id: str | None = None) -> Paths:
         plan_id=spec.id,
         journal_heading=spec.journal_heading,
         review_prefix=spec.review_prefix,
+        spec=spec,
     )
 
 
@@ -589,6 +599,11 @@ def build_ctx(p: Paths) -> dict:
     ctx: dict = {"state": state, "stop": load_stop(p), "hold": list(state.get("hold_steps") or [])}
     ctx["plan_id"] = p.plan_id
     ctx["review_prefix"] = p.review_prefix
+    # Утверждение считаем ДО сборщика: при его сбое решение всё равно должно знать,
+    # что план не утверждён.
+    approval = registry.approval_status(p.cfg, p.spec)
+    approval["started"] = registry.plan_started(p.cfg, p.spec)
+    ctx["approval"] = approval
     try:
         pkg = collector(p)
     except SystemExit as exc:
@@ -650,6 +665,14 @@ def _decide_base(ctx: dict) -> dict:
                               f"конвейер его не ведёт"}
         return {"action": "idle", "reason": "план закрыт — следующих шагов нет", "plan_done": True}
     sid = step["id"]
+    approval = ctx.get("approval") or {}
+    if approval.get("state") in ("missing", "changed") and not approval.get("started"):
+        # Неутверждённый план не заказывает карточку. Решение именно `idle`, а не
+        # отдельное действие: иначе пропуск съедал бы единственное действие тика (D5)
+        # и вытеснял остальные планы на каждом тике.
+        return {"action": "idle", "step": sid,
+                "reason": approval.get("reason") or "план не утверждён",
+                "approval": approval.get("state"), "approval_blocked": True}
     prev, prev_verdict = ctx.get("prev_closed"), ctx.get("prev_verdict")
     if prev and prev_verdict and prev_verdict["verdict"] == "REQUEST_CHANGES":
         # Журнал закрыл шаг, а ревью говорит «нужны правки»: вперёд идти нельзя.
@@ -929,6 +952,73 @@ def watch_idle(cfg: config_mod.Config, p: Paths, ctx: dict, decision: dict,
     return {"notice": notice, "waiting_since": since}
 
 
+APPROVAL_NOTICE_KEY = registry.APPROVAL_NOTICE_KEY
+
+
+def inherit_approval(p: Paths, approval: dict) -> dict:
+    """Записать унаследованную запись утверждения для уже идущего плана.
+
+    Ключи — те же, что у `plan_accept._write_approval`, плюс `inherited`: два формата
+    одной записи недопустимы.
+    """
+    record = {
+        "plan": str(p.plan_id),
+        "file": p.cfg.rel(Path(p.plan_file)),
+        "sha256": approval.get("sha256") or registry.sha256_file(p.plan_file),
+        "approved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "profile": os.environ.get("HERMES_PROFILE") or "default",
+        "inherited": True,
+    }
+    path = registry.approval_file_for(p.cfg, p.plan_id)
+    try:
+        state_io.save_json(path, record)
+    except OSError as exc:
+        raise GateError(f"запись утверждения не пишется: {path}: {exc}", p.plan_id) from exc
+    return record
+
+
+def ensure_approval(p: Paths, ctx: dict) -> dict | None:
+    """Дочитать утверждение для идущего плана: одна запись и одна строка в stdout.
+
+    Только исполняющий проход (`--run`): `--status` состояние не меняет. Повторный
+    вызов после записи ничего не пишет — в ctx уже `approved`.
+    """
+    approval = ctx.get("approval") or {}
+    if approval.get("state") == "approved" or not approval.get("started"):
+        return None
+    record = inherit_approval(p, approval)
+    approval.update(state="approved", inherited=True, record=record, reason="")
+    ctx["approval"] = approval
+    print(f"план {p.plan_id}: запись утверждения унаследована "
+          f"(inherited, sha256 {str(record.get('sha256') or '')[:12]})")
+    return record
+
+
+def approval_notice(p: Paths, ctx: dict, decision: dict, say=None) -> bool:
+    """Одно уведомление владельцу на план о пропуске по утверждению.
+
+    Отметка в состоянии плана (`approval_notice`) не зависит от `notify.enabled` —
+    так же работают сторож простоя и сводка. `touch()` этот ключ не снимает, поэтому
+    «одно на план» держится и после действий по другим шагам.
+    """
+    if not decision.get("approval_blocked"):
+        return False
+    state = ctx.get("state") or {}
+    if state.get(APPROVAL_NOTICE_KEY):
+        return False
+    reason = str(decision.get("reason") or "план не утверждён")
+    (say or (lambda text: notify(p.cfg, text)))(
+        f"⛔ план {p.plan_id} не ведётся: {reason}")
+    state[APPROVAL_NOTICE_KEY] = {
+        "at": time.strftime("%d.%m.%Y %H:%M:%S"),
+        "state": decision.get("approval") or "missing",
+        "reason": reason[:300],
+    }
+    ctx["state"] = state
+    save_state(p, state)
+    return True
+
+
 def digest_rows(cfg: config_mod.Config) -> list[dict]:
     """Строка сводки по каждому ведомому плану: закрыто за сутки, ожидание, стоп.
 
@@ -1204,6 +1294,10 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
     ctx = ctx if ctx is not None else build_ctx(p)
     say_raw = notify_fn or (lambda text: notify(p.cfg, text))
     plan_id = p.plan_id
+    # Наследование ДО решения: иначе идущий план навсегда получил бы «не утверждён».
+    # Только исполняющий проход — `--status` на диск не пишет.
+    if execute:
+        ensure_approval(p, ctx)
     decision = decide(ctx)
     cleared = ""
     if execute and decision.get("clear_incident"):
@@ -1236,6 +1330,12 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
     action = decision["action"]
     if action == "idle":
         # Простой виден только здесь (и в tick), поэтому и записывается здесь.
+        if decision.get("approval_blocked"):
+            # Сторож простоя для неутверждённого плана не запускается: иначе владелец
+            # получит второе уведомление о том же плане.
+            approval_notice(p, ctx, decision, say)
+            result["watch"] = {"notice": False, "waiting_since": None}
+            return result
         result["watch"] = watch_idle(p.cfg, p, ctx, decision, say)
         return result
     if action == "create_step":
@@ -1528,7 +1628,10 @@ def tick(cfg: config_mod.Config, execute: bool = True,
             status_by_plan[spec.id] = status_text(ctx, decision)
             if decision["action"] == "idle":
                 if execute:
-                    watch_idle(cfg, p, ctx, decision, lambda text: notify(cfg, text))
+                    if decision.get("approval_blocked"):
+                        approval_notice(p, ctx, decision, lambda text: notify(cfg, text))
+                    else:
+                        watch_idle(cfg, p, ctx, decision, lambda text: notify(cfg, text))
                 continue
             if not execute:
                 last_decision = decision

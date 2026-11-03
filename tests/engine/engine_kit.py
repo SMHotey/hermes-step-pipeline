@@ -4,9 +4,13 @@
 Вынесено из conftest, чтобы тесты могли импортировать помощники по имени
 (`tests/conftest.py` уже занят фикстурами плагина, и `import conftest` из
 вложенного каталога разрешается не туда).
+
+`make_project` пишет и запись утверждения плана: после шага 4-S7 страж не ведёт план
+без `plan_<НОМЕР>_approval.json` (нет записи — нет карточки).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -50,8 +54,38 @@ PLAN = """# 1. Демо-план конвейера
 """
 
 
-def make_project(root: Path, board: str = "testboard", **overrides) -> Path:
-    """Создать проект-приёмник: копия движка, план, pipeline.json."""
+def plan_sha256(path) -> str:
+    """sha256 сырых байтов файла плана — то же, что пишет `plan_accept`."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write_approval(root: Path, plan, plan_id=None, *, sha: str | None = None,
+                   **extra) -> Path:
+    """Записать `plan_<НОМЕР>_approval.json` как это делает `plan_accept._write_approval`.
+
+    `sha` и `**extra` — чтобы тесты могли положить испорченную запись (чужой хэш,
+    лишние ключи). Номер берётся из `plan_id` или из имени файла плана.
+    """
+    root = Path(root)
+    plan = Path(plan)
+    number = str(int(plan_id)) if plan_id is not None else plan.name.split("-")[0]
+    path = root / ".pipeline" / "state" / f"plan_{number}_approval.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "plan": number,
+        "file": plan.resolve().relative_to(root.resolve()).as_posix(),
+        "sha256": sha or plan_sha256(plan),
+        "approved_at": "2026-01-01T00:00:00",
+        "profile": "test",
+    }
+    payload.update(extra)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def make_project(root: Path, board: str = "testboard", approved: bool = True,
+                 **overrides) -> Path:
+    """Создать проект-приёмник: копия движка, план, pipeline.json, запись утверждения."""
     (root / ".pipeline").mkdir(parents=True, exist_ok=True)
     for name in ENGINE_FILES:
         shutil.copy2(ENGINE / name, root / ".pipeline" / name)
@@ -69,6 +103,8 @@ def make_project(root: Path, board: str = "testboard", **overrides) -> Path:
     data.update(overrides)
     (root / "pipeline.json").write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                        encoding="utf-8")
+    if approved:
+        write_approval(root, plans / "1-demo.md")
     return root
 
 

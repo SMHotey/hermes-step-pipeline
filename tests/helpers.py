@@ -2,6 +2,7 @@
 """Помощники тестов плагина: установленный проект, прогон стража, чтение борды."""
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -90,18 +91,40 @@ CREATE TABLE IF NOT EXISTS tasks (
 """
 
 
-def install_project(root: Path, board: str = "testboard") -> Path:
+def _write_approval(root: Path, plan: Path, plan_id: str = "1") -> Path:
+    """Запись утверждения плана: без неё страж не ведёт план (шаг 4-S7).
+
+    Та же причина, что у `engine_kit.make_project` (D8): фикстура ставит проект,
+    который конвейер ведёт с первого тика, — значит утверждение обязано быть.
+    """
+    path = root / ".pipeline" / "state" / f"plan_{plan_id}_approval.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "plan": plan_id,
+        "file": plan.relative_to(root).as_posix(),
+        "sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
+        "approved_at": "2026-01-01T00:00:00",
+        "profile": "test",
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def install_project(root: Path, board: str = "testboard", approved: bool = True) -> Path:
     """Проект с установленным движком — как после `hermes pipeline setup`."""
     (root / ".pipeline").mkdir(parents=True, exist_ok=True)
     for src in ENGINE.glob("*.py"):
         shutil.copy2(src, root / ".pipeline" / src.name)
     for rel in ("docs/plans", "docs/reviews", "docs/prompts"):
         (root / rel).mkdir(parents=True, exist_ok=True)
-    (root / "docs" / "plans" / "1-demo.md").write_text(PLAN, encoding="utf-8")
+    plan = root / "docs" / "plans" / "1-demo.md"
+    plan.write_text(PLAN, encoding="utf-8")
     cfg = json.loads(json.dumps(CONFIG))
     cfg["board"] = board
     (root / "pipeline.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
                                         encoding="utf-8")
+    if approved:
+        _write_approval(root, plan)
     return root
 
 

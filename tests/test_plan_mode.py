@@ -15,6 +15,16 @@ import pytest
 from step_pipeline import plan_mode
 
 
+@pytest.fixture()
+def project(tmp_path: Path) -> Path:
+    """Проект БЕЗ записи утверждения плана.
+
+    Шаг 4-S7 кладёт `plan_1_approval.json` в `.pipeline/state`, а тесты режима
+    проверяют, что каталога состояния у свежего проекта нет и чтение его не создаёт.
+    """
+    return helpers.install_project(tmp_path / "plan-mode-project", approved=False)
+
+
 def test_defaults_on_without_file(project: Path):
     """Отсутствие файла в существующем каталоге — режим включён, и чтение его не создаёт."""
     path = plan_mode.state_file(project)

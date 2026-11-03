@@ -14,10 +14,17 @@
 Файлы состояния — по одному комплекту на план: `plan_<НОМЕР>_state.json` и
 `plan_<НОМЕР>_stop.json` в каталоге `paths.state`.
 
+Здесь же читается запись утверждения плана (`plan_<НОМЕР>_approval.json` в том же
+каталоге состояния): модуль только сверяет её с файлом плана по sha256. Пишет запись
+не он — утверждает владелец командой `hermes pipeline plan --accept N`, а страж лишь
+читает её и для уже идущих планов сам пишет унаследованную запись (см. `gate.py`).
+
 Модуль только ЧИТАЕТ файлы планов и ничего не меняет.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -75,6 +82,77 @@ def state_file_for(cfg: config_mod.Config, plan_id: str) -> Path:
 
 def stop_file_for(cfg: config_mod.Config, plan_id: str) -> Path:
     return cfg.state_dir / f"plan_{normalize(plan_id)}_stop.json"
+
+
+# ───────────────────────────── утверждение плана ─────────────────────────────
+
+APPROVAL_TEMPLATE = "plan_{}_approval.json"
+# Отметка стража «владельцу уже сказали, что план не ведётся» — в состоянии плана.
+APPROVAL_NOTICE_KEY = "approval_notice"
+
+
+def approval_file_for(cfg: config_mod.Config, plan_id: str) -> Path:
+    """Путь записи утверждения плана в каталоге состояния проекта."""
+    return cfg.state_dir / APPROVAL_TEMPLATE.format(normalize(plan_id))
+
+
+def sha256_file(path) -> str:
+    """sha256 сырых байтов файла плана (без перекодирования: CRLF не мешает)."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def read_approval(cfg: config_mod.Config, plan_id: str) -> dict | None:
+    """Прочитать запись утверждения; нет файла, он битый или не словарь — `None`."""
+    path = approval_file_for(cfg, plan_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def approval_status(cfg: config_mod.Config, spec: PlanSpec) -> dict:
+    """Сверить запись утверждения с файлом плана.
+
+    `state`: `approved` | `missing` (записи нет или она не читается) | `changed`
+    (запись есть, но sha256 в ней отсутствует или не совпал с фактическим).
+    """
+    fact = sha256_file(spec.file)
+    record = read_approval(cfg, spec.id)
+    result = {"state": "approved", "reason": "", "record": record, "sha256": fact}
+    if record is None:
+        result["state"] = "missing"
+        result["reason"] = (
+            f"план {spec.id} не утверждён: нет записи "
+            f"{APPROVAL_TEMPLATE.format(spec.id)} (утверждает владелец: "
+            f"hermes pipeline plan --accept {spec.id})")
+        return result
+    saved = str(record.get("sha256") or "")
+    if saved != fact:
+        result["state"] = "changed"
+        result["reason"] = (
+            f"план {spec.id} изменён после утверждения: sha256 {fact[:12]} не совпал "
+            f"с записью {saved[:12] or '—'} (переутвердить: "
+            f"hermes pipeline plan --accept {spec.id})")
+    return result
+
+
+def plan_started(cfg: config_mod.Config, spec: PlanSpec) -> bool:
+    """План уже идёт: есть файл состояния ИЛИ закрытые шаги в журнале.
+
+    Файл состояния, в котором лежит ТОЛЬКО отметка о пропуске по утверждению
+    (`approval_notice`), работой по плану не считается: её пишет сам страж, и без этой
+    оговорки неутверждённый план «становился идущим» через тик после первого пропуска.
+    """
+    state_path = Path(spec.state_file)
+    if state_path.is_file():
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return True          # битое состояние — план уже трогали, разбираться не нам
+        if not isinstance(data, dict) or set(data) - {APPROVAL_NOTICE_KEY}:
+            return True
+    return bool(closed_steps(spec, cfg))
 
 
 # ───────────────────────────── разбор журнала ─────────────────────────────
