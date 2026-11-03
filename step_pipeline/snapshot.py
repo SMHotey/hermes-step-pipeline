@@ -931,6 +931,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         "package": None,
         "decision": None,
         "status": "",
+        "metrics": {},
         "cards": cards(proj.board_db(root, board)),
         "journal": [],
         "errors": [],
@@ -952,6 +953,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
                                     engine_dir=engine_dir, extra_env=extra_env) or {}
         out["decision"] = decision.get("decision") or {}
         out["status"] = decision.get("status") or ""
+        out["metrics"] = decision.get("metrics") or {}
     except Exception as exc:                                    # noqa: BLE001
         out["errors"].append(f"решение: {exc}")
     try:

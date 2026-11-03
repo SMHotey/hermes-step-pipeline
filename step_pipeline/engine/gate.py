@@ -39,7 +39,11 @@
 получает не больше ОДНОГО действия — иначе быстрый воркер успел бы закрыть карточку
 между действиями, и тик проскочил бы шаг целиком (исполнение и ревью сразу). Каждое
 применённое действие дописывается в состояние плана (`last_actions`, последние 20
-записей): истории тиков (план 2, S3) пока нет.
+записей) и в историю тиков: файл `history.jsonl` в каталоге состояния, по строке JSONL на
+действие, с ротацией по числу строк и размеру. Посчитанные по истории метрики отдаёт
+`--status --json` (ключ `metrics`), снимок — под тем же ключом: видно, сколько было
+действий за неделю, сколько шагов закрыто, сколько ушло на шаг и сколько было кругов
+правок и инцидентов.
 
 Простой виден сам: `idle` пишет `waiting_since`/`waiting_reason`, ожидание дольше
 `notify.watchdog_hours` даёт одно напоминание на причину не чаще раза в час, а раз в
@@ -127,8 +131,14 @@ COMMIT_RE = re.compile(r"коммит\S*\s*`([0-9a-f]{7,40})`", re.IGNORECASE)
 
 # Предел действий за тик: ключ `max_actions` в pipeline.json проекта, умолчание 1 (D1).
 MAX_ACTIONS_DEFAULT = 1
-# Сколько записей о действиях держим в состоянии плана: истории тиков пока нет (D7).
+# Сколько записей о действиях держим в состоянии плана: это краткая выжимка, полная
+# история — в `history.jsonl`.
 LAST_ACTIONS_KEPT = 20
+# История тиков: файл в каталоге состояния, пределы ротации и окно метрик (план 2, S3).
+HISTORY_NAME = "history.jsonl"
+HISTORY_MAX_LINES = 2000
+HISTORY_MAX_BYTES = 512 * 1024
+METRICS_DAYS = 7
 # Комментарий с находками в карточке правок: автор, предел длины и сколько находок берём.
 COMMENT_AUTHOR = "страж"
 COMMENT_MAX_LEN = 4000
@@ -183,6 +193,11 @@ def resolve_paths(cfg: config_mod.Config, plan_id: str | None = None) -> Paths:
         review_prefix=spec.review_prefix,
         spec=spec,
     )
+
+
+def history_path(cfg: config_mod.Config) -> Path:
+    """Файл истории тиков проекта: `<state_dir>/history.jsonl` (каталог может не быть)."""
+    return Path(cfg.state_dir) / HISTORY_NAME
 
 
 def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 120,
@@ -1582,6 +1597,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
               "detail": cleared, "incident_cleared": bool(cleared),
               "status": status_text(ctx, decision)}
     if not execute:
+        result["metrics"] = history_metrics(p.cfg)
         return result
 
     def say(text: str) -> None:
@@ -1757,6 +1773,9 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             p, files, f"docs(plan): закрыт шаг {step['id']} плана {plan_id} (ревью APPROVE)")
         result.update(applied=ok, detail=f"журнал: {'добавлена строка' if added else 'уже был'}; "
                                          f"коммит/пуш: {'ok ' + detail if ok else detail}")
+        # sha коммита для истории: свой коммит стража из detail, иначе — коммит из ревью (D5).
+        match = re.match(r"^([0-9a-f]{7,40})(?:\s|$)", detail.strip())
+        result["commit"] = match.group(1) if match else commit
         touch(f"close_step:{step['id']}")
         if ok:
             say(f"✅ план {plan_id}, шаг {step['id']} закрыт (ревью APPROVE, коммит {detail}). "
@@ -1877,22 +1896,187 @@ def step_key(plan_id: str, decision: dict) -> str | None:
     return f"{plan_id}:{step}" if step else None
 
 
-def remember_action(p: Paths, plan_id: str, decision: dict, detail: str) -> None:
-    """Дописать применённое действие в состояние плана (`last_actions`, D7).
+# ──────────────────────── история тиков и метрики ────────────────────────
 
-    Истории тиков пока нет (план 2, S3), поэтому пишем в состояние — атомарно, через
-    `load_state`/`save_state`. Чтение свежее: `run_gate` уже мог сохранить `pending_commit`,
-    и запись из устаревшего словаря стёрла бы его. `last_action`/`last_tick` из `touch()`
-    не трогаем: на `last_action` опирается сторож простоя.
+def history_lines(cfg: config_mod.Config) -> tuple[list[dict], int, int]:
+    """История тиков: (валидные записи, всего непустых строк, битых строк).
+
+    Валидная запись — объект JSON с числовым `ts` и непустым `action`. Всё остальное
+    (не JSON, JSON не объект, нет `ts`/`action`) — битая строка: в подсчётах метрик она
+    не участвует, но считается в `bad_lines` (D7). Файла нет или он не читается — пустая
+    история, а не падение: метрики обязаны собираться на любом состоянии проекта.
     """
+    path = history_path(cfg)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [], 0, 0
+    records: list[dict] = []
+    total = 0
+    bad = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        total += 1
+        try:
+            row = json.loads(line)
+        except (ValueError, TypeError):
+            bad += 1
+            continue
+        if not isinstance(row, dict):
+            bad += 1
+            continue
+        ts = row.get("ts")
+        if (not isinstance(ts, (int, float)) or isinstance(ts, bool)
+                or not str(row.get("action") or "")):
+            bad += 1
+            continue
+        records.append(row)
+    return records, total, bad
+
+
+def history_size(cfg: config_mod.Config) -> int:
+    """Размер файла истории в байтах; файла нет — ноль."""
+    try:
+        return int(history_path(cfg).stat().st_size)
+    except OSError:
+        return 0
+
+
+def append_history(cfg: config_mod.Config, record: dict) -> None:
+    """Дописать строку истории и уложить файл в пределы ротации (D6).
+
+    Обрезка идёт по строкам, а не по байтам: разрезанная строка JSONL — это битая строка.
+    Последняя записанная строка не выбрасывается никогда, даже если одна превышает предел
+    размера. Запись атомарная, через `state_io.atomic_write_text`.
+    """
+    path = history_path(cfg)
+    try:
+        old = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        old = []
+    lines = [line for line in old if line.strip()]
+    lines.append(json.dumps(record, ensure_ascii=False))
+    if len(lines) > HISTORY_MAX_LINES:
+        lines = lines[-HISTORY_MAX_LINES:]
+    # Размер считаем по байтам ровно так, как их запишет `atomic_write_text`
+    # (он переводит `\n` в os.linesep), и вычитаем отброшенные строки без пересчёта.
+    sep = os.linesep
+    size = len(sep.join(lines).encode("utf-8")) + len(sep)
+    drop = 0
+    while drop < len(lines) - 1 and size > HISTORY_MAX_BYTES:
+        size -= len(lines[drop].encode("utf-8")) + len(sep)
+        drop += 1
+    lines = lines[drop:]
+    state_io.atomic_write_text(path, "\n".join(lines) + "\n")
+
+
+def _median(values: list[float]) -> int:
+    """Медиана, округлённая до целых; чётное число — среднее двух центральных."""
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    value = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+    return int(round(value))
+
+
+def _plan_metrics(p: Paths, records: list[dict]) -> dict:
+    """Метрики одного плана: закрытые по журналу шаги, время шага, правки, инциденты."""
+    steps_closed = 0
+    try:
+        lines = Path(p.plan_file).read_text(encoding="utf-8", errors="replace").splitlines()
+        steps_closed = sum(1 for i in _journal_rows(p)
+                           if registry.status_of_row(lines[i]).startswith("ЗАКРЫТ"))
+    except (OSError, SystemExit):
+        steps_closed = 0
+    first_seen: dict[str, float] = {}
+    closed_at: dict[str, float] = {}
+    fix_rounds = 0
+    incidents = 0
+    for row in records:
+        if str(row.get("plan") or "") != p.plan_id:
+            continue
+        action = str(row.get("action") or "")
+        step = str(row.get("step") or "").upper()
+        ts = float(row["ts"])
+        if step:
+            if step not in first_seen or ts < first_seen[step]:
+                first_seen[step] = ts
+            if action == "close_step" and step not in closed_at:
+                closed_at[step] = ts
+        if action == "create_fix":
+            fix_rounds += 1
+        elif action == "stop":
+            incidents += 1
+    seconds = [closed_at[step] - first_seen[step] for step in closed_at
+               if step in first_seen and closed_at[step] >= first_seen[step]]
+    step_seconds = {"avg": int(round(sum(seconds) / len(seconds))) if seconds else 0,
+                    "median": _median(seconds) if seconds else 0,
+                    "measured": len(seconds)}
+    return {"steps_closed": steps_closed, "step_seconds": step_seconds,
+            "fix_rounds": fix_rounds, "incidents": incidents}
+
+
+def history_metrics(cfg: config_mod.Config, now: float | None = None) -> dict:
+    """Посчитать метрики по истории (D8). Ничего не пишет и не бросает наружу.
+
+    `actions_7d` — строки не старше окна по видам действия; `steps_closed` — по журналу
+    плана (поэтому совпадает с ним); `step_seconds` — по шагам, у которых в истории есть
+    и первое действие, и `close_step`; `fix_rounds` и `incidents` — по всей истории.
+    """
+    stamp = time.time() if now is None else float(now)
+    records, total, bad = history_lines(cfg)
+    cutoff = stamp - METRICS_DAYS * 86400
+    actions: dict[str, int] = {}
+    for row in records:
+        if float(row["ts"]) >= cutoff:
+            action = str(row.get("action") or "")
+            actions[action] = actions.get(action, 0) + 1
+    plans: dict[str, dict] = {}
+    for spec in registry.driven_specs(cfg):
+        try:
+            plans[spec.id] = _plan_metrics(resolve_paths(cfg, spec.id), records)
+        except Exception:  # noqa: BLE001 - сбой по одному плану не ломает остальные
+            plans[spec.id] = {"steps_closed": 0,
+                              "step_seconds": {"avg": 0, "median": 0, "measured": 0},
+                              "fix_rounds": 0, "incidents": 0}
+    return {
+        "generated_at": time.strftime("%d.%m.%Y %H:%M:%S"),
+        "window_days": METRICS_DAYS,
+        "actions_7d": actions,
+        "actions_7d_total": sum(actions.values()),
+        "plans": plans,
+        "history": {"lines": total, "bad_lines": bad, "size_bytes": history_size(cfg)},
+    }
+
+
+def remember_action(p: Paths, plan_id: str, decision: dict, detail: str,
+                    duration: float = 0.0, commit: str = "") -> None:
+    """Записать применённое действие в состояние плана и в историю тиков.
+
+    В состояние (`last_actions`, последние `LAST_ACTIONS_KEPT`) — как раньше: атомарно,
+    через `load_state`/`save_state`, свежим чтением (`run_gate` уже мог сохранить
+    `pending_commit`, и запись из устаревшего словаря стёрла бы его). `last_action`/
+    `last_tick` из `touch()` не трогаем: на `last_action` опирается сторож простоя.
+
+    В историю (`history.jsonl`) — строка на действие: `ts` (epoch, для окна и разностей),
+    `at` тем же форматом, что в состоянии, план, шаг, действие, длительность в секундах,
+    `detail` (те же 200 символов) и sha коммита, если он был (D4).
+    """
+    at = time.strftime("%d.%m.%Y %H:%M:%S")
+    action = str(decision.get("action") or "")
+    step = _step_of(decision)
+    text = str(detail or "")[:200]
     state = load_state(p)
     history = state.get("last_actions")
     history = list(history) if isinstance(history, list) else []
-    history.append({"at": time.strftime("%d.%m.%Y %H:%M:%S"), "plan": plan_id,
-                    "action": str(decision.get("action") or ""), "step": _step_of(decision),
-                    "detail": str(detail or "")[:200]})
+    history.append({"at": at, "plan": plan_id, "action": action, "step": step,
+                    "detail": text})
     state["last_actions"] = history[-LAST_ACTIONS_KEPT:]
     save_state(p, state)
+    append_history(p.cfg, {"ts": time.time(), "at": at, "plan": plan_id, "step": step,
+                           "action": action, "duration_s": round(float(duration), 3),
+                           "detail": text, "commit": str(commit or "")})
+
 
 
 def tick(cfg: config_mod.Config, execute: bool = True,
@@ -1967,7 +2151,9 @@ def tick(cfg: config_mod.Config, execute: bool = True,
                           f"второй раз не трогаю")
                 finish = True
                 break
+            started = time.monotonic()
             result = run_gate(p, execute=execute, ctx=ctx)
+            duration = round(time.monotonic() - started, 3)
             last_decision = result.get("decision") or decision
             entry = {"plan": spec.id, "action": str(decision.get("action") or ""),
                      "step": _step_of(decision), "applied": bool(result.get("applied")),
@@ -1977,7 +2163,8 @@ def tick(cfg: config_mod.Config, execute: bool = True,
                 touched.add(key)
             cleared_any = cleared_any or bool(result.get("incident_cleared"))
             if entry["applied"]:
-                remember_action(p, spec.id, decision, entry["detail"])
+                remember_action(p, spec.id, decision, entry["detail"], duration=duration,
+                                commit=str(result.get("commit") or ""))
             if not entry["applied"]:
                 reason = (f"действие {entry['action']} не применилось: "
                           f"{entry['detail'] or 'подробностей нет'} — второй попытки в этом тике нет")
@@ -2192,11 +2379,14 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"Выполнено [{result.get('plan_id')}]: {result['detail']}")
                     return 0
                 retried = retry_pending(p)
+                started = time.monotonic()
                 result = run_gate(p, execute=True)
+                duration = round(time.monotonic() - started, 3)
                 if result.get("applied") and (result.get("decision") or {}).get("action") != "idle":
                     # Ветка одного плана — тоже тик: применённое действие попадает в состояние.
                     remember_action(p, p.plan_id, result.get("decision") or {},
-                                    result.get("detail", ""))
+                                    result.get("detail", ""), duration=duration,
+                                    commit=str(result.get("commit") or ""))
                 result["pending_commit"] = retried
             finally:
                 state_io.release(lock)
