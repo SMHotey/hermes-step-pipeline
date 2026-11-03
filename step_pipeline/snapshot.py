@@ -87,8 +87,13 @@ def _ro(path: Path) -> sqlite3.Connection | None:
         return None
 
 
-def cards(db: Path, limit: int = 30) -> list[dict]:
-    """Последние карточки борды. Схема читается по факту: колонки менялись между версиями."""
+def cards(db: Path, limit: int = 30, key_prefix: str | None = None) -> list[dict]:
+    """Последние карточки борды или карточки по префиксу ключа идемпотентности.
+
+    Схема читается по факту: колонки менялись между версиями. `key_prefix` — фильтр в
+    SQL, а не окно «последние N задач»: иначе карточки старого шага выпадали из выборки
+    (находка ревью 3-S3).
+    """
     con = _ro(db)
     if con is None:
         return []
@@ -98,8 +103,15 @@ def cards(db: Path, limit: int = 30) -> list[dict]:
         if not cols:
             return []
         order = "created_at" if "created_at" in present else cols[0]
-        rows = con.execute(f"SELECT {', '.join(cols)} FROM tasks ORDER BY {order} DESC"
-                           f" LIMIT {int(limit)}").fetchall()
+        where, args = "", ()
+        if key_prefix:
+            if "idempotency_key" not in present:
+                return []
+            escaped = (key_prefix.replace("\\", "\\\\").replace("%", "\\%")
+                       .replace("_", "\\_"))
+            where, args = " WHERE idempotency_key LIKE ? ESCAPE '\\'", (escaped + "%",)
+        rows = con.execute(f"SELECT {', '.join(cols)} FROM tasks{where} ORDER BY {order} DESC"
+                           f" LIMIT {int(limit)}", args).fetchall()
     except sqlite3.Error:
         return []
     finally:
@@ -320,6 +332,18 @@ def _plan_state(root: Path, plan_id) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _plan_stop(root: Path, plan_id) -> dict:
+    """Стоп-флаг плана из `state_dir/plan_N_stop.json`; его наличие — не повод гасить допуск."""
+    if str(plan_id or "") == "":
+        return {}
+    path = proj.state_dir(Path(root)) / f"plan_{plan_id}_stop.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _fix_rounds(card_list: list[dict], plan_id, step_id) -> int:
     """Кругов правок по шагу: карточки с ключом `planloop:<план>:<шаг>:fix:` (D7)."""
     if not plan_id or not step_id:
@@ -432,6 +456,7 @@ def _overview(root: Path, cfg: dict, out: dict) -> dict:
 # ───────────────────────────── экран «Шаг» (план 3 S3) ─────────────────────────────
 
 STEP_LINES = 200                        # строк на блок экрана «Шаг»
+CARD_TEXT_LIMIT = 2000                  # символов результата карточки: с пометкой обрезки
 TEXT_SUFFIXES = (".md", ".txt", ".json", ".py", ".html", ".css", ".js", ".yaml", ".yml",
                  ".toml", ".ini", ".cfg")
 # Вердикт и коммит разбираются теми же выражениями, что у стража (`gate.py`): копия нужна
@@ -464,6 +489,10 @@ def safe_path(root: Path | str, rel: str | None) -> Path:
         raise UnsafePath(f"путь вне корня проекта: {raw}")
     parts = [part for part in raw.split("/") if part not in ("", ".")]
     if ".." in parts:
+        raise UnsafePath(f"путь вне корня проекта: {raw}")
+    # Схема (`file:///C:/…`, `file:/…`) — не путь проекта: без этой проверки она
+    # разрешалась в несуществующее имя внутри корня и давала 404 вместо отказа.
+    if parts and ":" in parts[0]:
         raise UnsafePath(f"путь вне корня проекта: {raw}")
     if any(part.startswith(".") for part in parts):
         raise UnsafePath(f"служебный файл не показывается: {raw}")
@@ -501,15 +530,28 @@ def read_text_safe(root: Path | str, rel: str | None,
                    limit: int = STEP_LINES) -> dict:
     """Текст файла проекта с обрезкой. Бросает `UnsafePath` на всё, что вне корня."""
     target = safe_path(root, rel)
+    # Порядок проверок важен для сообщения: каталог — не «не текстовый файл».
+    if not target.exists():
+        raise UnsafePath(f"файла нет: {rel}")
+    if target.is_dir():
+        raise UnsafePath(f"это каталог, а не файл: {rel}")
     if target.suffix.lower() not in TEXT_SUFFIXES:
         raise UnsafePath(f"показываем только текстовые файлы: {rel}")
-    if not target.is_file():
-        raise UnsafePath(f"файла нет: {rel}")
     try:
         text = target.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         raise UnsafePath(f"не прочитать {rel}: {exc}") from exc
     return {"path": str(rel or ""), "exists": True, **_clip(text, limit)}
+
+
+def _clip_chars(text: str, limit: int) -> dict:
+    """Обрезка по символам для текста без строк: та же явная пометка, что у `_clip`."""
+    raw = str(text or "")
+    cap = max(1, int(limit))
+    cut = len(raw) > cap
+    return {"text": raw[:cap], "shown": min(len(raw), cap), "total": len(raw),
+            "truncated": cut,
+            "note": f"показаны первые {cap} символов, всего {len(raw)}" if cut else ""}
 
 
 def comments(db: Path, task_id: str, limit: int = 20) -> list[dict]:
@@ -529,6 +571,23 @@ def comments(db: Path, task_id: str, limit: int = 20) -> list[dict]:
         con.close()
     return [{"author": str(row[0] or ""), "body": str(row[1] or "")[:2000],
              "created_at": row[2]} for row in rows]
+
+
+def comments_total(db: Path, task_id: str) -> int:
+    """Сколько комментариев у карточки всего: нужно для пометки обрезки."""
+    if not task_id:
+        return 0
+    con = _ro(db)
+    if con is None:
+        return 0
+    try:
+        row = con.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
+                          (str(task_id),)).fetchone()
+    except sqlite3.Error:
+        return 0
+    finally:
+        con.close()
+    return int(row[0] or 0) if row else 0
 
 
 def _plan_file_of(root: Path, cfg: dict, plan_id: str) -> Path | None:
@@ -607,30 +666,101 @@ def _contract(root: Path, cfg: dict, plan_id: str, step_id: str) -> dict:
             "path": _relative(root, path)}
 
 
-def _findings(text: str, limit: int = 40) -> list[dict]:
-    """Находки ревью: пункты раздела «Находки» с подзаголовками-уровнями."""
+_FINDING_NUMBER_RE = re.compile(r"^\s{0,8}(?P<num>\d{1,3})[.)]\s+(?P<text>\S.*)$")
+_FINDING_ROLE_RE = re.compile(r"^\s{0,8}(?:\*\*)?\[(?P<cls>[^\]]{1,60})\](?:\*\*)?\s*"
+                              r"(?P<text>\S.*)$")
+_FINDING_BOLD_RE = re.compile(r"^\s{0,8}\*\*(?P<head>[^*]{1,160})\*\*\s*(?P<text>.*)$")
+_FINDING_CLASS_RE = re.compile(r"блокирующ\w*|значим\w*|стилистическ\w*|критичн\w*|"
+                               r"незначительн\w*", re.IGNORECASE)
+# Строки, которые означают «находок нет», а не находку: их разбор не считает пунктами.
+_NO_FINDINGS_RE = re.compile(r"^(?:—|-|\*)?\s*(?:нет\b|не\s+найден\w*|отсутству\w*|"
+                             r"блокирующих\s+находок\s+нет)", re.IGNORECASE)
+
+
+def _finding_class(text: str) -> str:
+    """Явный класс находки из строки (`[блокирующая]`, `**[значимая]**`, `З1 (значимая…)`)."""
+    match = _FINDING_CLASS_RE.search(str(text or ""))
+    return match.group(0).lower() if match else ""
+
+
+def _findings_section(text: str, limit: int = 40) -> tuple[list[dict], str]:
+    """Находки ревью и пометка, если раздел непустой, но не разобран.
+
+    Разбираются все форматы, которыми пишут отчёты: пункты `- …`/`* …`, нумерованные
+    `1. …`, строки роли `[класс] file:line — …` и жирные `**[класс] …**`/`**З1 (класс).**`.
+    Пустой блок находок читается как «их нет», поэтому неразобранный раздел помечается.
+    """
     lines = text.splitlines()
     found = _headings(lines)
     start = next((pos for pos, (_i, level, title) in enumerate(found)
                   if level in (2, 3) and "наход" in title.lower()), None)
     if start is None:
-        return []
+        return [], ""
     end = _section_end(found, start, len(lines))
+    body = lines[found[start][0] + 1:end]
     rows: list[dict] = []
     group = ""
-    for line in lines[found[start][0] + 1:end]:
+    last_kind = ""
+    substantive = False
+    for line in body:
         head = _HEADING_RE.match(line)
         if head:
             group = head.group("title").strip()
             continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _NO_FINDINGS_RE.match(stripped):
+            continue
         match = _BULLET_RE.match(line)
         if match:
-            rows.append({"level": group, "text": match.group("text")})
-        elif rows and line.strip() and line.startswith((" ", "\t")):
-            rows[-1]["text"] += " " + line.strip()
+            item = _finding_item(match.group("text"), group)
+            rows.append(item)
+            last_kind = "bullet"
+        else:
+            numbered = _FINDING_NUMBER_RE.match(line)
+            role = _FINDING_ROLE_RE.match(line)
+            bold = _FINDING_BOLD_RE.match(line)
+            if numbered:
+                rows.append(_finding_item(numbered.group("text"), group))
+                last_kind = "number"
+            elif role:
+                rows.append(_finding_item(role.group("text"), group, role.group("cls")))
+                last_kind = "role"
+            elif bold and bold.group("text").strip():
+                rows.append(_finding_item((bold.group("head") + " " +
+                                           bold.group("text")).strip(), group))
+                last_kind = "bold"
+            elif bold:
+                rows.append(_finding_item(bold.group("head"), group))
+                last_kind = "bold"
+            elif rows and (line.startswith((" ", "\t")) or last_kind == "bold"):
+                # Перенос строки внутри пункта: у плана и отчётов он есть и в отступе,
+                # и без него (жирный пункт продолжается обычным абзацем).
+                rows[-1]["text"] = (rows[-1]["text"] + " " + stripped)[:1200]
+            else:
+                substantive = True
+                continue
         if len(rows) >= limit:
             break
-    return rows
+    note = ""
+    if not rows and substantive:
+        note = ("раздел «Находки» есть, но разобрать пункты не удалось — "
+                "смотри текст отчёта")
+    return rows, note
+
+
+def _finding_item(text: str, group: str, explicit: str = "") -> dict:
+    """Один пункт находки: класс из явной метки, иначе — из подзаголовка раздела."""
+    # `**` в тексте — разметка отчёта, а не содержимое: панель показывает пункт одной строкой.
+    body = str(text or "").replace("**", "").strip()
+    cls = _finding_class(explicit) or _finding_class(body)
+    return {"level": cls or group or "находка", "text": body, "class": cls}
+
+
+def _findings(text: str, limit: int = 40) -> list[dict]:
+    """Находки ревью: пункты раздела «Находки» с подзаголовками-уровнями."""
+    return _findings_section(text, limit)[0]
 
 
 def _review(root: Path, cfg: dict, plan_id: str, step_id: str,
@@ -640,8 +770,8 @@ def _review(root: Path, cfg: dict, plan_id: str, step_id: str,
            f"/{plan_id}-{step_id}.md")
     path = Path(root) / rel
     rows = {"exists": False, "path": rel, "verdict": "NONE", "occurrences": 0,
-            "commit": "", "findings": [], "text": "", "shown": 0, "total": 0,
-            "truncated": False, "note": ""}
+            "commit": "", "findings": [], "findings_note": "", "text": "", "shown": 0,
+            "total": 0, "truncated": False, "note": ""}
     if not path.is_file():
         rows["note"] = "отчёта ревью нет"
         return rows
@@ -654,9 +784,10 @@ def _review(root: Path, cfg: dict, plan_id: str, step_id: str,
     unique = sorted(set(found))
     verdict = "NONE" if not found else (unique[0] if len(unique) == 1 else "AMBIGUOUS")
     commit = _COMMIT_RE.search(text)
+    findings, findings_note = _findings_section(text)
     return {"exists": True, "path": rel, "verdict": verdict, "occurrences": len(found),
             "commit": commit.group(1) if commit else "",
-            "findings": _findings(text), **_clip(text, limit)}
+            "findings": findings, "findings_note": findings_note, **_clip(text, limit)}
 
 
 def _git_show(root: Path, sha: str, limit: int = STEP_LINES, timeout: int = 30) -> dict:
@@ -722,24 +853,36 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
             prompt["exists"] = False
     review = _review(root, cfg, plan, step, cap)
     held = [str(item) for item in (_plan_state(root, plan).get("hold_steps") or [])]
+    stop = _plan_stop(root, plan)
     db = proj.board_db(root, board)
     prefix = f"planloop:{plan}:{step}:"
     step_cards: list[dict] = []
-    for card in cards(db, limit=200):
-        key = str(card.get("idempotency_key") or "")
-        if not key.startswith(prefix):
-            continue
+    # Карточки — запросом по префиксу ключа: окно «последние N задач» теряло старый шаг.
+    for card in cards(db, limit=100, key_prefix=prefix):
         card_id = str(card.get("id") or "")
+        result = _clip_chars(str(card.get("result") or ""), CARD_TEXT_LIMIT)
+        shown_comments = comments(db, card_id)
+        total_comments = comments_total(db, card_id)
         step_cards.append({"id": card_id, "title": str(card.get("title") or ""),
                            "status": str(card.get("status") or ""),
-                           "assignee": str(card.get("assignee") or ""), "key": key,
-                           "result": str(card.get("result") or "")[:2000],
+                           "assignee": str(card.get("assignee") or ""),
+                           "key": str(card.get("idempotency_key") or ""),
+                           "result": result["text"], "result_note": result["note"],
+                           "result_truncated": result["truncated"],
                            "completed_at": card.get("completed_at"),
-                           "comments": comments(db, card_id)})
+                           "comments": shown_comments,
+                           "comments_note": (f"показаны первые {len(shown_comments)} "
+                                             f"комментариев, всего {total_comments}"
+                                             if total_comments > len(shown_comments) else "")})
     return {"ok": True, "plan": plan, "step": step, "title": contract.get("title") or "",
             "contract": contract, "prompt": prompt, "review": review,
             "commit": _git_show(root, review.get("commit") or "", cap),
-            "cards": step_cards, "hold": {"steps": held, "held": step in held},
+            "cards": step_cards,
+            # `allowed` — правило «стоп-флаг допуск не гасит» в снимке, а не в разметке:
+            # так его проверяет тест, а страница только рисует.
+            "hold": {"steps": held, "held": step in held, "allowed": step not in held,
+                     "stop": str(stop.get("kind") or ""),
+                     "stop_reason": str(stop.get("reason") or "")},
             "limit": cap}
 
 

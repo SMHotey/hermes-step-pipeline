@@ -19,7 +19,7 @@ import pytest
 PLUGIN = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from helpers import install_project, run_gate, stub_cards, complete_card  # noqa: E402
+from helpers import KANBAN_SCHEMA, install_project, run_gate, stub_cards, complete_card  # noqa: E402
 import project  # noqa: E402
 import snapshot  # noqa: E402
 import ui_server  # noqa: E402
@@ -458,6 +458,31 @@ REVIEW_APPROVE = """# Ревью: план 1, шаг S1
 - Коммит шага совпадает с HEAD
 """
 
+# Отчёт в форматах, которыми реально пишут ревью: строка роли `[класс] file:line — …`,
+# нумерованные пункты и жирный пункт с классом в скобках (находка Б1 ревью 3-S3).
+REVIEW_FORMATS = """# Ревью: план 1, шаг S1
+
+## ВЕРДИКТ: REQUEST_CHANGES
+
+Объект ревью: коммит `abc1234`
+
+## Находки
+
+### Блокирующие
+
+[блокирующая] `app/a.py:12` — выход не проверяется — ожидается проверка
+
+### Значимые
+
+1. `app/b.py:3` — тихая обрезка
+   продолжение пункта
+2. **[значимая]** `app/c.py:7` — нет пометки обрезки
+
+### Стилистические
+
+**С1 (стилистическая, расширение объёма).** `app/d.py:9` — лишний помощник
+"""
+
 
 def write_prompt(server, text: str = "## Постановка шага S1\n\n- границы: только app/models\n") -> Path:
     path = server["root"] / "docs" / "prompts" / "2026-11-01_1-S1_prompt.md"
@@ -480,6 +505,31 @@ def add_comment(db: Path, task_id: str, body: str, author: str = "reviewer") -> 
                           " author TEXT, body TEXT, created_at INTEGER);")
         con.execute("INSERT INTO task_comments (task_id, author, body, created_at)"
                     " VALUES (?, ?, ?, ?)", (task_id, author, body, 1))
+        con.commit()
+    finally:
+        con.close()
+
+
+def add_stub_cards(db: Path, key_prefix: str, count: int, created_at: int) -> None:
+    """Карточки чужого шага в поддельной борде: они новее карточки проверяемого шага."""
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(KANBAN_SCHEMA)
+        con.executemany(
+            "INSERT OR REPLACE INTO tasks (id, title, status, assignee, idempotency_key,"
+            " created_at, result, tenant) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(f"t_fill{index:03d}", "чужая карточка", "done", "pipeline",
+              f"{key_prefix}{index}", created_at + index + 1, "ok", "plan")
+             for index in range(count)])
+        con.commit()
+    finally:
+        con.close()
+
+
+def set_card_result(db: Path, task_id: str, result: str) -> None:
+    con = sqlite3.connect(db)
+    try:
+        con.execute("UPDATE tasks SET result = ? WHERE id = ?", (result, task_id))
         con.commit()
     finally:
         con.close()
@@ -514,6 +564,90 @@ def test_step_screen_shows_verdict_and_findings(server):
     assert review["commit"] == "abc1234"
     assert [item["level"] for item in review["findings"]] == ["Значимые", "Значимые"]
     assert "Обрезка" in review["findings"][0]["text"]
+
+
+def test_step_screen_parses_role_numbered_and_bold_findings(server):
+    """Находки разбираются во всех форматах отчётов: роль, нумерация, жирный пункт (Б1)."""
+    (server["root"] / "docs" / "reviews" / "1-S1.md").write_text(REVIEW_FORMATS,
+                                                                 encoding="utf-8")
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    review = data["review"]
+    assert [item["level"] for item in review["findings"]] == [
+        "блокирующая", "Значимые", "значимая", "стилистическая"]
+    assert "app/a.py:12" in review["findings"][0]["text"]
+    assert "продолжение пункта" in review["findings"][1]["text"]
+    assert "app/c.py:7" in review["findings"][2]["text"]
+    assert "app/d.py:9" in review["findings"][3]["text"]
+    assert review["findings_note"] == ""
+
+
+def test_step_screen_marks_unparsed_findings_section(server):
+    """Непустой раздел без разобранных пунктов помечается, а не выглядит пустым."""
+    (server["root"] / "docs" / "reviews" / "1-S1.md").write_text(
+        "# Ревью\n\n## ВЕРДИКТ: APPROVE\n\n## Находки\n\n"
+        "Сплошной текст без пунктов и меток класса.\n", encoding="utf-8")
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    assert data["review"]["findings"] == []
+    assert "разобрать" in data["review"]["findings_note"]
+
+
+def test_step_cards_found_beyond_last_200_board_cards(server):
+    """Карточки шага ищутся по префиксу ключа, а не окном последних задач борды (З1)."""
+    run_gate(server["root"], "--run")            # карточка постановки
+    (server["root"] / "docs" / "prompts" / "2026-11-01_1-S1_prompt.md").write_text(
+        "# p\n", encoding="utf-8")
+    run_gate(server["root"], "--run")            # карточка шага
+    mine = {str(card["key"]) for card in stub_cards(server["db"])
+            if str(card["key"]).startswith("planloop:1:S1:")}
+    assert mine, "фикстура не создала карточек шага"
+    add_stub_cards(server["db"], "planloop:1:S9:step:", 250, int(time.time()))
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    assert {card["key"] for card in data["cards"]} == mine
+
+
+def test_step_hold_available_under_owner_stop_flag(server):
+    """Стоп-флаг не гасит допуск: правило живёт в снимке (`hold.allowed`), а не в разметке."""
+    stop = server["root"] / ".pipeline" / "state" / "plan_1_stop.json"
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text(json.dumps({"reason": "остановка владельца", "source": "owner",
+                                "kind": "owner"}, ensure_ascii=False), encoding="utf-8")
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    assert data["hold"]["held"] is False and data["hold"]["allowed"] is True
+    assert data["hold"]["stop"] == "owner"
+    assert data["hold"]["stop_reason"] == "остановка владельца"
+
+
+def test_step_card_result_and_comments_clip_with_note(server):
+    """Результат и комментарии карточки обрезаются с пометкой, а не тихо (З3)."""
+    run_gate(server["root"], "--run")            # карточка постановки
+    (server["root"] / "docs" / "prompts" / "2026-11-01_1-S1_prompt.md").write_text(
+        "# p\n", encoding="utf-8")
+    run_gate(server["root"], "--run")            # карточка шага
+    step_card = next(card for card in stub_cards(server["db"])
+                     if str(card["key"]).endswith(":step"))
+    set_card_result(server["db"], step_card["id"], "я" * 2500)
+    for number in range(25):
+        add_comment(server["db"], step_card["id"], f"замечание {number}")
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    shown = next(card for card in data["cards"] if card["id"] == step_card["id"])
+    assert len(shown["result"]) == 2000 and shown["result_truncated"] is True
+    assert shown["result_note"] == "показаны первые 2000 символов, всего 2500"
+    assert len(shown["comments"]) == 20
+    assert shown["comments_note"] == "показаны первые 20 комментариев, всего 25"
+
+
+def test_file_route_rejects_scheme_and_names_directory(server):
+    """Схема — не путь проекта, а каталог получает своё сообщение (стилистическая С2)."""
+    status, data = get(server["url"] + "/api/file?path=" +
+                       urllib.parse.quote("file:///C:/Windows/win.ini"))
+    assert status == 400 and "вне корня" in data["error"]
+    status, data = get(server["url"] + "/api/file?path=docs/plans")
+    assert status == 400 and "каталог" in data["error"]
 
 
 def test_step_screen_marks_ambiguous_verdict(server):
@@ -583,14 +717,16 @@ def test_step_screen_cards_results_and_hold(server):
     assert shown[step_card["key"]]["result"] == "ok"
     assert shown[step_card["key"]]["comments"][0]["body"] == "замечание ревьюера"
     assert shown["planloop:1:S1:prompt"]["result"] == ""
-    assert data["hold"] == {"steps": [], "held": False}
+    assert data["hold"] == {"steps": [], "held": False, "allowed": True, "stop": "",
+                            "stop_reason": ""}
 
     # Допуск идёт с номером плана: иначе записался бы плану по умолчанию.
     status, payload = post(server["url"], {"action": "hold", "step": "S1", "plan": "1"})
     assert status == 200 and payload["ok"]
     assert "--plan 1" in server["state"].tail()[-1]
     status, data = get(server["url"] + "/api/step?plan=1&id=S1")
-    assert data["hold"] == {"steps": ["S1"], "held": True}
+    assert data["hold"] == {"steps": ["S1"], "held": True, "allowed": False, "stop": "",
+                            "stop_reason": ""}
 
 
 def test_file_route_reads_inside_root_with_clip(server):
@@ -629,7 +765,10 @@ def test_index_has_step_screen_markup():
     html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
     for anchor in ('id="tab-step"', 'data-tab="step"', "/api/step", 'id="step-contract"',
                    'id="step-prompt"', 'id="step-review"', 'id="step-commit"',
-                   'id="step-verdict"', 'id="step-findings"', 'id="btn-hold"',
-                   'id="btn-unhold"', "data-comments"):
+                   'id="step-verdict"', 'id="step-findings"', 'id="step-findings-note"',
+                   'id="btn-hold"', 'id="btn-unhold"', "data-comments", "renderStep(data)",
+                   # Экран шага перезагружается по паре «план + шаг», а доступность допуска
+                   # приходит из снимка (находки Б2 и З4 ревью 3-S3).
+                   "stepPairLoaded", "hold.allowed !== false"):
         assert anchor in html
 

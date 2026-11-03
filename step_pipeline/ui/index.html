@@ -258,6 +258,7 @@
             <div class="body">
               <div class="muted mono" id="step-review-path">—</div>
               <div id="step-findings"></div>
+              <div class="clip" id="step-findings-note"></div>
               <pre id="step-review-text">—</pre>
               <div class="clip" id="step-review-note"></div>
             </div>
@@ -452,6 +453,16 @@ function renderOverview(data) {
 
 // ── экран «Шаг» (план 3 S3): контракт, постановка, отчёт ревью, коммит ──
 let currentStep = null;   // выбранный шаг вкладки «Шаг»
+let stepPairLoaded = "";  // пара «план + шаг», для которой блоки уже нарисованы
+let stepPairPending = ""; // пара, запрос по которой сейчас в полёте
+
+function planIdOf() {
+  return String(window.__planId || currentPlan || "");
+}
+
+function stepPairOf() {
+  return currentStep ? planIdOf() + ":" + currentStep : "";
+}
 
 function showTab(name) {
   document.querySelectorAll(".tab").forEach((tab) => {
@@ -477,16 +488,35 @@ function fillStepPicker() {
   if (currentStep) picker.value = currentStep;
   picker.disabled = !ids.length;
   picker.onchange = () => { currentStep = picker.value; loadStep(); };
+  // Пара «план + шаг» сменилась в снимке — блоки обязаны догрузиться: иначе на экране
+  // контракт одного шага, а кнопка допуска отправляет другой (находка ревью 3-S3).
+  const pair = stepPairOf();
+  const onStepTab = $("tab-step").classList.contains("active");
+  if (pair && onStepTab && pair !== stepPairLoaded && pair !== stepPairPending) loadStep();
 }
 
 async function loadStep() {
-  const plan = window.__planId || currentPlan;
+  const plan = planIdOf();
   if (!plan || !currentStep) {
     $("step-title").textContent = "шаг не выбран — нет плана или шагов";
     return;
   }
-  const data = await api("/api/step?plan=" + encodeURIComponent(plan) +
-                         "&id=" + encodeURIComponent(currentStep));
+  const pair = stepPairOf();
+  stepPairPending = pair;
+  let data;
+  try {
+    data = await api("/api/step?plan=" + encodeURIComponent(plan) +
+                     "&id=" + encodeURIComponent(currentStep));
+  } catch (err) {
+    if (stepPairPending !== pair) return;
+    stepPairPending = "";
+    stepPairLoaded = pair;      // сеть не чинится повтором на каждом кадре SSE
+    $("step-title").textContent = "экран шага не собран: " + err;
+    return;
+  }
+  if (stepPairPending !== pair) return;   // пара уже сменилась: ответ устарел
+  stepPairPending = "";
+  stepPairLoaded = pair;
   if (!data.ok) {
     $("step-title").textContent = data.error || "экран шага не собран";
     toast(data.error || "экран шага не собран", true);
@@ -528,7 +558,11 @@ function renderStep(data) {
   $("step-findings").innerHTML = (review.findings || []).map((item) => {
     const cls = /блок/i.test(item.level) ? "bad" : (/стил/i.test(item.level) ? "muted" : "wait");
     return `<div class="finding ${cls}"><b>${esc(item.level || "находка")}</b>${esc(item.text)}</div>`;
-  }).join("");
+  }).join("") || (review.findings_note ? ""
+                   : `<div class="muted">находок в отчёте нет</div>`);
+  // Неразобранный раздел «Находки» помечается: пустой блок читался бы как «находок нет».
+  $("step-findings-note").textContent = review.findings_note || "";
+  $("step-findings-note").className = "clip" + (review.findings_note ? " bad" : "");
   $("step-review-text").textContent = review.text || "—";
   clipNote($("step-review-note"), review);
   if ((review.occurrences || 0) > 1) {
@@ -542,9 +576,11 @@ function renderStep(data) {
   clipNote($("step-commit-note"), commit.diff, commit.error);
 
   const hold = data.hold || {};
-  $("step-hold").textContent = hold.held ? "на ручном допуске" : "не на допуске";
+  const holdAllowed = hold.allowed !== false;   // правило считает снимок; стоп-флаг его не гасит
+  $("step-hold").textContent = (hold.held ? "на ручном допуске" : "не на допуске")
+    + (hold.stop ? ` · стоп-флаг: ${hold.stop}` : "");
   // Стоп-флаг кнопки не гасит: допуск — действие владельца, ради него экран и открывают.
-  $("btn-hold").disabled = !!window.__preview || !!hold.held;
+  $("btn-hold").disabled = !!window.__preview || !holdAllowed;
   $("btn-unhold").disabled = !!window.__preview || !hold.held;
 
   $("step-cards").innerHTML = (data.cards || []).map((card) => {
@@ -555,13 +591,15 @@ function renderStep(data) {
       <div class="row1"><span class="title">${esc(card.title)}</span>
         <span class="pill ${cls}">${esc(card.status)}</span></div>
       <div class="muted mono">${esc(card.key)} · ${esc(card.id)}</div>
-      ${card.result ? `<div class="res"><pre>${esc(card.result)}</pre></div>`
+      ${card.result ? `<div class="res"><pre>${esc(card.result)}</pre></div>
+        ${card.result_note ? `<div class="clip">${esc(card.result_note)}</div>` : ""}`
                     : `<div class="muted">результата нет</div>`}
       <a href="#comments-${esc(card.id)}" data-comments="${esc(card.id)}">комментарии (${list.length})</a>
       <details class="comments" id="comments-${esc(card.id)}">
         <summary>комментарии карточки</summary>
         ${list.map((msg) => `<div class="comment"><div class="muted">${esc(msg.author || "—")}</div>${esc(msg.body)}</div>`).join("")
           || `<div class="muted">комментариев нет</div>`}
+        ${card.comments_note ? `<div class="clip">${esc(card.comments_note)}</div>` : ""}
       </details></li>`;
   }).join("") || `<li class="muted">карточек шага нет</li>`;
   document.querySelectorAll("[data-comments]").forEach((link) => {
@@ -613,7 +651,7 @@ function render(data) {
       ${p.stop ? `<span class="stop">⛔ ${esc(p.stop.kind || "")}</span>` : ""}
     </div>`).join("") || `<span class="muted">планов с журналом не найдено</span>`;
   document.querySelectorAll(".plan-chip").forEach((chip) => {
-    chip.onclick = () => { currentPlan = chip.dataset.plan; currentStep = null;
+    chip.onclick = () => { currentPlan = chip.dataset.plan; currentStep = null; etag = null;
                            startEvents(); refresh(); };
   });
 
@@ -668,12 +706,14 @@ function render(data) {
 
 async function refresh() {
   const query = currentPlan ? `?plan=${encodeURIComponent(currentPlan)}` : "";
+  const requestedPlan = currentPlan;   // ответ на прошлый план страницу не перерисовывает
   // Прямой fetch, а не api(): нужны заголовок ETag и код 304 — на неизменённый снимок
   // сервер не отдаёт тело и не запускает движок.
   let res;
   try {
     res = await fetch("/api/snapshot" + query, {headers: etag ? {"If-None-Match": etag} : {}});
   } catch (err) { toast(String(err), true); return; }
+  if (requestedPlan !== currentPlan) return;
   if (res.status === 304) return;
   let data = null;
   try { data = await res.json(); } catch (e) { data = {ok: false, error: "не JSON: " + res.status}; }
@@ -700,9 +740,11 @@ async function refresh() {
 function startEvents() {
   // Поток зависит от плана: при его смене старый закрываем и открываем новый.
   if (stream) { stream.close(); stream = null; }
+  const planAtOpen = currentPlan;
   const query = currentPlan ? `?plan=${encodeURIComponent(currentPlan)}` : "";
   stream = new EventSource("/api/events" + query);
   const onFrame = (event) => {
+    if (planAtOpen !== currentPlan) return;   // кадр прошлого плана: страница уже другая
     let data = null;
     try { data = JSON.parse(event.data); } catch (e) { return; }
     etag = null;   // следующий refresh обязан получить тело целиком, а не 304
@@ -723,7 +765,7 @@ document.querySelectorAll(".tab").forEach((tab) => {
 // плану по умолчанию, а на вкладке выбран соседний.
 function stepAction(action) {
   if (!currentStep) { toast("шаг не выбран", true); return; }
-  const plan = window.__planId || currentPlan;
+  const plan = planIdOf();
   act(action, plan ? {step: currentStep, plan} : {step: currentStep})
     .then(() => loadStep());
 }

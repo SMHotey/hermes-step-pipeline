@@ -442,6 +442,9 @@ class Handler(BaseHTTPRequestHandler):
     # ── экран «Шаг» и файлы проекта (план 3 S3) ──
     def _get_step(self) -> None:
         """Экран шага: контракт, постановка, отчёт ревью, коммит и карточки шага."""
+        if not self._local_only():
+            self._json(403, {"ok": False, "error": "только localhost"})
+            return
         query = self._query()
         plan_id = str(query.get("plan") or "").strip()
         step_id = str(query.get("id") or query.get("step") or "").strip()
@@ -466,6 +469,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get_file(self) -> None:
         """Текст файла проекта: только внутри корня, обрезка с явной пометкой."""
+        if not self._local_only():
+            self._json(403, {"ok": False, "error": "только localhost"})
+            return
         query = self._query()
         rel = str(query.get("path") or "")
         try:
