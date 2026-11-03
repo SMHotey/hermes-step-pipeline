@@ -55,6 +55,7 @@ class Step:
 
 
 # Маркер пункта ВЕРХНЕГО уровня: строка с отступом — продолжение предыдущего пункта.
+# ANCHOR:пункты — разбор пунктов плана (П12)
 _BULLET_RE = re.compile(r"^(?:[-*+]|\d+\.)\s+(?P<text>.*)$")
 _DAYS_RE = re.compile(r"\((?P<days>\d+(?:[.,]\d+)?)\s*(?:[–-]\s*\d+(?:[.,]\d+)?\s*)?(?:дн|день|дня|дней)")
 _DAYS_PAREN_RE = re.compile(r"\s*\([^()]*(?:дн|день|дня|дней)[^()]*\)")
@@ -164,7 +165,6 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
     for label, text, _full in blocks:
         if len(text) < 15 or (label and label.startswith(_GOAL_SKIP_LABELS)):
             continue
-        # ANCHOR:критерий — стабильная ссылка для спеки и ревью
         if text.lower().startswith("готово"):
             continue
         cut = re.search(r"\s\d+\.\s", text)
@@ -196,6 +196,7 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
             if m:
                 owner = m.group(1)
         if not dod:
+            # ANCHOR:критерий — извлечение критерия «Готово» (П17)
             ready = _READY_RE.search(full)
             if ready:
                 dod = ready.group("rest").strip()
