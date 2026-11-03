@@ -144,6 +144,12 @@ METRICS_DAYS = 7
 COMMENT_AUTHOR = "страж"
 COMMENT_MAX_LEN = 4000
 FINDINGS_LIMIT = 5
+# Постановка следующего шага и ревью постановки (план 2, S6): отметка свежести recon
+# и что считать расхождением постановки с кодом.
+RECON_RE = re.compile(r"recon_commit\s*[:=]\s*`?([0-9a-f]{7,40})", re.IGNORECASE)
+# Правки вне `docs/` — расхождение постановки с кодом (D4): постановка и отчёты ревью
+# лежат в `docs/`, коммит самой постановки свежесть не отменяет.
+FRESH_DIFF_ARGS = [".", ":(exclude)docs"]
 
 
 # ───────────────────────────── окружение ─────────────────────────────
@@ -281,7 +287,11 @@ def review_path(p: Paths, step_id: str) -> Path:
 
 def verdict_of(p: Paths, step_id: str) -> dict | None:
     """Разобрать отчёт ревьюера. None — отчёта нет; verdict=NONE/AMBIGUOUS — отчёт негоден."""
-    path = review_path(p, step_id)
+    return verdict_at(review_path(p, step_id))
+
+
+def verdict_at(path: Path) -> dict | None:
+    """Разбор файла вердикта по пути: нужен и отчёту ревью, и отчёту ревью постановки."""
     if not path.is_file():
         return None
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -448,6 +458,78 @@ def prompt_rel(p: Paths, step_id: str) -> str | None:
     return p.cfg.rel(matches[-1])
 
 
+def prompt_recon(path: Path | str | None) -> str | None:
+    """`recon_commit` из шапки постановки: короткий или полный sha; нет отметки — None.
+
+    Отметку пишет промптер при снятии recon. Нет её — свежесть не подтвердить, поэтому
+    в режиме `auto` такая постановка ревью не требует (D5): иначе после шага встал бы
+    каждый проект со старыми постановками.
+    """
+    if not path:
+        return None
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    found = RECON_RE.search(text)
+    return found.group(1).lower() if found else None
+
+
+def head_commit(p: Paths) -> str:
+    """sha текущего HEAD; git недоступен или не репозиторий — пустая строка."""
+    try:
+        res = _run(["git", "rev-parse", "HEAD"], Path(p.repo), timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return res.stdout.strip().lower() if res.returncode == 0 else ""
+
+
+def prompt_fresh(p: Paths, recon: str | None) -> bool:
+    """Постановка снята с текущего кода: с `recon` до HEAD нет правок вне `docs/` (D4)."""
+    if not recon:
+        return False
+    try:
+        res = _run(["git", "diff", "--quiet", f"{recon}..HEAD", "--", *FRESH_DIFF_ARGS],
+                   Path(p.repo), timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.returncode == 0
+
+
+def prompt_review_path(p: Paths, step_id: str) -> Path:
+    """Отчёт ревью постановки: `docs/reviews/<префикс>-<шаг>-prompt.md`."""
+    return Path(p.review_dir) / f"{p.review_prefix}-{step_id}-prompt.md"
+
+
+def prompt_review_rel(p: Paths, step_id: str) -> str:
+    return p.cfg.rel(prompt_review_path(p, step_id))
+
+
+def prompt_verdict(p: Paths, step_id: str) -> dict | None:
+    """Вердикт ревью постановки + `recon` из отчёта: сверять надо ту же версию (D1)."""
+    result = verdict_at(prompt_review_path(p, step_id))
+    if result is None:
+        return None
+    result["recon"] = prompt_recon(result["path"])
+    return result
+
+
+def next_prompt_step(steps: list[dict], step_id: str) -> dict | None:
+    """Шаг, чья постановка заказывается заранее: N+1, если он не последний (D2).
+
+    У предпоследнего шага N+1 — последний, и заказ/гейт не работают: иначе конвейер
+    встал бы на закрытии последнего шага без постановки, которой уже не будет.
+    """
+    ids = [str(s.get("id") or "").upper() for s in steps or []]
+    want = str(step_id or "").upper()
+    if want not in ids:
+        return None
+    index = ids.index(want)
+    if index + 1 >= len(ids) - 1:
+        return None
+    return steps[index + 1]
+
+
 def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
     plan_id = p.plan_id
     plan_rel = p.cfg.rel(Path(p.plan_file))
@@ -518,9 +600,12 @@ def prompt_order_body(p: Paths, step: dict) -> str:
         f"1. Прочитать §{step_id} плана и фактическое состояние кода (файлы выше, `git log -3 -- <файлы>`).",
         "2. Написать постановку по блокам шаблона (роль и цель; контекст с file:line; границы;",
         "   задачи; как проверить; стоп-сигналы; формат отчёта; вопросы; ревью).",
-        "3. Раздел «Состояние на момент постановки»: что уже сделано, чего не хватает до «Готово =».",
-        "4. Гейт: `python .pipeline/check_task_prompt.py <файл>` → `ИТОГ: PASS`.",
-        "5. Коммит и пуш ТОЛЬКО файла постановки, затем kanban_complete: путь, результат гейта, sha.",
+        "3. В шапку постановки добавить строку `recon_commit:` с полным sha HEAD, на котором снят",
+        "   recon (рядом с датой, ветвью и HEAD): по ней страж отличает свежую постановку",
+        "   от устаревшей и не гоняет лишнее ревью.",
+        "4. Раздел «Состояние на момент постановки»: что уже сделано, чего не хватает до «Готово =».",
+        "5. Гейт: `python .pipeline/check_task_prompt.py <файл>` → `ИТОГ: PASS`.",
+        "6. Коммит и пуш ТОЛЬКО файла постановки, затем kanban_complete: путь, результат гейта, sha.",
         "",
         "ЗАПРЕТЫ: не править код приложения, не запускать тесты и сборки, не менять план,",
         "не коммитить чужие файлы (`git add` перечислением, не `-A`).",
@@ -573,6 +658,49 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
         "",
         "ЗАПРЕТЫ: не править код, не коммитить, не пушить, не запускать полный набор тестов,",
         "не трогать данные приложения. Ревьюер выносит суждение — исправляет исполнитель.",
+        "",
+        "Закрыть карточку через kanban_complete: вердикт одной строкой + путь отчёта.",
+    ])
+
+
+def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
+                            prompt: str | None) -> str:
+    """Тело карточки ревью постановки: постановка против текущего HEAD (правило 3)."""
+    plan_id = p.plan_id
+    plan_rel = p.cfg.rel(Path(p.plan_file))
+    prompt_line = f"`{prompt}`" if prompt else "— (файл постановки не найден)"
+    recon = prompt_recon(Path(p.repo) / prompt) if prompt else None
+    head = head_commit(p) or "—"
+    return "\n".join([
+        f"РЕВЬЮ ПОСТАНОВКИ ШАГА {step['id']} плана {plan_id} — {step['title']}",
+        "",
+        f"Отчёт писать в: `{report_rel}` (перезаписать, если файл есть).",
+        "",
+        f"Постановка: {prompt_line}",
+        f"Снята на: recon_commit `{recon or '—'}`; текущий HEAD: `{head}`.",
+        "Постановка старше кода: проверить, не разъехалась ли она с фактом.",
+        "Файлы уже существуют, поведение уже сделано, гейты не совпадают с реальными —",
+        "это находки, а не повод согласиться «на глаз».",
+        "",
+        "ИСТОЧНИКИ — РОВНО ТРИ: (1) постановка; (2) раздел шага в плане",
+        f"`{plan_rel}` §{step['id']}; (3) код — `git show`, файлы и тесты на HEAD.",
+        "Отчёт исполнителя и его транскрипт — НЕ доказательство.",
+        "",
+        "ЧТО ПРОВЕРИТЬ",
+        "- «Что сделать»: каждый пункт выполним на текущем коде, адреса file:line верны.",
+        "- Границы и запреты: не требуют того, что уже запрещено планом или ломает соседний код.",
+        "- Гейты: команды и ожидаемые цифры из постановки достижимы на HEAD.",
+        "- Расхождение постановки с планом/кодом — находка с указанием, что верно.",
+        "",
+        "ОБЯЗАТЕЛЬНЫЙ ФОРМАТ ОТЧЁТА",
+        f"- Файл `{report_rel}` содержит РОВНО ОДНУ строку вердикта (заголовок допустим):",
+        "  `## ВЕРДИКТ: APPROVE` либо `## ВЕРДИКТ: REQUEST_CHANGES`.",
+        "  Две строки вердикта или цитата чужого вердикта = страж остановит конвейер (AMBIGUOUS).",
+        f"- Первая строка отчёта — отметка версии: `recon_commit: {recon or '<sha постановки>'}`;",
+        "  тот же sha, что в шапке постановки. Другой sha — страж не примет ревью за эту версию.",
+        "",
+        "ЗАПРЕТЫ: не править постановку и код, не коммитить, не пушить, не запускать тесты.",
+        f"Постановку после REQUEST_CHANGES переписывает роль `{p.cfg.prompter}`, не ревьюер.",
         "",
         "Закрыть карточку через kanban_complete: вердикт одной строкой + путь отчёта.",
     ])
@@ -653,6 +781,10 @@ def build_ctx(p: Paths) -> dict:
     ctx["review_prefix"] = p.review_prefix
     # Файл плана: причина hold обязана ссылаться на раздел плана, а у `decide` нет `Paths`.
     ctx["plan_file"] = p.cfg.rel(Path(p.plan_file))
+    # Режимы плана 2 (S6) — в ctx, чтобы `decide` оставалась чистой функцией.
+    ctx["prefetch"] = bool(p.cfg.prefetch_prompt)
+    ctx["prompt_review"] = str(p.cfg.prompt_review)
+    ctx["require_prompt"] = bool(p.cfg.require_prompt)
     # Утверждение считаем ДО сборщика: при его сбое решение всё равно должно знать,
     # что план не утверждён.
     approval = registry.approval_status(p.cfg, p.spec)
@@ -662,7 +794,12 @@ def build_ctx(p: Paths) -> dict:
         pkg = collector(p)
     except SystemExit as exc:
         ctx.update(next=None, collector_error=str(exc), cards=[], verdict=None,
-                   journal_closed=False, prev_closed=None, prev_verdict=None)
+                   journal_closed=False, prev_closed=None, prev_verdict=None,
+                   # Без сборщика шагов ни постановки, ни N+1 не видно; «свежей» постановку
+                   # не считаем, иначе решение пропустило бы обязательное ревью.
+                   steps=[], prompt=None, prompt_recon=None, prompt_fresh=False,
+                   prompt_report=None, prompt_verdict=None, next_step=None,
+                   next_prompt=None, next_cards=[])
         return ctx
     step = pkg.get("next")
     ctx["next"] = step
@@ -677,6 +814,20 @@ def build_ctx(p: Paths) -> dict:
     ctx["cards"] = read_cards(p, f"planloop:{p.plan_id}:{step['id']}:") if step else []
     ctx["prev_cards"] = (read_cards(p, f"planloop:{p.plan_id}:{ctx['prev_closed']}:")
                          if ctx.get("prev_closed") else [])
+    # Постановка шага, её свежесть и постановка N+1 (правила 1-3 плана 2 S6). Стоимость:
+    # один `git diff` на тик и только когда постановка есть.
+    ctx["steps"] = list(pkg.get("steps") or [])
+    prompt = prompt_rel(p, step["id"]) if step else None
+    recon = prompt_recon(Path(p.repo) / prompt) if prompt else None
+    ctx["prompt"] = prompt
+    ctx["prompt_recon"] = recon
+    ctx["prompt_fresh"] = prompt_fresh(p, recon) if prompt else False
+    ctx["prompt_report"] = prompt_review_rel(p, step["id"]) if step else None
+    ctx["prompt_verdict"] = prompt_verdict(p, step["id"]) if step else None
+    nxt = next_prompt_step(ctx["steps"], step["id"]) if step else None
+    ctx["next_step"] = nxt
+    ctx["next_prompt"] = prompt_rel(p, nxt["id"]) if nxt else None
+    ctx["next_cards"] = (read_cards(p, f"planloop:{p.plan_id}:{nxt['id']}:") if nxt else [])
     return ctx
 
 
@@ -703,7 +854,9 @@ def decide(ctx: dict) -> dict:
         return dict(base, clear_incident=True,
                     reason=f"стоп-причина снята (было: {stop.get('reason', '')}); "
                            f"дальше — {base['action']}")
-    return base
+    # Предзаказ постановки N+1 (правило 2): только поверх ожидания и без своих блокировок.
+    prefetch = _prefetch_decision(ctx, base)
+    return prefetch or base
 
 
 def _decide_base(ctx: dict) -> dict:
@@ -775,6 +928,9 @@ def _decide_base(ctx: dict) -> dict:
                     "reason": (f"шаг {sid} помечен «Риск: high» — нужен допуск владельца; "
                                f"раздел плана: `{where}` §{sid}; снять: "
                                f"`python .pipeline/gate.py --unhold {sid}`")}
+        review = _prompt_review_decision(ctx, step)
+        if review:
+            return review
         return {"action": "create_step", "step": sid, "data": step}
     last_step = steps[-1]
     if last_step["status"] not in TERMINAL:
@@ -820,6 +976,19 @@ def _decide_base(ctx: dict) -> dict:
         return {"action": "stop", "step": sid,
                 "reason": f"вердикт {sid} не распознан ({what}): {Path(verdict['path']).name}"}
     if verdict["verdict"] == "APPROVE":
+        nxt = ctx.get("next_step")
+        # Правило 1: шаг не считается выполненным, пока нет постановки N+1. Гейт живёт
+        # в решении, а не в отказе `apply` (D10): иначе каждый тик давал бы повторный
+        # `applied=False` и съедал единственное действие, ничего не заказывая.
+        if (ctx.get("prefetch") and ctx.get("require_prompt") and nxt
+                and ctx.get("next_prompt") is None):
+            reason = close_block_reason(sid, nxt["id"])
+            orders = card_of(ctx.get("next_cards") or [], "prompt")
+            if orders:
+                return {"action": "idle", "step": sid, "reason": reason,
+                        "detail": f"карточка заказа {orders[-1]['id']}"}
+            return {"action": "create_prompt", "step": nxt["id"], "data": nxt,
+                    "after_close": True, "reason": reason}
         return {"action": "close_step", "step": sid, "data": step, "verdict": verdict,
                 "journal_closed": ctx.get("journal_closed")}
     if not fixes:
@@ -840,6 +1009,103 @@ def _decide_base(ctx: dict) -> dict:
         "Стоп инцидентный: снимется сам, как только появится вердикт APPROVE.",
     ]
     return {"action": "stop", "step": sid, "reason": reason, "details": chr(10).join(details)}
+
+
+def close_block_reason(step_id: str, next_id: str) -> str:
+    """Фраза гейта закрытия (правило 1): одна на решение, отказ `apply` и уведомление."""
+    return f"шаг {step_id} принят, но закрыть не могу: нет постановки {next_id}"
+
+
+def _prefetch_decision(ctx: dict, base: dict) -> dict | None:
+    """Заказ постановки N+1, пока шаг N в работе (правило 2), либо None.
+
+    Ожидание кодируется решением `idle`, а не повторным `applied=False`: иначе каждый
+    тик тратил бы единственное действие на одно и то же (D10). Порядок веток важен:
+    решение о заказе не спорит с блокировками основания (утверждение, инцидент, план).
+    """
+    if base.get("action") != "idle":
+        return None
+    if base.get("approval_blocked") or base.get("incident") or base.get("plan_done"):
+        return None
+    if not ctx.get("prefetch"):
+        return None
+    step, nxt = ctx.get("next"), ctx.get("next_step")
+    if not step or not nxt:
+        return None                        # следующий шаг последний или его нет (D2)
+    if not card_of(ctx.get("cards") or [], "step"):
+        return None                        # шаг ещё не взят в работу
+    if ctx.get("next_prompt") is not None:
+        return None                        # постановка N+1 уже есть
+    orders = card_of(ctx.get("next_cards") or [], "prompt")
+    if orders:
+        return {"action": "idle", "step": step["id"],
+                "reason": (f"постановка {nxt['id']} заказана заранее: карточка "
+                           f"{orders[-1]['id']} ({orders[-1]['status']})")}
+    return {"action": "create_prompt", "step": nxt["id"], "data": nxt,
+            "reason": f"постановка {nxt['id']} заказана заранее, пока шаг {step['id']} в работе"}
+
+
+def _prompt_review_needed(ctx: dict) -> bool:
+    """Режим `prompt_review`: `never` — нет, `always` — да, `auto` — только устаревшая."""
+    mode = str(ctx.get("prompt_review") or "auto").strip().lower()
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if not ctx.get("prompt_recon"):
+        return False                       # без отметки свежесть не проверить — не гоним (D5)
+    return not bool(ctx.get("prompt_fresh"))
+
+
+def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
+    """Ревью постановки до старта шага (правило 3): заказ, ожидание, стоп или None."""
+    sid = step["id"]
+    if not ctx.get("prompt"):
+        return None                        # постановки нет: решает обычная ветка create_step
+    if not _prompt_review_needed(ctx):
+        return None
+    report_rel = ctx.get("prompt_report") or prompt_review_rel_of(ctx, sid)
+    reports = [c for c in (ctx.get("cards") or [])
+               if (c.get("key") or "").endswith(":promptreview")]
+    if not reports:
+        return {"action": "create_prompt_review", "step": sid, "data": step,
+                "reason": (f"постановка {sid} устарела относительно HEAD "
+                           f"(recon_commit: {ctx.get('prompt_recon') or '—'}) — нужно ревью "
+                           f"постановки, отчёт {report_rel}")}
+    last = reports[-1]
+    if last["status"] not in TERMINAL:
+        return {"action": "idle", "step": sid,
+                "reason": f"ревью постановки {sid} идёт: карточка {last['id']} "
+                          f"({last['status']})"}
+    if last["status"] != "done":
+        detail = (last.get("error") or last.get("result") or "")[:300]
+        return {"action": "stop", "step": sid,
+                "reason": f"ревью постановки {sid} упало ({last['status']}): {detail}"}
+    verdict = ctx.get("prompt_verdict")
+    if verdict is None:
+        return {"action": "stop", "step": sid,
+                "reason": f"ревью постановки {sid} закрыто, но отчёта {report_rel} нет"}
+    if verdict["verdict"] in ("NONE", "AMBIGUOUS"):
+        what = "строки вердикта нет" if verdict["verdict"] == "NONE" else "строк вердикта несколько"
+        return {"action": "stop", "step": sid,
+                "reason": f"вердикт ревью постановки {sid} не распознан ({what}): "
+                          f"{Path(verdict['path']).name}"}
+    if verdict["verdict"] != "APPROVE":
+        return {"action": "stop", "step": sid,
+                "reason": (f"ревью постановки {sid} вернуло REQUEST_CHANGES — постановку "
+                           f"надо переписать: {Path(verdict['path']).name}")}
+    if (verdict.get("recon") or "") != (ctx.get("prompt_recon") or ""):
+        return {"action": "stop", "step": sid,
+                "reason": (f"ревью постановки {sid} не про эту версию: в отчёте recon_commit "
+                           f"{verdict.get('recon') or '—'}, в постановке "
+                           f"{ctx.get('prompt_recon') or '—'}")}
+    return None                            # APPROVE по той же версии — шаг стартует
+
+
+def prompt_review_rel_of(ctx: dict, step_id: str) -> str:
+    """Путь отчёта ревью постановки для синтетического ctx (без `Paths`)."""
+    prefix = ctx.get("review_prefix") or "?"
+    return f"docs/reviews/{prefix}-{step_id}-prompt.md"
 
 
 def _report_items(text: str) -> list[tuple[str, bool]]:
@@ -1962,6 +2228,40 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         else:
             say(f"не смог создать карточку шага {step['id']} — проверь `hermes kanban ls`")
         return result
+    if action == "create_prompt":
+        # Постановка N+1: заказ заранее (правило 2) и заказ вместо закрытия (правило 1).
+        step = decision["data"]
+        step_id = step["id"]
+        after_close = bool(decision.get("after_close"))
+        block_reason = str(decision.get("reason") or "")
+        try:
+            contract = collector(p, step_id).get("next") or {}
+        except SystemExit as exc:
+            reason = f"постановка {step_id} не заказана: {exc}"
+            write_stop(p, reason, "gate", kind="incident")
+            result.update(applied=True, detail=reason)
+            touch("stop:no_contract")
+            say("⛔ " + reason)
+            return result
+        data = contract or step
+        key = f"planloop:{plan_id}:{step_id}:prompt"
+        cid = create_card(p, f"[постановка {plan_id} {step_id}] {data.get('title', '')}",
+                          prompt_order_body(p, data), p.cfg.prompter, key,
+                          p.cfg.prompt_skills, max_runtime=p.cfg.prompt_runtime)
+        where = f"карточка {cid}" if cid else "карточку заказа создать не удалось"
+        ordered = f"постановка {step_id} заказана: {where}"
+        result.update(applied=bool(cid),
+                      detail=f"{block_reason}; {ordered}" if after_close else ordered)
+        touch(f"create_prompt:{cid}")
+        if cid and after_close:
+            say(f"⛔ {block_reason}. Заказ на постановку отправлен ({cid}) — как только она "
+                f"появится, шаг закроется сам")
+        elif cid:
+            say(f"план {plan_id}: постановка {step_id} заказана заранее ({cid}), "
+                f"работа над текущим шагом не ждёт")
+        else:
+            say(f"план {plan_id}: не смог заказать постановку {step_id} — проверь борду")
+        return result
     if action == "create_review":
         step, attempt = decision["data"], decision["attempt"]
         key = f"planloop:{plan_id}:{step['id']}:review:{attempt}"
@@ -1978,6 +2278,23 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             say(f"план {plan_id}, шаг {step['id']} исполнен, отправлен на ревью (карточка {cid})")
         else:
             say(f"не смог поставить ревью шага {step['id']} плана {plan_id}")
+        return result
+    if action == "create_prompt_review":
+        step = decision["data"]
+        key = f"planloop:{plan_id}:{step['id']}:promptreview"
+        report_rel = prompt_review_rel(p, step["id"])
+        cid = create_card(p, f"[ревью постановки {plan_id} {step['id']}] {step['title']}",
+                          prompt_review_card_body(p, step, report_rel,
+                                                  ctx.get("prompt") or prompt_rel(p, step["id"])),
+                          p.cfg.reviewer, key, p.cfg.review_skills,
+                          max_runtime=p.cfg.review_runtime)
+        result.update(applied=bool(cid), detail=f"карточка ревью постановки: {cid}")
+        touch(f"create_prompt_review:{cid}")
+        if cid:
+            say(f"план {plan_id}: постановка шага {step['id']} старше кода — поставил ревью "
+                f"постановки (карточка {cid}), шаг не начинаю")
+        else:
+            say(f"план {plan_id}: не смог поставить ревью постановки шага {step['id']}")
         return result
     if action == "create_rereview":
         prev_id = decision["step"]
@@ -2036,6 +2353,13 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         return result
     if action == "close_step":
         step, verdict = decision["data"], decision["verdict"]
+        nxt = ctx.get("next_step")
+        # Защитная проверка гейта (D10): решение такое состояние уже отсекает, но гонка
+        # (постановку убрали между тиками) не должна закрыть шаг без постановки N+1.
+        if (ctx.get("prefetch") and ctx.get("require_prompt") and nxt
+                and ctx.get("next_prompt") is None):
+            result.update(applied=False, detail=close_block_reason(step["id"], nxt["id"]))
+            return result
         commit = verdict.get("commit") or ""
         if commit:
             exists = _run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], Path(p.repo))

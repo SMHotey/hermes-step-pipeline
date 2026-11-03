@@ -55,6 +55,11 @@ DEFAULTS: dict = {
     "driven_plans": ["*"],
     # Шаг без промта-постановки не начинается: страж закажет постановку роли prompter.
     "require_prompt": True,
+    # Предзаказ постановки N+1, пока шаг N в работе, и гейт закрытия без неё (план 2, S6).
+    "prefetch_prompt": True,
+    # Ревью постановки против текущего HEAD: auto — только устаревшая, always — каждая,
+    # never — поведение как до шага (правило 3 плана 2 S6).
+    "prompt_review": "auto",
     "runtimes": {"step": "3h", "review": "150m", "prompt": "45m"},
     "kanban": {"tenant": "plan"},
     "git": {"commit": True, "push": True},
@@ -86,6 +91,11 @@ DEFAULTS: dict = {
         },
     },
 }
+
+
+# Режимы ревью постановки: иное значение в pipeline.json — ошибка конфигурации, а не
+# молчаливое «auto»: владелец должен узнать, что его настройка не подействовала.
+PROMPT_REVIEW_MODES = ("auto", "always", "never")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -130,6 +140,8 @@ class Config:
     default_plan: str | None
     driven: tuple[str, ...]
     require_prompt: bool
+    prefetch_prompt: bool
+    prompt_review: str
     step_runtime: str
     review_runtime: str
     prompt_runtime: str
@@ -232,6 +244,11 @@ def load(repo: Path | str | None = None) -> Config:
     if "id" not in step_regex.groupindex:
         raise ConfigError(f"в step_id_regex нет именованной группы id: {pattern}")
 
+    prompt_review = str(raw.get("prompt_review") or "auto").strip().lower()
+    if prompt_review not in PROMPT_REVIEW_MODES:
+        raise ConfigError(f"prompt_review: неизвестный режим {prompt_review!r}; допустимо: "
+                          f"auto | always | never")
+
     cfg = Config(
         repo=root,
         project=str(raw.get("project") or root.name),
@@ -252,6 +269,8 @@ def load(repo: Path | str | None = None) -> Config:
         default_plan=(str(raw["default_plan"]) if raw.get("default_plan") else None),
         driven=driven,
         require_prompt=bool(raw.get("require_prompt", True)),
+        prefetch_prompt=bool(raw.get("prefetch_prompt", True)),
+        prompt_review=prompt_review,
         step_runtime=str(runtimes.get("step") or "3h"),
         review_runtime=str(runtimes.get("review") or "150m"),
         prompt_runtime=str(runtimes.get("prompt") or "45m"),

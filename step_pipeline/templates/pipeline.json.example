@@ -26,6 +26,8 @@
   "default_plan": null,
   "driven_plans": ["*"],
   "require_prompt": true,
+  "prefetch_prompt": true,
+  "prompt_review": "auto",
   "max_actions": 1,
   "runtimes": {
     "step": "3h",
