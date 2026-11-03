@@ -692,7 +692,8 @@ function renderSetup(data) {
     const bad = setupState.errors[step.id];
     const cls = bad ? "bad" : (step.done ? "ok" : "wait");
     const label = bad ? "ошибка" : (step.done ? "готово" : "нужно");
-    const action = step.id === "checks" || step.done ? "Проверить" : "Выполнить";
+    const action = step.id === "checks" ? "Перепроверить"
+      : (step.done ? "Проверить" : "Выполнить");
     return `<li class="step-card">
       <div class="row1"><span class="title">${esc(step.title)}</span>
         <span class="pill ${cls}">${esc(label)}</span></div>
@@ -724,7 +725,12 @@ async function runSetupStep(step) {
   // Токен живёт только в поле формы: сервер его не возвращает, поле гасится сразу.
   $("setup-token").value = "";
   setupState.errors[step] = data.ok ? "" : (data.error || "шаг не выполнен");
-  $("setup-log").textContent = (data.log || []).join("\n") || data.error || "—";
+  // Лог мастера накапливается: строки шагов дописываются, а не затирают друг друга.
+  const logEl = $("setup-log");
+  const lines = (data.log || []).join("\n") || data.error || "—";
+  logEl.textContent = logEl.textContent && logEl.textContent !== "выполняется…"
+    ? logEl.textContent + "\n" + lines
+    : lines;
   if (data.ok) toast("Установка: " + step + " — готово");
   else toast(data.error || "шаг не выполнен", true);
   etag = null;

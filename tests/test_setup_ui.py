@@ -263,6 +263,13 @@ def test_profiles_and_cron_steps_call_existing_setup(stub, tmp_path: Path):   # 
     assert {call[1] for call in trust_calls} == {"shop", "prompter", "reviewer"}
     assert all(call[4] == str(root) for call in trust_calls)
 
+    # Имена ролей — из конфига, а не из формы: иначе зелёный шаг с чужими именами
+    # оставлял бы `next` на `profiles` навсегда (факт считается по pipeline.json).
+    other = setup_flow.run_setup_step(root, "profiles", {"driver": "shop2"})
+    assert other["ok"] is True
+    assert other["next"] == "telegram"
+    assert "shop2" not in {call[1] for call in stub.calls if call[0] == "-p"}
+
     cron = setup_flow.run_setup_step(root, "cron")
     assert cron["ok"] is True
     marker = json.loads((root / ".pipeline" / "cron.json").read_text(encoding="utf-8"))
@@ -299,6 +306,33 @@ def test_telegram_step_keeps_token_out_of_responses(stub, monkeypatch,   # noqa:
         _status, state = get_json(url + "/api/setup")
     assert state["values"]["telegram_token_set"] is True
     assert TOKEN not in json.dumps(state, ensure_ascii=False)
+
+    # Имя переменной панель берёт из конфига (`notify.token_env`), как и факт шага:
+    # при своём имени она не должна врать «токена нет» у закрытого шага.
+    cfg["notify"]["token_env"] = "MY_BOT_TOKEN"
+    (root / "pipeline.json").write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    (stub.home / "shop" / ".env").write_text("MY_BOT_TOKEN=" + TOKEN + "\n", encoding="utf-8")
+    with running(root) as (url, _httpd):
+        _status, custom = get_json(url + "/api/setup")
+    assert custom["values"]["telegram_token_set"] is True
+
+    # Принудительная утечка: Telegram отклоняет токен и повторяет его в тексте ошибки.
+    # Редакция обязана ловить то же (срезанное) значение, что исполнил шаг, иначе токен
+    # с хвостовым переводом строки уходит в ответ API и в state.log панели.
+    def reject(token: str) -> dict:
+        raise setup_flow.telegram.TelegramError("Unauthorized: " + token)
+
+    monkeypatch.setattr(setup_flow.telegram, "get_me", reject)
+    with running(root) as (url, httpd):
+        code, body = post_setup(url, {"step": "telegram",
+                                      "values": {"token": TOKEN + "\n", "chat": "42"}})
+        tail = "\n".join(httpd.RequestHandlerClass.state.tail())
+
+    assert code == 400, body
+    assert body["ok"] is False
+    assert TOKEN not in json.dumps(body, ensure_ascii=False)
+    assert TOKEN not in tail
+    assert "***" in body["error"] and "***" in tail
 
 
 def test_preview_hides_master_and_rejects_post(hermes_stub, tmp_path: Path):   # noqa: ARG001

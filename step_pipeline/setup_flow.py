@@ -1367,12 +1367,17 @@ def setup_status(project: Path) -> dict[str, Any]:
                       if item["id"] != "checks" and not item["done"]), None)
     driver = roles_from_config(cfg)[0]
     env = env_values(driver)
+    # Имена переменных — из конфига, как в `_telegram_fact`: при своём имени
+    # переменной панель не должна показывать «токена нет» у закрытого шага.
+    notify = cfg.get("notify") or {}
+    token_env = str(notify.get("token_env") or TOKEN_ENV)
+    chat_env = str(notify.get("chat_env") or CHAT_ENV)
     values = {
         **setup_defaults(project),
         "engine_version": engine_version(project),
         "plugin_version": plugin_version(),
-        "telegram_token_set": bool(env.get(TOKEN_ENV)),
-        "telegram_chat": str(env.get(CHAT_ENV) or ""),
+        "telegram_token_set": bool(env.get(token_env)),
+        "telegram_chat": str(env.get(chat_env) or ""),
     }
     return {"steps": steps, "next": next_step, "values": values}
 
@@ -1434,6 +1439,15 @@ def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str
     driver = given.get("driver") or profiles.get("driver") or defaults["driver"]
     prompter = given.get("prompter") or profiles.get("prompter") or defaults["prompter"]
     reviewer = given.get("reviewer") or profiles.get("reviewer") or defaults["reviewer"]
+    if step != "project":
+        # Конфиг важнее формы у всех шагов, кроме «Проекта»: имена ролей и борду пишет
+        # в `pipeline.json` он же, а факты шагов считаются по конфигу (`_board_fact`,
+        # `_profiles_fact`, `_telegram_fact`, `_cron_fact`). Шаг по форме с другими
+        # именами давал зелёный шаг и вечный `next` на нём самом.
+        board = str(cfg.get("board") or board)
+        driver = str(profiles.get("driver") or driver)
+        prompter = str(profiles.get("prompter") or prompter)
+        reviewer = str(profiles.get("reviewer") or reviewer)
 
     if step == "project":
         # D8: только предмет шага. Уведомления не выключаем, борду не создаём,
@@ -1554,7 +1568,10 @@ def _setup_checks(project: Path, cfg: dict[str, Any], log: Log) -> None:
         log.ok("cron: джоба стража заведена")
     else:
         log.warn("cron: метки .pipeline/cron.json нет — страж сам не запустится")
-    log.ok("telegram: " + ("включён" if _telegram_fact(cfg) else "выключен"))
+    if _telegram_fact(cfg):
+        log.ok("telegram: включён")
+    else:
+        log.warn("telegram: выключен — токен и chat id не настроены")
     lint = plan_lint.lint_project(project)
     if lint.problems:
         log.warn(f"линтер планов: проблем {len(lint.problems)} — "

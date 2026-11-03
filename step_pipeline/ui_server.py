@@ -600,7 +600,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         raw_values = payload.get("values")
         values = raw_values if isinstance(raw_values, dict) else {}
-        token = str(values.get("token") or "")
+        # Редакция тем же значением, которое исполнит шаг: `run_setup_step` срезает
+        # значения формы (`.strip()`), поэтому токен с хвостовым переводом строки
+        # иначе не совпадает с текстом ошибки и уходит в ответ и в `state.log`.
+        token = str(values.get("token") or "").strip()
         try:
             result = setup_flow.run_setup_step(self.state.project, step, values)
         except Exception as exc:                                # noqa: BLE001
