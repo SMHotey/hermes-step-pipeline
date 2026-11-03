@@ -1411,7 +1411,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         result.update(applied=bool(cid), detail=f"карточка шага: {cid}")
         touch(f"create_step:{cid}")
         if cid:
-            say(f"взял в работу шаг {step['id']} — {step['title']} (карточка {cid})")
+            say(f"план {plan_id}, шаг {step['id']} взят в работу — {step['title']} (карточка {cid})")
         else:
             say(f"не смог создать карточку шага {step['id']} — проверь `hermes kanban ls`")
         return result
@@ -1428,9 +1428,9 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         result.update(applied=bool(cid), detail=f"карточка ревью: {cid}")
         touch(f"create_review:{cid}")
         if cid:
-            say(f"шаг {step['id']} исполнен, отправлен на ревью (карточка {cid})")
+            say(f"план {plan_id}, шаг {step['id']} исполнен, отправлен на ревью (карточка {cid})")
         else:
-            say(f"не смог поставить ревью шага {step['id']}")
+            say(f"не смог поставить ревью шага {step['id']} плана {plan_id}")
         return result
     if action == "create_rereview":
         prev_id = decision["step"]
@@ -1453,7 +1453,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         result.update(applied=bool(cid), detail=f"повторное ревью {prev_id}: {cid}")
         touch(f"create_rereview:{cid}")
         if cid:
-            say(f"шаг {prev_id} закрыт в журнале, но ревью было REQUEST_CHANGES — "
+            say(f"план {plan_id}, шаг {prev_id} закрыт в журнале, но ревью было REQUEST_CHANGES — "
                 f"ставлю повторное ревью (карточка {cid})")
         else:
             say(f"не смог поставить повторное ревью шага {prev_id}")
@@ -1469,7 +1469,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         result.update(applied=bool(cid), detail=f"карточка правок: {cid}")
         touch(f"create_fix:{cid}")
         if cid:
-            say(f"ревью {step['id']}: REQUEST_CHANGES → правки в работе (карточка {cid}), "
+            say(f"план {plan_id}, ревью {step['id']}: REQUEST_CHANGES → правки в работе (карточка {cid}), "
                 f"это единственный автоматический круг")
         else:
             say(f"ревью {step['id']}: REQUEST_CHANGES, но карточку правок создать не удалось")
@@ -1495,7 +1495,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                                          f"коммит/пуш: {'ok ' + detail if ok else detail}")
         touch(f"close_step:{step['id']}")
         if ok:
-            say(f"✅ шаг {step['id']} закрыт (ревью APPROVE, коммит {detail}). "
+            say(f"✅ план {plan_id}, шаг {step['id']} закрыт (ревью APPROVE, коммит {detail}). "
                 f"Следующий шаг стартует автоматически")
         else:
             state["pending_commit"] = {"files": files, "step": step["id"], "reason": detail}
