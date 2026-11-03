@@ -457,6 +457,7 @@ def _overview(root: Path, cfg: dict, out: dict) -> dict:
 
 STEP_LINES = 200                        # строк на блок экрана «Шаг»
 CARD_TEXT_LIMIT = 2000                  # символов результата карточки: с пометкой обрезки
+FINDING_TEXT_LIMIT = 1200               # символов текста одной находки: с пометкой обрезки
 TEXT_SUFFIXES = (".md", ".txt", ".json", ".py", ".html", ".css", ".js", ".yaml", ".yml",
                  ".toml", ".ini", ".cfg")
 # Вердикт и коммит разбираются теми же выражениями, что у стража (`gate.py`): копия нужна
@@ -673,8 +674,17 @@ _FINDING_BOLD_RE = re.compile(r"^\s{0,8}\*\*(?P<head>[^*]{1,160})\*\*\s*(?P<text
 _FINDING_CLASS_RE = re.compile(r"блокирующ\w*|значим\w*|стилистическ\w*|критичн\w*|"
                                r"незначительн\w*", re.IGNORECASE)
 # Строки, которые означают «находок нет», а не находку: их разбор не считает пунктами.
+# Формы — как пишут отчёты: «Находок нет.», «Блокирующих и значимых находок нет.»,
+# «Замечаний нет.»; проверяются только на самостоятельной строке (абзац или свой пункт).
 _NO_FINDINGS_RE = re.compile(r"^(?:—|-|\*)?\s*(?:нет\b|не\s+найден\w*|отсутству\w*|"
-                             r"блокирующих\s+находок\s+нет)", re.IGNORECASE)
+                             r"(?:(?:блокирующих|значимых|стилистических|критичных)"
+                             r"(?:\s+и\s+(?:блокирующих|значимых|стилистических|критичных))*\s+)?"
+                             r"(?:находок|замечаний|проблем)\s+нет\b)",
+                             re.IGNORECASE)
+# Раздел находок шага: точный заголовок «Находки» (допускается нумерация «6. Находки»).
+_STEP_FINDINGS_TITLE = re.compile(r"^\s*(?:\d{1,3}[.)]\s*)?находки\s*$", re.IGNORECASE)
+# Итоги прошлых кругов и наблюдения — не раздел находок шага.
+_CLOSED_FINDINGS_RE = re.compile(r"закрыт|не\s+наход", re.IGNORECASE)
 
 
 def _finding_class(text: str) -> str:
@@ -686,63 +696,81 @@ def _finding_class(text: str) -> str:
 def _findings_section(text: str, limit: int = 40) -> tuple[list[dict], str]:
     """Находки ревью и пометка, если раздел непустой, но не разобран.
 
+    Раздел ищется по точному заголовку «Находки» (допускается нумерация «6. Находки»), иначе
+    берётся последний раздел про находки, кроме итогов прошлых кругов («Находки круга 1 —
+    закрыты», «Закрытие находок круга 1») и «не находок»: первый подходящий заголовок как раз
+    и оказывался закрытым.
     Разбираются все форматы, которыми пишут отчёты: пункты `- …`/`* …`, нумерованные
     `1. …`, строки роли `[класс] file:line — …` и жирные `**[класс] …**`/`**З1 (класс).**`.
     Пустой блок находок читается как «их нет», поэтому неразобранный раздел помечается.
     """
     lines = text.splitlines()
     found = _headings(lines)
-    start = next((pos for pos, (_i, level, title) in enumerate(found)
-                  if level in (2, 3) and "наход" in title.lower()), None)
+    sections = [pos for pos, (_i, level, _title) in enumerate(found) if level in (2, 3)]
+    start = next((pos for pos in sections
+                  if _STEP_FINDINGS_TITLE.match(found[pos][2])), None)
+    if start is None:
+        tail = [pos for pos in sections
+                if "наход" in found[pos][2].lower()
+                and not _CLOSED_FINDINGS_RE.search(found[pos][2])]
+        start = tail[-1] if tail else None
     if start is None:
         return [], ""
     end = _section_end(found, start, len(lines))
     body = lines[found[start][0] + 1:end]
     rows: list[dict] = []
     group = ""
-    last_kind = ""
     substantive = False
+    fresh = True                    # строка начинает абзац, а не продолжает пункт
     for line in body:
         head = _HEADING_RE.match(line)
         if head:
             group = head.group("title").strip()
+            fresh = True
             continue
         stripped = line.strip()
         if not stripped:
+            fresh = True
             continue
-        if _NO_FINDINGS_RE.match(stripped):
-            continue
+        # «Находок нет.» — самостоятельное утверждение: целый абзац или свой пункт.
+        # Продолжение пункта («Нет адресов …») им не считается и приклеивается ниже.
         match = _BULLET_RE.match(line)
+        numbered = _FINDING_NUMBER_RE.match(line)
+        role = _FINDING_ROLE_RE.match(line)
+        bold = _FINDING_BOLD_RE.match(line)
+        if (fresh or match or numbered or role or bold) and _NO_FINDINGS_RE.match(stripped):
+            continue
+        # Строка без метки сразу после пункта (без пустой строки) — перенос внутри пункта:
+        # в отчётах он бывает и с отступом, и без него.
+        continues = bool(rows) and (not fresh or line.startswith((" ", "\t")))
+        fresh = False
         if match:
-            item = _finding_item(match.group("text"), group)
-            rows.append(item)
-            last_kind = "bullet"
+            rows.append(_finding_item(match.group("text"), group))
         else:
-            numbered = _FINDING_NUMBER_RE.match(line)
-            role = _FINDING_ROLE_RE.match(line)
-            bold = _FINDING_BOLD_RE.match(line)
             if numbered:
                 rows.append(_finding_item(numbered.group("text"), group))
-                last_kind = "number"
             elif role:
                 rows.append(_finding_item(role.group("text"), group, role.group("cls")))
-                last_kind = "role"
             elif bold and bold.group("text").strip():
                 rows.append(_finding_item((bold.group("head") + " " +
                                            bold.group("text")).strip(), group))
-                last_kind = "bold"
             elif bold:
                 rows.append(_finding_item(bold.group("head"), group))
-                last_kind = "bold"
-            elif rows and (line.startswith((" ", "\t")) or last_kind == "bold"):
-                # Перенос строки внутри пункта: у плана и отчётов он есть и в отступе,
-                # и без него (жирный пункт продолжается обычным абзацем).
-                rows[-1]["text"] = (rows[-1]["text"] + " " + stripped)[:1200]
+            elif continues:
+                rows[-1]["text"] = rows[-1]["text"] + " " + stripped
             else:
                 substantive = True
                 continue
         if len(rows) >= limit:
             break
+    # Обрезка текста находки — с явной пометкой, как у остальных блоков экрана.
+    for row in rows:
+        clipped = _clip_chars(row["text"], FINDING_TEXT_LIMIT)
+        row["text"] = clipped["text"]
+        row["truncated"] = clipped["truncated"]
+        row["total"] = clipped["total"]
+        if clipped["truncated"]:
+            row["note"] = clipped["note"]
     note = ""
     if not rows and substantive:
         note = ("раздел «Находки» есть, но разобрать пункты не удалось — "
@@ -756,11 +784,6 @@ def _finding_item(text: str, group: str, explicit: str = "") -> dict:
     body = str(text or "").replace("**", "").strip()
     cls = _finding_class(explicit) or _finding_class(body)
     return {"level": cls or group or "находка", "text": body, "class": cls}
-
-
-def _findings(text: str, limit: int = 40) -> list[dict]:
-    """Находки ревью: пункты раздела «Находки» с подзаголовками-уровнями."""
-    return _findings_section(text, limit)[0]
 
 
 def _review(root: Path, cfg: dict, plan_id: str, step_id: str,

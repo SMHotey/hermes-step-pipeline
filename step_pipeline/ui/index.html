@@ -557,7 +557,9 @@ function renderStep(data) {
   $("step-review-path").textContent = (review.path || "—") + (review.exists ? "" : " (файла нет)");
   $("step-findings").innerHTML = (review.findings || []).map((item) => {
     const cls = /блок/i.test(item.level) ? "bad" : (/стил/i.test(item.level) ? "muted" : "wait");
-    return `<div class="finding ${cls}"><b>${esc(item.level || "находка")}</b>${esc(item.text)}</div>`;
+    // Обрезка текста находки — с пометкой, как у блоков и карточек.
+    const note = item.note ? `<div class="clip">${esc(item.note)}</div>` : "";
+    return `<div class="finding ${cls}"><b>${esc(item.level || "находка")}</b>${esc(item.text)}${note}</div>`;
   }).join("") || (review.findings_note ? ""
                    : `<div class="muted">находок в отчёте нет</div>`);
   // Неразобранный раздел «Находки» помечается: пустой блок читался бы как «находок нет».

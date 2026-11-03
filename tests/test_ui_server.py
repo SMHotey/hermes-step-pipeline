@@ -593,6 +593,112 @@ def test_step_screen_marks_unparsed_findings_section(server):
     assert "разобрать" in data["review"]["findings_note"]
 
 
+# Итоги прошлого круга перед разделом шага: таблица «Закрытие находок» (1-S2) и пункты
+# «Находки круга 1 — закрыты» (1-S4) — разделом находок шага не считаются (Б1 круга 2).
+REVIEW_CLOSED_TABLE = """# Ревью: план 1, шаг S1
+
+## ВЕРДИКТ: REQUEST_CHANGES
+
+## 5. Закрытие находок круга 1
+
+| находка | итог |
+|---|---|
+| закрытая первая | закрыта |
+| закрытая вторая | закрыта |
+
+## 7. Находки
+
+- `app/a.py:12` — текущая находка первая
+- `app/b.py:13` — текущая находка вторая
+"""
+
+REVIEW_CLOSED_HEADING = """# Ревью: план 1, шаг S1
+
+## ВЕРДИКТ: REQUEST_CHANGES
+
+## 5. Находки круга 1 — закрыты
+
+- `app/old.py:1` — закрытая находка первая
+- `app/old.py:2` — закрытая находка вторая
+
+## 6. Находки этого круга
+
+- `app/c.py:7` — текущая находка третья
+- `app/d.py:9` — текущая находка четвёртая
+"""
+
+# Точный «Находки» идёт позже разделов-кандидатов: он и должен победить.
+REVIEW_EXACT_LATER = """# Ревью: план 1, шаг S1
+
+## ВЕРДИКТ: REQUEST_CHANGES
+
+## 5. Находки этого круга
+
+- `app/e.py:5` — не тот раздел
+
+## 7. Находки
+
+- `app/f.py:6` — точный раздел
+"""
+
+
+@pytest.mark.parametrize("report,expected,marker", [(REVIEW_CLOSED_TABLE, 2, "текущая"),
+                                                   (REVIEW_CLOSED_HEADING, 2, "текущая"),
+                                                   (REVIEW_EXACT_LATER, 1, "точный")])
+def test_step_findings_skip_closed_rounds(server, report, expected, marker):
+    """Раздел находок — «Находки» шага, а не итоги круга 1 (Б1 ревью 3-S3)."""
+    (server["root"] / "docs" / "reviews" / "1-S1.md").write_text(report, encoding="utf-8")
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    review = data["review"]
+    assert len(review["findings"]) == expected
+    assert all(marker in item["text"] for item in review["findings"])
+    assert review["findings_note"] == ""
+
+
+def test_step_finding_text_clips_with_note(server):
+    """Длинный текст находки обрезается с пометкой, а не молча (Б2 ревью 3-S3)."""
+    (server["root"] / "docs" / "reviews" / "1-S1.md").write_text(
+        "# Ревью\n\n## ВЕРДИКТ: REQUEST_CHANGES\n\n## Находки\n\n- начало находки "
+        + "я" * 1500 + "\n", encoding="utf-8")
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    item = data["review"]["findings"][0]
+    assert len(item["text"]) == 1200 and item["truncated"] is True
+    assert item["total"] > 1200
+    assert item["note"] == f"показаны первые 1200 символов, всего {item['total']}"
+    # Страница обязана донести пометку обрезки до блока находок.
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    assert "item.note" in html
+
+
+@pytest.mark.parametrize("line", ["", "Находок нет.", "Блокирующих и значимых находок нет.",
+                                  "Замечаний нет."])
+def test_step_findings_absence_forms_are_not_an_error(server, line):
+    """«Находок нет.» — не ошибка разбора, пометки быть не должно (значимая 1 ревью 3-S3)."""
+    (server["root"] / "docs" / "reviews" / "1-S1.md").write_text(
+        "# Ревью\n\n## ВЕРДИКТ: APPROVE\n\n## Находки\n\n" + (line + "\n" if line else ""),
+        encoding="utf-8")
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    assert data["review"]["findings"] == []
+    assert data["review"]["findings_note"] == ""
+
+
+def test_step_finding_continuation_starting_with_net_is_kept(server):
+    """Строка «Нет …» продолжает жирный пункт, а не отбрасывается (значимая 2 ревью 3-S3)."""
+    (server["root"] / "docs" / "reviews" / "1-S1.md").write_text(
+        "# Ревью\n\n## ВЕРДИКТ: REQUEST_CHANGES\n\n## Находки\n\n"
+        "**[стилистическая] формат отчёта — неполон.**\n"
+        "Нет пофайловых адресов `path:line` и нет остатка владельцу.\n", encoding="utf-8")
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    findings = data["review"]["findings"]
+    assert len(findings) == 1
+    assert "Нет пофайловых адресов" in findings[0]["text"]
+    assert findings[0]["level"] == "стилистическая"
+
+
 def test_step_cards_found_beyond_last_200_board_cards(server):
     """Карточки шага ищутся по префиксу ключа, а не окном последних задач борды (З1)."""
     run_gate(server["root"], "--run")            # карточка постановки
