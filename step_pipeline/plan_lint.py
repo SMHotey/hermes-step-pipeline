@@ -15,8 +15,8 @@
 
 Правила разбора плана — ОСОЗНАННАЯ КОПИЯ правил движка (решение D5): плагин не
 импортирует движок как модуль (`project.py`), поэтому регулярки скопированы из
-`engine/registry.py:31`, `engine/next_step.py:54,58` и `engine/config.py:51`
-символ в символ, а смысл проверок повторяет `next_step.py:70-100,156-169`,
+`engine/registry.py:31`, `engine/next_step.py:58,62` и `engine/config.py:51`
+символ в символ, а смысл проверок повторяет `next_step.py:92-122,179-197`,
 `registry.py:101-126`. Расхождение с движком — дефект, а не настройка.
 """
 from __future__ import annotations
@@ -40,9 +40,9 @@ _HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>\S.*?)\s*$")  # regis
 # Имя плана: номер, дефис, слаг, .md — иначе движок план не увидит (registry.py:30).
 _NAME_RE = re.compile(r"^\d{1,2}-.+\.md$")
 _PLAN_NUM_RE = re.compile(r"^(\d{1,2})-")
-# Критерий готовности — engine/next_step.py:58.
+# Критерий готовности — engine/next_step.py:62.
 _READY_RE = re.compile(r"готово(?:\s*\([^)]*\))?\s*[=:]\s*(?P<rest>.+)", re.IGNORECASE)
-# Маркер пункта верхнего уровня — engine/next_step.py:54.
+# Маркер пункта верхнего уровня — engine/next_step.py:58.
 _BULLET_RE = re.compile(r"^(?:[-*+]|\d+\.)\s+(?P<text>.*)$")
 # Пункт «Гейты: —» считается пустым.
 _EMPTY_GATES = ("", "—", "-", "−")
@@ -145,7 +145,7 @@ def _content_end(found: list[tuple[int, int, str]], idx: int, level: int, limit:
 
 
 def _section_blocks(lines: list[str]) -> list[tuple[str, str, str]]:
-    """Пункты раздела: (метка, текст, полный текст) — копия next_step.py:70-100."""
+    """Пункты раздела: (метка, текст, полный текст) — копия next_step.py:92-122."""
     chunks: list[tuple[str, list[str]]] = []
     for line in lines:
         if not line.strip():

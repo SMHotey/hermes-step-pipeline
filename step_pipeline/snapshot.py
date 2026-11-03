@@ -35,6 +35,7 @@ STAGE_LABELS = {"create_step": "заказ постановки", "create_review
                 "stop": "остановлен", "create_rereview_after_fix": "повторное ревью"}
 ACTION_LABELS = {"create_step": "шаг", "create_prompt": "постановка", "create_review": "ревью",
                  "create_fix": "правки", "create_rereview": "ревью", "close_step": "журнал",
+                 "hold_risk": "ручной допуск",
                  "idle": "ждёт", "stop": "стоп", "retry_pending": "довыкладка"}
 
 CACHE_TTL = 2.5          # секунд: снимок не старше этого отдаётся из памяти

@@ -18,7 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from engine_kit import make_project
+import config as config_mod
+from engine_kit import cards, make_project, write_approval
 from stub_hermes import SCHEMA
 
 import gate
@@ -221,3 +222,57 @@ def test_one_action_per_step_in_one_tick(tmp_path: Path, fast_stub: Path) -> Non
     assert payload["actions_count"] == 1
     assert "уже получал действие" in payload["reason"]
     assert [a["action"] for a in payload["actions"]] == ["create_step"]
+
+
+RISK_PLAN = """# 1. Демо-план конвейера
+
+Цель: проверить, что страж ведёт шаги.
+
+## Шаги
+
+### S1. Опасный шаг (1 дн)
+
+- Файл: `app/danger.py`
+- Тесты/гейты: `python -m pytest tests/test_danger.py -q` → 1 passed
+- Риск: high
+- Готово = опасный шаг сделан
+
+### S2. Обычный шаг (1 дн)
+
+- Файл: `app/plain.py`
+- Тесты/гейты: `python -m pytest tests/test_plain.py -q` → 1 passed
+- Готово = обычный шаг сделан
+
+## Журнал выполнения
+
+| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |
+|---|---|---|---|---|
+| — | S1 | — | — | открыт |
+| — | S2 | — | — | открыт |
+"""
+
+
+def test_risk_hold_is_not_swallowed_by_multi_action_tick(project: Path, hermes_stub: Path,
+                                                         monkeypatch) -> None:
+    """`max_actions=2`: рискованный шаг первым действием уходит в hold, карточек ноль.
+
+    Инвариант «одно действие на шаг за тик» не даёт второму действию обойти hold:
+    `hold_risk` ставится первым и остаётся единственным действием тика.
+    """
+    monkeypatch.setenv("PIPELINE_REPO", str(project))
+    plan = project / "docs" / "plans" / "1-demo.md"
+    plan.write_text(RISK_PLAN, encoding="utf-8")
+    write_approval(project, plan)          # план изменён: sha256 в записи утверждения
+    cfg = config_mod.load(project)
+
+    res = gate.tick(cfg, max_actions=2)
+
+    actions = res["actions"]
+    assert len(actions) == 1, actions
+    assert actions[0]["action"] == "hold_risk", actions
+    assert actions[0]["applied"] is True, actions
+    assert actions[0]["step"] == "S1"
+    keys = [c["key"] for c in cards(hermes_stub)] if hermes_stub.is_file() else []
+    assert keys == []                          # ни карточки шага, ни заказа постановки
+    assert gate.load_state(gate.resolve_paths(cfg, "1"))["hold_steps"] == ["S1"]
+    assert res["reason"] == "во всех планах нет работы"

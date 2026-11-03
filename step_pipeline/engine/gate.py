@@ -792,7 +792,8 @@ def status_text(ctx: dict, decision: dict) -> str:
     # Риск и ручной допуск видны всегда: по ним владелец решает, снимать ли hold.
     hold = [str(h).upper() for h in (ctx.get("hold") or [])]
     lines.append(f"Ручной допуск (hold): {', '.join(hold) or '—'}")
-    lines.append(f"Риск шага: {step.get('risk') or 'normal'}")
+    # Шага нет — и риска нет: «normal» у пустой строки читается как «риск обычный».
+    lines.append(f"Риск шага: {((step.get('risk') or 'normal') if step else '—')}")
     if ctx.get("verdict"):
         v = ctx["verdict"]
         lines.append(f"Вердикт: {v['verdict']} (строк: {v['occurrences']}, "
@@ -1547,7 +1548,8 @@ def plans_rows(cfg: config_mod.Config) -> list[dict]:
         try:
             nxt = collector(p).get("next") or {}
             step_id = nxt.get("id") or "—"
-            risk = str(nxt.get("risk") or "normal")
+            # Шага нет — риска нет: пустая строка, а не «normal», иначе данные врут.
+            risk = str(nxt.get("risk") or "normal") if nxt else ""
         except SystemExit as exc:
             print(f"[plans] план {spec.id}: сборщик шагов не работает: {exc}", file=sys.stderr)
         stop = load_stop(p)

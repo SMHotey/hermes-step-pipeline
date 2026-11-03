@@ -94,6 +94,20 @@ def test_hold_and_unhold_change_state(cfg):
     assert gate.load_state(p)["hold_steps"] == []
 
 
+def test_unhold_from_chat_marks_released(cfg):
+    """Снятие допуска из чата — то же действие владельца, что `--unhold` (D4).
+
+    Отметку `hold_released` пишут оба пути: без неё автоматический риск-hold вернулся бы
+    на следующем тике и шаг держался бы вечно (план 2 §S4).
+    """
+    p = gate.resolve_paths(cfg, "1")
+    gate.handle_command(cfg, "/hold S1")
+    gate.handle_command(cfg, "/unhold S1")
+    state = gate.load_state(p)
+    assert state["hold_steps"] == []
+    assert state["hold_released"] == ["S1"]
+
+
 def test_status_reports_stop_and_plans(cfg, monkeypatch):
     monkeypatch.setattr(gate, "plans_table", lambda _cfg: "| план | шаг |\n| 1 | S1 |")
     p = gate.resolve_paths(cfg, "1")
