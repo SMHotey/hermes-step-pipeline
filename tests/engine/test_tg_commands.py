@@ -229,3 +229,20 @@ def test_ask_agent_runs_oneshot_session_per_chat(cfg, monkeypatch):
     assert gate.ask_agent(cfg, "привет", CHAT) == "ответ агента"
     assert "chat" in seen["cmd"] and "--oneshot" in seen["cmd"]
     assert f"tg-{CHAT}" in seen["cmd"]
+
+
+def test_clean_agent_output_strips_service_noise():
+    crlf = chr(13) + chr(10)
+    esc = chr(27)
+    raw = (crlf + "session_id: 20261103_1" + crlf + esc + "[32mОтвет" + esc + "[0m агента"
+           + crlf + "вторая строка" + crlf)
+    assert gate.clean_agent_output(raw) == "Ответ агента" + chr(10) + "вторая строка"
+
+
+def test_clean_agent_output_keeps_plain_text():
+    assert gate.clean_agent_output("просто текст") == "просто текст"
+
+
+def test_clean_agent_output_drops_resume_notice():
+    raw = "ответ" + chr(10) + "↻ Resumed session 20261103_1 (1 user message)"
+    assert gate.clean_agent_output(raw) == "ответ"

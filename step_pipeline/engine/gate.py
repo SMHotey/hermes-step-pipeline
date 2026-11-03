@@ -1348,18 +1348,31 @@ def owner_ids(cfg: config_mod.Config) -> set[str]:
     return ids
 
 
+ANSI_RE = re.compile(chr(27) + r"\[[0-9;?]*[A-Za-z]")
+
+
+def clean_agent_output(text: str) -> str:
+    """Ответ агента без служебных строк, CR и ANSI-цветов — чтобы чат читался."""
+    raw = (text or "").replace(chr(13) + chr(10), chr(10)).replace(chr(13), chr(10))
+    clean = ANSI_RE.sub("", raw)
+    lines = [line for line in clean.splitlines()
+             if not line.strip().startswith(("session_id:", "Session:", "↻", "⟳"))
+             and "Resumed session" not in line]
+    return chr(10).join(lines).strip()
+
+
 def ask_agent(cfg: config_mod.Config, text: str, chat: str, timeout: int = 240) -> str:
     """Свободный текст владельца — в диалог с агентом профиля, сессия на чат."""
     dialog = cfg.notify.get("dialog")
     if isinstance(dialog, dict) and dialog.get("enabled") is False:
         return "диалог выключен (notify.dialog.enabled)"
-    cmd = [_hermes(), "-p", str(cfg.driver), "chat", "-q", text, "--oneshot",
+    cmd = [_hermes(), "-p", str(cfg.driver), "chat", "-q", text, "--oneshot", "-Q",
            "--continue", f"tg-{chat}", "--create-if-missing"]
     try:
         res = _run(cmd, None, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 - диалог не должен ронять опрос
         return f"агент недоступен: {exc}"
-    out = ((res.stdout or "") + (res.stderr or "")).strip()
+    out = clean_agent_output((res.stdout or "") + (res.stderr or ""))
     if not out:
         return "агент не ответил (пустой ответ)"
     return out[: TG_TEXT_LIMIT - 100]
