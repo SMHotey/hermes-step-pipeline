@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -434,4 +437,199 @@ def test_index_subscribes_to_events_and_slow_poll():
     assert "/api/events" in html
     assert "setInterval(refresh, 30000)" in html
     assert "setInterval(refresh, 5000)" not in html
+
+
+# ── экран «Шаг»: контракт, постановка, вердикт, коммит (план 3 S3) ──
+
+REVIEW_APPROVE = """# Ревью: план 1, шаг S1
+
+## ВЕРДИКТ: APPROVE
+
+## Объект ревью
+Объект ревью: коммит `{sha}` (HEAD, ветка main).
+
+## Находки
+
+### Блокирующие
+— нет
+
+### Значимые
+- Обрезка длинного текста проверена, пометка есть
+- Коммит шага совпадает с HEAD
+"""
+
+
+def write_prompt(server, text: str = "## Постановка шага S1\n\n- границы: только app/models\n") -> Path:
+    path = server["root"] / "docs" / "prompts" / "2026-11-01_1-S1_prompt.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def write_review(server, sha: str = "abc1234") -> Path:
+    path = server["root"] / "docs" / "reviews" / "1-S1.md"
+    path.write_text(REVIEW_APPROVE.format(sha=sha), encoding="utf-8")
+    return path
+
+
+def add_comment(db: Path, task_id: str, body: str, author: str = "reviewer") -> None:
+    """Комментарий карточки в поддельной борде: своей схемой, как у настоящей."""
+    con = sqlite3.connect(db)
+    try:
+        con.executescript("CREATE TABLE IF NOT EXISTS task_comments ("
+                          "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT,"
+                          " author TEXT, body TEXT, created_at INTEGER);")
+        con.execute("INSERT INTO task_comments (task_id, author, body, created_at)"
+                    " VALUES (?, ?, ?, ?)", (task_id, author, body, 1))
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_step_screen_shows_contract_and_prompt(server):
+    write_prompt(server)
+    status, data = get(server["url"] + "/api/step?plan=1&id=s1")
+    assert status == 200 and data["ok"]
+    assert data["plan"] == "1" and data["step"] == "S1"
+    assert data["title"].startswith("Таблица счетов")
+    contract = data["contract"]
+    assert contract["found"] is True
+    assert contract["files"] == ["app/models/invoice.py", "tests/test_invoice.py"]
+    assert contract["gates"] == ["python -m pytest tests/test_invoice.py -q"]
+    assert contract["done"].startswith("таблица `invoice` создана")
+    assert data["prompt"]["exists"] is True
+    assert data["prompt"]["path"] == "docs/prompts/2026-11-01_1-S1_prompt.md"
+    assert "Постановка шага S1" in data["prompt"]["text"]
+    # Отчёта ревью нет — экран это пишет, а не выдумывает вердикт.
+    assert data["review"]["exists"] is False and data["review"]["verdict"] == "NONE"
+    assert data["commit"]["available"] is False
+
+
+def test_step_screen_shows_verdict_and_findings(server):
+    write_review(server)
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    review = data["review"]
+    assert review["exists"] is True and review["path"] == "docs/reviews/1-S1.md"
+    assert review["verdict"] == "APPROVE" and review["occurrences"] == 1
+    assert review["commit"] == "abc1234"
+    assert [item["level"] for item in review["findings"]] == ["Значимые", "Значимые"]
+    assert "Обрезка" in review["findings"][0]["text"]
+
+
+def test_step_screen_marks_ambiguous_verdict(server):
+    (server["root"] / "docs" / "reviews" / "1-S1.md").write_text(
+        "## ВЕРДИКТ: APPROVE\n\n## ВЕРДИКТ: REQUEST_CHANGES\n", encoding="utf-8")
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    assert data["review"]["verdict"] == "AMBIGUOUS" and data["review"]["occurrences"] == 2
+
+
+def test_step_screen_clips_long_text_with_note(server):
+    write_prompt(server, "\n".join(f"строка {number}" for number in range(1, 501)))
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1&lines=5")
+    assert status == 200
+    prompt = data["prompt"]
+    assert prompt["truncated"] is True
+    assert prompt["shown"] == 5 and prompt["total"] == 500
+    assert prompt["note"] == "показаны первые 5 строк, всего 500"
+    assert prompt["text"].splitlines()[-1] == "строка 5"
+
+
+def test_step_screen_unknown_plan_and_step(server):
+    status, data = get(server["url"] + "/api/step?plan=1&id=S99")
+    assert status == 404 and data["ok"] is False and "S99" in data["error"]
+    status, data = get(server["url"] + "/api/step?plan=1")
+    assert status == 400 and "plan" in data["error"]
+    status, data = get(server["url"] + "/api/step?plan=9&id=S1")
+    assert status == 404 and "9" in data["error"] and "не найден" in data["error"]
+
+
+def test_step_screen_shows_git_show_of_step_commit(server):
+    if not shutil.which("git"):
+        pytest.skip("git недоступен")
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(server["root"]), *args], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace")
+
+    assert git("init").returncode == 0
+    assert git("add", "docs/plans/1-demo.md", "pipeline.json").returncode == 0
+    commit = git("-c", "user.name=Тест", "-c", "user.email=test@example.com",
+                 "commit", "-m", "feat: шаг 1-S1 (тест)")
+    assert commit.returncode == 0, commit.stderr
+    sha = git("rev-parse", "HEAD").stdout.strip()
+    write_review(server, sha)
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1&lines=10")
+    assert status == 200
+    assert data["commit"]["available"] is True, data["commit"]["error"]
+    assert data["commit"]["sha"] == sha
+    assert "1-demo.md" in data["commit"]["stat"]
+    assert data["commit"]["diff"]["text"], "дифф коммита пуст"
+
+
+def test_step_screen_cards_results_and_hold(server):
+    run_gate(server["root"], "--run")            # карточка постановки
+    (server["root"] / "docs" / "prompts" / "2026-11-01_1-S1_prompt.md").write_text(
+        "# p\n", encoding="utf-8")
+    run_gate(server["root"], "--run")            # карточка шага
+    complete_card(server["db"], ":step")
+    step_card = next(card for card in stub_cards(server["db"])
+                     if str(card["key"]).endswith(":step"))
+    add_comment(server["db"], step_card["id"], "замечание ревьюера")
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    shown = {card["key"]: card for card in data["cards"]}
+    assert shown[step_card["key"]]["status"] == "done"
+    assert shown[step_card["key"]]["result"] == "ok"
+    assert shown[step_card["key"]]["comments"][0]["body"] == "замечание ревьюера"
+    assert shown["planloop:1:S1:prompt"]["result"] == ""
+    assert data["hold"] == {"steps": [], "held": False}
+
+    # Допуск идёт с номером плана: иначе записался бы плану по умолчанию.
+    status, payload = post(server["url"], {"action": "hold", "step": "S1", "plan": "1"})
+    assert status == 200 and payload["ok"]
+    assert "--plan 1" in server["state"].tail()[-1]
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert data["hold"] == {"steps": ["S1"], "held": True}
+
+
+def test_file_route_reads_inside_root_with_clip(server):
+    status, data = get(server["url"] + "/api/file?path=docs/plans/1-demo.md&lines=3")
+    assert status == 200 and data["ok"] and data["exists"] is True
+    assert data["path"] == "docs/plans/1-demo.md"
+    assert data["shown"] == 3 and data["truncated"] is True
+    assert data["note"] == f"показаны первые 3 строки, всего {data['total']}"
+    assert data["text"].splitlines()[0].startswith("# 1.")
+
+
+def test_file_route_rejects_paths_outside_root(server, tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("чужое", encoding="utf-8")
+    for path in ("../secret.txt", "docs/../../secret.txt", str(secret), "/etc/passwd",
+                 "C:/Windows/win.ini", ".env", ".git/config"):
+        status, data = get(server["url"] + "/api/file?path=" + urllib.parse.quote(path))
+        assert status == 400, path
+        assert data["ok"] is False
+        assert "вне корня" in data["error"] or "служебный" in data["error"], data["error"]
+
+
+def test_file_route_rejects_symlink_outside_root(server, tmp_path):
+    outside = tmp_path / "outside.md"
+    outside.write_text("чужое", encoding="utf-8")
+    link = server["root"] / "docs" / "link.md"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("симлинки на этой машине недоступны")
+    status, data = get(server["url"] + "/api/file?path=docs/link.md")
+    assert status == 400 and "вне корня" in data["error"]
+
+
+def test_index_has_step_screen_markup():
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    for anchor in ('id="tab-step"', 'data-tab="step"', "/api/step", 'id="step-contract"',
+                   'id="step-prompt"', 'id="step-review"', 'id="step-commit"',
+                   'id="step-verdict"', 'id="step-findings"', 'id="btn-hold"',
+                   'id="btn-unhold"', "data-comments"):
+        assert anchor in html
 

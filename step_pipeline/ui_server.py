@@ -6,6 +6,9 @@
     GET  /api/snapshot     JSON состояния: планы, шаги, карточки, журнал, решение
                            (отдаёт ETag и 304 при неизменённом снимке)
     GET  /api/events       поток событий (Server-Sent Events): снимок сразу и на изменение
+    GET  /api/step         экран шага: контракт из плана, постановка, отчёт ревью,
+                           `git show` коммита шага, карточки шага (?plan=<N>&id=<S>)
+    GET  /api/file         текст файла проекта, только внутри корня (?path=<...>)
     POST /api/action       действия: tick, stop, resume, hold, unhold,
                            save_config, save_telegram, test_telegram
     POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
@@ -23,6 +26,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 try:
     from . import plan_mode
@@ -124,14 +128,20 @@ def act_hold(state: State, payload: dict) -> dict:
     step = str(payload.get("step") or "").strip()
     if not step:
         return {"ok": False, "error": "нужен шаг"}
-    return _run_engine(state, "--hold", step)
+    plan = str(payload.get("plan") or "").strip()
+    # Без `--plan` ручной допуск записался бы плану по умолчанию: на вкладке «Шаг» выбран
+    # может быть соседний план, поэтому его номер идёт в команду.
+    extra = ["--plan", plan] if plan else []
+    return _run_engine(state, "--hold", step, *extra)
 
 
 def act_unhold(state: State, payload: dict) -> dict:
     step = str(payload.get("step") or "").strip()
     if not step:
         return {"ok": False, "error": "нужен шаг"}
-    return _run_engine(state, "--unhold", step)
+    plan = str(payload.get("plan") or "").strip()
+    extra = ["--plan", plan] if plan else []
+    return _run_engine(state, "--unhold", step, *extra)
 
 
 def act_save_config(state: State, payload: dict) -> dict:
@@ -309,15 +319,29 @@ class Handler(BaseHTTPRequestHandler):
         return payload if isinstance(payload, dict) else {}
 
     # ── снимок и поток событий ──
+    def _query(self) -> dict[str, str]:
+        """Параметры строки запроса: значения декодируются (путь приходит с `%20` и `/`)."""
+        out: dict[str, str] = {}
+        if "?" in self.path:
+            for part in self.path.split("?", 1)[1].split("&"):
+                if not part:
+                    continue
+                key, _, value = part.partition("=")
+                out[unquote(key)] = unquote(value)
+        return out
+
     def _plan_param(self) -> str | None:
         """Параметр `plan=` из строки запроса (нет параметра — None)."""
-        plan = None
-        if "?" in self.path:
-            query = self.path.split("?", 1)[1]
-            for part in query.split("&"):
-                if part.startswith("plan="):
-                    plan = part.split("=", 1)[1] or None
-        return plan
+        return self._query().get("plan") or None
+
+    @staticmethod
+    def _line_limit(query: dict[str, str], default: int = snap.STEP_LINES) -> int:
+        """Сколько строк блока отдавать: параметр `lines`, иначе умолчание, с потолком."""
+        try:
+            value = int(str(query.get("lines") or default))
+        except (TypeError, ValueError):
+            value = default
+        return max(1, min(value, 5000))
 
     def _snapshot_body(self, plan: str | None) -> bytes:
         """Тело ответа `/api/snapshot`: снимок + журнал сервера + режим планировщика + ok."""
@@ -404,10 +428,56 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/events":
             self._events(self._plan_param())
             return
+        if path == "/api/step":
+            self._get_step()
+            return
+        if path == "/api/file":
+            self._get_file()
+            return
         if path == "/api/health":
             self._json(200, {"ok": True, "root": str(self.state.project)})
             return
         self._json(404, {"ok": False, "error": "нет такого маршрута"})
+
+    # ── экран «Шаг» и файлы проекта (план 3 S3) ──
+    def _get_step(self) -> None:
+        """Экран шага: контракт, постановка, отчёт ревью, коммит и карточки шага."""
+        query = self._query()
+        plan_id = str(query.get("plan") or "").strip()
+        step_id = str(query.get("id") or query.get("step") or "").strip()
+        if not plan_id or not step_id:
+            self._json(400, {"ok": False, "error": "нужны параметры plan и id (например, ?plan=3&id=S3)"})
+            return
+        try:
+            data = snap.step_detail(self.state.project, plan_id, step_id,
+                                    limit=self._line_limit(query), board=self.state.board)
+        except ValueError as exc:
+            self._json(400, {"ok": False, "error": str(exc)})
+            return
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        if not (data.get("contract") or {}).get("found"):
+            self._json(404, {"ok": False,
+                             "error": (data.get("contract") or {}).get("error")
+                             or f"шаг {step_id} не найден в плане {plan_id}"})
+            return
+        self._json(200, data)
+
+    def _get_file(self) -> None:
+        """Текст файла проекта: только внутри корня, обрезка с явной пометкой."""
+        query = self._query()
+        rel = str(query.get("path") or "")
+        try:
+            data = snap.read_text_safe(self.state.project, rel, limit=self._line_limit(query))
+        except snap.UnsafePath as exc:
+            code = 404 if str(exc).startswith("файла нет") else 400
+            self._json(code, {"ok": False, "error": str(exc)})
+            return
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        self._json(200, {"ok": True, **data})
 
     # ── POST ──
     def do_POST(self) -> None:                                  # noqa: N802 - stdlib API

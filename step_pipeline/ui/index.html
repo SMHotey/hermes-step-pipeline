@@ -34,8 +34,14 @@
                    font-weight: 600; }
   button.danger:hover { border-color: var(--bad); color: var(--bad); }
   button:disabled { opacity: .45; cursor: default; }
-  main { display: grid; grid-template-columns: minmax(420px, 1.15fr) minmax(360px, .85fr);
-         gap: 16px; padding: 16px 20px 28px; }
+  main { padding: 16px 20px 28px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .tab { background: transparent; border-color: transparent; color: var(--muted); }
+  .tab.active { background: var(--panel); border-color: var(--accent); color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .cols { display: grid; grid-template-columns: minmax(420px, 1.15fr) minmax(360px, .85fr);
+          gap: 16px; }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
             padding: 14px 16px; }
   section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
@@ -111,7 +117,40 @@
   .ov-badge { display: inline-block; margin-top: 10px; padding: 3px 9px; border-radius: 999px;
               font-size: 12px; color: #1b0b0b; background: var(--bad); border: 1px solid var(--bad); }
   .ov-badge[hidden] { display: none; }
-  @media (max-width: 980px) { main { grid-template-columns: 1fr; } .flow { grid-template-columns: 1fr 1fr; }
+  .step-head { font-size: 15px; font-weight: 600; margin: 2px 0 2px; }
+  .step-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+                  margin: 10px 0 6px; font-size: 12.5px; }
+  select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+           border-radius: 8px; padding: 6px 8px; font-size: 13px; }
+  .block { border: 1px solid var(--line); border-radius: 10px; margin-top: 10px;
+           background: var(--panel-2); }
+  .block > summary { cursor: pointer; padding: 9px 12px; font-size: 11px; font-weight: 600;
+                     text-transform: uppercase; letter-spacing: .07em; color: var(--muted);
+                     list-style: none; }
+  .block > summary::-webkit-details-marker { display: none; }
+  .block > summary:before { content: "▸ "; color: var(--accent); }
+  .block[open] > summary:before { content: "▾ "; }
+  .block .body { padding: 0 12px 12px; }
+  .kv { display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px; margin: 0;
+        font-size: 12.5px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; white-space: pre-wrap; }
+  .clip { font-size: 11.5px; color: var(--warn); margin-top: 6px; }
+  .clip.bad { color: var(--bad); }
+  .finding { padding: 5px 8px; border-left: 3px solid var(--line); margin: 4px 0;
+             font-size: 12.5px; }
+  .finding.bad { border-left-color: var(--bad); }
+  .finding.wait { border-left-color: var(--warn); }
+  .finding.muted { border-left-color: var(--line); color: var(--muted); }
+  .finding b { display: block; font-size: 10.5px; text-transform: uppercase;
+               letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+  .step-card { padding: 8px 0; border-bottom: 1px solid #1b2230; }
+  .step-card .res pre { max-height: 120px; margin-top: 4px; }
+  details.comments { margin-top: 4px; }
+  details.comments summary { cursor: pointer; font-size: 11.5px; color: var(--accent); }
+  .comment { border-left: 2px solid var(--line); padding: 3px 8px; margin: 4px 0;
+             font-size: 12px; }
+  @media (max-width: 980px) { .cols { grid-template-columns: 1fr; } .flow { grid-template-columns: 1fr 1fr; }
                               .ov-grid { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -134,6 +173,13 @@
 </header>
 
 <main>
+  <nav class="tabs">
+    <button class="tab active" data-tab="overview" id="tab-btn-overview">Обзор</button>
+    <button class="tab" data-tab="step" id="tab-btn-step">Шаг</button>
+  </nav>
+
+  <div class="tab-panel active" id="tab-overview">
+  <div class="cols">
   <div>
     <section id="overview">
       <h2>Обзор</h2>
@@ -173,6 +219,68 @@
       <h2>Лог действий</h2>
       <pre id="log">—</pre>
     </section>
+  </div>
+  </div>
+  </div>
+
+  <!-- Экран «Шаг» (план 3 S3): четыре источника на одной странице, только чтение. -->
+  <div class="tab-panel" id="tab-step">
+    <div class="cols">
+      <div>
+        <section>
+          <h2>Шаг <span class="mono" id="step-id">—</span></h2>
+          <div class="step-head" id="step-title">—</div>
+          <div class="muted mono" id="step-plan-path"></div>
+          <div class="step-actions">
+            <label class="muted" for="step-picker">шаг</label>
+            <select id="step-picker"></select>
+            <button id="btn-hold">Ручной допуск</button>
+            <button id="btn-unhold">Снять допуск</button>
+            <span class="muted" id="step-hold">—</span>
+          </div>
+
+          <details class="block" id="step-contract" open>
+            <summary>Контракт из плана</summary>
+            <div class="body"><dl class="kv" id="step-contract-kv"></dl></div>
+          </details>
+
+          <details class="block" id="step-prompt">
+            <summary>Постановка</summary>
+            <div class="body">
+              <div class="muted mono" id="step-prompt-path">—</div>
+              <pre id="step-prompt-text">—</pre>
+              <div class="clip" id="step-prompt-note"></div>
+            </div>
+          </details>
+
+          <details class="block" id="step-review" open>
+            <summary>Отчёт ревью <span class="pill" id="step-verdict">—</span></summary>
+            <div class="body">
+              <div class="muted mono" id="step-review-path">—</div>
+              <div id="step-findings"></div>
+              <pre id="step-review-text">—</pre>
+              <div class="clip" id="step-review-note"></div>
+            </div>
+          </details>
+
+          <details class="block" id="step-commit">
+            <summary>Коммит шага</summary>
+            <div class="body">
+              <div class="muted mono" id="step-commit-sha">—</div>
+              <pre id="step-commit-stat">—</pre>
+              <pre id="step-commit-diff">—</pre>
+              <div class="clip" id="step-commit-note"></div>
+            </div>
+          </details>
+        </section>
+      </div>
+      <div>
+        <section>
+          <h2>Карточки шага и правок</h2>
+          <ul id="step-cards"><li class="muted">—</li></ul>
+        </section>
+      </div>
+    </div>
   </div>
 </main>
 
@@ -342,6 +450,131 @@ function renderOverview(data) {
   tick.disabled = !tickAllowed || panelBusy;
 }
 
+// ── экран «Шаг» (план 3 S3): контракт, постановка, отчёт ревью, коммит ──
+let currentStep = null;   // выбранный шаг вкладки «Шаг»
+
+function showTab(name) {
+  document.querySelectorAll(".tab").forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.tab === name);
+  });
+  document.querySelectorAll(".tab-panel").forEach((panel) => {
+    panel.classList.toggle("active", panel.id === "tab-" + name);
+  });
+  if (name === "step") loadStep();
+}
+
+function fillStepPicker() {
+  const steps = window.__steps || [];
+  const picker = $("step-picker");
+  const ids = steps.map((s) => String(s.id));
+  if (picker.dataset.ids !== ids.join(",")) {
+    picker.dataset.ids = ids.join(",");
+    picker.innerHTML = ids.map((id) => `<option value="${esc(id)}">${esc(id)}</option>`).join("");
+  }
+  if (!currentStep || !ids.includes(String(currentStep))) {
+    currentStep = window.__nextStep || ids[0] || null;
+  }
+  if (currentStep) picker.value = currentStep;
+  picker.disabled = !ids.length;
+  picker.onchange = () => { currentStep = picker.value; loadStep(); };
+}
+
+async function loadStep() {
+  const plan = window.__planId || currentPlan;
+  if (!plan || !currentStep) {
+    $("step-title").textContent = "шаг не выбран — нет плана или шагов";
+    return;
+  }
+  const data = await api("/api/step?plan=" + encodeURIComponent(plan) +
+                         "&id=" + encodeURIComponent(currentStep));
+  if (!data.ok) {
+    $("step-title").textContent = data.error || "экран шага не собран";
+    toast(data.error || "экран шага не собран", true);
+    return;
+  }
+  renderStep(data);
+}
+
+function clipNote(el, block, fallback) {
+  // Пометка обрезки — часть контракта: тихого усечения быть не должно.
+  const note = (block && block.note) || fallback || "";
+  el.textContent = note;
+  el.className = "clip" + (/нет|не прочитан|недоступ|git/i.test(note) ? " bad" : "");
+}
+
+function renderStep(data) {
+  const contract = data.contract || {};
+  $("step-id").textContent = data.step || "—";
+  $("step-title").textContent = data.title || "—";
+  $("step-plan-path").textContent = contract.path || "";
+  const rows = [["цель", contract.goal], ["файлы", (contract.files || []).join("\n")],
+                ["гейты", (contract.gates || []).join("\n")],
+                ["что сделать", contract.what], ["готово =", contract.done]];
+  $("step-contract-kv").innerHTML = rows.map(([key, value]) =>
+    `<dt>${esc(key)}</dt><dd>${esc(value || "—")}</dd>`).join("");
+
+  const prompt = data.prompt || {};
+  $("step-prompt-path").textContent = prompt.path || "постановки нет";
+  $("step-prompt-text").textContent = prompt.text || "—";
+  clipNote($("step-prompt-note"), prompt);
+
+  const review = data.review || {};
+  const verdict = String(review.verdict || "NONE");
+  const badge = $("step-verdict");
+  badge.textContent = verdict === "NONE" ? "нет отчёта" : verdict;
+  badge.className = "pill " + (verdict === "APPROVE" ? "ok"
+                               : (verdict === "REQUEST_CHANGES" ? "bad" : "wait"));
+  $("step-review-path").textContent = (review.path || "—") + (review.exists ? "" : " (файла нет)");
+  $("step-findings").innerHTML = (review.findings || []).map((item) => {
+    const cls = /блок/i.test(item.level) ? "bad" : (/стил/i.test(item.level) ? "muted" : "wait");
+    return `<div class="finding ${cls}"><b>${esc(item.level || "находка")}</b>${esc(item.text)}</div>`;
+  }).join("");
+  $("step-review-text").textContent = review.text || "—";
+  clipNote($("step-review-note"), review);
+  if ((review.occurrences || 0) > 1) {
+    $("step-review-note").textContent += ` · строк вердикта: ${review.occurrences}`;
+  }
+
+  const commit = data.commit || {};
+  $("step-commit-sha").textContent = commit.sha || "коммит в отчёте не указан";
+  $("step-commit-stat").textContent = commit.stat || "—";
+  $("step-commit-diff").textContent = (commit.diff || {}).text || "—";
+  clipNote($("step-commit-note"), commit.diff, commit.error);
+
+  const hold = data.hold || {};
+  $("step-hold").textContent = hold.held ? "на ручном допуске" : "не на допуске";
+  // Стоп-флаг кнопки не гасит: допуск — действие владельца, ради него экран и открывают.
+  $("btn-hold").disabled = !!window.__preview || !!hold.held;
+  $("btn-unhold").disabled = !!window.__preview || !hold.held;
+
+  $("step-cards").innerHTML = (data.cards || []).map((card) => {
+    const cls = card.status === "done" ? "ok"
+      : (["crashed", "blocked", "timed_out", "gave_up"].includes(card.status) ? "bad" : "run");
+    const list = card.comments || [];
+    return `<li class="step-card" id="card-${esc(card.id)}">
+      <div class="row1"><span class="title">${esc(card.title)}</span>
+        <span class="pill ${cls}">${esc(card.status)}</span></div>
+      <div class="muted mono">${esc(card.key)} · ${esc(card.id)}</div>
+      ${card.result ? `<div class="res"><pre>${esc(card.result)}</pre></div>`
+                    : `<div class="muted">результата нет</div>`}
+      <a href="#comments-${esc(card.id)}" data-comments="${esc(card.id)}">комментарии (${list.length})</a>
+      <details class="comments" id="comments-${esc(card.id)}">
+        <summary>комментарии карточки</summary>
+        ${list.map((msg) => `<div class="comment"><div class="muted">${esc(msg.author || "—")}</div>${esc(msg.body)}</div>`).join("")
+          || `<div class="muted">комментариев нет</div>`}
+      </details></li>`;
+  }).join("") || `<li class="muted">карточек шага нет</li>`;
+  document.querySelectorAll("[data-comments]").forEach((link) => {
+    link.onclick = (event) => {
+      event.preventDefault();
+      const box = $("comments-" + link.dataset.comments);
+      if (!box) return;
+      box.open = true;
+      box.scrollIntoView({block: "center"});
+    };
+  });
+}
+
 function render(data) {
   $("project").textContent = data.project || "—";
   $("board").textContent = "борда: " + (data.board || "—");
@@ -380,7 +613,8 @@ function render(data) {
       ${p.stop ? `<span class="stop">⛔ ${esc(p.stop.kind || "")}</span>` : ""}
     </div>`).join("") || `<span class="muted">планов с журналом не найдено</span>`;
   document.querySelectorAll(".plan-chip").forEach((chip) => {
-    chip.onclick = () => { currentPlan = chip.dataset.plan; startEvents(); refresh(); };
+    chip.onclick = () => { currentPlan = chip.dataset.plan; currentStep = null;
+                           startEvents(); refresh(); };
   });
 
   const plan = data.plan || {};
@@ -400,6 +634,13 @@ function render(data) {
   $("flow").innerHTML = (stepId ? stageOf(data.cards || [], plan.id, stepId) : []).map((s) => `
     <div class="stage ${s.cls}"><b>${esc(s.title)}</b><span>${esc(s.hint)}</span></div>`).join("")
     || `<div class="stage"><b>Нет шага</b><span>все закрыты или план не выбран</span></div>`;
+
+  // Контекст вкладки «Шаг»: ею управляет снимок, а не догадки страницы.
+  window.__planId = plan.id || currentPlan || null;
+  window.__steps = plan.steps || [];
+  window.__nextStep = nextId || null;
+  window.__preview = !!data.preview;
+  fillStepPicker();
 
   $("status").textContent = [
     `решение: ${decision.action || "—"} — ${decision.reason || ""}`,
@@ -475,6 +716,19 @@ function startEvents() {
 }
 
 $("btn-tick").onclick = () => act("tick", currentPlan ? {plan: currentPlan} : {});
+document.querySelectorAll(".tab").forEach((tab) => {
+  tab.onclick = () => showTab(tab.dataset.tab);
+});
+// Допуск рядом с шагом: номер плана уходит вместе с шагом, иначе действие запишется
+// плану по умолчанию, а на вкладке выбран соседний.
+function stepAction(action) {
+  if (!currentStep) { toast("шаг не выбран", true); return; }
+  const plan = window.__planId || currentPlan;
+  act(action, plan ? {step: currentStep, plan} : {step: currentStep})
+    .then(() => loadStep());
+}
+$("btn-hold").onclick = () => stepAction("hold");
+$("btn-unhold").onclick = () => stepAction("unhold");
 $("btn-stop").onclick = () => {
   const reason = prompt("Причина остановки (после текущего шага):", "остановка владельца");
   if (reason !== null) act("stop", {reason});

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -426,6 +427,320 @@ def _overview(root: Path, cfg: dict, out: dict) -> dict:
             "progress": progress,
             # Задел под бейдж критичных проблем шага S5 (D8): проверки здесь не запускаются.
             "checks": None}
+
+
+# ───────────────────────────── экран «Шаг» (план 3 S3) ─────────────────────────────
+
+STEP_LINES = 200                        # строк на блок экрана «Шаг»
+TEXT_SUFFIXES = (".md", ".txt", ".json", ".py", ".html", ".css", ".js", ".yaml", ".yml",
+                 ".toml", ".ini", ".cfg")
+# Вердикт и коммит разбираются теми же выражениями, что у стража (`gate.py`): копия нужна
+# потому, что движок вендорится в проект и импортировать его из плагина нельзя (D5).
+_VERDICT_RE = re.compile(r"^#{0,4}\s*ВЕРДИКТ\s*:\s*(APPROVE|REQUEST_CHANGES)\s*$",
+                         re.IGNORECASE | re.MULTILINE)
+_COMMIT_RE = re.compile(r"коммит\S*\s*`([0-9a-f]{7,40})`", re.IGNORECASE)
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_WIN_ABS_RE = re.compile(r"^[A-Za-z]:")
+_BULLET_RE = re.compile(r"^\s*[-*]\s+(?P<text>.+?)\s*$")
+_LABEL_RE = re.compile(r"^(?P<label>[^:=]{1,24}?)\s*[:=]\s*(?P<value>.*)$")
+_TICK_RE = re.compile(r"`([^`]+)`")
+
+
+class UnsafePath(ValueError):
+    """Путь за пределы проекта или не показываемый файл: панель такое не читает."""
+
+
+def safe_path(root: Path | str, rel: str | None) -> Path:
+    """Файл строго внутри корня проекта.
+
+    Отклоняются абсолютные пути, `..`, точки (`.env`, `.git/…`) и симлинки, ведущие
+    наружу: экран «Шаг» показывает только файлы проекта — это контракт шага 3-S3.
+    """
+    base = Path(root).resolve()
+    raw = str(rel or "").strip().replace("\\", "/")
+    if not raw:
+        raise UnsafePath("пустой путь")
+    if raw.startswith(("/", "~")) or _WIN_ABS_RE.match(raw):
+        raise UnsafePath(f"путь вне корня проекта: {raw}")
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if ".." in parts:
+        raise UnsafePath(f"путь вне корня проекта: {raw}")
+    if any(part.startswith(".") for part in parts):
+        raise UnsafePath(f"служебный файл не показывается: {raw}")
+    try:
+        real = base.joinpath(*parts).resolve()
+    except OSError as exc:
+        raise UnsafePath(f"путь не разрешается: {raw} ({exc})") from exc
+    if real != base and base not in real.parents:
+        raise UnsafePath(f"путь вне корня проекта: {raw}")
+    return real
+
+
+def _lines_word(count: int) -> str:
+    """Форма слова «строка»: 1 строка, 3 строки, 5 строк — пометка читается человеком."""
+    if count % 10 == 1 and count % 100 != 11:
+        return "строка"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return "строки"
+    return "строк"
+
+
+def _clip(text: str, limit: int = STEP_LINES) -> dict:
+    """Обрезать текст по строкам с явной пометкой: тихого усечения быть не должно."""
+    lines = str(text or "").splitlines()
+    total = len(lines)
+    cap = max(1, int(limit or STEP_LINES))
+    shown = lines[:cap]
+    cut = total > len(shown)
+    return {"text": "\n".join(shown), "shown": len(shown), "total": total, "truncated": cut,
+            "note": (f"показаны первые {len(shown)} {_lines_word(len(shown))}, всего {total}"
+                     if cut else "")}
+
+
+def read_text_safe(root: Path | str, rel: str | None,
+                   limit: int = STEP_LINES) -> dict:
+    """Текст файла проекта с обрезкой. Бросает `UnsafePath` на всё, что вне корня."""
+    target = safe_path(root, rel)
+    if target.suffix.lower() not in TEXT_SUFFIXES:
+        raise UnsafePath(f"показываем только текстовые файлы: {rel}")
+    if not target.is_file():
+        raise UnsafePath(f"файла нет: {rel}")
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise UnsafePath(f"не прочитать {rel}: {exc}") from exc
+    return {"path": str(rel or ""), "exists": True, **_clip(text, limit)}
+
+
+def comments(db: Path, task_id: str, limit: int = 20) -> list[dict]:
+    """Комментарии карточки: на них ведёт ссылка «комментарии» с экрана шага."""
+    if not task_id:
+        return []
+    con = _ro(db)
+    if con is None:
+        return []
+    try:
+        rows = con.execute("SELECT author, body, created_at FROM task_comments"
+                           " WHERE task_id = ? ORDER BY created_at LIMIT ?",
+                           (str(task_id), int(limit))).fetchall()
+    except sqlite3.Error:                    # борда старой версии: таблицы может не быть
+        return []
+    finally:
+        con.close()
+    return [{"author": str(row[0] or ""), "body": str(row[1] or "")[:2000],
+             "created_at": row[2]} for row in rows]
+
+
+def _plan_file_of(root: Path, cfg: dict, plan_id: str) -> Path | None:
+    """Файл плана `<номер>-*.md` — то же имя, что распознаёт реестр движка."""
+    folder = Path(root) / str((cfg.get("paths") or {}).get("plans") or "docs/plans")
+    if not folder.is_dir():
+        return None
+    prefix = f"{plan_id}-"
+    matches = sorted(path for path in folder.glob("*.md")
+                     if re.match(rf"^{re.escape(prefix)}\d*", path.name))
+    return matches[0] if matches else None
+
+
+def _bullets(lines: list[str]) -> list[str]:
+    """Пункты `- …` с приклеенными строками переноса (в плане они переносятся по ширине)."""
+    out: list[str] = []
+    current: str | None = None
+    for line in lines:
+        match = _BULLET_RE.match(line)
+        if match:
+            if current:
+                out.append(current)
+            current = match.group("text")
+        elif current is not None and line.strip() and not line.lstrip().startswith(("#", "|")):
+            current += " " + line.strip()
+        elif current is not None and not line.strip():
+            out.append(current)
+            current = None
+    if current:
+        out.append(current)
+    return out
+
+
+def _contract(root: Path, cfg: dict, plan_id: str, step_id: str) -> dict:
+    """Контракт шага из плана: цель, файлы, гейты, «что сделать» и «Готово =»."""
+    empty = {"found": False, "title": "", "goal": "", "files": [], "gates": [], "what": "",
+             "done": ""}
+    path = _plan_file_of(root, cfg, plan_id)
+    if path is None:
+        return {**empty, "error": f"файл плана {plan_id} не найден"}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return {**empty, "error": f"план не прочитан: {exc}"}
+    try:
+        step_re = re.compile(str(cfg.get("step_id_regex") or _DEFAULT_STEP_ID))
+    except re.error:
+        step_re = re.compile(_DEFAULT_STEP_ID)
+    found = _headings(lines)
+    for pos, (index, _level, title) in enumerate(found):
+        match = step_re.match(title)
+        if not match or match.group("id").upper() != step_id:
+            continue
+        title_text = title[match.end():].strip().lstrip(".").strip()
+        body = lines[index + 1:_section_end(found, pos, len(lines))]
+        rows = {"found": True, "title": title_text, "goal": "", "files": [], "gates": [],
+                "what": "", "done": ""}
+        for bullet in _bullets(body):
+            label = _LABEL_RE.match(bullet)
+            if label is None:
+                continue
+            key = label.group("label").strip().lower()
+            value = label.group("value").strip()
+            if key.startswith("цель"):
+                rows["goal"] = value
+            elif key.startswith("файл"):
+                rows["files"] = [item.strip() for item in _TICK_RE.findall(value)] or [value]
+            elif key.startswith(("тест", "гейт")):
+                rows["gates"] = [item.strip() for item in _TICK_RE.findall(value)] or [value]
+            elif key.startswith("что сделать"):
+                rows["what"] = value
+            elif key.startswith("готово"):
+                rows["done"] = value
+        return {**rows, "path": _relative(root, path)}
+    return {**empty, "error": f"шаг {step_id} в плане {plan_id} не найден",
+            "path": _relative(root, path)}
+
+
+def _findings(text: str, limit: int = 40) -> list[dict]:
+    """Находки ревью: пункты раздела «Находки» с подзаголовками-уровнями."""
+    lines = text.splitlines()
+    found = _headings(lines)
+    start = next((pos for pos, (_i, level, title) in enumerate(found)
+                  if level in (2, 3) and "наход" in title.lower()), None)
+    if start is None:
+        return []
+    end = _section_end(found, start, len(lines))
+    rows: list[dict] = []
+    group = ""
+    for line in lines[found[start][0] + 1:end]:
+        head = _HEADING_RE.match(line)
+        if head:
+            group = head.group("title").strip()
+            continue
+        match = _BULLET_RE.match(line)
+        if match:
+            rows.append({"level": group, "text": match.group("text")})
+        elif rows and line.strip() and line.startswith((" ", "\t")):
+            rows[-1]["text"] += " " + line.strip()
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _review(root: Path, cfg: dict, plan_id: str, step_id: str,
+            limit: int = STEP_LINES) -> dict:
+    """Отчёт ревью: путь, текст, вердикт (ровно как у стража), коммит шага, находки."""
+    rel = (f"{((cfg.get('paths') or {}).get('reviews') or 'docs/reviews').rstrip('/')}"
+           f"/{plan_id}-{step_id}.md")
+    path = Path(root) / rel
+    rows = {"exists": False, "path": rel, "verdict": "NONE", "occurrences": 0,
+            "commit": "", "findings": [], "text": "", "shown": 0, "total": 0,
+            "truncated": False, "note": ""}
+    if not path.is_file():
+        rows["note"] = "отчёта ревью нет"
+        return rows
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        rows["note"] = f"отчёт не прочитан: {exc}"
+        return rows
+    found = [match.group(1).upper() for match in _VERDICT_RE.finditer(text)]
+    unique = sorted(set(found))
+    verdict = "NONE" if not found else (unique[0] if len(unique) == 1 else "AMBIGUOUS")
+    commit = _COMMIT_RE.search(text)
+    return {"exists": True, "path": rel, "verdict": verdict, "occurrences": len(found),
+            "commit": commit.group(1) if commit else "",
+            "findings": _findings(text), **_clip(text, limit)}
+
+
+def _git_show(root: Path, sha: str, limit: int = STEP_LINES, timeout: int = 30) -> dict:
+    """`git show` коммита шага: сводка целиком, дифф — с обрезкой и явной пометкой."""
+    sha = str(sha or "").strip().lower()
+    rows = {"sha": sha, "short": sha[:7], "available": False, "error": "",
+            "stat": "", "diff": {"text": "", "shown": 0, "total": 0, "truncated": False,
+                                 "note": ""}}
+    if not _SHA_RE.match(sha):
+        rows["error"] = "в отчёте ревью нет коммита шага"
+        return rows
+    base = ["git", "-C", str(root)]
+    try:
+        stat = proj.run([*base, "show", "--stat", "--no-color", "--format=%h %s", sha],
+                        timeout=timeout)
+        patch = proj.run([*base, "show", "--patch", "--no-color", "--format=", sha],
+                         timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        rows["error"] = f"git недоступен: {exc}"
+        return rows
+    if stat.returncode != 0:
+        rows["error"] = ((stat.stderr or stat.stdout or "").strip() or
+                         f"git show {sha}: код {stat.returncode}")[:400]
+        return rows
+    rows["available"] = True
+    rows["stat"] = (stat.stdout or "").strip()
+    if patch.returncode != 0:
+        rows["error"] = ((patch.stderr or patch.stdout or "").strip() or
+                         f"git show --patch {sha}: код {patch.returncode}")[:400]
+        return rows
+    rows["diff"] = _clip((patch.stdout or "").strip(), limit)
+    return rows
+
+
+def step_detail(project: Path | str | None = None, plan_id: str | int = "",
+                step_id: str = "", limit: int = STEP_LINES,
+                board: str | None = None) -> dict:
+    """Экран «Шаг»: контракт из плана, постановка, отчёт ревью, коммит и карточки шага.
+
+    Ничего не пишет и движок не запускает: только файлы проекта, `git show` и борда.
+    Контракт ищется по файлу плана `<номер>-*.md` — того же вида, что ведёт страж.
+    """
+    root = Path(project).resolve() if project else proj.find_project()
+    cfg = proj.read_config(root)
+    plan = str(plan_id).strip()
+    if plan.isdigit():
+        plan = str(int(plan))
+    step = str(step_id or "").strip().upper()
+    if not plan or not step:
+        raise ValueError("нужны параметр plan и id шага")
+    cap = max(1, int(limit or STEP_LINES))
+    contract = _contract(root, cfg, plan, step)
+    prompt_path = _prompt_file(root, cfg, plan, step)
+    prompt: dict = {"exists": prompt_path is not None,
+                    "path": _relative(root, prompt_path),
+                    "text": "", "shown": 0, "total": 0, "truncated": False,
+                    "note": "" if prompt_path else "постановки нет"}
+    if prompt_path is not None:
+        try:
+            prompt.update(_clip(prompt_path.read_text(encoding="utf-8", errors="replace"), cap))
+        except OSError as exc:
+            prompt["note"] = f"постановка не прочитана: {exc}"
+            prompt["exists"] = False
+    review = _review(root, cfg, plan, step, cap)
+    held = [str(item) for item in (_plan_state(root, plan).get("hold_steps") or [])]
+    db = proj.board_db(root, board)
+    prefix = f"planloop:{plan}:{step}:"
+    step_cards: list[dict] = []
+    for card in cards(db, limit=200):
+        key = str(card.get("idempotency_key") or "")
+        if not key.startswith(prefix):
+            continue
+        card_id = str(card.get("id") or "")
+        step_cards.append({"id": card_id, "title": str(card.get("title") or ""),
+                           "status": str(card.get("status") or ""),
+                           "assignee": str(card.get("assignee") or ""), "key": key,
+                           "result": str(card.get("result") or "")[:2000],
+                           "completed_at": card.get("completed_at"),
+                           "comments": comments(db, card_id)})
+    return {"ok": True, "plan": plan, "step": step, "title": contract.get("title") or "",
+            "contract": contract, "prompt": prompt, "review": review,
+            "commit": _git_show(root, review.get("commit") or "", cap),
+            "cards": step_cards, "hold": {"steps": held, "held": step in held},
+            "limit": cap}
 
 
 def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | None) -> dict:
