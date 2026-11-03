@@ -108,50 +108,6 @@ def make_project(root: Path, board: str = "testboard", approved: bool = True,
     return root
 
 
-def plan_body(count: int = 4, closed: dict | None = None) -> str:
-    """План из `count` шагов с журналом; `closed` задаёт статус строки (`S1` → «ЗАКРЫТ»).
-
-    Нужен тестам предзаказа постановки (план 2, S6): им важны и число шагов (последний
-    шаг предзаказ не получает), и уже закрытые строки журнала.
-    """
-    statuses = closed or {}
-    parts = ["# 1. Демо-план конвейера", "", "Цель: проверить предзаказ постановки.", "",
-             "## Шаги", ""]
-    for i in range(1, count + 1):
-        parts += [f"### S{i}. Шаг номер {i} (1 дн)", "",
-                  f"- Файл: `app/s{i}.py`",
-                  f"- Тесты/гейты: `python -m pytest tests/test_s{i}.py -q` → 1 passed",
-                  f"- Готово = шаг S{i} сделан", ""]
-    parts += ["## Журнал выполнения", "",
-              "| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |",
-              "|---|---|---|---|---|"]
-    for i in range(1, count + 1):
-        status = statuses.get(f"S{i}", "открыт")
-        parts.append(f"| — | S{i} | — | — | {status} |")
-    return "\n".join(parts) + "\n"
-
-
-def write_plan(root: Path, text: str) -> Path:
-    """Переписать план проекта и переутвердить его (запись хранит sha файла плана)."""
-    root = Path(root)
-    path = root / "docs" / "plans" / "1-demo.md"
-    path.write_text(text, encoding="utf-8")
-    write_approval(root, path)
-    return path
-
-
-def write_prompt(root: Path, step: str, recon: str | None = None) -> Path:
-    """Постановка шага; `recon` — отметка `recon_commit:` в шапке (план 2, S6)."""
-    root = Path(root)
-    folder = root / "docs" / "prompts"
-    folder.mkdir(parents=True, exist_ok=True)
-    head = f"recon_commit: {recon}\n" if recon else ""
-    path = folder / f"2026-11-04_1-{step}_prompt.md"
-    path.write_text(f"# Постановка {step}\n\n{head}\n## Ревью\n\nроль `reviewer`.\n",
-                    encoding="utf-8")
-    return path
-
-
 def cards(db: Path) -> list[dict]:
     """Все карточки из поддельной борды (для проверок)."""
     con = sqlite3.connect(db)

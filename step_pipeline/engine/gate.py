@@ -687,10 +687,13 @@ def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
         "Отчёт исполнителя и его транскрипт — НЕ доказательство.",
         "",
         "ЧТО ПРОВЕРИТЬ",
-        "- «Что сделать»: каждый пункт выполним на текущем коде, адреса file:line верны.",
-        "- Границы и запреты: не требуют того, что уже запрещено планом или ломает соседний код.",
-        "- Гейты: команды и ожидаемые цифры из постановки достижимы на HEAD.",
-        "- Расхождение постановки с планом/кодом — находка с указанием, что верно.",
+        "- Адреса `path:line` в постановке живые: файл есть, строка на HEAD — про то же самое.",
+        "- Имена символов, ключей конфига и тестов не выдуманы: они находятся в коде.",
+        "- «Готово =» и гейты постановки не противоречат разделу шага в плане.",
+        "- Объём и запреты на месте: постановка не расширяет шаг и не разрешает запрещённое.",
+        "- Стоп-сигналы не обходятся формулировками («уточнить», «при необходимости»).",
+        "- Блок «Ревью» требует вердикта роли `reviewer`, а не самопроверки исполнителя.",
+        "- Расхождение постановки с планом или кодом — находка с указанием, что верно.",
         "",
         "ОБЯЗАТЕЛЬНЫЙ ФОРМАТ ОТЧЁТА",
         f"- Файл `{report_rel}` содержит РОВНО ОДНУ строку вердикта (заголовок допустим):",
@@ -854,9 +857,14 @@ def decide(ctx: dict) -> dict:
         return dict(base, clear_incident=True,
                     reason=f"стоп-причина снята (было: {stop.get('reason', '')}); "
                            f"дальше — {base['action']}")
-    # Предзаказ постановки N+1 (правило 2): только поверх ожидания и без своих блокировок.
-    prefetch = _prefetch_decision(ctx, base)
-    return prefetch or base
+    # Предзаказ постановки N+1 (правило 2): только поверх ожидания и без его блокировок.
+    if (base["action"] == "idle" and not base.get("approval_blocked")
+            and not base.get("incident") and not base.get("plan_done")
+            and not base.get("close_blocked")):
+        prefetch = _prefetch_decision(ctx)
+        if prefetch:
+            return prefetch
+    return base
 
 
 def _decide_base(ctx: dict) -> dict:
@@ -985,7 +993,7 @@ def _decide_base(ctx: dict) -> dict:
             reason = close_block_reason(sid, nxt["id"])
             orders = card_of(ctx.get("next_cards") or [], "prompt")
             if orders:
-                return {"action": "idle", "step": sid, "reason": reason,
+                return {"action": "idle", "step": sid, "reason": reason, "close_blocked": True,
                         "detail": f"карточка заказа {orders[-1]['id']}"}
             return {"action": "create_prompt", "step": nxt["id"], "data": nxt,
                     "after_close": True, "reason": reason}
@@ -1016,17 +1024,12 @@ def close_block_reason(step_id: str, next_id: str) -> str:
     return f"шаг {step_id} принят, но закрыть не могу: нет постановки {next_id}"
 
 
-def _prefetch_decision(ctx: dict, base: dict) -> dict | None:
+def _prefetch_decision(ctx: dict) -> dict | None:
     """Заказ постановки N+1, пока шаг N в работе (правило 2), либо None.
 
     Ожидание кодируется решением `idle`, а не повторным `applied=False`: иначе каждый
-    тик тратил бы единственное действие на одно и то же (D10). Порядок веток важен:
-    решение о заказе не спорит с блокировками основания (утверждение, инцидент, план).
+    тик тратил бы единственное действие на одно и то же (D10).
     """
-    if base.get("action") != "idle":
-        return None
-    if base.get("approval_blocked") or base.get("incident") or base.get("plan_done"):
-        return None
     if not ctx.get("prefetch"):
         return None
     step, nxt = ctx.get("next"), ctx.get("next_step")
@@ -2249,18 +2252,13 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                           prompt_order_body(p, data), p.cfg.prompter, key,
                           p.cfg.prompt_skills, max_runtime=p.cfg.prompt_runtime)
         where = f"карточка {cid}" if cid else "карточку заказа создать не удалось"
-        ordered = f"постановка {step_id} заказана: {where}"
+        ordered = f"постановка {step_id} заказана заранее: {where}"
         result.update(applied=bool(cid),
                       detail=f"{block_reason}; {ordered}" if after_close else ordered)
         touch(f"create_prompt:{cid}")
-        if cid and after_close:
-            say(f"⛔ {block_reason}. Заказ на постановку отправлен ({cid}) — как только она "
-                f"появится, шаг закроется сам")
-        elif cid:
-            say(f"план {plan_id}: постановка {step_id} заказана заранее ({cid}), "
-                f"работа над текущим шагом не ждёт")
-        else:
-            say(f"план {plan_id}: не смог заказать постановку {step_id} — проверь борду")
+        # Молчим, если это плановый предзаказ: сообщение — только про гейт закрытия.
+        if after_close:
+            say(f"⛔ {block_reason}. {ordered} — как только постановка появится, шаг закроется сам")
         return result
     if action == "create_review":
         step, attempt = decision["data"], decision["attempt"]
