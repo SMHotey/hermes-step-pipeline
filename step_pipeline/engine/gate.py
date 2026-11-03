@@ -775,8 +775,39 @@ def _decide_base(ctx: dict) -> dict:
     if not fixes:
         return {"action": "create_fix", "step": sid, "data": step, "round": 1,
                 "parent": last_review["id"]}
-    return {"action": "stop", "step": sid,
-            "reason": f"второй REQUEST_CHANGES по шагу {sid} — автоматический круг правок исчерпан"}
+    findings = _review_findings(Path(verdict["path"]), 5)
+    reason = f"второй REQUEST_CHANGES по шагу {sid} — автоматический круг правок исчерпан"
+    details = [f"Замечания ревью ({Path(verdict['path']).name}):"]
+    details += [f"  - {f}" for f in findings] or ["  - пунктов в отчёте не нашёл, смотри отчёт целиком"]
+    details += [
+        "Что делать (выбери одно):",
+        "  1) принять как есть, если замечания непринципиальны: gate.py --resume и закрыть шаг;",
+        "  2) переписать постановку шага в docs/prompts/ и вернуть шаг в работу;",
+        "  3) доправить вручную по замечаниям и запустить тик: ревью пойдёт заново.",
+        "Стоп инцидентный: снимется сам, как только появится вердикт APPROVE.",
+    ]
+    return {"action": "stop", "step": sid, "reason": reason, "details": chr(10).join(details)}
+
+
+def _review_findings(path: Path, limit: int = 5) -> list[str]:
+    """Выжимка замечаний из отчёта ревью: пункты списков без воды."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    items: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("|"):
+            continue
+        if line[:2] in ("- ", "* ") or (line[:1].isdigit() and line[1:3] in (". ", ") ")):
+            item = line[2:].strip() if line[:2] in ("- ", "* ") else line[3:].strip()
+            item = item.replace("`", "").strip(" .;")
+            if len(item) >= 12 and item not in items:
+                items.append(item[:180])
+        if len(items) >= limit:
+            break
+    return items
 
 
 def status_text(ctx: dict, decision: dict) -> str:
@@ -1510,7 +1541,9 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         result.update(applied=True, detail=reason)
         touch("stop")
         if previous != reason:
+            extra = decision.get("details") or ""
             say("⛔ конвейер остановлен: " + reason
+                + (chr(10) + chr(10) + extra if extra else "")
                 + chr(10) + "После устранения причины продолжится сам; снять принудительно:"
                 + " `python .pipeline/gate.py --resume`")
         return result

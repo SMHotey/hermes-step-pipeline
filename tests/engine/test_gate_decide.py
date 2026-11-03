@@ -59,14 +59,37 @@ def test_review_request_changes_creates_fix():
     assert d["round"] == 1
 
 
-def test_second_request_changes_stops():
+def test_second_request_changes_stops_with_findings(tmp_path):
+    lines = ["VERDICT: REQUEST_CHANGES", "", "## Замечания", "",
+             "- риск шага не проверяется при ручном допуске",
+             "- вывод статуса врёт про hold"]
+    report = tmp_path / "2-S1.md"
+    report.write_text(chr(10).join(lines) + chr(10), encoding="utf-8")
     cards = [card("step", "done", short="1"),
              card("review", "done", n="1", short="2"),
              card("fix", "done", n="1", short="3"),
              card("review", "done", n="2", short="4")]
-    d = gate.decide(ctx(cards=cards, verdict={"verdict": "REQUEST_CHANGES", "path": "x"}))
+    d = gate.decide(ctx(cards=cards, verdict={"verdict": "REQUEST_CHANGES",
+                                        "path": str(report)}))
     assert d["action"] == "stop"
     assert "второй REQUEST_CHANGES" in d["reason"]
+    details = d["details"]
+    assert "риск шага не проверяется" in details
+    assert "вывод статуса врёт про hold" in details
+    assert "Что делать (выбери одно)" in details
+    assert "переписать постановку" in details
+
+
+def test_review_findings_skips_short_and_markup(tmp_path):
+    lines = ["# Заголовок", "- мало",
+             "- это осмысленное замечание по коду", "| a | b |",
+             "1. нумерованное замечание тоже берём"]
+    report = tmp_path / "r.md"
+    report.write_text(chr(10).join(lines), encoding="utf-8")
+    items = gate._review_findings(report, 5)
+    assert "это осмысленное замечание по коду" in items
+    assert "нумерованное замечание тоже берём" in items
+    assert "мало" not in items
 
 
 def test_fix_in_progress_is_idle():
