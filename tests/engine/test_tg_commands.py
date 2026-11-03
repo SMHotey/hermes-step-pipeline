@@ -169,6 +169,8 @@ def test_poll_reports_webhook_conflict(cfg, monkeypatch):
     fake = FakeTG(fail={"ok": False, "error_code": 409,
                         "description": "Conflict: can't use getUpdates method"})
     monkeypatch.setattr(gate, "_tg_call", fake)
+    # Ветка 409 зовёт notify: без подмены тест делает настоящий sendMessage.
+    monkeypatch.setattr(gate, "notify", lambda _cfg, _text: True)
     result = gate.poll_commands(cfg)
 
     assert result["ok"] is False

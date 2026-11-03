@@ -127,12 +127,20 @@ def test_setup_warns_about_webhook(tmp_path: Path, monkeypatch, capsys, fake_her
     monkeypatch.setattr(setup_flow.telegram, "get_me", lambda token: {"username": "demo_bot"})
     monkeypatch.setattr(setup_flow.telegram, "get_webhook_info",
                         lambda token: {"url": "https://example.test/hook"})
+    # Сеть в тестах — только подделки §4: ни getChat, ни sendMessage наружу не идут.
+    monkeypatch.setattr(setup_flow.telegram, "validate_chat", lambda token, chat: {"id": chat})
+    monkeypatch.setattr(setup_flow.telegram, "send_message", lambda token, chat, text: True)
 
-    setup_flow.run_setup(args(project=str(target), board="shop", driver="shop",
-                              no_telegram=False, telegram_token="123:ABC",
-                              telegram_chat="42", no_test=True))
+    code = setup_flow.run_setup(args(project=str(target), board="shop", driver="shop",
+                                     no_telegram=False, telegram_token="123:ABC",
+                                     telegram_chat="42", no_test=True))
     out = capsys.readouterr().out
     assert "вебхук" in out and "getUpdates → 409" in out
+    # Мастер не сломался на предупреждении: код 0 и токен/чат в .env (§5.1 п.14).
+    assert code == 0
+    env = (tmp_path / "h" / "shop" / ".env").read_text(encoding="utf-8")
+    assert f"{setup_flow.TOKEN_ENV}=123:ABC" in env
+    assert f"{setup_flow.CHAT_ENV}=42" in env
 
 
 def test_bad_token_leaves_notifications_off(tmp_path: Path, monkeypatch, fake_hermes):
