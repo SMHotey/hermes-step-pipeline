@@ -116,6 +116,18 @@ hermes pipeline doctor  --project <путь>
 
 ## 8. Грабли, уже пойманные (не наступать снова)
 
+- **Постановку нельзя писать одним куском.** Воркер промптера упирается в лимит вывода
+  модели (`finish_reason=length`), файл не создаётся, карточка уходит в повтор и дважды
+  выжигает `max_runtime` 2700 с. Правило в скилле: части по 40–70 строк + `wc -l` после
+  каждой. Тест-сторож: `tests/test_roles.py::test_prompter_skill_writes_prompt_in_chunks`.
+- **Адреса кода в спеке — только якоря.** Строки разъезжаются после каждой вставки, ревью
+  ловит это как блокирующее. Формат `файл.py#ANCHOR:имя` → комментарий `# ANCHOR:имя`.
+  Тест-сторож: `tests/test_roles.py::test_spec_anchors_resolve_to_code` (якорь без кода или
+  задвоенный якорь валит прогон).
+- **Улучшения ролей живут в `step_pipeline/roles/`, а не в `.hermes/`.** `.hermes/` в
+  `.gitignore` — правка там не доезжает до других проектов и не попадает в коммит.
+  Тесты-сторожа: `test_reviewer_skill_requires_recommendations_section`,
+  `test_prompter_skill_writes_prompt_in_chunks`.
 - **`hermes` в PATH не гарантирован.** Тесты не должны звать настоящий бинарник:
   подделывать `proj.run_hermes` (иначе CI на ubuntu падает `FileNotFoundError: 'hermes'`).
 - **Windows-консоль cp1251.** Любой русский вывод движка падал `UnicodeEncodeError`,

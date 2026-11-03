@@ -94,3 +94,30 @@ def test_plan_authoring_skill_has_planning_mode_protocol():
     section = text.split("## Режим планирования", 1)[1].split("\n## ", 1)[0]
     assert "не утверждает план сам" in section, "нет прямого запрета утверждать план самому"
     assert "plan-mode on" in section, "не сказано, какой командой включить режим"
+
+
+def test_reviewer_skill_requires_recommendations_section():
+    """Раздел рекомендаций обязан ехать в комплекте: .hermes/ в gitignore."""
+    text = (ROLES / "pipeline-reviewer" / "SKILL.md").read_text(encoding="utf-8")
+    assert "## Рекомендации владельцу" in text
+    assert "## Рекомендации" in text.split("## Принцип независимости")[0]
+
+
+def test_prompter_skill_writes_prompt_in_chunks():
+    """Правило «писать частями» — защита от лимита вывода модели."""
+    text = (ROLES / "pipeline-prompter" / "SKILL.md").read_text(encoding="utf-8")
+    assert "## Как писать файл постановки" in text
+    assert "40–70 строк" in text or "40-70 строк" in text
+
+
+def test_spec_anchors_resolve_to_code():
+    """Каждая ссылка #ANCHOR:имя в спеке обязана находить комментарий в коде."""
+    spec = (PLUGIN / "docs" / "PLAN-FORMAT.md").read_text(encoding="utf-8")
+    refs = set(re.findall(r"#ANCHOR:([^`\s,;|]+)", spec))
+    assert refs, "в спеке не осталось якорей — проверь, не откатили ли перевод адресов"
+    code = "".join(p.read_text(encoding="utf-8")
+                   for p in (PLUGIN / "step_pipeline" / "engine").glob("*.py"))
+    missing = sorted(r for r in refs if f"# ANCHOR:{r}" not in code)
+    assert not missing, f"якоря без кода: {missing}"
+    doubled = sorted(r for r in refs if code.count(f"# ANCHOR:{r}") > 1)
+    assert not doubled, f"якорь встречается дважды: {doubled}"
