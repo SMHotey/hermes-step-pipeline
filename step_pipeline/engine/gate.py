@@ -779,6 +779,9 @@ def _decide_base(ctx: dict) -> dict:
     reason = f"второй REQUEST_CHANGES по шагу {sid} — автоматический круг правок исчерпан"
     details = [f"Замечания ревью ({Path(verdict['path']).name}):"]
     details += [f"  - {f}" for f in findings] or ["  - пунктов в отчёте не нашёл, смотри отчёт целиком"]
+    recs = _review_recommendations(Path(verdict["path"]), 3)
+    if recs:
+        details += ["Рекомендации ревьюера:"] + [f"  - {r}" for r in recs]
     details += [
         "Что делать (выбери одно):",
         "  1) принять как есть, если замечания непринципиальны: gate.py --resume и закрыть шаг;",
@@ -808,6 +811,32 @@ def _review_findings(path: Path, limit: int = 5) -> list[str]:
         if len(items) >= limit:
             break
     return items
+
+
+def _review_recommendations(path: Path, limit: int = 3) -> list[str]:
+    """Раздел «Рекомендации» из отчёта ревью: что владельцу делать, а не что не так."""
+    items = _review_findings(path, 50)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    picked: list[str] = []
+    inside = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            inside = "рекомендац" in line.lower()
+            continue
+        if not inside or not line:
+            continue
+        if line[:2] in ("- ", "* ") or (line[:1].isdigit() and line[1:3] in (". ", ") ")):
+            item = (line[2:] if line[:2] in ("- ", "* ") else line[3:]).strip()
+            item = item.replace("`", "").strip(" .;")
+            if len(item) >= 8 and item not in picked:
+                picked.append(item[:200])
+        if len(picked) >= limit:
+            break
+    return picked
 
 
 def status_text(ctx: dict, decision: dict) -> str:

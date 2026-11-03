@@ -80,6 +80,25 @@ def test_second_request_changes_stops_with_findings(tmp_path):
     assert "переписать постановку" in details
 
 
+def test_details_prefer_reviewer_recommendations(tmp_path):
+    lines = ["## ВЕРДИКТ: REQUEST_CHANGES", "", "## Находки", "",
+             "- правка файла из списка Запрещено", "",
+             "## Рекомендации владельцу", "",
+             "- откатить строку ACTION_LABELS в snapshot.py",
+             "- поправить адрес в §11.2 на gate.py:1402-1418"]
+    report = tmp_path / "2-S1.md"
+    report.write_text(chr(10).join(lines), encoding="utf-8")
+    cards = [card("step", "done", short="1"),
+             card("review", "done", n="1", short="2"),
+             card("fix", "done", n="1", short="3"),
+             card("review", "done", n="2", short="4")]
+    d = gate.decide(ctx(cards=cards, verdict={"verdict": "REQUEST_CHANGES",
+                                        "path": str(report)}))
+    details = d["details"]
+    assert "Рекомендации ревьюера:" in details
+    assert details.index("откатить строку") < details.index("Что делать")
+    assert "правка файла из списка" not in details.split("Рекомендации")[1]
+
 def test_review_findings_skips_short_and_markup(tmp_path):
     lines = ["# Заголовок", "- мало",
              "- это осмысленное замечание по коду", "| a | b |",
