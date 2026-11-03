@@ -283,6 +283,8 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "StepPipelineUI/1.0"
     state: State  # задаётся в serve()
 
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - имя из stdlib
         return
 
@@ -296,11 +298,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", cache_control)
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
             self.send_header("Content-Security-Policy", CSP)
             for name, value in (extra or {}).items():
                 self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
+            self.close_connection = True
         except (BrokenPipeError, ConnectionAbortedError, OSError):
             # браузер закрыл соединение на автообновлении — это норма, не ошибка сервера
             return
