@@ -163,7 +163,7 @@ Markdown-заголовок первого уровня разделом не с
 - Метки «важно…», «примечани…», «ограничени…» дают заметки шага; несколько заметок
   склеиваются в одну строку через пробел (`step_pipeline/engine/next_step.py:184-185,201`).
 - Метка «риск…» даёт `risk` шага: берётся первое слово значения в нижнем регистре,
-  годятся `low`, `normal`, `high` (`step_pipeline/engine/next_step.py:75-83,190-191`).
+  годятся `low`, `normal`, `high` (`step_pipeline/engine/next_step.py:75-83,189-190`).
   Любое другое значение — пусто, опечатка, русское слово — считается `high`: ошибка в
   плане не должна делать опасный шаг безопасным. «Риск по умолчанию normal» относится
   только к отсутствию пункта. `high` — единственное значение, которое меняет решения
@@ -171,7 +171,7 @@ Markdown-заголовок первого уровня разделом не с
   (`gate.py#ANCHOR:hold_risk_decision`, исполнение — `gate.py#ANCHOR:hold_risk_action`); `low` и `normal`
   ведут шаг обычным порядком.
 - Метка «авто…» даёт `auto` шага: правдой считаются `да`, `yes`, `true`, `1`
-  (`step_pipeline/engine/next_step.py:86-89,192-193`). Это запись договорённости в
+  (`step_pipeline/engine/next_step.py:86-89,191-192`). Это запись договорённости в
   контракте шага, а не отмена ожидания: в решении стража она не участвует, и `high` ею
   не отменяется (`step_pipeline/engine/gate.py:715-727`).
 - Цель шага — первый пункт, у которого текст не короче 15 символов, метка не начинается
@@ -387,5 +387,5 @@ Markdown-заголовок первого уровня разделом не с
 | П22 | отличия линтера от движка перечислены в §9 | §9 | `step_pipeline/plan_lint.py:220-240,243-269` | нет прямого теста |
 | П23 | панель показывает последние 8 строк журнала: первый заголовок любого уровня с маркером | §6 | `step_pipeline/snapshot.py:63-93` | `tests/test_preview.py:57` — только хвост журнала; выбор заголовка любого уровня и лимит 8 строк не покрыты |
 | П24 | параметры грамматики из `pipeline.json`: маркеры, `step_id_regex` с «^» и группой `id`, `paths.plans` | §7 | `step_pipeline/engine/config.py:42-51,213-220` | `tests/engine/test_next_step.py:214,306,314` |
-| П25 | риск шага: пункт «Риск:» → `low`/`normal`/`high`, нераспознанное значение → `high`, отсутствие пункта → `normal`; `high` без допуска владельца даёт `hold_risk` вместо карточки | §5 | `step_pipeline/engine/next_step.py:75-83,190-191`; `step_pipeline/engine/gate.py#ANCHOR:hold_risk_decision`, `gate.py#ANCHOR:hold_risk_action` | `tests/engine/test_risk.py:90,105,150` |
-| П26 | «Авто:» → `auto` (`да`/`yes`/`true`/`1`); в решении стража не участвует и риск `high` не отменяет | §5 | `step_pipeline/engine/next_step.py:86-89,192-193` | `tests/engine/test_risk.py:90,150` |
+| П25 | риск шага: пункт «Риск:» → `low`/`normal`/`high`, нераспознанное значение → `high`, отсутствие пункта → `normal`; `high` без допуска владельца даёт `hold_risk` вместо карточки | §5 | `step_pipeline/engine/next_step.py:75-83,189-190`; `step_pipeline/engine/gate.py#ANCHOR:hold_risk_decision`, `gate.py#ANCHOR:hold_risk_action` | `tests/engine/test_risk.py:90,105,150` |
+| П26 | «Авто:» → `auto` (`да`/`yes`/`true`/`1`); в решении стража не участвует и риск `high` не отменяет | §5 | `step_pipeline/engine/next_step.py:86-89,191-192` | `tests/engine/test_risk.py:90,150` |

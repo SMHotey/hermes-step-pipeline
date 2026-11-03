@@ -54,8 +54,7 @@ class Step:
     auto: bool = False
 
 
-# Маркер пункта ВЕРХНЕГО уровня: строка с отступом — продолжение предыдущего пункта.
-# ANCHOR:пункты — разбор пунктов плана (П12)
+# Маркер пункта ВЕРХНЕГО уровня: строка с отступом — продолжение предыдущего пункта.  # ANCHOR:пункты
 _BULLET_RE = re.compile(r"^(?:[-*+]|\d+\.)\s+(?P<text>.*)$")
 _DAYS_RE = re.compile(r"\((?P<days>\d+(?:[.,]\d+)?)\s*(?:[–-]\s*\d+(?:[.,]\d+)?\s*)?(?:дн|день|дня|дней)")
 _DAYS_PAREN_RE = re.compile(r"\s*\([^()]*(?:дн|день|дня|дней)[^()]*\)")
@@ -196,8 +195,8 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
             if m:
                 owner = m.group(1)
         if not dod:
-            # ANCHOR:критерий — извлечение критерия «Готово» (П17)
-            ready = _READY_RE.search(full)
+            # Критерий «Готово» ищется по полному тексту пункта, а не по обрезке.
+            ready = _READY_RE.search(full)  # ANCHOR:критерий
             if ready:
                 dod = ready.group("rest").strip()
     return Step(id=sid, epoch="", title=title, days=days, owner=owner, goal=goal,
