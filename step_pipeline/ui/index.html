@@ -91,24 +91,28 @@
       border: 1px solid var(--line); background: var(--bg); color: var(--text); font-size: 13px; }
   .row { display: flex; gap: 10px; }
   .row > div { flex: 1; }
-  .next-action { border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 12px;
-                 background: var(--panel-2); }
-  .next-action.bad { border-left-color: var(--bad); }
-  .next-label { font-size: 18px; font-weight: 600; letter-spacing: .2px; }
-  .next-reason { margin-top: 4px; font-size: 13px; }
-  .next-why { margin-top: 6px; font-size: 12.5px; color: var(--bad); }
-  .progress-row { margin: 10px 0; }
-  .progress-head { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px;
-                   flex-wrap: wrap; }
-  .bar { height: 6px; margin-top: 5px; border-radius: 999px; overflow: hidden;
-         background: var(--panel-2); border: 1px solid var(--line); }
-  .bar i { display: block; height: 100%; background: var(--accent); }
-  .kv-list { display: grid; gap: 5px; font-size: 12.5px; }
-  .kv { display: flex; gap: 10px; }
-  .kv > span { color: var(--muted); min-width: 150px; }
-  .kv > b { font-weight: 500; }
-  .hidden { display: none; }
-  @media (max-width: 980px) { main { grid-template-columns: 1fr; } .flow { grid-template-columns: 1fr 1fr; } }
+  .ov-head { font-size: 17px; font-weight: 600; letter-spacing: .2px;
+             border-left: 3px solid var(--accent); padding: 6px 0 6px 10px; }
+  .ov-reason { margin-top: 4px; font-size: 13px; color: var(--muted); }
+  .ov-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px;
+             margin-top: 12px; }
+  .ov-item { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+             padding: 8px 10px; display: flex; flex-direction: column; gap: 3px; }
+  .ov-item span { font-size: 11px; color: var(--muted); text-transform: uppercase;
+                  letter-spacing: .06em; }
+  .ov-item b { font-size: 13px; font-weight: 600; }
+  .ov-bar { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12.5px; }
+  .ov-bar > span:first-child { min-width: 64px; }
+  .ov-track { flex: 1; height: 6px; border-radius: 999px; overflow: hidden;
+              background: var(--panel-2); border: 1px solid var(--line); }
+  .ov-fill { display: block; height: 100%; background: var(--accent); }
+  .ov-bar.active > span:first-child { color: var(--accent); }
+  .ov-stop { color: var(--bad); }
+  .ov-badge { display: inline-block; margin-top: 10px; padding: 3px 9px; border-radius: 999px;
+              font-size: 12px; color: #1b0b0b; background: var(--bad); border: 1px solid var(--bad); }
+  .ov-badge[hidden] { display: none; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } .flow { grid-template-columns: 1fr 1fr; }
+                              .ov-grid { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
 <body>
@@ -132,16 +136,17 @@
 <main>
   <div>
     <section id="overview">
-      <h2>Следующее действие</h2>
-      <div class="next-action" id="next-action">
-        <div class="next-label" id="next-label">Тик</div>
-        <div class="next-reason" id="next-reason">…</div>
-        <div class="next-why hidden" id="next-why"></div>
+      <h2>Обзор</h2>
+      <div class="ov-head" id="ov-tick">Тик: —</div>
+      <div class="ov-reason" id="ov-reason">…</div>
+      <div class="ov-badge" id="ov-badge" hidden></div>
+      <div class="ov-grid">
+        <div class="ov-item"><span>висит</span><b class="mono" id="ov-waiting">—</b></div>
+        <div class="ov-item"><span>кругов правок</span><b class="mono" id="ov-rounds">0</b></div>
+        <div class="ov-item"><span>постановка</span><b class="mono" id="ov-prompt">—</b></div>
+        <div class="ov-item"><span>риск шага</span><b class="mono" id="ov-risk">—</b></div>
       </div>
-      <h2 style="margin-top:16px">Прогресс планов</h2>
-      <div id="progress"><span class="muted">—</span></div>
-      <h2 style="margin-top:16px">Состояние шага</h2>
-      <div class="kv-list" id="state-rows"><div class="kv muted">—</div></div>
+      <div id="ov-bars"><span class="muted">—</span></div>
     </section>
     <section style="margin-top:16px">
       <h2>Поток текущего шага</h2>
@@ -210,6 +215,7 @@ let timer = null;
 let etag = null;      // ETag последнего полученного снимка: с ним идёт If-None-Match
 let stream = null;    // EventSource: поток событий с сервера
 let panelBusy = false; // идёт действие: кнопки гасятся до ответа сервера
+let tickAllowed = true; // доступно ли действие Тик по снимку (стоп-флаг, предпросмотр)
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => (
@@ -256,7 +262,10 @@ function actionLabel(action) {
 
 function setBusy(busy) {
   panelBusy = busy;
-  ["btn-tick", "btn-stop", "btn-resume"].forEach((id) => { $(id).disabled = busy; });
+  ["btn-stop", "btn-resume"].forEach((id) => { $(id).disabled = busy; });
+  // «Тик» включается только когда действие доступно: иначе `.finally` после «Стопа»
+  // вернул бы кнопку в строй при стоп-флаге и до следующего кадра/опроса.
+  $("btn-tick").disabled = busy || !tickAllowed;
 }
 
 function stageOf(cards, planId, stepId) {
@@ -283,75 +292,54 @@ function stageOf(cards, planId, stepId) {
   ];
 }
 
-function stamp(ts) {
-  // Время карточки борды — секунды epoch; показываем коротко, без секунд.
-  if (!ts) return "";
-  const date = new Date(Number(ts) * 1000);
-  return date.toLocaleDateString("ru-RU", {day: "2-digit", month: "2-digit"}) + " " +
-         date.toLocaleTimeString("ru-RU", {hour: "2-digit", minute: "2-digit"});
-}
-
-function age(ts) {
-  if (!ts) return "";
-  const sec = Math.max(0, Math.round(Date.now() / 1000 - Number(ts)));
-  if (sec < 60) return sec + " с";
-  if (sec < 3600) return Math.round(sec / 60) + " мин";
-  if (sec < 86400) return Math.round(sec / 3600) + " ч " + Math.round((sec % 3600) / 60) + " мин";
-  return Math.round(sec / 86400) + " дн";
-}
-
 function renderOverview(data) {
-  // Блок «что сделает Тик» целиком из снимка: страница ничего не додумывает и не
-  // повторяет правила стража. Критичных проблем из проверок (S5) в снимке нет —
-  // бейдж не рисуем, пустышка хуже её отсутствия.
+  // Блок «Обзор» целиком из снимка: страница ничего не додумывает и не повторяет правила
+  // стража. Значения приходят готовыми строками — подпись, причина, простой, прогресс.
   const ov = data.overview || {};
-  const act = ov.next_action || {};
-  $("next-action").className = "next-action" + (act.disabled ? " bad" : "");
-  $("next-label").textContent = act.label || "Тик";
-  $("next-reason").textContent = act.reason || "страж причину не сообщил";
-  const why = $("next-why");
-  why.textContent = act.why || "";
-  why.className = "next-why" + (act.why ? "" : " hidden");
+  $("ov-tick").textContent = ov.tick_label || "Тик: —";
+  $("ov-reason").textContent = ov.reason || "страж причину не сообщил";
 
-  const tick = $("btn-tick");
-  tick.textContent = act.label || "Тик";
-  tick.disabled = !!act.disabled || panelBusy;
-  tick.title = act.why || "";
+  const waiting = ov.waiting || null;
+  const waitingEl = $("ov-waiting");
+  waitingEl.textContent = waiting ? waiting.text : "—";
+  waitingEl.title = waiting && waiting.reason ? waiting.reason : "";
 
-  const rows = (ov.progress || []).filter((p) => p.driven);
-  $("progress").innerHTML = rows.map((p) => {
+  $("ov-rounds").textContent = String(ov.fix_rounds ?? 0);
+  const prompt = ov.prompt || {};
+  const promptEl = $("ov-prompt");
+  promptEl.textContent = prompt.exists ? "есть" : "нет";
+  promptEl.title = prompt.path || "";
+  $("ov-risk").textContent = ov.risk || "—";
+
+  const active = String((data.plan || {}).id ?? "");
+  const rows = ov.progress || [];
+  $("ov-bars").innerHTML = rows.map((p) => {
     const total = Number(p.total || 0);
     const closed = Number(p.closed || 0);
     const width = total > 0 ? Math.min(100, Math.round(closed * 100 / total)) : 0;
-    const nums = total > 0 ? `${closed} из ${total}` : `${closed} закрыто`;
-    const next = p.next && p.next !== "—" ? `<span class="pill run">→ ${esc(p.next)}</span>`
-                                           : `<span class="pill ok">закрыт</span>`;
-    const hold = (p.hold || []).length
-      ? `<span class="pill wait">допуск: ${esc((p.hold || []).join(", "))}</span>` : "";
-    const stop = p.stop ? `<span class="pill bad">стоп: ${esc(p.stop.kind || "")}</span>` : "";
-    return `<div class="progress-row">
-      <div class="progress-head"><b>план ${esc(p.id)}</b>
-        <span class="muted">${esc(nums)}</span>${next}${hold}${stop}</div>
-      <div class="bar"><i style="width:${width}%"></i></div></div>`;
-  }).join("") || `<span class="muted">ведомых планов нет</span>`;
+    const nums = total > 0 ? `${closed}/${total}` : `${closed} закрыто`;
+    return `<div class="ov-bar${String(p.id) === active ? " active" : ""}">
+      <span>план ${esc(p.id)}</span>
+      <span class="ov-track"><i class="ov-fill" style="width:${width}%"></i></span>
+      <span class="mono">${esc(nums)}</span>
+      ${p.stop ? '<span class="ov-stop" title="стоп-флаг">⛔</span>' : ""}
+    </div>`;
+  }).join("") || `<span class="muted">планов с журналом не найдено</span>`;
 
-  const st = ov.state || null;
-  const prompt = (st || {}).prompt || {};
-  let hangs = "—";
-  if (st && st.status === "done" && st.completed) {
-    hangs = `закрыто ${stamp(st.completed)}`;
-  } else if (st && st.since) {
-    hangs = `${st.status || "—"} · ${age(st.since)} (с ${stamp(st.since)})`;
-  }
-  const kv = [
-    ["шаг", st ? `${st.step} · ${st.title || ""}` : "—"],
-    ["висит в состоянии", hangs],
-    ["кругов правок", st ? String(st.fix_rounds ?? 0) : "—"],
-    ["постановка", prompt.exists ? "есть · " + prompt.file : "нет"],
-    ["риск шага", st && st.risk ? st.risk : "—"],
-  ];
-  $("state-rows").innerHTML = kv.map(([k, v]) =>
-    `<div class="kv"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("");
+  // Бейдж критичных проблем: проверки — объём шага S5, пока в снимке `checks: null`.
+  const checks = ov.checks || null;
+  const critical = checks ? Number(checks.critical || 0) : 0;
+  const badge = $("ov-badge");
+  badge.hidden = !(critical > 0);
+  badge.textContent = critical > 0 ? `критичных проблем: ${critical}` : "";
+
+  // Доступность «Тика» решает снимок; `setBusy` включает кнопку только вместе с этим
+  // признаком, иначе стоп-флаг терялся бы после любого действия панели.
+  tickAllowed = ov.tick_available !== false;
+  const tick = $("btn-tick");
+  tick.textContent = ov.tick_label || "Тик";
+  tick.title = tickAllowed ? (ov.tick_label || "Тик") : (ov.tick_disabled_reason || "");
+  tick.disabled = !tickAllowed || panelBusy;
 }
 
 function render(data) {

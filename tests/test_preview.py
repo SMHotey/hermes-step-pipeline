@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from helpers import PLAN, install_project  # noqa: E402
+from helpers import PLAN, PLUGIN, install_project  # noqa: E402
 import cli  # noqa: E402
 import snapshot  # noqa: E402
 import ui_server  # noqa: E402
@@ -123,48 +123,53 @@ SECOND_PLAN = """# 2. Второй план
 """
 
 
-def test_overview_announces_tick_and_blocks_it_on_stop(tmp_path: Path):
-    """Обзор называет действие Тика с причиной и гасит кнопку при стоп-флаге (шаг 3-S2)."""
+def test_overview_tick_consequence_and_stop(tmp_path: Path, monkeypatch, bare_project: Path):
+    """Обзор называет следствие Тика с причиной и гасит кнопку при стоп-флаге (шаг 3-S2)."""
+    # Без этого снимок читает НАСТОЯЩУЮ борду профиля, и чужие карточки меняют обзор (D11).
+    monkeypatch.setenv("PIPELINE_KANBAN_DB", str(tmp_path / "kanban-empty.db"))
     root = install_project(tmp_path / "overview", board="overview-board")
     (root / "docs" / "plans" / "2-second.md").write_text(SECOND_PLAN, encoding="utf-8")
     snapshot.clear_cache()
 
-    view = snapshot.snapshot(root, plan="1")["overview"]
-    action = view["next_action"]
-    assert action["label"] == "Тик: заказ постановки S1"
-    assert "нет постановки шага S1" in action["reason"]
-    assert action["disabled"] is False and action["why"] == ""
-    assert view["state"]["prompt"] == {"exists": False, "file": ""}
-    assert view["state"]["fix_rounds"] == 0
-    assert view["state"]["risk"] == "normal"
-    # Прогресс: у открытого плана число шагов из пакета, у соседнего — из запуска движка
-    # по изменению файла плана (в `gate.py --plans` этого числа нет, а свой парсер плана
-    # в плагине не заводится).
-    by_id = {row["id"]: row for row in view["progress"]}
-    assert (by_id["1"]["closed"], by_id["1"]["total"]) == (0, 2)
+    data = snapshot.snapshot(root, plan="1")
+    ov = data["overview"]
+    assert ov["tick_label"] == "Тик: заказ постановки S1"
+    assert ov["tick_available"] is True and ov["tick_disabled_reason"] == ""
+    assert ov["reason"] and "нет постановки шага S1" in ov["reason"]
+    assert ov["prompt"] == {"exists": False, "path": ""}
+    assert ov["stop"] is None
+    assert ov["risk"] == "normal"
+    assert ov["fix_rounds"] == 0
+    assert ov["waiting"] is None
+    assert ov["checks"] is None
+    # Прогресс: по строке на план, число шагов — по файлу плана (движок не запускается).
+    by_id = {row["id"]: row for row in ov["progress"]}
+    assert {"1", "2"} <= set(by_id)
+    assert by_id["1"]["total"] == len(data["plan"]["steps"]) == 2
+    assert by_id["1"]["closed"] == 0
     assert (by_id["2"]["closed"], by_id["2"]["total"]) == (1, 2)
 
     stop = root / ".pipeline" / "state" / "plan_1_stop.json"
-    stop.write_text(json.dumps({"kind": "owner", "reason": "проверка владельца",
-                                "at": "03.11.2026 10:00"}, ensure_ascii=False), encoding="utf-8")
+    stop.write_text(json.dumps({"kind": "owner", "source": "owner",
+                                "reason": "решение владельца", "at": "03.11.2026 10:00:00"},
+                               ensure_ascii=False), encoding="utf-8")
     snapshot.clear_cache()
 
-    blocked = snapshot.snapshot(root, plan="1")["overview"]["next_action"]
-    assert blocked["disabled"] is True
-    assert "стоп-флаг владельца" in blocked["why"]
-    assert "проверка владельца" in blocked["why"]
+    stopped = snapshot.snapshot(root, plan="1")["overview"]
+    assert stopped["tick_available"] is False
+    assert "стоп" in stopped["tick_disabled_reason"]
+    assert "Продолжить" in stopped["tick_disabled_reason"]
+    assert "решение владельца" in stopped["tick_disabled_reason"]
+    assert stopped["stop"]["kind"] == "owner"
 
     # Предпросмотр гасит кнопку тем же полем снимка, а не догадкой страницы.
-    bare = tmp_path / "bare-overview"
-    (bare / "docs" / "plans").mkdir(parents=True)
-    (bare / "docs" / "plans" / "7-real.md").write_text(PLAN_TEXT, encoding="utf-8")
     snapshot.clear_cache()
-    preview_action = snapshot.snapshot(bare, preview=True)["overview"]["next_action"]
-    assert preview_action["disabled"] is True
-    assert "предпросмотр" in preview_action["why"]
+    preview = snapshot.snapshot(bare_project, preview=True)["overview"]
+    assert preview["tick_available"] is False
+    assert "предпросмотр" in preview["tick_disabled_reason"]
 
-    html = (Path(__file__).resolve().parents[1] / "step_pipeline" / "ui" / "index.html").read_text(
-        encoding="utf-8")
-    for anchor in ('id="next-action"', 'id="next-label"', 'id="next-why"',
-                   'id="progress"', 'id="state-rows"', "renderOverview(data)"):
+    html = (PLUGIN / "ui" / "index.html").read_text(encoding="utf-8")
+    for anchor in ('id="overview"', 'id="ov-tick"', 'id="ov-reason"', 'id="ov-bars"',
+                   'id="ov-badge"', 'id="ov-waiting"', 'id="ov-rounds"', 'id="ov-prompt"',
+                   'id="ov-risk"', "tick_label"):
         assert anchor in html

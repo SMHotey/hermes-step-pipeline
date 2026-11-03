@@ -12,10 +12,17 @@
 только `stat` (mtime_ns + size) файлов плана, каталога состояния и базы борды, плюс сам
 `pipeline.json`. Содержимое файлов отпечаток не читает: это дешёвая проверка «менялось ли
 что-то», а не второй проход по данным.
+
+Ключ `overview` — вычисленное следствие кнопки «Тик» до нажатия: подпись действия, причина,
+доступность (стоп-флаг выбранного плана и предпросмотр), простой из состояния плана и
+прогресс закрыто/всего по файлам планов. Ради этого движок НЕ запускается: число шагов
+разбирается по заголовкам файла плана, иначе сборка снимка подорожала бы на запуск на план
+(критерий шага 3-S1 — не больше 20 запусков движка в минуту).
 """
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -35,7 +42,8 @@ STAGE_LABELS = {"create_step": "заказ постановки", "create_review
                 "stop": "остановлен", "create_rereview_after_fix": "повторное ревью"}
 ACTION_LABELS = {"create_step": "шаг", "create_prompt": "постановка", "create_review": "ревью",
                  "create_fix": "правки", "create_rereview": "ревью", "close_step": "журнал",
-                 "idle": "ждёт", "stop": "стоп", "retry_pending": "довыкладка"}
+                 "idle": "ждёт", "stop": "стоп", "retry_pending": "довыкладка",
+                 "hold_risk": "ручной допуск"}
 
 CACHE_TTL = 2.5          # секунд: снимок не старше этого отдаётся из памяти
 CACHE_LIMIT = 8          # ключей: проект × план × предпросмотр × борда
@@ -51,13 +59,22 @@ ACTION_REASONS = {
     "hold_risk": "шаг помечен риском — страж поставит ручной допуск владельца",
 }
 
+# Эффект действия для подписи кнопки «Тик»: подпись читает владелец, поэтому у каждого
+# действия стража русское существительное, а не ключ решения.
+EFFECT_LABELS = {"create_step": "шаг", "create_prompt": "постановка", "create_review": "ревью",
+                 "create_rereview": "повторное ревью", "create_fix": "правки после ревью",
+                 "create_rereview_after_fix": "повторное ревью", "close_step": "журнал и коммит",
+                 "hold_risk": "допуск по риску", "retry_pending": "довыкладка",
+                 "idle": "ждёт", "stop": "стоп"}
+PROMPT_EFFECT = "заказ постановки"
+NO_STEP_ACTIONS = ("idle", "stop")      # шаг в подпись не попадает
+
+_HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>\S.*?)\s*$")
+_DEFAULT_STEP_ID = r"(?P<id>[A-Za-z]{1,4}\d+[A-Za-z]?(?:-\d+)?)"
+
 # Кэш процесса: ключ → (время сборки по monotonic, отпечаток источников, снимок).
 _CACHE: dict[tuple, tuple[float, tuple, dict]] = {}
 _CACHE_LOCK = threading.RLock()
-
-# Кэш числа шагов по планам для полосы прогресса: ключ → (отпечаток файла плана, данные).
-_OVERVIEW: dict[tuple, tuple[tuple, dict]] = {}
-_OVERVIEW_LOCK = threading.RLock()
 
 
 def _ro(path: Path) -> sqlite3.Connection | None:
@@ -183,11 +200,9 @@ def clear_cache() -> None:
     """Очистить кэш снимков: тестам для изоляции, действиям — как страховка после записи."""
     with _CACHE_LOCK:
         _CACHE.clear()
-    with _OVERVIEW_LOCK:
-        _OVERVIEW.clear()
 
 
-def prompt_file(root: Path, plan_id, step_id) -> Path | None:
+def _prompt_file(root: Path, cfg: dict, plan_id, step_id) -> Path | None:
     """Постановка шага: `<prompts_dir>/<дата>_<план>-<шаг>_prompt.md` (дата в имени любая).
 
     Тот же поиск, что у стража (`gate.py:prompt_rel`): панель показывает состояние
@@ -196,7 +211,6 @@ def prompt_file(root: Path, plan_id, step_id) -> Path | None:
     plan_id, step_id = str(plan_id or ""), str(step_id or "")
     if not plan_id or not step_id:
         return None
-    cfg = proj.read_config(Path(root))
     folder = Path(root) / str((cfg.get("paths") or {}).get("prompts") or "docs/prompts")
     if not folder.is_dir():
         return None
@@ -214,141 +228,204 @@ def _relative(root: Path, path: Path | None) -> str:
         return str(path)
 
 
-def next_action_view(root: Path, decision: dict, plan_row: dict | None, plan_id,
-                     preview: bool) -> dict:
-    """Что сделает Тик и почему: подпись кнопки, причина, запрет нажатия.
+def _headings(lines: list[str]) -> list[tuple[int, int, str]]:
+    """(индекс строки, уровень, заголовок) по всем заголовкам файла плана."""
+    found: list[tuple[int, int, str]] = []
+    for index, line in enumerate(lines):
+        match = _HEADING_RE.match(line)
+        if match:
+            found.append((index, len(match.group("hashes")), match.group("title")))
+    return found
 
-    Причина берётся из решения стража; у действий без `reason` (заказ шага и тройка
-    «ревью/правки/журнал») она собирается из самого действия — панель не выдумывает
-    последствий, а называет те, что записаны в решении.
+
+def _section_end(found: list[tuple[int, int, str]], pos: int, limit: int) -> int:
+    """Первый заголовок того же или более высокого уровня — граница раздела."""
+    level = found[pos][1]
+    for index in range(pos + 1, len(found)):
+        if found[index][1] <= level:
+            return found[index][0]
+    return limit
+
+
+def _is_step_title(step_re: re.Pattern, title: str) -> bool:
+    """Заголовок шага: идентификатор по `step_id_regex`, затем точка и название."""
+    match = step_re.match(title)
+    if not match:
+        return False
+    rest = title[match.end():].strip()
+    return rest.startswith(".") and bool(rest[1:].strip())
+
+
+def _steps_total(root: Path, cfg: dict, plan_rel: str) -> int:
+    """Число шагов плана по файлу: раздел с маркером шагов и заголовки `### <ШАГ>. название`.
+
+    Повторяет разбор движка (`next_step.plan_steps`), но без запуска движка: сборка снимка
+    не имеет права добавлять запуски (критерий шага 3-S1). Нет файла, раздела или
+    совпадений — 0.
     """
-    decision = decision or {}
+    if not plan_rel:
+        return 0
+    try:
+        lines = (Path(root) / plan_rel).read_text(encoding="utf-8",
+                                                 errors="replace").splitlines()
+    except OSError:
+        return 0
+    marker = str((cfg.get("markers") or {}).get("steps") or "шаг").lower()
+    try:
+        step_re = re.compile(str(cfg.get("step_id_regex") or _DEFAULT_STEP_ID))
+    except re.error:
+        return 0
+    found = _headings(lines)
+    span = None
+    for pos, (index, level, title) in enumerate(found):
+        if level >= 2 and marker in title.lower():
+            span = (index, _section_end(found, pos, len(lines)))
+            break
+    if span is None:
+        return 0
+    return sum(1 for index, _level, title in found
+               if span[0] < index < span[1] and _is_step_title(step_re, title))
+
+
+def _duration(seconds) -> str:
+    """Длительность по-русски: «4 ч 10 мин», «4 ч», «45 мин», «меньше минуты».
+
+    Формат — как у стража (`gate.py:_ago`); копия нужна потому, что движок вендорится в
+    проект и импортировать его из плагина нельзя (D5).
+    """
+    try:
+        total = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "меньше минуты"
+    hours, minutes = total // 3600, total % 3600 // 60
+    if hours and minutes:
+        return f"{hours} ч {minutes} мин"
+    if hours:
+        return f"{hours} ч"
+    if minutes:
+        return f"{minutes} мин"
+    return "меньше минуты"
+
+
+def _plan_state(root: Path, plan_id) -> dict:
+    """Состояние плана из `state_dir/plan_N_state.json`; нет файла или битый — пустой словарь."""
+    if str(plan_id or "") == "":
+        return {}
+    path = proj.state_dir(Path(root)) / f"plan_{plan_id}_state.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _fix_rounds(card_list: list[dict], plan_id, step_id) -> int:
+    """Кругов правок по шагу: карточки с ключом `planloop:<план>:<шаг>:fix:` (D7)."""
+    if not plan_id or not step_id:
+        return 0
+    prefix = f"planloop:{plan_id}:{str(step_id).upper()}:fix:"
+    return sum(1 for card in card_list or []
+               if str(card.get("idempotency_key") or "").startswith(prefix))
+
+
+def _overview(root: Path, cfg: dict, out: dict) -> dict:
+    """Экран «Обзор»: что произойдёт при Тик — подпись, причина, доступность, простой, прогресс.
+
+    Всё считается здесь, чтобы подпись и запрет нажатия проверялись питоном, а страница
+    оставалась рисовальщиком (D1). Имена полей — ровно те, что читает страница (D4); движок
+    ради обзора не запускается: число шагов берётся из файлов планов.
+    """
+    decision = out.get("decision") or {}
+    package = out.get("package") or {}
+    plan_row = out.get("plan") or {}
+    plan_id = str(plan_row.get("id") or "")
     action = str(decision.get("action") or "")
-    data = decision.get("data") if isinstance(decision.get("data"), dict) else {}
-    step = str(decision.get("step") or data.get("id") or "").upper()
-    stage = STAGE_LABELS.get(action, action)
-    # У простоя подпись «Тик: ждёт» ничего не обещает — кнопка остаётся «Тик».
-    label = "Тик" if action in ("", "idle") else " ".join(("Тик:", stage, step)).strip()
+    raw_data = decision.get("data")
+    data: dict = raw_data if isinstance(raw_data, dict) else {}
+    raw_next = package.get("next")
+    next_step: dict = raw_next if isinstance(raw_next, dict) else {}
+    step = str(decision.get("step") or data.get("id") or next_step.get("id") or "").upper()
+
+    prompt = _prompt_file(root, cfg, plan_id, step)
+    prompt_rows = {"exists": prompt is not None, "path": _relative(root, prompt)}
+
+    # «Заказ постановки» и «шаг» приходят одним действием `create_step` — различает их
+    # только факт наличия постановки (D2).
+    effect = EFFECT_LABELS.get(action, action)
+    if action == "create_step" and out.get("require_prompt", True) and not prompt_rows["exists"]:
+        effect = PROMPT_EFFECT
+    if not action:
+        tick_label = "Тик: —"
+    elif step and action not in NO_STEP_ACTIONS:
+        tick_label = f"Тик: {effect} {step}"
+    else:
+        tick_label = f"Тик: {effect}"
+
     reason = str(decision.get("reason") or "")
     if not reason:
         if action == "create_step" and step:
             reason = (f"постановка шага {step} на месте — страж закажет карточку шага"
-                      if prompt_file(root, plan_id, step) else
+                      if prompt_rows["exists"] else
                       f"нет постановки шага {step} — страж закажет её у роли промптера "
                       f"и остановится до появления файла")
         elif action == "create_prompt" and step:
             reason = f"нет постановки шага {step} — страж закажет её у роли промптера"
         else:
             reason = ACTION_REASONS.get(action, "")
-    stop = (plan_row or {}).get("stop") or None
-    kind = str((stop or {}).get("kind") or "owner")
-    disabled, why = False, ""
-    if preview:
-        disabled = True
-        why = "предпросмотр — только чтение: конвейер в проект не установлен"
+
+    # Стоп — только у ВЫБРАННОГО плана: действия панели адресованы ему, чужой стоп не
+    # должен глушить кнопку (D3).
+    chosen = next((row for row in out.get("plans") or []
+                   if str(row.get("id")) == plan_id), None)
+    stop_row = (chosen or {}).get("stop") or None
+    stop = None
+    if stop_row:
+        stop = {"kind": str(stop_row.get("kind") or "owner"),
+                "reason": str(stop_row.get("reason") or ""),
+                "at": str(stop_row.get("at") or "")}
+
+    tick_available, disabled_reason = True, ""
+    if out.get("preview"):
+        tick_available = False
+        disabled_reason = ("предпросмотр — только чтение: поставь конвейер в проект "
+                           "(`hermes pipeline setup`)")
     elif stop:
-        disabled = True
-        where = f" (с {stop.get('at')})" if (stop or {}).get("at") else ""
-        if kind == "incident":
-            why = (f"инцидентный стоп: {stop.get('reason') or 'причина не записана'}{where} — "
-                   f"страж снимет его сам, как только причина уйдёт")
-        else:
-            why = (f"стоп-флаг владельца: {stop.get('reason') or 'причина не записана'}{where} — "
-                   f"Тик ничего не сделает, пока не нажато «Продолжить»")
-    elif action == "stop":
-        disabled = True
-        why = f"страж остановлен: {reason or 'нужно действие человека'}"
-    return {"action": action, "stage": stage, "step": step, "label": label,
-            "reason": reason, "disabled": disabled, "why": why}
+        tick_available = False
+        where = f" (с {stop['at']})" if stop["at"] else ""
+        disabled_reason = (f"стоп-флаг ({stop['kind']}): "
+                           f"{stop['reason'] or 'причина не записана'}{where}; снять: "
+                           f"кнопка «Продолжить» или `python .pipeline/gate.py --resume`")
 
+    # Простой читается из состояния плана (`waiting_since` пишет сторож), а не из карточки:
+    # карточка живёт минуты, простой — часы.
+    state = _plan_state(root, plan_id)
+    since = state.get("waiting_since")
+    waiting = None
+    if isinstance(since, (int, float)) and not isinstance(since, bool):
+        seconds = max(0, int(time.time() - float(since)))
+        waiting = {"seconds": seconds, "text": _duration(seconds),
+                   "reason": str(state.get("waiting_reason") or "")}
 
-def step_state_view(root: Path, plan_id, plan_row: dict | None, step: dict | None,
-                    card_list: list[dict]) -> dict | None:
-    """Строки состояния открытого шага: сколько висит, кругов правок, постановка, риск."""
-    if not isinstance(step, dict) or not step.get("id"):
-        return None
-    sid = str(step["id"]).upper()
-    prefix = f"planloop:{plan_id}:{sid}:"
-    mine = [c for c in card_list if str(c.get("idempotency_key") or "").startswith(prefix)]
-    rounds = sum(1 for c in mine if ":fix:" in str(c.get("idempotency_key") or ""))
-    prompt = prompt_file(root, plan_id, sid)
-    # cards() отдаёт новые первыми: текущая карточка — первая незавершённая, иначе свежая.
-    active = next((c for c in mine if str(c.get("status") or "") != "done"), mine[0] if mine else None)
-    active = active or {}
-    return {
-        "step": sid,
-        "title": str(step.get("title") or ""),
-        "card": str(active.get("id") or ""),
-        "status": str(active.get("status") or ""),
-        "since": active.get("created_at"),
-        "completed": active.get("completed_at"),
-        "fix_rounds": rounds,
-        "prompt": {"exists": prompt is not None, "file": _relative(root, prompt)},
-        # Риск шага есть только когда шаг есть: `normal` у пустой строки врал бы.
-        "risk": str(step.get("risk") or (plan_row or {}).get("risk") or ""),
-    }
+    risk = str(next_step.get("risk") or data.get("risk") or "")
 
+    progress: list[dict] = []
+    for row in out.get("plans") or []:
+        progress.append({
+            "id": str(row.get("id")),
+            "closed": int(row.get("closed") or 0),
+            "total": _steps_total(root, cfg, str(row.get("file") or "")),
+            "driven": bool(row.get("driven")),
+            "next": str(row.get("next") or ""),
+            "stop": bool(row.get("stop")),
+        })
 
-def plan_totals(root: Path, plan_id: str, plan_file: str, engine_dir: Path | None,
-                extra_env: dict) -> dict:
-    """Число шагов плана из пакета движка — один запуск на изменение файла плана.
-
-    `gate.py --plans` число шагов не отдаёт, а своего парсера плана в плагине нет (D1).
-    Кеш привязан к `stat` файла плана: полоса прогресса не добавляет запусков движка
-    на каждую сборку снимка (бюджет шага S1).
-    """
-    path = Path(root) / plan_file
-    stamp = _stat_entry("plan", path)
-    key = (str(Path(root)), str(plan_id), str(engine_dir or ""))
-    with _OVERVIEW_LOCK:
-        cached = _OVERVIEW.get(key)
-        if cached is not None and cached[0] == stamp:
-            return dict(cached[1])
-    value: dict = {}
-    try:
-        pkg = proj.engine_json(root, "next_step.py", "--plan", str(plan_id),
-                               engine_dir=engine_dir, extra_env=extra_env) or {}
-        value = {"total": int(pkg.get("steps_total") or 0),
-                 "closed": len(pkg.get("closed") or [])}
-    except Exception:                                           # noqa: BLE001
-        value = {}
-    with _OVERVIEW_LOCK:
-        _OVERVIEW[key] = (stamp, value)
-    return dict(value)
-
-
-def progress_view(root: Path, plans: list[dict], package: dict, engine_dir: Path | None,
-                  extra_env: dict) -> list[dict]:
-    """Полоса прогресса по планам: закрыто/всего, следующий шаг, допуск и стоп."""
-    package = package or {}
-    chosen = str(package.get("plan_id") or "")
-    rows: list[dict] = []
-    for plan in plans or []:
-        pid = str(plan.get("id"))
-        closed = int(plan.get("closed") or 0)
-        total = None
-        if pid == chosen:
-            total = int(package.get("steps_total") or 0) or None
-        elif plan.get("driven") and plan.get("file"):
-            total = plan_totals(root, pid, str(plan["file"]), engine_dir, extra_env).get("total") or None
-        rows.append({"id": pid, "driven": bool(plan.get("driven")), "closed": closed,
-                     "total": total, "next": str(plan.get("next") or ""),
-                     "risk": str(plan.get("risk") or ""), "hold": list(plan.get("hold") or []),
-                     "stop": plan.get("stop") or None})
-    return rows
-
-
-def overview(root: Path, plan_id, plan_row: dict | None, decision: dict, package: dict,
-             plans: list[dict], card_list: list[dict], engine_dir: Path | None,
-             extra_env: dict, preview: bool) -> dict:
-    """Экран «Обзор»: последствие кнопки до нажатия и состояние открытого шага."""
-    next_step = (package or {}).get("next") or None
-    return {
-        "plan": str(plan_id or ""),
-        "next_action": next_action_view(root, decision, plan_row, plan_id, preview),
-        "state": step_state_view(root, plan_id, plan_row, next_step, card_list),
-        "progress": progress_view(root, plans, package or {}, engine_dir, extra_env),
-    }
+    return {"action": action, "step": step, "prompt": prompt_rows, "tick_label": tick_label,
+            "reason": reason, "stop": stop, "tick_available": tick_available,
+            "tick_disabled_reason": disabled_reason, "waiting": waiting,
+            "fix_rounds": _fix_rounds(out.get("cards") or [], plan_id, step), "risk": risk,
+            "progress": progress,
+            # Задел под бейдж критичных проблем шага S5 (D8): проверки здесь не запускаются.
+            "checks": None}
 
 
 def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | None) -> dict:
@@ -416,9 +493,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
     decision = out.get("decision") or {}
     out["stage"] = ACTION_LABELS.get(decision.get("action") or "", decision.get("action") or "")
     out["stop"] = any((p.get("stop") for p in out["plans"]))
-    plan_row = next((p for p in out["plans"] if str(p.get("id")) == str(chosen)), None)
-    out["overview"] = overview(root, chosen, plan_row, decision, out.get("package") or {},
-                               out["plans"], out["cards"], engine_dir, extra_env, preview)
+    out["overview"] = _overview(root, cfg, out)
     return out
 
 
