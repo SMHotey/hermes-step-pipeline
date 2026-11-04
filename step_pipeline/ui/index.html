@@ -151,14 +151,16 @@
   details.comments summary { cursor: pointer; font-size: 11.5px; color: var(--accent); }
   .comment { border-left: 2px solid var(--line); padding: 3px 8px; margin: 4px 0;
              font-size: 12px; }
-  /* Вкладка «Проверки» (план 3 S5): находки кликабельны — переход к шагу. */
+  /* Вкладка «Проверки» (план 3 S5): кликабельны только находки с шагом (§4.2). */
   .checks-clean { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--ok);
                   border-radius: 8px; background: rgba(47, 107, 58, .12); font-size: 13px; }
   .checks-clean[hidden] { display: none; }
   .checks-lint { list-style: none; margin: 8px 0 0; padding: 0; }
-  .checks-lint .finding { cursor: pointer; }
-  .checks-lint .finding:hover { border-left-color: var(--accent); }
+  .checks-lint .finding.goto { cursor: pointer; }
+  .checks-lint .finding.goto:hover { border-left-color: var(--accent); }
   .checks-lint .finding .where { float: right; color: var(--accent); }
+  /* Находка без шага — обычный текст: ни курсора, ни акцентной стрелки. */
+  .checks-lint .finding:not(.goto) .where { color: inherit; }
   .checks-problem { font-size: 12.5px; color: var(--bad); margin: 4px 0; }
   @media (max-width: 980px) { .cols { grid-template-columns: 1fr; } .flow { grid-template-columns: 1fr 1fr; }
                               .ov-grid { grid-template-columns: 1fr 1fr; } }
@@ -853,14 +855,21 @@ function renderChecks(data) {
     ? "файлов планов: " + (lint.files ?? 0) + ", находок: " + findings.length
     : "не проверяли";
   $("checks-lint").innerHTML = findings.map((item) => {
-    const where = item.step ? "→ " + item.step : (item.plan ? "→ план " + item.plan : "");
-    const cls = item.step ? "bad" : "wait";
-    return `<li class="finding ${cls}" data-plan="${esc(item.plan || "")}"
-                data-step="${esc(item.step || "")}">
+    const step = item.step || "";
+    const plan = item.plan || "";
+    // §4.2: кликабельна только находка с шагом; без шага — обычный текст без стрелки
+    // (стрелка «→ план N» читалась как приглашение к переходу, которого нет).
+    const where = step ? "→ " + step : (plan ? "план " + plan : "");
+    const cls = step ? "bad goto" : "wait";
+    const title = step
+      ? ` title="открыть шаг ${esc(step)} в плане ${esc(plan || "?")}"` : "";
+    return `<li class="finding ${cls}" data-plan="${esc(plan)}"
+                data-step="${esc(step)}"${title}>
       <span class="where">${esc(where)}</span>
       <b>${esc(item.file)}:${esc(item.line || 0)}</b>${esc(item.text)}</li>`;
   }).join("") || `<li class="muted">${checked ? "находок нет" : "не проверяли"}</li>`;
-  document.querySelectorAll("#checks-lint .finding").forEach((item) => {
+  // Обработчик — только строкам с шагом: у находки без шага переходить некуда (§4.2).
+  document.querySelectorAll("#checks-lint .finding.goto").forEach((item) => {
     item.onclick = () => gotoSighting(item.dataset.plan, item.dataset.step);
   });
   // Идущая чужая проверка (busy): подрачиваем cached-состояние до её конца — иначе
@@ -871,6 +880,9 @@ function renderChecks(data) {
 // Переход по находке: план и шаг становятся контекстом вкладки «Шаг».
 function gotoSighting(plan, step) {
   if (!plan) { toast("у находки нет номера плана — открой файл плана", true); return; }
+  // §4.2: без шага переходить некуда — не притворяемся, что есть (кликабельных строк без
+  // step не бывает, это защита от программного вызова).
+  if (!step) { toast("у находки нет шага — переходить некуда", true); return; }
   // Контекст вкладки «Шаг» — оба поля (§4.4): без __planId первый запрос /api/step ушёл бы
   // с прежним планом, пока снимок нового ещё едет (находка ревью 3-S5).
   window.__planId = String(plan);

@@ -1134,3 +1134,24 @@ def test_index_has_checks_tab_markup():
     # §4.1: панель «Проверок» — сразу после панели «Шаг», до «Установки».
     panels = [html.index(f'id="tab-{name}"') for name in ("step", "checks", "setup")]
     assert panels == sorted(panels), panels
+
+
+def test_index_makes_only_step_findings_clickable():
+    """§4.2: находка без шага — обычный текст; с шагом — title и переход (ревью 3-S5)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    start = html.index('$("checks-lint").innerHTML = findings.map')
+    end = html.index("// Идущая чужая проверка", start)
+    block = html[start:end]
+    # Обработчик вешается только на строки с шагом: у находки без step переходить некуда.
+    assert 'querySelectorAll("#checks-lint .finding.goto")' in block
+    assert 'querySelectorAll("#checks-lint .finding")' not in block
+    # Класс кликабельности и title — условно по непустому step.
+    assert 'step ? "bad goto" : "wait"' in block
+    assert 'title="открыть шаг ${esc(step)} в плане ${esc(plan || "?")}"' in block
+    # Строка без шага не притворяется переходом: ни стрелки, ни подсказки.
+    assert 'step ? "→ " + step : (plan ? "план " + plan : "")' in block
+    assert "function gotoSighting(plan, step)" in html
+    assert "if (!step)" in html
+    # CSS: курсор и подсветка — только у кликабельных строк.
+    assert ".checks-lint .finding.goto { cursor: pointer; }" in html
+    assert ".checks-lint .finding { cursor: pointer; }" not in html
