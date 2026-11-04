@@ -357,11 +357,18 @@ def checks(state: State, plan: str = "", refresh: bool = False) -> dict:
     return dict(payload)
 
 
-def checks_summary(state: State) -> dict:
-    """Короткая форма проверок для бейджа в шапке: без списков."""
-    payload = checks(state)
-    return {"critical": payload.get("critical"), "found": bool(payload.get("checked_at")),
-            "checked_at": payload.get("checked_at") or "", "busy": payload.get("busy")}
+def checks_summary(state: State) -> dict | None:
+    """Короткая форма проверок для снимка (S5, §3.6): ``None``, пока проверки не было,
+    иначе четыре поля — ``checked_at``, ``critical``, ``problems``, ``notes``. Без
+    блокировки, напрямую из ``state.checks``: бейдж читает ``critical`` из снимка.
+    """
+    payload = state.checks
+    if not payload:
+        return None
+    return {"checked_at": payload.get("checked_at") or "",
+            "critical": payload.get("critical"),
+            "problems": list(payload.get("problems") or []),
+            "notes": list(payload.get("notes") or [])}
 
 
 ACTIONS = {
@@ -491,8 +498,8 @@ class Handler(BaseHTTPRequestHandler):
         data = snap.snapshot(self.state.project, plan, preview=self.state.preview,
                              board=self.state.board)
         # Короткая форма проверок для бейджа: прогон запускает вкладка «Проверки», здесь
-        # только то, что уже посчитано (или «не проверяли»). overview копируется, иначе
-        # правка ушла бы в кэш снимка.
+        # только то, что уже посчитано (или None, пока проверки не было). overview
+        # копируется, иначе правка ушла бы в кэш снимка.
         data["overview"] = dict(data.get("overview") or {})
         data["overview"]["checks"] = checks_summary(self.state)
         data["log"] = self.state.tail()

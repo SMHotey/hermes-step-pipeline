@@ -1082,15 +1082,16 @@ def test_checks_failure_is_visible_instead_of_empty(server, monkeypatch):
 
 
 def test_snapshot_carries_checks_summary_for_badge(server):
-    """Бейдж в шапке берёт короткую форму из снимка: до проверки — «не проверяли»."""
+    """Снимок несёт короткую форму §3.6: до проверки — None, после — четыре поля."""
     _, before = get(server["url"] + "/api/snapshot")
-    assert before["overview"]["checks"] == {"critical": None, "found": False,
-                                            "checked_at": "", "busy": False}
+    assert before["overview"]["checks"] is None
+
     get(server["url"] + "/api/checks?refresh=1")
     _, after = get(server["url"] + "/api/snapshot")
     summary = after["overview"]["checks"]
-    assert summary["found"] is True and summary["critical"] > 0
-    assert set(summary) == {"critical", "found", "checked_at", "busy"}
+    assert set(summary) == {"checked_at", "critical", "problems", "notes"}
+    assert summary["checked_at"] and summary["critical"] > 0
+    assert isinstance(summary["problems"], list) and summary["notes"]
 
 
 def test_checks_work_in_preview_and_create_nothing(tmp_path: Path, hermes_stub: Path):
@@ -1115,10 +1116,21 @@ def test_checks_work_in_preview_and_create_nothing(tmp_path: Path, hermes_stub: 
 
 
 def test_index_has_checks_tab_markup():
-    """Вкладка «Проверки»: кнопка, пустой вид, находки со ссылкой на шаг."""
+    """Вкладка «Проверки»: опоры §4.1/§4.2, бейдж в шапке, переход к шагу (§5.1)."""
     html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
     for anchor in ('data-tab="checks"', 'id="tab-checks"', "/api/checks", "refresh=1",
-                   'id="btn-checks"', 'id="checks-clean"', 'id="checks-lint"',
-                   'id="checks-lint-note"', 'id="checks-notes"', "renderChecks(data)",
-                   "gotoSighting", "ov.checks", "не проверяли"):
-        assert anchor in html
+                   'id="btn-checks-refresh"', 'id="checks-badge"', 'id="checks-empty"',
+                   'id="checks-clean"', 'id="checks-when"', 'id="checks-doctor"',
+                   'id="checks-lint"', 'id="checks-lint-note"', "Диагностика (doctor)",
+                   "renderChecks(data)", "gotoSighting", "ov.checks", "не проверяли",
+                   # автозапуск один раз на загрузку (§4.6) и оба поля контекста (§4.4)
+                   "checksStarted", "loadChecks(true)", "window.__planId = String(plan)",
+                   "currentStep = step"):
+        assert anchor in html, anchor
+    # §4.1: вкладки в порядке «Обзор, Шаг, Проверки, Установка».
+    tabs = [html.index(f'data-tab="{name}"') for name in ("overview", "step", "checks",
+                                                          "setup")]
+    assert tabs == sorted(tabs), tabs
+    # §4.1: панель «Проверок» — сразу после панели «Шаг», до «Установки».
+    panels = [html.index(f'id="tab-{name}"') for name in ("step", "checks", "setup")]
+    assert panels == sorted(panels), panels

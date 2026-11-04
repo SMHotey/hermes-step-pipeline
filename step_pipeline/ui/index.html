@@ -155,7 +155,7 @@
   .checks-clean { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--ok);
                   border-radius: 8px; background: rgba(47, 107, 58, .12); font-size: 13px; }
   .checks-clean[hidden] { display: none; }
-  .checks-lint, .checks-notes { list-style: none; margin: 8px 0 0; padding: 0; }
+  .checks-lint { list-style: none; margin: 8px 0 0; padding: 0; }
   .checks-lint .finding { cursor: pointer; }
   .checks-lint .finding:hover { border-left-color: var(--accent); }
   .checks-lint .finding .where { float: right; color: var(--accent); }
@@ -172,6 +172,8 @@
   <span class="badge mono" id="ui-ver" title="версия движка и отпечаток страницы">—</span>
   <span class="badge" id="mode">…</span>
   <span class="badge" id="telegram">telegram</span>
+  <!-- Бейдж критичных проблем (план 3 S5, §4.5): виден с любой вкладки, клик ведёт в «Проверки». -->
+  <span class="badge stop" id="checks-badge" hidden></span>
   <label class="plan-mode" title="действует со следующей сессии">
     <input type="checkbox" id="plan-mode"> Режим планировщика
   </label>
@@ -187,8 +189,8 @@
   <nav class="tabs">
     <button class="tab active" data-tab="overview" id="tab-btn-overview">Обзор</button>
     <button class="tab" data-tab="step" id="tab-btn-step">Шаг</button>
-    <button class="tab" data-tab="setup" id="tab-btn-setup">Установка</button>
     <button class="tab" data-tab="checks" id="tab-btn-checks">Проверки</button>
+    <button class="tab" data-tab="setup" id="tab-btn-setup">Установка</button>
   </nav>
 
   <div class="tab-panel active" id="tab-overview">
@@ -296,6 +298,35 @@
       </div>
     </div>
   </div>
+  <!-- Проверки (план 3 S5): doctor и линтер всех планов, номера строк, переход к шагу.
+       Блоки и id — постановка §4.2: шапка, «не проверяли», «всё в порядке», doctor, линтер. -->
+  <div class="tab-panel" id="tab-checks">
+    <div class="cols">
+      <div>
+        <section>
+          <h2>Проверки конвейера</h2>
+          <div class="step-actions">
+            <button id="btn-checks-refresh">Перепроверить</button>
+            <span class="muted mono" id="checks-when">не проверяли</span>
+          </div>
+          <div class="ov-reason" id="checks-empty">не проверяли — нажми «Перепроверить»</div>
+          <div class="checks-clean" id="checks-clean" hidden>
+            <b>Всё в порядке.</b>
+            <span class="muted">Проверено, проблем нет — исправлять нечего.</span>
+          </div>
+          <h2 style="margin-top:14px">Диагностика (doctor)</h2>
+          <div id="checks-doctor"></div>
+        </section>
+      </div>
+      <div>
+        <section>
+          <h2>Линтер планов</h2>
+          <div class="muted" id="checks-lint-note">не проверяли</div>
+          <ul class="checks-lint" id="checks-lint"><li class="muted">—</li></ul>
+        </section>
+      </div>
+    </div>
+  </div>
   <!-- Мастер установки (план 3 S4): шаги вызывают существующие функции setup_flow. -->
   <div class="tab-panel" id="tab-setup">
     <div class="cols">
@@ -325,35 +356,6 @@
           <label for="setup-chat">Chat id или @канал</label>
           <input type="text" id="setup-chat">
           <pre id="setup-log">—</pre>
-        </section>
-      </div>
-    </div>
-  </div>
-  <!-- Проверки (план 3 S5): doctor и линтер всех планов, номера строк, переход к шагу. -->
-  <div class="tab-panel" id="tab-checks">
-    <div class="cols">
-      <div>
-        <section>
-          <h2>Проверки конвейера</h2>
-          <div class="ov-reason" id="checks-note">не проверяли — нажми «Перепроверить»</div>
-          <div class="step-actions">
-            <button id="btn-checks">Перепроверить</button>
-            <span class="muted mono" id="checks-at">—</span>
-          </div>
-          <div class="checks-clean" id="checks-clean" hidden>
-            <b>Всё в порядке.</b>
-            <span class="muted">Проверено, проблем нет — исправлять нечего.</span>
-          </div>
-          <div id="checks-problems"></div>
-          <h2 style="margin-top:14px">Линтер планов</h2>
-          <div class="muted" id="checks-lint-note">не проверяли</div>
-          <ul class="checks-lint" id="checks-lint"><li class="muted">—</li></ul>
-        </section>
-      </div>
-      <div>
-        <section>
-          <h2>Что проверили</h2>
-          <ul class="checks-notes" id="checks-notes"><li class="muted">—</li></ul>
         </section>
       </div>
     </div>
@@ -520,6 +522,13 @@ function renderOverview(data) {
   badge.textContent = critical > 0 ? `критичных проблем: ${critical}` : "";
   badge.title = critical > 0 ? "открыть проверки" : "";
   badge.onclick = () => showTab("checks");
+  // Бейдж в шапке (§4.5): тот же источник (`ov.checks` из снимка) и та же кликабельность,
+  // что у «Обзора» — виден с любой вкладки, «проблем: N» при critical > 0.
+  const headBadge = $("checks-badge");
+  headBadge.hidden = !(critical > 0);
+  headBadge.textContent = critical > 0 ? `проблем: ${critical}` : "";
+  headBadge.title = critical > 0 ? "открыть проверки" : "";
+  headBadge.onclick = () => showTab("checks");
 
   // Доступность «Тика» решает снимок; `setBusy` включает кнопку только вместе с этим
   // признаком, иначе стоп-флаг терялся бы после любого действия панели.
@@ -784,51 +793,62 @@ async function runSetupStep(step) {
 }
 
 // ── проверки (план 3 S5): doctor и линтер планов, только чтение ──
-let checksBusy = false;   // запрос проверок в полёте: кнопку не дёргаем дважды
+let checksBusy = false;    // запрос проверок в полёте: кнопку не дёргаем дважды
+let checksStarted = false; // автозапуск один раз на загрузку страницы (§4.6, решение Q2)
 
 function checksTime(stamp) {
   return stamp ? String(stamp).replace("T", " ") : "";
 }
 
-async function loadChecks(refresh) {
+async function loadChecks(recheck) {
   if (checksBusy) return;
   checksBusy = true;
-  const note = $("checks-note");
-  const before = note.textContent;
-  if (refresh) note.textContent = "проверяю…";
+  const btn = $("btn-checks-refresh");
+  // §4.3: на время своей проверки на кнопке «проверяю…» и disabled.
+  if (recheck) { btn.textContent = "проверяю…"; btn.disabled = true; }
   let data;
   try {
-    data = await api("/api/checks" + (refresh ? "?refresh=1" : ""));
+    data = await api("/api/checks" + (recheck ? "?refresh=1" : ""));
   } catch (err) {
     data = {ok: false, error: String(err)};
   }
   checksBusy = false;
   if (!data.ok) {
-    // Без refresh старое состояние не затираем: отказ сети — не «проверено».
-    if (refresh) note.textContent = data.error || "проверки недоступны";
+    // Отказ сети — не «проверено»: прежнее состояние остаётся, ошибка уходит в тост.
+    btn.textContent = "Перепроверить";
+    btn.disabled = false;
     toast(data.error || "проверки недоступны", true);
     return;
   }
   renderChecks(data);
+  // Бейдж в шапке живёт из снимка (§4.5): после перепроверки запрашиваем снимок заново,
+  // иначе «проблем: N» дождётся только следующего полминутного опроса.
+  if (recheck) refresh();
 }
 
 function renderChecks(data) {
   const lint = data.lint || {};
   const findings = lint.problems || [];
   const problems = data.problems || [];
+  const notes = data.notes || [];
   const checked = !!data.checked_at;
-  const critical = (data.critical === null || data.critical === undefined)
-    ? null : Number(data.critical);
-  $("checks-note").textContent = data.busy ? "проверка идёт…"
-    : (checked ? "критичных проблем: " + (critical || 0)
-               : "не проверяли — панель их ещё не запускала");
-  $("checks-at").textContent = checked ? "проверено " + checksTime(data.checked_at) : "—";
+  const busy = !!data.busy;
+  // §4.3: на время busy — «проверяю…» на кнопке и disabled; иначе кнопка в строе.
+  const btn = $("btn-checks-refresh");
+  btn.textContent = busy ? "проверяю…" : "Перепроверить";
+  btn.disabled = busy;
+  // §4.2: время проверки — «не проверяли» либо «проверено …».
+  $("checks-when").textContent = checked
+    ? "проверено " + checksTime(data.checked_at) : "не проверяли";
+  // Вид «не проверяли» виден, пока checked_at пуст и проверка не идёт (§4.2).
+  $("checks-empty").hidden = checked || busy;
   // «Проверено, чисто» — отдельный вид: пустой список находок читался бы как «не проверяли».
   $("checks-clean").hidden = !(checked && !problems.length && !findings.length);
-  $("checks-problems").innerHTML = problems.map((text) =>
-    `<div class="checks-problem">✗ ${esc(text)}</div>`).join("")
-    || (checked ? `<div class="muted">доктор проблем не нашёл</div>`
-                : `<div class="muted">доктор ещё не запускался</div>`);
+  // Диагностика (doctor): заметки приглушённо, проблемы — классом проблемы (§4.2).
+  $("checks-doctor").innerHTML =
+    notes.map((text) => `<div class="muted">· ${esc(text)}</div>`).join("")
+    + (problems.map((text) => `<div class="checks-problem">✗ ${esc(text)}</div>`).join("")
+       || (checked ? "" : `<div class="muted">доктор ещё не запускался</div>`));
   $("checks-lint-note").textContent = checked
     ? "файлов планов: " + (lint.files ?? 0) + ", находок: " + findings.length
     : "не проверяли";
@@ -843,14 +863,17 @@ function renderChecks(data) {
   document.querySelectorAll("#checks-lint .finding").forEach((item) => {
     item.onclick = () => gotoSighting(item.dataset.plan, item.dataset.step);
   });
-  $("checks-notes").innerHTML = (data.notes || []).map((text) =>
-    `<li class="finding muted">${esc(text)}</li>`).join("")
-    || `<li class="muted">проверки ничего не сообщили</li>`;
+  // Идущая чужая проверка (busy): подрачиваем cached-состояние до её конца — иначе
+  // кнопка осталась бы «проверяю…» без шанса вернуться в строй.
+  if (busy) setTimeout(() => loadChecks(false), 2000);
 }
 
 // Переход по находке: план и шаг становятся контекстом вкладки «Шаг».
 function gotoSighting(plan, step) {
   if (!plan) { toast("у находки нет номера плана — открой файл плана", true); return; }
+  // Контекст вкладки «Шаг» — оба поля (§4.4): без __planId первый запрос /api/step ушёл бы
+  // с прежним планом, пока снимок нового ещё едет (находка ревью 3-S5).
+  window.__planId = String(plan);
   currentPlan = String(plan);
   currentStep = step ? String(step) : null;
   etag = null;
@@ -966,6 +989,14 @@ function render(data) {
     .join("") || `<li class="muted">журнал пуст</li>`;
 
   $("log").textContent = (data.log || []).join("\n—\n") || "—";
+
+  // Один автозапуск проверок на загрузку страницы (§4.6, решение Q2): после первого
+  // снимка, дальше только кнопка «Перепроверить». Бейдж обновится этим же запуском —
+  // loadChecks после перепроверки заново тянет снимок.
+  if (!checksStarted) {
+    checksStarted = true;
+    loadChecks(true);
+  }
 }
 
 async function refresh() {
@@ -1035,7 +1066,7 @@ function stepAction(action) {
 }
 $("btn-hold").onclick = () => stepAction("hold");
 $("btn-unhold").onclick = () => stepAction("unhold");
-$("btn-checks").onclick = () => loadChecks(true);
+$("btn-checks-refresh").onclick = () => loadChecks(true);
 $("btn-stop").onclick = () => {
   const reason = prompt("Причина остановки (после текущего шага):", "остановка владельца");
   if (reason !== null) act("stop", {reason});

@@ -47,7 +47,11 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
     cfg = proj.read_config(project)
     notes.append(f"проект {project}")
     board_name = cfg.get("board") or board
-    notes.append(f"борда {board_name}")
+    if board_name:
+        notes.append(f"борда {board_name}")
+    else:
+        # Явный вид вместо пустой строки «борда » (стилистическая находка ревью 3-S5).
+        notes.append("борда не задана")
     try:
         proj.engine(project, "gate.py")
         notes.append("движок .pipeline/gate.py на месте")
@@ -125,7 +129,6 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
             problems.append(f"Telegram: {exc}")
     else:
         notes.append("Telegram: не настроен")
-    cron = proj.run_hermes("-p", driver, "cron", "list")
     marker = project / ".pipeline" / "cron.json"
     job_name = "План: страж шага (конвейер)"
     if marker.is_file():
@@ -135,6 +138,9 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
             driver = info.get("driver") or driver
         except (OSError, json.JSONDecodeError):
             pass
+        # Список джоб спрашиваем только когда маркер есть: у проекта без конвейера
+        # cron-джобы быть не может, а вызов тянет `hermes` целиком (секунды в панели).
+        cron = proj.run_hermes("-p", driver, "cron", "list")
         if job_name in (cron.stdout or ""):
             notes.append(f"cron-джоба стража: есть ({job_name}, профиль {driver})")
         else:
