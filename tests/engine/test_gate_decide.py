@@ -59,6 +59,18 @@ def test_review_request_changes_creates_fix():
     assert d["round"] == 1
 
 
+def test_second_request_changes_creates_second_fix_round():
+    """Правило 4: после первого круга правок даётся ещё один, а не стоп."""
+    cards = [card("step", "done", short="1"),
+             card("review", "done", n="1", short="2"),
+             card("fix", "done", n="1", short="3"),
+             card("review", "done", n="2", short="4")]
+    d = gate.decide(ctx(cards=cards, verdict={"verdict": "REQUEST_CHANGES", "path": "x"}))
+    assert d["action"] == "create_fix"
+    assert d["round"] == 2
+    assert d["parent"] == "t_4"
+
+
 def test_second_request_changes_stops_with_findings(tmp_path):
     lines = ["VERDICT: REQUEST_CHANGES", "", "## Замечания", "",
              "- риск шага не проверяется при ручном допуске",
@@ -68,16 +80,31 @@ def test_second_request_changes_stops_with_findings(tmp_path):
     cards = [card("step", "done", short="1"),
              card("review", "done", n="1", short="2"),
              card("fix", "done", n="1", short="3"),
-             card("review", "done", n="2", short="4")]
+             card("review", "done", n="2", short="4"),
+             card("fix", "done", n="2", short="5"),
+             card("review", "done", n="3", short="6")]
     d = gate.decide(ctx(cards=cards, verdict={"verdict": "REQUEST_CHANGES",
                                         "path": str(report)}))
     assert d["action"] == "stop"
-    assert "второй REQUEST_CHANGES" in d["reason"]
+    assert "лимит" in d["reason"]
     details = d["details"]
     assert "риск шага не проверяется" in details
     assert "вывод статуса врёт про hold" in details
     assert "Что делать (выбери одно)" in details
     assert "переписать постановку" in details
+
+
+def test_fix_rounds_limit_one_restores_stop(tmp_path):
+    """max_fix_rounds=1 — прежнее поведение: стоп после первого круга правок."""
+    report = tmp_path / "2-S1.md"
+    report.write_text("## ВЕРДИКТ: REQUEST_CHANGES\n", encoding="utf-8")
+    cards = [card("step", "done", short="1"),
+             card("review", "done", n="1", short="2"),
+             card("fix", "done", n="1", short="3"),
+             card("review", "done", n="2", short="4")]
+    d = gate.decide(ctx(cards=cards, max_fix_rounds=1,
+                        verdict={"verdict": "REQUEST_CHANGES", "path": str(report)}))
+    assert d["action"] == "stop"
 
 
 def test_details_prefer_reviewer_recommendations(tmp_path):
@@ -91,7 +118,9 @@ def test_details_prefer_reviewer_recommendations(tmp_path):
     cards = [card("step", "done", short="1"),
              card("review", "done", n="1", short="2"),
              card("fix", "done", n="1", short="3"),
-             card("review", "done", n="2", short="4")]
+             card("review", "done", n="2", short="4"),
+             card("fix", "done", n="2", short="5"),
+             card("review", "done", n="3", short="6")]
     d = gate.decide(ctx(cards=cards, verdict={"verdict": "REQUEST_CHANGES",
                                         "path": str(report)}))
     details = d["details"]

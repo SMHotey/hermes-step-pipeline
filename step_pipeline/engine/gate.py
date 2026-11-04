@@ -132,6 +132,10 @@ COMMIT_RE = re.compile(r"коммит\S*\s*`([0-9a-f]{7,40})`", re.IGNORECASE)
 
 # Предел действий за тик: ключ `max_actions` в pipeline.json проекта, умолчание 1 (D1).
 MAX_ACTIONS_DEFAULT = 1
+# Сколько кругов правок по ревью разрешено автоматически, если в pipeline.json не задано
+# `max_fix_rounds`. Два круга — правило владельца: одна правка редко закрывает все замечания,
+# а второй отказ уже требует решения человека.
+DEFAULT_FIX_ROUNDS = 2
 # Сколько записей о действиях держим в состоянии плана: это краткая выжимка, полная
 # история — в `history.jsonl`.
 LAST_ACTIONS_KEPT = 20
@@ -788,6 +792,9 @@ def build_ctx(p: Paths) -> dict:
     ctx["prefetch"] = bool(p.cfg.prefetch_prompt)
     ctx["prompt_review"] = str(p.cfg.prompt_review)
     ctx["require_prompt"] = bool(p.cfg.require_prompt)
+    # Лимит автоматических кругов правок по ревью: решение чистым остаётся, но правило
+    # живёт в конфигурации проекта, а не в коде.
+    ctx["max_fix_rounds"] = int(p.cfg.max_fix_rounds)
     # Утверждение считаем ДО сборщика: при его сбое решение всё равно должно знать,
     # что план не утверждён.
     approval = registry.approval_status(p.cfg, p.spec)
@@ -999,11 +1006,15 @@ def _decide_base(ctx: dict) -> dict:
                     "after_close": True, "reason": reason}
         return {"action": "close_step", "step": sid, "data": step, "verdict": verdict,
                 "journal_closed": ctx.get("journal_closed")}
-    if not fixes:
-        return {"action": "create_fix", "step": sid, "data": step, "round": 1,
-                "parent": last_review["id"]}
+    max_fix_rounds = int(ctx.get("max_fix_rounds") or DEFAULT_FIX_ROUNDS)
+    if len(fixes) < max_fix_rounds:
+        # Круги правок не бесконечны, но и не один: после первого REQUEST_CHANGES исполнитель
+        # получает ещё круг, и только исчерпание лимита останавливает конвейер (правило 4).
+        return {"action": "create_fix", "step": sid, "data": step,
+                "round": len(fixes) + 1, "parent": last_review["id"]}
     findings = _review_findings(Path(verdict["path"]), 5)
-    reason = f"второй REQUEST_CHANGES по шагу {sid} — автоматический круг правок исчерпан"
+    reason = (f"REQUEST_CHANGES по шагу {sid} — исчерпан лимит автоматических кругов правок "
+              f"({max_fix_rounds})")
     details = [f"Замечания ревью ({Path(verdict['path']).name}):"]
     details += [f"  - {f}" for f in findings] or ["  - пунктов в отчёте не нашёл, смотри отчёт целиком"]
     recs = _review_recommendations(Path(verdict["path"]), 3)

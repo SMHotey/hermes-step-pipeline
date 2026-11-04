@@ -60,6 +60,10 @@ DEFAULTS: dict = {
     # Ревью постановки против текущего HEAD: auto — только устаревшая, always — каждая,
     # never — поведение как до шага (правило 3 плана 2 S6).
     "prompt_review": "auto",
+    # Сколько автоматических кругов правок по ревью делает страж, прежде чем остановиться.
+    # 1 — прежнее поведение (стоп на втором REQUEST_CHANGES); 2 — исполнителю даётся ещё
+    # один круг до решения владельца. Останавливает всё равно лимит, а не первый отказ.
+    "max_fix_rounds": 2,
     "runtimes": {"step": "3h", "review": "150m", "prompt": "45m"},
     "kanban": {"tenant": "plan"},
     "git": {"commit": True, "push": True},
@@ -117,6 +121,25 @@ def _env_list(name: str) -> tuple[str, ...] | None:
     return items or None
 
 
+def _fix_rounds(value: object) -> int:
+    """Лимит автоматических кругов правок: целое ≥ 1 (по умолчанию 2).
+
+    Мусор в `pipeline.json` — ошибка конфигурации, а не молчаливое умолчание: иначе
+    владелец будет думать, что правило действует, а движок остановится, как раньше.
+    """
+    if value is None:
+        return 2
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ConfigError(f"max_fix_rounds должен быть целым числом, получено: {value!r}")
+    try:
+        rounds = int(value)
+    except ValueError as exc:
+        raise ConfigError(f"max_fix_rounds должен быть целым числом, получено: {value!r}") from exc
+    if rounds < 1:
+        raise ConfigError(f"max_fix_rounds должен быть ≥ 1, получено: {rounds}")
+    return rounds
+
+
 @dataclass(frozen=True)
 class Config:
     """Разобранная конфигурация одного проекта."""
@@ -142,6 +165,7 @@ class Config:
     require_prompt: bool
     prefetch_prompt: bool
     prompt_review: str
+    max_fix_rounds: int
     step_runtime: str
     review_runtime: str
     prompt_runtime: str
@@ -271,6 +295,7 @@ def load(repo: Path | str | None = None) -> Config:
         require_prompt=bool(raw.get("require_prompt", True)),
         prefetch_prompt=bool(raw.get("prefetch_prompt", True)),
         prompt_review=prompt_review,
+        max_fix_rounds=_fix_rounds(raw.get("max_fix_rounds")),
         step_runtime=str(runtimes.get("step") or "3h"),
         review_runtime=str(runtimes.get("review") or "150m"),
         prompt_runtime=str(runtimes.get("prompt") or "45m"),

@@ -28,6 +28,7 @@
   "require_prompt": true,
   "prefetch_prompt": true,
   "prompt_review": "auto",
+  "max_fix_rounds": 2,
   "max_actions": 1,
   "runtimes": {
     "step": "3h",
