@@ -54,10 +54,15 @@ def write_prompt(root: Path, step: str, recon: str | None = None) -> Path:
     return path
 
 
-def write_report(root: Path, verdict: str, recon: str = "1111111") -> Path:
-    """Отчёт ревью постановки: отметка версии + одна строка вердикта."""
+def write_report(root: Path, verdict: str, recon: str | None = "1111111") -> Path:
+    """Отчёт ревью постановки: отметка версии + одна строка вердикта.
+
+    `recon=None` пишет отчёт без строки `recon_commit:` — отчёт старого образца,
+    который D6 не обязан принимать.
+    """
     path = Path(root) / "docs" / "reviews" / "1-S1-prompt.md"
-    path.write_text(f"recon_commit: {recon}\n\n## ВЕРДИКТ: {verdict}\n\nпроверено\n",
+    head = f"recon_commit: {recon}\n" if recon else ""
+    path.write_text(f"{head}\n## ВЕРДИКТ: {verdict}\n\nпроверено\n",
                     encoding="utf-8")
     return path
 
@@ -113,23 +118,41 @@ def stand(project: Path, hermes_stub: Path, monkeypatch):
 
 
 def test_fresh_prompt_starts_without_review(stand):
-    """`recon_commit` равен HEAD — постановка свежая, ревью не нужно (режим auto)."""
+    """`recon_commit` равен HEAD — постановка свежая, ревью не нужно (режим auto).
+
+    После recon закоммичено только в `docs/`: `git diff` (код 0) отсекает эти правки
+    исключением `:(exclude)docs` — без него постановка ложно считалась бы устаревшей.
+    """
     root, p, db = stand
     write_plan(root, plan_body(3))
     head = init_repo(root)
+    # docs-коммит после recon: другого кода в диапазоне нет
+    (root / "docs" / "notes.md").write_text("заметка\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-m", "docs only")
     prompt = write_prompt(root, "S1", recon=head)
-
-    res = gate.run_gate(p, execute=True, notify_fn=quiet)
+    res = gate.run_gate(paths(root), execute=True, notify_fn=quiet)
     assert res["decision"]["action"] == "create_step", res["decision"]
-    assert "planloop:1:S1:promptreview" not in keys_of(db)
+    assert "planloop:1:S1:step" in keys_of(db)
+    assert not any(c["key"].endswith(":promptreview") for c in cards(db))
     assert gate.prompt_fresh(p, gate.prompt_recon(prompt)) is True
 
 
 def test_stale_prompt_waits_for_prompt_review(stand):
-    """Коммита `1111111` не существует: постановка устарела, шаг ждёт ревью постановки."""
+    """После recon закоммичен код: `git diff` вернул 1 — без ревью постановки шаг не стартует.
+
+    Это ветка кода 1 в `prompt_fresh`; путь кода 128 (git не нашёл sha) покрыт в
+    `test_prompt_review_verdict_controls_start`, там постановка без репозитория.
+    """
     root, p, db = stand
     write_plan(root, plan_body(3))
-    write_prompt(root, "S1", recon="1111111")
+    head = init_repo(root)
+    # кодовый коммит после recon: в диапазоне есть правка вне docs/
+    (root / "app").mkdir()
+    (root / "app" / "s1.py").write_text("x = 1\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-m", "code after recon")
+    write_prompt(root, "S1", recon=head)
 
     first = gate.run_gate(p, execute=True, notify_fn=quiet)
     assert first["decision"]["action"] == "create_prompt_review", first["decision"]
@@ -176,7 +199,13 @@ def test_prompt_review_verdict_controls_start(stand):
 
 
 def test_prompt_review_modes(stand):
-    """`always` ревьюит и свежую постановку, `never` — никакую; умолчания и опечатка."""
+    """`always` ревьюит свежую постановку, `never` пропускает заведомо устаревшую.
+
+    Режимы проверяются так, чтобы каждый отличался от `auto`: `always` — на свежей
+    постановке (её `auto` ревью не требует), `never` — на устаревшей (`recon_commit:
+    1111111`, §4.7 п.10: без ветки `never` тут остался бы `auto` с ревью). Между ними —
+    D6: постановка без отметки не принимает APPROVE без строки `recon_commit:`.
+    """
     root, p, db = stand
     write_plan(root, plan_body(3))
     head = init_repo(root)
@@ -187,10 +216,24 @@ def test_prompt_review_modes(stand):
     assert always["decision"]["action"] == "create_prompt_review", always["decision"]
     assert sum(1 for c in cards(db) if c["key"] == "planloop:1:S1:promptreview") == 1
 
+    # D6: в постановке отметки нет, отчёт APPROVE без строки `recon_commit:` — сверять
+    # нечего, шаг не стартует (раньше две пустоты считались совпадением версий).
+    write_prompt(root, "S1")                            # без recon_commit, как старые постановки
+    complete(db, ":promptreview")
+    write_report(root, "APPROVE", recon=None)           # без строки recon_commit
+    unmarked = gate.run_gate(paths(root), execute=True, notify_fn=quiet)
+    assert unmarked["decision"]["action"] == "stop", unmarked["decision"]
+    assert "не про эту версию" in unmarked["detail"]
+    assert "planloop:1:S1:step" not in keys_of(db)
+    Path(p.stop_file).unlink()                          # снять инцидент перед следующим тиком
+
     set_config(root, prompt_review="never")
+    write_prompt(root, "S1", recon="1111111")           # устаревшая (§4.7 п.10)
     never = gate.run_gate(paths(root), execute=True, notify_fn=quiet)
     assert never["decision"]["action"] == "create_step", never["decision"]
     assert "planloop:1:S1:step" in keys_of(db)
+    # `never` новых ревью не заказывает: карточка, открытая в `always`, не считается
+    assert sum(1 for c in cards(db) if c["key"] == "planloop:1:S1:promptreview") == 1
 
     # Файл без новых ключей читается на умолчаниях (старые проекты не ломаются).
     set_config(root, prefetch_prompt=None, prompt_review=None)

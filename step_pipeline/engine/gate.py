@@ -1097,10 +1097,17 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
         return {"action": "stop", "step": sid,
                 "reason": (f"ревью постановки {sid} вернуло REQUEST_CHANGES — постановку "
                            f"надо переписать: {Path(verdict['path']).name}")}
-    if (verdict.get("recon") or "") != (ctx.get("prompt_recon") or ""):
+    # D6: без строки `recon_commit:` в отчёте сверять нечего — не принимаем, даже если
+    # и в постановке отметки нет: так ловится APPROVE, написанный до переписывания постановки.
+    if not verdict.get("recon"):
+        return {"action": "stop", "step": sid,
+                "reason": (f"ревью постановки {sid} не про эту версию: в отчёте "
+                           f"{Path(verdict['path']).name} нет строки recon_commit, "
+                           f"в постановке {ctx.get('prompt_recon') or 'отметки нет'}")}
+    if verdict["recon"] != (ctx.get("prompt_recon") or ""):
         return {"action": "stop", "step": sid,
                 "reason": (f"ревью постановки {sid} не про эту версию: в отчёте recon_commit "
-                           f"{verdict.get('recon') or '—'}, в постановке "
+                           f"{verdict['recon']}, в постановке "
                            f"{ctx.get('prompt_recon') or '—'}")}
     return None                            # APPROVE по той же версии — шаг стартует
 
