@@ -81,6 +81,8 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     ui.add_argument("--preview", action="store_true",
                     help="показать проект без установки конвейера (только чтение)")
     ui.add_argument("--board", default="", help="борда для предпросмотра")
+    ui.add_argument("--extra-project", action="append", default=[], metavar="PATH",
+                    help="разовый проект в реестре панели (можно несколько раз)")
     ui.set_defaults(handler=cmd_ui)
 
     doctor = sub.add_parser("doctor", help="проверить установку и окружение")
@@ -115,8 +117,17 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
 
 
 def _project(raw: str) -> Path:
+    """Проект команды: `--project`, затем проект по умолчанию, затем поиск вверх от cwd.
+
+    Проект по умолчанию — ключ `project_root` из схемы плагина (`config.yaml` Hermes)
+    или env `PIPELINE_PROJECT_ROOT`: так `hermes pipeline status` работает из любого
+    каталога, а не только из корня репозитория.
+    """
     if raw:
         return Path(raw).expanduser().resolve()
+    configured = proj.configured_project_root()
+    if configured is not None:
+        return configured
     return proj.find_project()
 
 
@@ -224,23 +235,25 @@ def cmd_ui(args) -> int:
     port = args.port or int(proj.read_config(project).get("ui_port") or 8770)
     preview = bool(getattr(args, "preview", False))
     board = getattr(args, "board", "") or None
+    extra = list(getattr(args, "extra_project", []) or [])
     if getattr(args, "stop", False):
         result = ui_control.stop(project)
         print(result.get("detail") or result.get("error"), file=sys.stdout if result["ok"] else sys.stderr)
         return 0 if result["ok"] else 1
     if getattr(args, "detach", False):
-        result = ui_control.start(project, port, args.host, preview=preview, board=board)
+        result = ui_control.start(project, port, args.host, preview=preview, board=board,
+                                  extra_projects=extra)
         if not result.get("ok"):
             print(f"ошибка: {result.get('error')}", file=sys.stderr)
             return 1
-        extra = " (уже был запущен)" if result.get("already") else ""
-        print(f"UI конвейера: {result['url']}{extra}")
+        extra_note = " (уже был запущен)" if result.get("already") else ""
+        print(f"UI конвейера: {result['url']}{extra_note}")
         print(f"остановить:  hermes pipeline ui --project \"{project}\" --stop")
         return 0
     try:
         url = ui_server.serve(project, host=args.host, port=port,
                               open_browser=not args.no_open, preview=preview,
-                              board=board)
+                              board=board, extra_projects=extra)
     except RuntimeError as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 1

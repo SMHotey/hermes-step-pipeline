@@ -26,6 +26,17 @@
   .badge.stop { color: #1b0b0b; background: var(--bad); border-color: var(--bad); }
   .plan-mode { display: flex; align-items: center; gap: 6px; font-size: 12px;
                color: var(--muted); }
+  /* Переключатель проекта (S6): в шапке, рядом с бейджем проекта. */
+  .project-switch { background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+                    border-radius: 999px; padding: 3px 9px; font-size: 12px; max-width: 220px; }
+  .project-switch:hover { border-color: var(--accent); }
+  /* Сводка реестра: выбранный проект подсвечен, строка кликабельна. */
+  #projects-table table { width: 100%; }
+  #projects-table tbody tr { cursor: pointer; }
+  #projects-table tbody tr:hover td { color: var(--accent); }
+  #projects-table tbody tr.current td { background: rgba(64, 196, 255, .07); }
+  #projects-table tbody tr.current b::after { content: " •"; color: var(--accent); }
+  #projects-table .pill.bad { color: var(--bad); border-color: var(--bad); }
   .spacer { flex: 1; }
   button { background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
            border-radius: 8px; padding: 7px 12px; cursor: pointer; font-size: 13px; }
@@ -170,6 +181,8 @@
 <header>
   <h1>Конвейер шагов</h1>
   <span class="badge mono" id="project">—</span>
+  <select id="project-switch" class="project-switch" hidden
+          title="проект реестра: действия и снимок адресуются ему"></select>
   <span class="badge mono" id="board">—</span>
   <span class="badge mono" id="ui-ver" title="версия движка и отпечаток страницы">—</span>
   <span class="badge" id="mode">…</span>
@@ -198,6 +211,11 @@
   <div class="tab-panel active" id="tab-overview">
   <div class="cols">
   <div>
+    <!-- Сводка реестра (план 3 S6): один экран на все проекты, где стоит конвейер. -->
+    <section id="projects-summary">
+      <h2>Проекты</h2>
+      <div id="projects-table"><span class="muted">реестр не загружен</span></div>
+    </section>
     <section id="overview">
       <h2>Обзор</h2>
       <div class="ov-head" id="ov-tick">Тик: —</div>
@@ -399,6 +417,9 @@ const $ = (id) => document.getElementById(id);
 // потребуют отдельным шагом, без правки страницы.
 const PANEL_HEADERS = {"Content-Type": "application/json", "X-Pipeline-Panel": "1"};
 let currentPlan = null;
+// Проект реестра (S6): "" — проект, с которым запущен сервер. Пустой id в запросы
+// не попадает, чтобы адрес оставался прежним и старые закладки работали.
+let currentProject = "";
 let timer = null;
 let etag = null;      // ETag последнего полученного снимка: с ним идёт If-None-Match
 let stream = null;    // EventSource: поток событий с сервера
@@ -431,10 +452,12 @@ function act(action, payload = {}) {
   api("/api/action", {
     method: "POST",
     headers: PANEL_HEADERS,
-    body: JSON.stringify({action, ...payload}),
+    // Проект уходит телом, а не адресом: POST адресован действию, а не ресурсу (§4.4).
+    body: JSON.stringify({action, ...(currentProject ? {project: currentProject} : {}), ...payload}),
   }).then((data) => {
-    if (data.ok) toast(actionLabel(action) + ": готово");
-    else toast((data.error || data.stderr || "ошибка"), true);
+    const who = data.project && data.project.name ? " · " + data.project.name : "";
+    if (data.ok) toast(actionLabel(action) + who + ": готово");
+    else toast(((data.error || data.stderr || "ошибка") + who), true);
     // Снимок после действия нужен свежий и целиком: старый ETag больше не годится.
     etag = null;
     startEvents();
@@ -447,6 +470,88 @@ function actionLabel(action) {
   return {tick: "Тик", stop: "Стоп", resume: "Продолжить",
           hold: "Допуск", unhold: "Снят допуск"}[action] || action;
 }
+
+// ── реестр проектов (план 3 S6): один экран на все репозитории ──
+function withProject(url) {
+  // GET-адреса ресурса: проект — параметр запроса (§4.4). Пустой id не дописывается.
+  if (!currentProject) return url;
+  return url + (url.includes("?") ? "&" : "?") + "project=" + encodeURIComponent(currentProject);
+}
+
+function switchProject(id) {
+  const next = String(id || "");
+  if (next === currentProject) return;
+  currentProject = next;
+  // Контекст прежнего проекта больше не верен целиком: снимок, пара «план + шаг»
+  // и проверки принадлежат другому репозиторию.
+  etag = null;
+  currentPlan = null;
+  currentStep = null;
+  stepPairLoaded = "";
+  stepPairPending = "";
+  checksStarted = false;
+  window.__planId = null;
+  window.__steps = [];
+  window.__nextStep = null;
+  window.__configLoaded = false;
+  if (stream) { stream.close(); stream = null; }
+  refresh();
+  startEvents();
+  loadProjects();
+}
+
+function renderProjects(data, current) {
+  const box = $("projects-table");
+  const rows = data.projects || [];
+  const selected = current || data.default || "";
+  const switcher = $("project-switch");
+  if (switcher) {
+    const ids = rows.map((p) => p.id).join(",");
+    if (switcher.dataset.ids !== ids) {
+      switcher.dataset.ids = ids;
+      switcher.innerHTML = rows.map((p) =>
+        `<option value="${esc(p.id)}">${esc(p.name)}${p.installed ? "" : " (не установлен)"}</option>`
+      ).join("");
+    }
+    switcher.value = selected;
+    // Один проект — переключать нечего: селект прячется, бейдж проекта остаётся.
+    switcher.hidden = rows.length < 2;
+  }
+  box.innerHTML = `<table><thead><tr><th>Проект</th><th>Установлен</th><th>План</th>
+      <th>Следующий шаг</th><th>Закрыто</th><th>Стоп</th><th>Простой</th></tr></thead><tbody>` +
+    rows.map((p) => {
+      const stop = p.stop
+        ? `${esc(p.stop.kind || "стоп")}: ${esc(p.stop.reason || "причина не записана")}`
+        : "—";
+      const installed = p.installed
+        ? '<span class="pill ok">да</span>'
+        : '<span class="pill bad">не установлен</span>';
+      return `<tr data-project="${esc(p.id)}" class="${p.id === selected ? "current" : ""}"
+                  title="перейти к проекту ${esc(p.name)}">
+        <td><b>${esc(p.name)}</b><div class="muted mono">${esc(p.id)}</div></td>
+        <td>${installed}${p.error ? `<div class="muted">${esc(p.error)}</div>` : ""}</td>
+        <td class="mono">${esc(p.plan || "—")}</td>
+        <td class="mono">${esc(p.next || "—")}</td>
+        <td class="mono">${esc(p.closed)} / ${esc(p.total)}</td>
+        <td>${stop}</td>
+        <td class="mono">${esc((p.idle || {}).text || "—")}</td>
+      </tr>`;
+    }).join("") + `</tbody></table>`;
+  box.querySelectorAll("tbody tr").forEach((tr) => {
+    tr.onclick = () => switchProject(tr.dataset.project);
+  });
+}
+
+async function loadProjects() {
+  let data;
+  try {
+    data = await api("/api/projects");
+  } catch (err) {
+    return;   // сводка не критична: экран проекта работает и без неё
+  }
+  if (data && data.ok) renderProjects(data, currentProject || data.default);
+}
+
 
 function setBusy(busy) {
   panelBusy = busy;
@@ -597,8 +702,8 @@ async function loadStep() {
   stepPairPending = pair;
   let data;
   try {
-    data = await api("/api/step?plan=" + encodeURIComponent(plan) +
-                     "&id=" + encodeURIComponent(currentStep));
+    data = await api(withProject("/api/step?plan=" + encodeURIComponent(plan) +
+                                 "&id=" + encodeURIComponent(currentStep)));
   } catch (err) {
     if (stepPairPending !== pair) return;
     stepPairPending = "";
@@ -711,7 +816,7 @@ function renderStep(data) {
 const setupState = {steps: [], next: null, errors: {}};
 
 async function loadSetup() {
-  const data = await api("/api/setup");
+  const data = await api(withProject("/api/setup"));
   if (!data.ok) {
     $("setup-note").textContent = data.error || "мастер недоступен";
     return;
@@ -776,7 +881,8 @@ async function runSetupStep(step) {
   const data = await api("/api/setup", {
     method: "POST",
     headers: PANEL_HEADERS,
-    body: JSON.stringify({step, values}),
+    // Проект уходит телом: мастер ставит конвейер в выбранный проект реестра.
+    body: JSON.stringify({step, values, ...(currentProject ? {project: currentProject} : {})}),
   });
   // Токен живёт только в поле формы: сервер его не возвращает, поле гасится сразу.
   $("setup-token").value = "";
@@ -810,7 +916,7 @@ async function loadChecks(recheck) {
   if (recheck) { btn.textContent = "проверяю…"; btn.disabled = true; }
   let data;
   try {
-    data = await api("/api/checks" + (recheck ? "?refresh=1" : ""));
+    data = await api(withProject("/api/checks" + (recheck ? "?refresh=1" : "")));
   } catch (err) {
     data = {ok: false, error: String(err)};
   }
@@ -919,9 +1025,18 @@ function render(data) {
     ["btn-tick", "btn-stop", "btn-resume"].forEach((id) => { $(id).disabled = true; });
     $("btn-tick").title = $("btn-stop").title = $("btn-resume").title =
       "конвейер в проект не установлен — только чтение";
+  } else if (data.installed === false) {
+    // Проект реестра без .pipeline — «не установлен», а не ошибка экрана (§4.1).
+    mode.textContent = "НЕ УСТАНОВЛЕН";
+    mode.className = "badge stop";
+    ["btn-tick", "btn-stop", "btn-resume"].forEach((id) => { $(id).disabled = true; });
+    $("btn-tick").title = $("btn-stop").title = $("btn-resume").title =
+      "конвейер не установлен в этот проект — вкладка «Установка»";
   } else {
     mode.textContent = stopped ? "СТОП" : (decision.action || "—");
     mode.className = "badge " + (stopped ? "stop" : (["idle"].includes(decision.action) ? "" : "run"));
+    // Кнопки возвращаются в строй только здесь: предпросмотр и «не установлен» их гасят.
+    $("btn-stop").disabled = $("btn-resume").disabled = panelBusy;
   }
   const tg = data.telegram || {};
   const tgEl = $("telegram");
@@ -1012,15 +1127,18 @@ function render(data) {
 }
 
 async function refresh() {
+  loadProjects();
   const query = currentPlan ? `?plan=${encodeURIComponent(currentPlan)}` : "";
   const requestedPlan = currentPlan;   // ответ на прошлый план страницу не перерисовывает
+  const requestedProject = currentProject;
   // Прямой fetch, а не api(): нужны заголовок ETag и код 304 — на неизменённый снимок
   // сервер не отдаёт тело и не запускает движок.
   let res;
   try {
-    res = await fetch("/api/snapshot" + query, {headers: etag ? {"If-None-Match": etag} : {}});
+    res = await fetch(withProject("/api/snapshot" + query),
+                      {headers: etag ? {"If-None-Match": etag} : {}});
   } catch (err) { toast(String(err), true); return; }
-  if (requestedPlan !== currentPlan) return;
+  if (requestedPlan !== currentPlan || requestedProject !== currentProject) return;
   if (res.status === 304) return;
   let data = null;
   try { data = await res.json(); } catch (e) { data = {ok: false, error: "не JSON: " + res.status}; }
@@ -1045,13 +1163,15 @@ async function refresh() {
 }
 
 function startEvents() {
-  // Поток зависит от плана: при его смене старый закрываем и открываем новый.
+  // Поток зависит от проекта и плана: при их смене старый закрываем и открываем новый.
   if (stream) { stream.close(); stream = null; }
   const planAtOpen = currentPlan;
+  const projectAtOpen = currentProject;
   const query = currentPlan ? `?plan=${encodeURIComponent(currentPlan)}` : "";
-  stream = new EventSource("/api/events" + query);
+  stream = new EventSource(withProject("/api/events" + query));
   const onFrame = (event) => {
-    if (planAtOpen !== currentPlan) return;   // кадр прошлого плана: страница уже другая
+    // Кадр прошлого проекта/плана: страница уже другая.
+    if (planAtOpen !== currentPlan || projectAtOpen !== currentProject) return;
     let data = null;
     try { data = JSON.parse(event.data); } catch (e) { return; }
     etag = null;   // следующий refresh обязан получить тело целиком, а не 304
@@ -1065,6 +1185,7 @@ function startEvents() {
 }
 
 $("btn-tick").onclick = () => act("tick", currentPlan ? {plan: currentPlan} : {});
+$("project-switch").onchange = (event) => switchProject(event.target.value);
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.onclick = () => showTab(tab.dataset.tab);
 });
@@ -1108,7 +1229,8 @@ $("plan-mode").onchange = (event) => {
   const pm = $("plan-mode");
   const on = event.target.checked;
   pm.disabled = true;
-  api("/api/plan-mode", {method: "POST", headers: PANEL_HEADERS, body: JSON.stringify({on})})
+  api("/api/plan-mode", {method: "POST", headers: PANEL_HEADERS,
+                         body: JSON.stringify({on, ...(currentProject ? {project: currentProject} : {})})})
     .then((data) => {
       if (data.ok) {
         toast("Режим планировщика: " + (on ? "on" : "off") + " — действует со следующей сессии");

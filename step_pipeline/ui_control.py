@@ -62,7 +62,8 @@ def _alive(pid: int) -> bool:
 
 def start(project: Path, port: int, host: str = "127.0.0.1",
           wait_seconds: float = 20.0, preview: bool = False,
-          board: str | None = None) -> dict:
+          board: str | None = None,
+          extra_projects: list[str] | None = None) -> dict:
     """Поднять UI отдельным процессом. Возвращает {ok, url, pid, port, error}."""
     if is_up(port, host):
         old = read_pid(project)
@@ -76,6 +77,8 @@ def start(project: Path, port: int, host: str = "127.0.0.1",
         cmd.append("--preview")
     if board:
         cmd += ["--board", board]
+    for extra in extra_projects or []:
+        cmd += ["--extra-project", str(extra)]
     kwargs: dict = {"cwd": str(project), "stdout": open(log, "ab"), "stderr": subprocess.STDOUT,
                     "stdin": subprocess.DEVNULL}
     if os.name == "nt":

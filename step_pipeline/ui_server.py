@@ -11,6 +11,7 @@
     GET  /api/file         текст файла проекта, только внутри корня (?path=<...>)
     GET  /api/checks       проверки: doctor и линтер планов (?refresh=1 — перепроверить,
                            ?plan=<N> — только один план); действий не выполняют
+    GET  /api/projects     сводка реестра: проект, план, следующий шаг, закрыто, стоп, простой
     GET  /api/setup        мастер установки: шаги, следующий шаг, значения формы (без токена)
     POST /api/setup        один шаг мастера: {"step": ..., "values": {...}},
                            заголовок X-Pipeline-Panel; токен уходит в .env профиля
@@ -132,18 +133,28 @@ def _redact(text: str, secret: str) -> str:
 
 
 class State:
-    """Разделяемое состояние сервера: проект, журнал действий, режим чтения."""
+    """Разделяемое состояние сервера: проект, журнал действий, режим чтения.
 
-    def __init__(self, project: Path, preview: bool = False, board: str | None = None) -> None:
+    Один `State` на проект реестра (D6): журнал действий, кэш проверок и настройки
+    панели не смешиваются у соседних проектов. `id` и `name` — из реестра (D5).
+    """
+
+    def __init__(self, project: Path, preview: bool = False, board: str | None = None,
+                 project_id: str = "", name: str = "") -> None:
         self.project = project
         self.preview = preview
         self.board = board
+        self.id = project_id or project.name
+        self.name = name or project.name
         self.log: deque[str] = deque(maxlen=200)
         self.cache: dict[str, Any] = {}
         self.lock = threading.Lock()
         # Проверки (план 3 S5): последний результат и признак «проверка идёт».
         self.checks: dict[str, Any] | None = None
         self.checks_lock = threading.Lock()
+        # Сводка реестра (план 3 S6): кэш на CACHE_TTL, чтобы переключение вкладок
+        # не запускало `gate.py --plans` по каждому проекту (D8).
+        self.projects_cache: tuple[float, dict] | None = None
 
     def note(self, text: str) -> None:
         with self.lock:
@@ -383,9 +394,69 @@ ACTIONS = {
 }
 
 
+# ───────────────────────── реестр проектов (план 3 S6) ─────────────────────────
+
+def _installed(project: Path) -> bool:
+    """Конвейер установлен: в проекте есть `.pipeline/gate.py` (§4.1)."""
+    return (Path(project) / ".pipeline" / "gate.py").is_file()
+
+
+def _display_name(root: Path) -> str:
+    """Имя проекта для панели: `project` из `pipeline.json`, иначе имя каталога."""
+    name = str(proj.read_config(root).get("project") or "").strip()
+    return name or Path(root).name
+
+
+def _registry_rows(project: Path, extra_projects: list[str | Path] | None) -> list[dict]:
+    """Реестр: проект сервера, потом `projects.json`, потом разовые пути (D4, D5).
+
+    Один каталог не попадает в реестр дважды (§4.3): проект по умолчанию, который
+    владелец вписал ещё и в файл, не раздваивается в таблице.
+    """
+    rows: list[dict] = []
+
+    def add(root: Path | str, name: str = "", wanted_id: str = "",
+            source: str = "registry") -> None:
+        path = Path(root).expanduser().resolve()
+        if any(row["root"] == path for row in rows):
+            return
+        base = wanted_id or proj.slug(name or path.name)
+        project_id, number = base, 2
+        while any(row["id"] == project_id for row in rows):
+            project_id, number = f"{base}-{number}", number + 1
+        rows.append({"id": project_id, "name": name or _display_name(path),
+                     "root": path, "source": source})
+
+    add(project, source="default")
+    for entry in proj.read_projects():
+        add(entry["root"], entry["name"], entry["id"])
+    for extra in extra_projects or []:
+        add(extra, source="command line")
+    return rows
+
+
+def _missing_snapshot(state: State) -> dict:
+    """Снимок проекта без конвейера: 200 и объяснение в `errors`, а не 500.
+
+    Форма — как у обычного снимка: страница не должна знать, что проекта нет,
+    кроме `installed: false` и строки ошибки (D9).
+    """
+    root = Path(state.project)
+    return {"project": state.name, "root": str(root),
+            "board": state.board or str(proj.read_config(root).get("board") or "default"),
+            "profiles": {}, "runtimes": {}, "driven": [], "require_prompt": True,
+            "telegram": {"enabled": False, "chat": ""},
+            "preview": state.preview, "plans": [], "plan": None, "package": None,
+            "decision": None, "status": "", "metrics": {}, "cards": [], "journal": [],
+            "errors": [f"конвейер не установлен в проект: нет {root / '.pipeline' / 'gate.py'}"]}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "StepPipelineUI/1.0"
     state: State  # задаётся в serve()
+    # Реестр проектов (S6) задаётся в make_server: записи реестра и их состояния.
+    registry: list[dict] = []
+    states: dict[str, State] = {}
 
     protocol_version = "HTTP/1.1"
 
@@ -473,6 +544,108 @@ class Handler(BaseHTTPRequestHandler):
         """Параметр `plan=` из строки запроса (нет параметра — None)."""
         return self._query().get("plan") or None
 
+    # ── реестр проектов: выбор адресата (план 3 S6) ──
+    def _state_of(self, row: dict) -> State:
+        """Состояние проекта реестра: создаётся при первом обращении (D6)."""
+        state = self.states.get(row["id"])
+        if state is None:
+            state = State(row["root"], preview=self.state.preview, board=self.state.board,
+                          project_id=row["id"], name=row["name"])
+            self.states[row["id"]] = state
+            row["state"] = state
+        return state
+
+    def _choose_project(self, raw: Any) -> State | None:
+        """Проект запроса: без параметра — серверный, неизвестный `id` — ответ 400.
+
+        Молча работать с чужим проектом нельзя: страница подписана именем проекта,
+        значит и ошибка обязана называть, какой `id` не найден (D7).
+        """
+        wanted = str(raw or "").strip()
+        if not wanted:
+            return self.state
+        for row in self.registry:
+            if str(row["id"]) == wanted:
+                return self._state_of(row)
+        ids = ", ".join(str(row["id"]) for row in self.registry) or "—"
+        self._json(400, {"ok": False, "error": f"неизвестный проект: {wanted}; доступные: {ids}",
+                         "projects": [str(row["id"]) for row in self.registry]})
+        return None
+
+    def _summary_plans(self, state: State) -> list[dict]:
+        """`gate.py --plans` проекта; в предпросмотре — движком плагина, как снимок."""
+        if state.preview:
+            extra = {"PIPELINE_ASSUME_DEFAULTS": "1"}
+            if state.board:
+                extra["PIPELINE_BOARD"] = state.board
+            data = proj.engine_json(state.project, "gate.py", "--plans", timeout=90,
+                                    engine_dir=proj.ENGINE_SRC, extra_env=extra)
+        else:
+            data = proj.engine_json(state.project, "gate.py", "--plans", timeout=90)
+        return data if isinstance(data, list) else []
+
+    def _project_summary(self, row: dict) -> dict:
+        """Строка сводки: план, следующий шаг, закрыто, стоп, простой (D8).
+
+        Полный снимок проекта здесь не собирается: на каждый проект хватает одного
+        `gate.py --plans` и файла состояния плана — иначе таблица тянула бы движок
+        трижды на репозиторий.
+        """
+        state = self._state_of(row)
+        root = Path(row["root"])
+        summary = {"id": row["id"], "name": row["name"], "root": str(root),
+                   "source": row["source"], "installed": _installed(root),
+                   "plan": "", "next": "—", "closed": 0, "total": 0,
+                   "stop": None, "idle": None, "error": ""}
+        if not summary["installed"] and not state.preview:
+            return summary
+        try:
+            cfg = proj.read_config(root)
+            plans = self._summary_plans(state)
+        except Exception as exc:                                # noqa: BLE001
+            summary["error"] = f"{type(exc).__name__}: {exc}"
+            return summary
+        if not plans:
+            return summary
+        # План, у которого есть открытые шаги, иначе первый — как в снимке.
+        chosen = next((p for p in plans if str(p.get("next") or "") not in ("", "—", "None")),
+                      plans[0])
+        plan_id = str(chosen.get("id") or "")
+        summary["plan"] = plan_id
+        summary["next"] = str(chosen.get("next") or "—")
+        summary["closed"] = int(chosen.get("closed") or 0)
+        summary["total"] = snap._steps_total(root, cfg, str(chosen.get("file") or ""))
+        stop_row = chosen.get("stop")
+        if isinstance(stop_row, dict) and stop_row:
+            summary["stop"] = {"kind": str(stop_row.get("kind") or "owner"),
+                               "reason": str(stop_row.get("reason") or "")}
+        plan_state = snap._plan_state(root, plan_id)
+        since = plan_state.get("waiting_since")
+        if isinstance(since, (int, float)) and not isinstance(since, bool):
+            summary["idle"] = {"text": snap._duration(max(0, int(time.time() - float(since))))}
+        return summary
+
+    def _projects_payload(self) -> dict:
+        """Сводка реестра с кэшем на CACHE_TTL: один `State` сервера держит его (D8)."""
+        cached = self.state.projects_cache
+        if cached is not None and time.monotonic() - cached[0] <= snap.CACHE_TTL:
+            return cached[1]
+        payload = {"ok": True, "default": self.state.id,
+                   "preview": bool(self.state.preview),
+                   "projects": [self._project_summary(row) for row in self.registry]}
+        self.state.projects_cache = (time.monotonic(), payload)
+        return payload
+
+    def _get_projects(self) -> None:
+        """Сводная таблица репозиториев: только чтение, действий не выполняет."""
+        if not self._local_only():
+            self._json(403, {"ok": False, "error": "только localhost"})
+            return
+        try:
+            self._json(200, self._projects_payload())
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
     @staticmethod
     def _line_limit(query: dict[str, str], default: int = snap.STEP_LINES) -> int:
         """Сколько строк блока отдавать: параметр `lines`, иначе умолчание, с потолком."""
@@ -482,9 +655,9 @@ class Handler(BaseHTTPRequestHandler):
             value = default
         return max(1, min(value, 5000))
 
-    def _snapshot_with_version(self, plan: str | None) -> bytes:
+    def _snapshot_with_version(self, plan: str | None, state: State | None = None) -> bytes:
         """Снимок + версия UI: панель показывает, что именно ей отдал сервер."""
-        body = self._snapshot_body(plan)
+        body = self._snapshot_body(plan, state)
         try:
             data = json.loads(body.decode("utf-8"))
         except ValueError:
@@ -493,17 +666,27 @@ class Handler(BaseHTTPRequestHandler):
         data["ui_sha"] = ui_sha()
         return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
-    def _snapshot_body(self, plan: str | None) -> bytes:
-        """Тело ответа `/api/snapshot`: снимок + журнал сервера + режим планировщика + ok."""
-        data = snap.snapshot(self.state.project, plan, preview=self.state.preview,
-                             board=self.state.board)
+    def _snapshot_body(self, plan: str | None, state: State | None = None) -> bytes:
+        """Тело ответа `/api/snapshot`: снимок + журнал сервера + режим планировщика + ok.
+
+        Проект реестра без `.pipeline` получает 200 и пустую форму с объяснением (D9):
+        ошибка на этом экране означала бы, что сводка по соседям недоступна.
+        """
+        state = state or self.state
+        if state.preview or _installed(state.project):
+            data = snap.snapshot(state.project, plan, preview=state.preview,
+                                 board=state.board)
+        else:
+            data = _missing_snapshot(state)
         # Короткая форма проверок для бейджа: прогон запускает вкладка «Проверки», здесь
         # только то, что уже посчитано (или None, пока проверки не было). overview
         # копируется, иначе правка ушла бы в кэш снимка.
         data["overview"] = dict(data.get("overview") or {})
-        data["overview"]["checks"] = checks_summary(self.state)
-        data["log"] = self.state.tail()
-        data["plan_mode"] = plan_mode.read_mode(self.state.project)
+        data["overview"]["checks"] = checks_summary(state)
+        data["log"] = state.tail()
+        data["plan_mode"] = plan_mode.read_mode(state.project)
+        data["installed"] = _installed(state.project)
+        data["project_id"] = state.id
         data["ok"] = True
         return _json_bytes(data)
 
@@ -512,12 +695,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"event: snapshot\ndata: " + body + b"\n\n")
         self.wfile.flush()
 
-    def _events(self, plan: str | None) -> None:
+    def _events(self, plan: str | None, state: State | None = None) -> None:
         """Поток событий: первый кадр сразу, дальше — по изменению отпечатка.
 
         Живёт не дольше EVENTS_MAX_SECONDS и закрывается: переподключение — забота
         EventSource. Любая сетевая ошибка (вкладку закрыли) — норма, а не сбой сервера.
         """
+        state = state or self.state
         if not self._local_only():
             self._json(403, {"ok": False, "error": "только localhost"})
             return
@@ -531,18 +715,18 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
         try:
-            stamp = snap.fingerprint(self.state.project, plan, self.state.preview,
-                                     self.state.board)
-            self._event_frame(self._snapshot_with_version(plan))
+            stamp = snap.fingerprint(state.project, plan, state.preview,
+                                     state.board)
+            self._event_frame(self._snapshot_with_version(plan, state))
             started = last_ping = time.monotonic()
             while time.monotonic() - started < EVENTS_MAX_SECONDS:
                 time.sleep(EVENTS_POLL)
                 now = time.monotonic()
-                current = snap.fingerprint(self.state.project, plan, self.state.preview,
-                                           self.state.board)
+                current = snap.fingerprint(state.project, plan, state.preview,
+                                           state.board)
                 if current != stamp:
                     stamp = current
-                    self._event_frame(self._snapshot_with_version(plan))
+                    self._event_frame(self._snapshot_with_version(plan, state))
                     last_ping = now
                 elif now - last_ping >= EVENTS_PING_SECONDS:
                     self.wfile.write(b": ping\n\n")
@@ -568,8 +752,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, body, "text/html; charset=utf-8")
             return
         if path == "/api/snapshot":
+            state = self._choose_project(self._query().get("project"))
+            if state is None:
+                return
             try:
-                body = self._snapshot_with_version(self._plan_param())
+                body = self._snapshot_with_version(self._plan_param(), state)
             except Exception as exc:                            # noqa: BLE001
                 self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
                 return
@@ -581,7 +768,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, body, extra={"ETag": tag}, cache_control="no-cache")
             return
         if path == "/api/events":
-            self._events(self._plan_param())
+            state = self._choose_project(self._query().get("project"))
+            if state is None:
+                return
+            self._events(self._plan_param(), state)
+            return
+        if path == "/api/projects":
+            self._get_projects()
             return
         if path == "/api/step":
             self._get_step()
@@ -608,14 +801,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"ok": False, "error": "только localhost"})
             return
         query = self._query()
+        state = self._choose_project(query.get("project"))
+        if state is None:
+            return
         plan_id = str(query.get("plan") or "").strip()
         step_id = str(query.get("id") or query.get("step") or "").strip()
         if not plan_id or not step_id:
             self._json(400, {"ok": False, "error": "нужны параметры plan и id (например, ?plan=3&id=S3)"})
             return
         try:
-            data = snap.step_detail(self.state.project, plan_id, step_id,
-                                    limit=self._line_limit(query), board=self.state.board)
+            data = snap.step_detail(state.project, plan_id, step_id,
+                                    limit=self._line_limit(query), board=state.board)
         except ValueError as exc:
             self._json(400, {"ok": False, "error": str(exc)})
             return
@@ -635,9 +831,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"ok": False, "error": "только localhost"})
             return
         query = self._query()
+        state = self._choose_project(query.get("project"))
+        if state is None:
+            return
         rel = str(query.get("path") or "")
         try:
-            data = snap.read_text_safe(self.state.project, rel, limit=self._line_limit(query))
+            data = snap.read_text_safe(state.project, rel, limit=self._line_limit(query))
         except snap.UnsafePath as exc:
             code = 404 if str(exc).startswith("файла нет") else 400
             self._json(code, {"ok": False, "error": str(exc)})
@@ -658,10 +857,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"ok": False, "error": "только localhost"})
             return
         query = self._query()
+        state = self._choose_project(query.get("project"))
+        if state is None:
+            return
         plan = str(query.get("plan") or "").strip()
         refresh = str(query.get("refresh") or "") not in ("", "0", "false", "no")
         try:
-            data = checks(self.state, plan, refresh=refresh)
+            data = checks(state, plan, refresh=refresh)
         except Exception as exc:                                # noqa: BLE001
             self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             return
@@ -673,14 +875,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self._local_only():
             self._json(403, {"ok": False, "error": "только localhost"})
             return
+        state = self._choose_project(self._query().get("project"))
+        if state is None:
+            return
         try:
-            data = setup_flow.setup_status(self.state.project)
+            data = setup_flow.setup_status(state.project)
         except Exception as exc:                                # noqa: BLE001
             self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             return
-        preview = bool(getattr(self.state, "preview", False))
+        preview = bool(getattr(state, "preview", False))
         self._json(200, {"ok": True, "preview": preview, "enabled": not preview,
-                         "project": str(self.state.project),
+                         "project": str(state.project),
                          "steps": data["steps"], "next": data["next"],
                          "values": data["values"]})
 
@@ -708,6 +913,9 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._read_json_body()
         if payload is None:
             return
+        state = self._choose_project(payload.get("project"))
+        if state is None:
+            return
         step = str(payload.get("step") or "").strip()
         if step not in setup_flow.SETUP_STEPS:
             allowed = ", ".join(setup_flow.SETUP_STEPS)
@@ -722,7 +930,7 @@ class Handler(BaseHTTPRequestHandler):
         # иначе не совпадает с текстом ошибки и уходит в ответ и в `state.log`.
         token = str(values.get("token") or "").strip()
         try:
-            result = setup_flow.run_setup_step(self.state.project, step, values)
+            result = setup_flow.run_setup_step(state.project, step, values)
         except Exception as exc:                                # noqa: BLE001
             self._json(500, {"ok": False, "step": step,
                              "error": _redact(f"{type(exc).__name__}: {exc}", token)})
@@ -730,9 +938,10 @@ class Handler(BaseHTTPRequestHandler):
         # Секрет вычищается из всего, что уходит наружу: и в ответ, и в лог панели.
         log = [_redact(str(line), token) for line in result.get("log") or []]
         error = _redact(str(result.get("error") or ""), token)
-        self.state.note(_redact(f"мастер: шаг {step}\n" + "\n".join(log), token))
+        state.note(_redact(f"мастер: шаг {step}\n" + "\n".join(log), token))
         if result.get("ok"):
             snap.clear_cache()      # шаг пишет на диск: прежний снимок больше не верен
+            self.state.projects_cache = None   # и сводка реестра — тоже
         body = {"ok": bool(result.get("ok")), "step": step,
                 "already": bool(result.get("already")), "next": result.get("next"),
                 "log": log}
@@ -760,24 +969,39 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._read_json_body()
         if payload is None:
             return
+        # Отказ предпросмотра не зависит от проекта (D10): сначала «только чтение»,
+        # потом выбор проекта и проверка установки.
+        if getattr(self.state, "preview", False):
+            self._json(400, {"ok": False, "error": "режим предпросмотра: действия выключены — "
+                                                   "поставь конвейер (hermes pipeline setup)"})
+            return
+        state = self._choose_project(payload.get("project"))
+        if state is None:
+            return
         action = str(payload.get("action") or "").strip()
         handler = ACTIONS.get(action)
         if handler is None:
             self._json(400, {"ok": False, "error": f"неизвестное действие: {action}"})
             return
-        if getattr(self.state, "preview", False):
-            self._json(400, {"ok": False, "error": "режим предпросмотра: действия выключены — "
-                                                   "поставь конвейер (hermes pipeline setup)"})
+        stamp = {"id": state.id, "name": state.name}
+        if not _installed(state.project):
+            self._json(400, {"ok": False, "project": stamp,
+                             "error": f"конвейер не установлен в проект {state.project}: "
+                                      f"нет .pipeline/gate.py"})
             return
         try:
-            result = handler(self.state, payload)
+            result = handler(state, payload)
         except Exception as exc:                                # noqa: BLE001
-            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            self._json(500, {"ok": False, "project": stamp,
+                             "error": f"{type(exc).__name__}: {exc}"})
             return
         result.setdefault("action", action)
+        # Действие подписано проектом: иначе по ответу не видно, кого оно коснулось (D7).
+        result["project"] = stamp
         # Действие могло записать на диск: кэш снимка сбрасываем, чтобы ответ и следующий
         # запрос не отдавали состояние «до».
         snap.clear_cache()
+        self.state.projects_cache = None      # сводка живёт на состоянии сервера (D8)
         self._json(200 if result.get("ok") else 400, result)
 
     def _post_plan_mode(self) -> None:
@@ -796,25 +1020,40 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(on, bool):
             self._json(400, {"ok": False, "error": "нужно поле on: true или false"})
             return
+        state = self._choose_project(payload.get("project"))
+        if state is None:
+            return
         try:
-            result = set_plan_mode(self.state, on)
+            result = set_plan_mode(state, on)
         except Exception as exc:                                # noqa: BLE001
             self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             return
+        result["project"] = {"id": state.id, "name": state.name}
         self._json(200, result)
 
 
 def make_server(project: Path, host: str = "127.0.0.1", port: int = 8770,
-                preview: bool = False, board: str | None = None) -> ThreadingHTTPServer:
-    """Собрать сервер, не запуская его (нужно тестам)."""
+                preview: bool = False, board: str | None = None,
+                extra_projects: list[str | Path] | None = None) -> ThreadingHTTPServer:
+    """Собрать сервер, не запуская его (нужно тестам).
+
+    Реестр строится здесь: проект сервера первым, дальше `projects.json` профиля и
+    разовые пути из командной строки. `state` сервера — состояние первого проекта,
+    остальные состояния создаются при первом обращении (`states`).
+    """
+    rows = _registry_rows(project, extra_projects)
+    state = State(rows[0]["root"], preview=preview, board=board,
+                  project_id=rows[0]["id"], name=rows[0]["name"])
+    rows[0]["state"] = state
     handler = type("BoundHandler", (Handler,),
-                   {"state": State(project, preview=preview, board=board)})
+                   {"state": state, "registry": rows, "states": {state.id: state}})
     return ThreadingHTTPServer((host, port), handler)
 
 
 def serve(project: Path, host: str = "127.0.0.1", port: int = 8770,
           open_browser: bool = True, preview: bool = False,
-          board: str | None = None) -> str:
+          board: str | None = None,
+          extra_projects: list[str | Path] | None = None) -> str:
     """Запустить UI в фоновом потоке и вернуть URL."""
     busy = busy_version(host, port)
     if busy:
@@ -822,7 +1061,8 @@ def serve(project: Path, host: str = "127.0.0.1", port: int = 8770,
         # старый сервер продолжает отвечать, а новый молча простаивает.
         raise RuntimeError(f"порт {port} занят другим UI конвейера (версия {busy}); "
                            f"останови его: hermes pipeline ui --stop, или задай --port")
-    server = make_server(project, host, port, preview=preview, board=board)
+    server = make_server(project, host, port, preview=preview, board=board,
+                         extra_projects=extra_projects)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="pipeline-ui")
     thread.start()
     actual_port = server.server_address[1]

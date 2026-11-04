@@ -1155,3 +1155,237 @@ def test_index_makes_only_step_findings_clickable():
     # CSS: курсор и подсветка — только у кликабельных строк.
     assert ".checks-lint .finding.goto { cursor: pointer; }" in html
     assert ".checks-lint .finding { cursor: pointer; }" not in html
+
+# ───────────────────────── реестр проектов (план 3 S6) ─────────────────────────
+
+def write_registry(home: Path, entries: list[dict]) -> Path:
+    """Реестр в home профиля: панель читает его, но никогда не пишет (D4)."""
+    path = home / "projects.json"
+    path.write_text(json.dumps({"projects": entries}, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    return path
+
+
+def running(root: Path, **kwargs):
+    """Сервер в потоке: нужен там, где фикстура `server` не подходит (свой реестр)."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def manager():
+        httpd = ui_server.make_server(root, port=0, **kwargs)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{httpd.server_address[1]}", httpd
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    return manager()
+
+
+def test_projects_route_lists_two_projects(tmp_path: Path, hermes_stub: Path,
+                                           isolated_hermes_home: Path):
+    """Два репозитория видны на одном экране: строка несёт все поля сводки (§4.2)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    second = install_project(tmp_path / "beta", board="uiboard")
+    write_registry(isolated_hermes_home,
+                   [{"id": "beta", "name": "Бета", "root": str(second)}])
+    with running(first) as (url, _httpd):
+        status, data = get(url + "/api/projects")
+    assert status == 200 and data["ok"] is True
+    rows = {row["id"]: row for row in data["projects"]}
+    assert sorted(rows) == ["alpha", "beta"]
+    assert data["default"] == "alpha"
+    assert rows["alpha"]["source"] == "default"
+    assert rows["beta"]["source"] == "registry"
+    assert rows["beta"]["name"] == "Бета" and rows["beta"]["installed"] is True
+    for row in rows.values():
+        assert set(row) >= {"id", "name", "root", "installed", "plan", "next", "closed",
+                            "total", "stop", "idle", "source"}
+    assert rows["alpha"]["next"] == "S1" and rows["alpha"]["total"] == 2
+    assert rows["beta"]["plan"] == "1" and rows["beta"]["stop"] is None
+
+
+def test_registry_entry_without_pipeline_is_installed_false(tmp_path: Path, hermes_stub: Path,
+                                                           isolated_hermes_home: Path):
+    """Каталог без `.pipeline` — «не установлен», а снимок по нему всё равно 200 (D9)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    write_registry(isolated_hermes_home,
+                   [{"id": "bare", "name": "Голый", "root": str(bare)}])
+    with running(first) as (url, _httpd):
+        status, data = get(url + "/api/projects")
+        snap_status, snapshot = get(url + "/api/snapshot?project=bare")
+        action_status, action = post(url, {"action": "tick", "project": "bare"})
+    rows = {row["id"]: row for row in data["projects"]}
+    assert status == 200 and rows["bare"]["installed"] is False
+    assert rows["bare"]["next"] == "—" and rows["bare"]["total"] == 0
+    assert snap_status == 200 and snapshot["ok"] is True
+    assert snapshot["installed"] is False and snapshot["plans"] == []
+    assert snapshot["errors"], "неустановленный проект обязан объяснить, чего не хватает"
+    assert action_status == 400 and "не установлен" in action["error"]
+    assert action["project"] == {"id": "bare", "name": "Голый"}
+    assert not (bare / ".pipeline").exists()
+
+
+def test_registry_skips_duplicate_and_missing_roots(tmp_path: Path, hermes_stub: Path,
+                                                    isolated_hermes_home: Path):
+    """Дубли по каталогу, запись без root и несуществующий каталог в реестр не попадают."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    second = install_project(tmp_path / "beta", board="uiboard")
+    write_registry(isolated_hermes_home, [
+        {"id": "first-again", "root": str(first)},
+        {"id": "no-root"},
+        {"id": "gone", "root": str(tmp_path / "нет-такого-каталога")},
+        {"id": "beta", "name": "Бета", "root": str(second)},
+    ])
+    with running(first) as (url, _httpd):
+        _, data = get(url + "/api/projects")
+    assert [row["id"] for row in data["projects"]] == ["alpha", "beta"]
+
+
+def test_extra_project_joins_registry_from_command_line(tmp_path: Path, hermes_stub: Path):
+    """Разовый путь из `--extra-project` — такая же строка реестра (D3)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    extra = install_project(tmp_path / "gamma", board="uiboard")
+    with running(first, extra_projects=[str(extra)]) as (url, _httpd):
+        _, data = get(url + "/api/projects")
+    rows = {row["id"]: row for row in data["projects"]}
+    assert sorted(rows) == ["alpha", "gamma"]
+    assert rows["gamma"]["source"] == "command line"
+
+
+def test_action_by_one_project_does_not_touch_another(tmp_path: Path, hermes_stub: Path,
+                                                      isolated_hermes_home: Path):
+    """Действие адресуется выбранному проекту и подписано его именем (§4.3)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    second = install_project(tmp_path / "beta", board="uiboard")
+    write_registry(isolated_hermes_home,
+                   [{"id": "beta", "name": "Бета", "root": str(second)}])
+    with running(first) as (url, httpd):
+        status, action = post(url, {"action": "stop", "reason": "стоп по альфе",
+                                    "project": "alpha"})
+        _, alpha_snapshot = get(url + "/api/snapshot")
+        _, beta_snapshot = get(url + "/api/snapshot?project=beta")
+        _, rows = get(url + "/api/projects")
+    assert status == 200 and action["ok"] is True, action
+    # Подпись ответа — имя проекта, к которому отнеслись: у A оно своё, у B — «Бета».
+    assert action["project"] == {"id": "alpha", "name": "demo"}
+    assert httpd.RequestHandlerClass.registry[0]["state"] is httpd.RequestHandlerClass.state
+    assert (first / ".pipeline" / "state" / "plan_1_stop.json").is_file()
+    # Сосед не тронут: ни стоп-флага, ни изменений в снимке B.
+    assert not (second / ".pipeline" / "state" / "plan_1_stop.json").exists()
+    assert alpha_snapshot["root"] == str(first.resolve())
+    assert beta_snapshot["root"] == str(second.resolve())
+    assert beta_snapshot["overview"]["step"] == "S1"
+    assert beta_snapshot["overview"]["stop"] is None
+    beta_row = {row["id"]: row for row in rows["projects"]}["beta"]
+    assert beta_row["stop"] is None
+
+
+def test_unknown_project_is_400_and_missing_project_is_default(tmp_path: Path, hermes_stub: Path,
+                                                               isolated_hermes_home: Path):
+    """Неизвестный id — 400 с перечнем; без параметра — проект сервера (D7)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    ghost = "чужой"
+    with running(first) as (url, httpd):
+        status, data = get(url + "/api/snapshot?project=" + urllib.parse.quote(ghost))
+        action_status, action = post(url, {"action": "stop", "project": ghost})
+        default_status, default = get(url + "/api/snapshot")
+    assert status == 400 and "неизвестный проект" in data["error"]
+    assert "alpha" in data["error"] and data["projects"] == ["alpha"]
+    assert action_status == 400 and "неизвестный проект" in action["error"]
+    assert default_status == 200
+    assert default["root"] == str(httpd.RequestHandlerClass.state.project.resolve())
+
+
+def test_preview_refuses_actions_for_every_project(tmp_path: Path, hermes_stub: Path,
+                                                   isolated_hermes_home: Path):
+    """Предпросмотр гасит действия всем проектам, а сводку отдаёт (D10)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    second = install_project(tmp_path / "beta", board="uiboard")
+    write_registry(isolated_hermes_home,
+                   [{"id": "beta", "name": "Бета", "root": str(second)}])
+    with running(first, preview=True) as (url, _httpd):
+        status, data = get(url + "/api/projects")
+        own_status, own = post(url, {"action": "tick"})
+        other_status, other = post(url, {"action": "tick", "project": "beta"})
+    assert status == 200 and len(data["projects"]) == 2 and data["preview"] is True
+    for code, body in ((own_status, own), (other_status, other)):
+        assert code == 400 and "предпросмотр" in body["error"]
+    assert not (second / ".pipeline" / "state" / "plan_1_stop.json").exists()
+
+
+def test_helpers_read_registry_and_ignore_broken_file(tmp_path: Path, isolated_hermes_home: Path,
+                                                      monkeypatch):
+    """`read_projects`: битый файл — пусто, дубли id разводятся, root остаётся Path."""
+    monkeypatch.delenv("PIPELINE_PROJECTS_FILE", raising=False)
+    (isolated_hermes_home / "projects.json").write_text("{не json", encoding="utf-8")
+    assert project.read_projects() == []
+    one = tmp_path / "one"
+    two = tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+    write_registry(isolated_hermes_home, [{"id": "same", "root": str(one)},
+                                          {"id": "same", "root": str(two)}])
+    rows = project.read_projects()
+    assert [row["id"] for row in rows] == ["same", "same-2"]
+    assert all(isinstance(row["root"], Path) for row in rows)
+    assert rows[0]["name"] == "one", "без имени берётся имя каталога"
+
+
+def test_configured_project_root_reads_manifest_key(tmp_path: Path, isolated_hermes_home: Path,
+                                                    monkeypatch):
+    """Ключ `project_root` из `config.yaml` home профиля читается без PyYAML."""
+    monkeypatch.delenv("PIPELINE_PROJECT_ROOT", raising=False)
+    root = tmp_path / "configured"
+    root.mkdir()
+    (isolated_hermes_home / "config.yaml").write_text(
+        "agent:\n  max_turns: 10\nplugins:\n  entries:\n    step_pipeline:\n      settings:\n"
+        f"        project_root: {root}\n        ui_theme: dark\n", encoding="utf-8")
+    assert project.configured_project_root() == root.resolve()
+
+    (isolated_hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - step_pipeline\n", encoding="utf-8")
+    assert project.configured_project_root() is None
+
+
+def test_configured_project_root_env_wins(tmp_path: Path, isolated_hermes_home: Path,
+                                          monkeypatch):
+    """`PIPELINE_PROJECT_ROOT` важнее файла; несуществующий каталог — `None`."""
+    from_yaml = tmp_path / "from-yaml"
+    from_env = tmp_path / "from-env"
+    from_yaml.mkdir()
+    from_env.mkdir()
+    (isolated_hermes_home / "config.yaml").write_text(
+        "plugins:\n  entries:\n    step_pipeline:\n      settings:\n"
+        f"        project_root: {from_yaml}\n", encoding="utf-8")
+    monkeypatch.setenv("PIPELINE_PROJECT_ROOT", str(from_env))
+    assert project.configured_project_root() == from_env.resolve()
+    monkeypatch.setenv("PIPELINE_PROJECT_ROOT", str(tmp_path / "нет-такого"))
+    assert project.configured_project_root() is None
+
+
+def test_index_has_project_registry_markup():
+    """Шапка, сводка и состояние страницы: опоры задачи 7 (§4.2)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    for anchor in ('id="project-switch"', 'id="projects-summary"', 'id="projects-table"',
+                   "/api/projects", "function withProject", "function switchProject",
+                   "currentProject", "renderProjects", "loadProjects()",
+                   "data.installed === false", "не установлен"):
+        assert anchor in html, anchor
+    # Переключение сбрасывает контекст прежнего проекта целиком (§4.4).
+    start = html.index("function switchProject(id)")
+    end = html.index("function renderProjects", start)
+    block = html[start:end]
+    for anchor in ("etag = null", "currentPlan = null", "currentStep = null",
+                   'stepPairLoaded = ""', "checksStarted = false",
+                   "refresh();", "startEvents();"):
+        assert anchor in block, anchor
+    # GET-адреса идут через withProject: без него запрос ушёл бы чужому проекту.
+    for call in ('withProject("/api/snapshot"', 'withProject("/api/events"',
+                 'withProject("/api/step?', 'withProject("/api/checks"',
+                 'withProject("/api/setup"'):
+        assert call in html, call

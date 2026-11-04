@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +41,134 @@ def find_project(start: Path | str | None = None) -> Path:
             return candidate
     raise ProjectNotFound(
         f"не нашёл {MARKER} ни в {here}, ни выше. Установи конвейер: `hermes pipeline setup`")
+
+
+def hermes_home() -> Path:
+    """Home профиля Hermes (не корень Hermes): где живут `projects.json` и `config.yaml`.
+
+    `HERMES_HOME` в процессе, запущенном Hermes, уже указывает на каталог профиля
+    (`hermes_cli/profiles.py: resolve_profile_env`), у именованного профиля это
+    `…/hermes/profiles/ИМЯ`. Без него — `LOCALAPPDATA/hermes/profile…`, затем `~/.hermes`.
+    Импорт `setup_flow` отсюда запрещён (циклический), поэтому блок осознанно продублирован.
+    """
+    env = os.environ.get("HERMES_HOME")
+    if env:
+        return Path(env).expanduser()
+    local = os.environ.get("LOCALAPPDATA")
+    base = Path(local) / "hermes" if local else Path.home() / ".hermes"
+    profile = os.environ.get("HERMES_PROFILE")
+    if profile and (base / "profiles" / profile).is_dir():
+        return base / "profiles" / profile
+    return base
+
+
+def projects_file() -> Path:
+    """Реестр проектов панели: env `PIPELINE_PROJECTS_FILE`, иначе `<home профиля>/projects.json`."""
+    env = os.environ.get("PIPELINE_PROJECTS_FILE")
+    return Path(env).expanduser() if env else hermes_home() / "projects.json"
+
+
+def read_projects() -> list[dict[str, Any]]:
+    """Записи реестра: `{"id", "name", "root"}`; битый файл — пустой список.
+
+    Запись без `root` пропускается: угадывать, какой проект имелся в виду, нельзя.
+    Неуникальные `id` получают суффикс `-2`, `-3` — по ним панель адресует действия.
+    Пути не проверяются: каталог без `.pipeline` показывается как «не установлен».
+    """
+    try:
+        data = json.loads(projects_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    raw = data.get("projects") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        raw_root = item.get("root") or item.get("path")
+        if not raw_root or not str(raw_root).strip():
+            continue
+        root = Path(str(raw_root)).expanduser().resolve()
+        if not root.is_dir():
+            continue            # каталога нет — запись нечего показывать (§4.1)
+        name = str(item.get("name") or "").strip() or root.name
+        base = str(item.get("id") or "").strip() or slug(name)
+        project_id, number = base, 2
+        while any(row["id"] == project_id for row in out):
+            project_id, number = f"{base}-{number}", number + 1
+        out.append({"id": project_id, "name": name, "root": root})
+    return out
+
+
+def _yaml_scalar(value: str) -> str:
+    """Значение YAML-строки: без кавычек и хвостового комментария."""
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        return text[1:-1]
+    return re.split(r"\s+#", text, maxsplit=1)[0].strip()
+
+
+def _yaml_project_root(text: str) -> str:
+    """`project_root` из блока `plugins … step_pipeline` без PyYAML (в CI его нет).
+
+    Разбор по отступам, а не по фиксированной схеме: Hermes кладёт значения схемы
+    плагина в `config.yaml` вложенными словарями, и точная глубина — его дело.
+    """
+    stack: list[tuple[int, str]] = []      # (отступ, ключ) открытых блоков
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lead = len(line) - len(line.lstrip())
+        match = re.match(r"^([^:#]+):(.*)$", stripped)
+        if not match:
+            continue
+        name = match.group(1).strip().strip("'\"")
+        value = match.group(2).strip()
+        while stack and stack[-1][0] >= lead:
+            stack.pop()
+        if name == "project_root":
+            path = [key for _indent, key in stack]
+            if "plugins" in path and any("step_pipeline" in key for key in path):
+                return _yaml_scalar(value)
+            continue
+        if not value:                      # `ключ:` — открывается вложенный блок
+            stack.append((lead, name))
+    return ""
+
+
+def _config_yaml_candidates() -> list[Path]:
+    """`config.yaml` в home профиля — там Hermes хранит значения схемы плагина."""
+    return [hermes_home() / "config.yaml"]
+
+
+def configured_project_root() -> Path | None:
+    """Проект по умолчанию: env `PIPELINE_PROJECT_ROOT`, затем ключ схемы плагина.
+
+    Ключ `project_root` объявлен в `config_schema`, поэтому его значение живёт
+    в `config.yaml` home профиля (`plugins.entries.step_pipeline.settings`). Нечитаемый
+    файл, отсутствие ключа и несуществующий каталог дают `None` — тогда работает поиск
+    вверх от cwd, как раньше.
+    """
+    env_root = os.environ.get("PIPELINE_PROJECT_ROOT")
+    if env_root and env_root.strip():
+        # env — решение владельца: ключ из config.yaml его не подменяет, но
+        # несуществующий каталог всё равно даёт `None` (проекта по умолчанию нет).
+        path = Path(env_root.strip()).expanduser()
+        return path.resolve() if path.is_dir() else None
+    raw = ""
+    for path in _config_yaml_candidates():
+        try:
+            raw = _yaml_project_root(path.read_text(encoding="utf-8"))
+        except OSError:
+            raw = ""
+        if raw.strip():
+            break
+    if not raw.strip():
+        return None
+    path = Path(raw.strip()).expanduser()
+    return path.resolve() if path.is_dir() else None
 
 
 def read_config(project: Path) -> dict[str, Any]:

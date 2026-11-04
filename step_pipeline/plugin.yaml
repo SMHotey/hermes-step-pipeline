@@ -26,3 +26,6 @@ config_schema:
     type: str
     env: STEP_PIPELINE_TELEGRAM_CHAT_ID
     description: "Куда слать уведомления: chat id или @канал"
+  project_root:
+    type: str
+    description: "Путь к проекту по умолчанию для панели и команд без --project (если пусто — поиск вверх от текущего каталога)"
