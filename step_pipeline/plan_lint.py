@@ -52,11 +52,16 @@ _STEP_HEADING_HINT = "заголовок шага не по формату «###
 
 @dataclass(frozen=True)
 class Problem:
-    """Одна находка: файл для показа, строка (1-based; 0 — весь файл) и текст."""
+    """Одна находка: файл для показа, строка (1-based; 0 — весь файл), текст и шаг.
+
+    *step* — шаг, к которому относится находка: по нему панель даёт переход к шагу.
+    Пустая строка значит «ко всему файлу» (имя файла, регулярка, разделы).
+    """
 
     file: str
     line: int
     text: str
+    step: str = ""
 
     def __str__(self) -> str:
         return f"{self.file}:{self.line}: {self.text}" if self.line else f"{self.file}: {self.text}"
@@ -201,11 +206,11 @@ def _bullet_problems(shown: str, sid: str, line: int,
     gates = [b for b in blocks if b[0].startswith(("тест", "гейт", "проверк"))]
     out: list[Problem] = []
     if not files:
-        out.append(Problem(shown, line, f"шаг {sid}: нет пункта «Файл:»"))
+        out.append(Problem(shown, line, f"шаг {sid}: нет пункта «Файл:»", sid))
     if not gates:
-        out.append(Problem(shown, line, f"шаг {sid}: нет пункта «Гейты:»"))
+        out.append(Problem(shown, line, f"шаг {sid}: нет пункта «Гейты:»", sid))
     elif all(b[1].strip() in _EMPTY_GATES for b in gates):
-        out.append(Problem(shown, line, f"шаг {sid}: гейты пустые"))
+        out.append(Problem(shown, line, f"шаг {sid}: гейты пустые", sid))
     ready = False
     for _label, _text, full in blocks:
         m = _READY_RE.search(full)
@@ -213,7 +218,7 @@ def _bullet_problems(shown: str, sid: str, line: int,
             ready = True
             break
     if not ready:
-        out.append(Problem(shown, line, f"шаг {sid}: нет критерия «Готово =»"))
+        out.append(Problem(shown, line, f"шаг {sid}: нет критерия «Готово =»", sid))
     return out
 
 
@@ -252,18 +257,20 @@ def _journal_problems(shown: str, lines: list[str], rows: list[int],
             continue
         if cells and cells[0].lower() in ("дата", "date"):
             continue
+        # Шаг вычисляется до проверки колонок: находка «строка журнала» тоже знает шаг,
+        # а панель даёт по нему переход. Строка без шага остаётся без него.
+        sid = _row_step(cells, step_regex)
         if len(cells) != JOURNAL_COLUMNS:
             problems.append(Problem(shown, i + 1,
                                     f"строка журнала без {JOURNAL_COLUMNS} колонок "
-                                    f"(нашлось {len(cells)})"))
-        sid = _row_step(cells, step_regex)
+                                    f"(нашлось {len(cells)})", sid or ""))
         if sid is None:
             problems.append(Problem(shown, i + 1, "строка журнала без шага во второй колонке"))
             continue
         if len(cells) < JOURNAL_COLUMNS:
             continue
         if sid in steps:
-            problems.append(Problem(shown, i + 1, f"шаг {sid} повторяется в журнале"))
+            problems.append(Problem(shown, i + 1, f"шаг {sid} повторяется в журнале", sid))
             continue
         steps[sid] = i + 1
     return problems, steps
@@ -328,7 +335,7 @@ def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
         body_end = _span_end(inside, pos, end)
         problems.extend(_bullet_problems(shown, sid, idx + 1, lines[idx + 1:body_end]))
         if sid in steps:
-            problems.append(Problem(shown, idx + 1, f"шаг {sid} повторяется в разделе шагов"))
+            problems.append(Problem(shown, idx + 1, f"шаг {sid} повторяется в разделе шагов", sid))
             continue
         steps[sid] = idx + 1
 
@@ -344,10 +351,10 @@ def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
 
     for sid, line in steps.items():
         if sid not in journal_steps:
-            problems.append(Problem(shown, line, f"шаг {sid} есть только в разделе шагов"))
+            problems.append(Problem(shown, line, f"шаг {sid} есть только в разделе шагов", sid))
     for sid, line in journal_steps.items():
         if sid not in steps:
-            problems.append(Problem(shown, line, f"шаг {sid} есть только в журнале"))
+            problems.append(Problem(shown, line, f"шаг {sid} есть только в журнале", sid))
     return problems
 
 

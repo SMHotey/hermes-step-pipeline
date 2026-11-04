@@ -9,6 +9,8 @@
     GET  /api/step         экран шага: контракт из плана, постановка, отчёт ревью,
                            `git show` коммита шага, карточки шага (?plan=<N>&id=<S>)
     GET  /api/file         текст файла проекта, только внутри корня (?path=<...>)
+    GET  /api/checks       проверки: doctor и линтер планов (?refresh=1 — перепроверить,
+                           ?plan=<N> — только один план); действий не выполняют
     GET  /api/setup        мастер установки: шаги, следующий шаг, значения формы (без токена)
     POST /api/setup        один шаг мастера: {"step": ..., "values": {...}},
                            заголовок X-Pipeline-Panel; токен уходит в .env профиля
@@ -35,10 +37,14 @@ from urllib.parse import unquote
 import urllib.request
 
 try:
+    from . import doctor
+    from . import plan_lint
     from . import plan_mode
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
 except ImportError:  # pragma: no cover
+    import doctor  # type: ignore
+    import plan_lint  # type: ignore
     import plan_mode  # type: ignore
     import project as proj  # type: ignore
     import setup_flow  # type: ignore
@@ -135,6 +141,9 @@ class State:
         self.log: deque[str] = deque(maxlen=200)
         self.cache: dict[str, Any] = {}
         self.lock = threading.Lock()
+        # Проверки (план 3 S5): последний результат и признак «проверка идёт».
+        self.checks: dict[str, Any] | None = None
+        self.checks_lock = threading.Lock()
 
     def note(self, text: str) -> None:
         with self.lock:
@@ -282,6 +291,79 @@ def set_plan_mode(state: State, on: bool) -> dict:
             "changed_at": payload["changed_at"]}
 
 
+# ───────────────────────────── проверки в панели (план 3 S5) ─────────────────────────────
+
+def _blank_checks() -> dict:
+    """Пустая форма проверок: «не проверяли» отличается от «проверено, чисто»."""
+    return {"ok": True, "checked_at": "", "busy": False, "critical": None,
+            "notes": [], "problems": [], "lint": {"files": 0, "problems": []}}
+
+
+def plan_id_of(file: str) -> str:
+    """Номер плана из имени файла находки (`docs/plans/3-panel.md` → `3`).
+
+    Регулярка берётся у линтера, чтобы имя считалось ровно так же, как при поиске плана.
+    """
+    match = plan_lint._PLAN_NUM_RE.match(Path(str(file)).name)
+    return str(int(match.group(1))) if match else ""
+
+
+def collect_checks(state: State, plan: str = "") -> dict:
+    """Проверки панели: doctor без своего линтера плюс структурный линтер планов.
+
+    Действий конвейера здесь нет и файлов проект не получает. Движок запускается только
+    на чтение — снимок для строки «решение стража» (как в `hermes pipeline doctor`).
+    """
+    report = doctor.collect(state.project, plan, with_lint=False,
+                            preview=state.preview, board=state.board or "")
+    lint = plan_lint.lint_project(state.project, plan)
+    findings = [{"plan": plan_id_of(problem.file), "step": problem.step,
+                 "file": problem.file, "line": problem.line, "text": problem.text}
+                for problem in lint.problems]
+    return {"ok": True, "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "busy": False,
+            "critical": len(report.problems) + len(findings),
+            "notes": list(report.notes), "problems": list(report.problems),
+            "lint": {"files": len(lint.files), "problems": findings}}
+
+
+def checks(state: State, plan: str = "", refresh: bool = False) -> dict:
+    """Результат проверок; *refresh* запускает их заново.
+
+    Пока проверка идёт, вторая не начинается: ответ помечается `busy: true` и несёт
+    прежние данные — панель не плодит параллельные прогоны на каждый кадр.
+    """
+    if not refresh:
+        payload = dict(state.checks) if state.checks else _blank_checks()
+        payload["busy"] = state.checks_lock.locked()
+        return payload
+    if not state.checks_lock.acquire(blocking=False):
+        payload = dict(state.checks) if state.checks else _blank_checks()
+        payload["busy"] = True
+        return payload
+    try:
+        try:
+            payload = collect_checks(state, plan)
+        except Exception as exc:                                # noqa: BLE001
+            # Панель показывает отказ, а не пустоту: иначе «проверено, чисто» соврёт.
+            previous = dict(state.checks) if state.checks else _blank_checks()
+            text = f"проверка не удалась: {type(exc).__name__}: {exc}"
+            state.note(text)
+            previous["problems"] = [text]
+            previous["busy"] = False
+            payload = previous
+        state.checks = payload
+    finally:
+        state.checks_lock.release()
+    return dict(payload)
+
+
+def checks_summary(state: State) -> dict:
+    """Короткая форма проверок для бейджа в шапке: без списков."""
+    payload = checks(state)
+    return {"critical": payload.get("critical"), "found": bool(payload.get("checked_at")),
+            "checked_at": payload.get("checked_at") or "", "busy": payload.get("busy")}
+
+
 ACTIONS = {
     "tick": act_tick,
     "stop": act_stop,
@@ -408,6 +490,11 @@ class Handler(BaseHTTPRequestHandler):
         """Тело ответа `/api/snapshot`: снимок + журнал сервера + режим планировщика + ok."""
         data = snap.snapshot(self.state.project, plan, preview=self.state.preview,
                              board=self.state.board)
+        # Короткая форма проверок для бейджа: прогон запускает вкладка «Проверки», здесь
+        # только то, что уже посчитано (или «не проверяли»). overview копируется, иначе
+        # правка ушла бы в кэш снимка.
+        data["overview"] = dict(data.get("overview") or {})
+        data["overview"]["checks"] = checks_summary(self.state)
         data["log"] = self.state.tail()
         data["plan_mode"] = plan_mode.read_mode(self.state.project)
         data["ok"] = True
@@ -495,6 +582,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/file":
             self._get_file()
             return
+        if path == "/api/checks":
+            self._get_checks()
+            return
         if path == "/api/setup":
             self._get_setup()
             return
@@ -549,6 +639,26 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             return
         self._json(200, {"ok": True, **data})
+
+    # ── проверки (план 3 S5) ──
+    def _get_checks(self) -> None:
+        """Проверки: doctor и линтер планов. Действий не выполняют, файлов не пишут.
+
+        `?refresh=1` — перепроверить; без него отдаётся последний результат или пустой
+        вид «не проверяли» (`checked_at: ""`).
+        """
+        if not self._local_only():
+            self._json(403, {"ok": False, "error": "только localhost"})
+            return
+        query = self._query()
+        plan = str(query.get("plan") or "").strip()
+        refresh = str(query.get("refresh") or "") not in ("", "0", "false", "no")
+        try:
+            data = checks(self.state, plan, refresh=refresh)
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        self._json(200, data)
 
     # ── мастер установки (план 3 S4) ──
     def _get_setup(self) -> None:

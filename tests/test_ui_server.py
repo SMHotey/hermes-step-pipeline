@@ -939,3 +939,186 @@ def test_events_frame_carries_ui_version(server):
             break
     assert frame is not None, chunk[:300]
     assert frame["version"] == ui_server.plugin_version()
+
+
+# ───────────────────────── проверки в панели (план 3 S5) ─────────────────────────
+
+BROKEN_PLAN = """# 3. Кривой план
+
+## Шаги
+
+### S1. Шаг без критерия готовности (1 дн)
+
+- Файл: `app/x.py`
+- Тесты/гейты: `python -m pytest tests/test_x.py -q` → 1 passed
+
+## Журнал выполнения
+
+| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |
+|---|---|---|---|---|
+| — | S1 | — | — | открыт |
+"""
+
+
+def _line_of(text: str, needle: str) -> int:
+    for number, line in enumerate(text.splitlines(), 1):
+        if needle in line:
+            return number
+    raise AssertionError(f"в тексте нет строки с {needle!r}")
+
+
+def test_checks_start_in_not_checked_state(server):
+    """«Не проверяли» — отдельное состояние, а не пустой список находок."""
+    status, data = get(server["url"] + "/api/checks")
+    assert status == 200 and data["ok"] is True
+    assert data["checked_at"] == "" and data["critical"] is None
+    assert data["busy"] is False
+    assert data["notes"] == [] and data["problems"] == []
+    assert data["lint"] == {"files": 0, "problems": []}
+
+
+def test_checks_refresh_reports_line_plan_and_step(server):
+    """Находка линтера приходит с номером строки, планом и шагом — для перехода."""
+    root = server["root"]
+    (root / "docs" / "plans" / "3-broken.md").write_text(BROKEN_PLAN, encoding="utf-8")
+    status, data = get(server["url"] + "/api/checks?refresh=1")
+    assert status == 200 and data["ok"] is True
+    assert data["checked_at"] and data["busy"] is False
+    findings = data["lint"]["problems"]
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["file"] == "docs/plans/3-broken.md"
+    assert finding["plan"] == "3" and finding["step"] == "S1"
+    assert finding["line"] == _line_of(BROKEN_PLAN, "### S1. Шаг без критерия")
+    assert "нет критерия «Готово =»" in finding["text"]
+    # Критичные = проблемы доктора (здесь их заведомо больше нуля) + находки линтера.
+    assert data["critical"] == len(data["problems"]) + len(findings) > 0
+    # Доктор сюда свой линтер не подмешивает: находки живут в одном месте.
+    assert not any("Готово" in problem for problem in data["problems"])
+
+    # Ограничение одним планом: у чистого плана 1 находок нет.
+    scoped = get(server["url"] + "/api/checks?refresh=1&plan=1")[1]
+    assert scoped["lint"]["files"] == 1 and scoped["lint"]["problems"] == []
+
+
+def test_checks_never_expose_bot_token(server, monkeypatch, tmp_path):
+    """Отказ Telegram идёт в панель как текст, но токен в ответ не попадает."""
+    token = "123456:AAzz-secret-token"
+    profiles = tmp_path / "profiles"
+    monkeypatch.setattr(project, "profile_dir", lambda name: profiles / name)
+    env = profiles / "demo" / ".env"
+    env.parent.mkdir(parents=True, exist_ok=True)
+    env.write_text("STEP_PIPELINE_TELEGRAM_BOT_TOKEN=" + token + "\n"
+                   "STEP_PIPELINE_TELEGRAM_CHAT_ID=42\n", encoding="utf-8")
+
+    def boom(_token):
+        raise ui_server.telegram.TelegramError("сеть недоступна: таймаут")
+
+    monkeypatch.setattr(ui_server.telegram, "get_me", boom)
+    status, _headers, body = get_raw(server["url"] + "/api/checks?refresh=1")
+    assert status == 200
+    assert token.encode("utf-8") not in body
+    data = json.loads(body.decode("utf-8"))
+    assert any(problem.startswith("Telegram:") for problem in data["problems"])
+
+
+def test_checks_perform_no_actions_and_write_no_files(server, monkeypatch):
+    """Проверки — только чтение: ни одного действия и ни одного нового файла.
+
+    Читающие запуски движка (снимок для строки «решение стража») допустимы — это
+    `gate.py --plans/--status/next_step.py --json`. Запрещены действия.
+    """
+    root = server["root"]
+
+    def tree() -> list[str]:
+        # `__pycache__` — след самого python у движка, а не запись проекта.
+        return sorted(path.relative_to(root).as_posix() for path in root.rglob("*")
+                      if "__pycache__" not in path.parts and path.suffix != ".pyc")
+
+    calls = engine_counter(monkeypatch)
+    before = tree()
+    status, data = get(server["url"] + "/api/checks?refresh=1")
+    after = tree()
+    assert status == 200 and data["ok"] is True
+    mutating = ["--run", "--stop", "--resume", "--hold", "--unhold", "--approve",
+                "--resume"]
+    assert not [call for call in calls
+                if any(str(arg) in mutating for arg in call[2:])]
+    assert before == after
+
+
+def test_checks_refresh_does_not_start_second_run(server, monkeypatch):
+    """Пока проверка идёт, повторный запрос возвращает busy и прежние данные."""
+    started: list[str] = []
+
+    def slow(state, plan=""):
+        started.append(plan)
+        payload = ui_server._blank_checks()
+        payload["checked_at"] = "2026-11-04T10:00:00"
+        return payload
+
+    monkeypatch.setattr(ui_server, "collect_checks", slow)
+    state = server["state"]
+    assert state.checks_lock.acquire(blocking=False)
+    try:
+        status, data = get(server["url"] + "/api/checks?refresh=1")
+    finally:
+        state.checks_lock.release()
+    assert status == 200 and data["busy"] is True
+    assert started == [], "второй прогон поверх идущего не запускается"
+
+
+def test_checks_failure_is_visible_instead_of_empty(server, monkeypatch):
+    """Отказ проверки виден как проблема, а не как «проверено, чисто»."""
+    def boom(state, plan=""):
+        raise RuntimeError("диск отвалился")
+
+    monkeypatch.setattr(ui_server, "collect_checks", boom)
+    status, data = get(server["url"] + "/api/checks?refresh=1")
+    assert status == 200 and data["ok"] is True
+    assert data["problems"] == ["проверка не удалась: RuntimeError: диск отвалился"]
+    assert data["critical"] is None and data["busy"] is False
+    assert any("проверка не удалась" in line for line in server["state"].tail())
+
+
+def test_snapshot_carries_checks_summary_for_badge(server):
+    """Бейдж в шапке берёт короткую форму из снимка: до проверки — «не проверяли»."""
+    _, before = get(server["url"] + "/api/snapshot")
+    assert before["overview"]["checks"] == {"critical": None, "found": False,
+                                            "checked_at": "", "busy": False}
+    get(server["url"] + "/api/checks?refresh=1")
+    _, after = get(server["url"] + "/api/snapshot")
+    summary = after["overview"]["checks"]
+    assert summary["found"] is True and summary["critical"] > 0
+    assert set(summary) == {"critical", "found", "checked_at", "busy"}
+
+
+def test_checks_work_in_preview_and_create_nothing(tmp_path: Path, hermes_stub: Path):
+    """Предпросмотр: вкладка проверок работает и ничего не пишет в проект."""
+    root = tmp_path / "bare"
+    (root / "docs" / "plans").mkdir(parents=True)
+    (root / "docs" / "plans" / "7-real.md").write_text(BROKEN_PLAN.replace("# 3.", "# 7."),
+                                                       encoding="utf-8")
+    httpd = ui_server.make_server(root, port=0, preview=True)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        status, data = get(url + "/api/checks?refresh=1")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert status == 200 and data["ok"] is True
+    assert data["notes"], "доктор обязан отчитаться даже без установленного конвейера"
+    assert data["critical"] and data["critical"] > 0
+    assert not (root / ".pipeline").exists()
+    assert not (root / "pipeline.json").exists()
+
+
+def test_index_has_checks_tab_markup():
+    """Вкладка «Проверки»: кнопка, пустой вид, находки со ссылкой на шаг."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    for anchor in ('data-tab="checks"', 'id="tab-checks"', "/api/checks", "refresh=1",
+                   'id="btn-checks"', 'id="checks-clean"', 'id="checks-lint"',
+                   'id="checks-lint-note"', 'id="checks-notes"', "renderChecks(data)",
+                   "gotoSighting", "ov.checks", "не проверяли"):
+        assert anchor in html

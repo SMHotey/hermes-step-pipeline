@@ -11,14 +11,14 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from . import doctor
     from . import plan_accept
-    from . import plan_lint
     from . import plan_mode
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
 except ImportError:  # pragma: no cover - отладка файлом
+    import doctor  # type: ignore
     import plan_accept  # type: ignore
-    import plan_lint  # type: ignore
     import plan_mode  # type: ignore
     import project as proj  # type: ignore
     import setup_flow  # type: ignore
@@ -256,113 +256,9 @@ def cmd_ui(args) -> int:
 
 def cmd_doctor(args) -> int:
     project = _project(args.project)
-    problems: list[str] = []
-    notes: list[str] = []
-    cfg = proj.read_config(project)
-    notes.append(f"проект {project}")
-    notes.append(f"борда {cfg.get('board')}")
-    try:
-        proj.engine(project, "gate.py")
-        notes.append("движок .pipeline/gate.py на месте")
-    except proj.ProjectNotFound as exc:
-        problems.append(str(exc))
-    plans = sorted((project / "docs" / "plans").glob("*.md"))
-    notes.append(f"файлов планов: {len(plans)}")
-    # Линтер формата: неверный план должен быть виден до запуска, а не через сутки простоя.
-    lint = plan_lint.lint_project(project, getattr(args, "plan", "") or "")
-    if lint.problems:
-        for problem in lint.problems:
-            problems.append(f"план {problem}")
-    elif getattr(args, "plan", ""):
-        notes.append(f"планы: линтер проверил только план «{args.plan}», проблем нет")
-    else:
-        notes.append(f"планы: линтер — файлов {len(lint.files)}, проблем нет")
-    engine_ver = setup_flow.engine_version(project)
-    plugin_ver = setup_flow.plugin_version()
-    if engine_ver and engine_ver != plugin_ver:
-        problems.append(f"движок {engine_ver} старее плагина {plugin_ver} — "
-                        f"hermes pipeline setup --upgrade")
-    elif engine_ver:
-        notes.append(f"версия движка: {engine_ver}")
-    elif (project / ".pipeline").is_dir():
-        notes.append("у движка нет маркера версии — поставь через setup")
-    if not plans:
-        notes.append("! ни одного плана — конвейеру нечего вести")
-    db = proj.board_db(project)
-    notes.append(f"борда БД: {db} ({'есть' if db.is_file() else 'НЕТ'})")
-    if not db.is_file():
-        problems.append("нет sqlite борды — карточки не создадутся (проверь --board)")
-    roles = setup_flow.roles_from_config(cfg)
-    driver = roles[0]
-    # Доверие проверяем чтением конфига профиля: `skills trust` с путём ПИШЕТ в него.
-    untrusted = [role for role in roles if not setup_flow.is_project_trusted(role, project)]
-    for role in untrusted:
-        problems.append(f'доверие ({role}): проект не доверен этому профилю — '
-                        f'hermes -p {role} skills trust "{project}"')
-    if not untrusted:
-        notes.append(f"доверие: проект доверен всем ролям ({', '.join(roles)})")
-    # Ключ должен быть сохранён в профиле: под демоном шлюза запись `env:*` выпадает
-    # из ротации (`No usable credentials found for provider`), а в интерактивной
-    # сессии та же запись работает — зелёная установка с мёртвым конвейером.
-    no_key: list[tuple[str, str]] = []
-    for role in roles:
-        saved, provider = setup_flow.has_saved_credential(role)
-        if not saved:
-            no_key.append((role, provider))
-    for role, provider in no_key:
-        if provider:
-            problems.append(f"ключ ({role}): в профиле нет сохранённого ключа провайдера "
-                            f"{provider} — hermes -p {role} auth add {provider} --type api-key")
-        else:
-            problems.append(f"ключ ({role}): в профиле нет сохранённого ключа — "
-                            f"провайдер не определён, hermes -p {role} auth list")
-    if not no_key:
-        notes.append(f"ключи: сохранённый ключ провайдера есть у всех ролей "
-                     f"({', '.join(roles)})")
-    env_file = proj.profile_dir(driver) / ".env"
-    token = chat = ""
-    if env_file.is_file():
-        for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("STEP_PIPELINE_TELEGRAM_BOT_TOKEN="):
-                token = line.split("=", 1)[1]
-            elif line.startswith("STEP_PIPELINE_TELEGRAM_CHAT_ID="):
-                chat = line.split("=", 1)[1]
-    if token and chat:
-        try:
-            me = telegram.get_me(token)
-            notes.append(f"Telegram: @{me.get('username')} → {chat}")
-        except telegram.TelegramError as exc:
-            problems.append(f"Telegram: {exc}")
-    else:
-        notes.append("Telegram: не настроен")
-    cron = proj.run_hermes("-p", driver, "cron", "list")
-    marker = project / ".pipeline" / "cron.json"
-    job_name = "План: страж шага (конвейер)"
-    if marker.is_file():
-        try:
-            info = json.loads(marker.read_text(encoding="utf-8"))
-            job_name = info.get("name") or job_name
-            driver = info.get("driver") or driver
-        except (OSError, json.JSONDecodeError):
-            pass
-        if job_name in (cron.stdout or ""):
-            notes.append(f"cron-джоба стража: есть ({job_name}, профиль {driver})")
-        else:
-            problems.append(f"cron-джоба «{job_name}» не найдена у профиля {driver} — "
-                            f"конвейер не будет двигаться сам")
-    else:
-        problems.append("cron для этого проекта не заводился — "
-                        "конвейер работает только по кнопке «Тик»")
-    status = snap.snapshot(project)
-    decision = status.get("decision") or {}
-    notes.append(f"решение стража: {decision.get('action')} — {decision.get('reason')}")
-    print("Диагностика конвейера:")
-    for note in notes:
-        print(f"  · {note}")
-    for problem in problems:
-        print(f"  ✗ {problem}")
-    print("\nИТОГ:", "OK" if not problems else "ЕСТЬ ПРОБЛЕМЫ")
-    return 0 if not problems else 1
+    report = doctor.collect(project, getattr(args, "plan", "") or "")
+    print(doctor.format_report(report))
+    return 0 if not report.problems else 1
 
 
 def cmd_notify_test(args) -> int:

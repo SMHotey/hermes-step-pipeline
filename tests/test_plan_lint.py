@@ -193,6 +193,36 @@ def test_step_requires_file_and_nonempty_gates(project: Path):
     assert "гейты пустые" in texts
 
 
+def test_problem_carries_step_for_panel_navigation(project: Path):
+    """Находка знает свой шаг: по нему панель даёт переход к шагу (шаг 3-S5)."""
+    (project / "docs" / "plans" / "2-broken.md").write_text(BROKEN, encoding="utf-8")
+    broken = plan_lint.lint_project(project, "2").problems
+    assert sorted(problem.step for problem in broken) == ["S1", "S2"]
+
+    # Строка журнала без колонок тоже знает шаг: он лежит во второй колонке.
+    text = """# 3. Короткий журнал
+
+## Шаги
+
+### S1. Шаг с нормальным описанием (0.5 дн)
+
+- Файл: `app/x.py`
+- Тесты/гейты: `python -m pytest tests/test_x.py -q` → 1 passed
+- Готово = шаг описан
+
+""" + JOURNAL_TAIL + "| — | S1 | — | открыт |\n"
+    (project / "docs" / "plans" / "3-short.md").write_text(text, encoding="utf-8")
+    short = plan_lint.lint_project(project, "3").problems
+    columns = [problem for problem in short if "колонок" in problem.text]
+    assert len(columns) == 1 and columns[0].step == "S1"
+
+    # Находки уровня файла шага не знают: переходить по ним некуда.
+    (project / "docs" / "plans" / "plans.md").write_text(helpers.PLAN, encoding="utf-8")
+    file_level = [problem for problem in plan_lint.lint_project(project, "").problems
+                  if "номер-слаг" in problem.text]
+    assert len(file_level) == 1 and file_level[0].step == ""
+
+
 def test_doctor_plan_flag_reports_lint_problems_and_exits_1(project: Path,
                                                            monkeypatch, capsys,
                                                            tmp_path: Path):
