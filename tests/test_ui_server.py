@@ -2310,3 +2310,237 @@ def test_runs_history_marks_timeout_and_quota(server):
     assert attempts[1]["label"] == "квота провайдера"
     assert "лимит 2 ч" in attempts[0]["output"]
     assert "429" in attempts[1]["output"]
+
+
+# ───────────────────────── уведомления (план 3 S10) ─────────────────────────
+# Всё на tmp-проектах и tmp-реестре фикстур: сеть и Telegram подменяются, всплывающее
+# окно проверяется разметкой страницы — настоящий браузер тесту не нужен.
+
+NOTIFY_DEFAULT = ["step_started", "step_closed", "changes_requested", "plan_stopped",
+                  "card_crashed", "card_timed_out", "card_rate_limited"]
+NOTIFY_ALL = NOTIFY_DEFAULT + ["tick_action", "plan_idle"]
+
+
+def notify_registry(home: Path, entries: list[dict], global_enabled: bool = True) -> Path:
+    """Реестр с глобальным выключателем: контейнер `notify` плюс записи проектов (§4.1)."""
+    path = home / "projects.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"notify": {"enabled": global_enabled}, "projects": entries},
+                               ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def test_notify_off_by_default(tmp_path: Path, hermes_stub: Path,
+                               isolated_hermes_home: Path):
+    """Свежий реестр: выключено у всех, девять видов, событий нет (D1, D2)."""
+    root = install_project(tmp_path / "alpha", board="uiboard")
+    with running(root) as (url, _httpd):
+        status, data = get(url + "/api/notify")
+        assert status == 200 and data["ok"] is True
+        # Ключа `notify` нет — это «выключено», а не «включено по умолчанию».
+        assert data["global"]["enabled"] is False
+        assert [kind["id"] for kind in data["kinds"]] == NOTIFY_ALL
+        assert data["projects"] and all(row["enabled"] is False for row in data["projects"])
+        for row in data["projects"]:
+            assert row["events"] == NOTIFY_DEFAULT
+        snap_status, snap_data = get(url + "/api/snapshot?plan=1")
+    assert snap_status == 200
+    assert snap_data["notify"]["enabled"] is False
+    assert snap_data["notify"]["global_enabled"] is False
+    assert snap_data["notify"]["events"] == []
+    html = index_html()
+    for anchor in ('id="tab-btn-notify"', 'data-tab="notify"', 'id="tab-notify"',
+                   "Notification.requestPermission", '"granted"',
+                   "только когда вкладка"):
+        assert anchor in html, anchor
+
+
+def test_notify_settings_persist(tmp_path: Path, hermes_stub: Path,
+                                 isolated_hermes_home: Path):
+    """POST по проекту реестра пишется в файл и переживает перезапуск сервера (D1)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    beta = install_project(tmp_path / "beta", board="uiboard")
+    write_registry(isolated_hermes_home,
+                   [{"id": "beta", "name": "Бета", "root": str(beta)}])
+    with running(alpha) as (url, _httpd):
+        status, data = post_to(url, "/api/notify",
+                               {"project": "beta", "enabled": True,
+                                "events": ["step_closed"]})
+    assert status == 200 and data["ok"] is True
+    saved = json.loads((isolated_hermes_home / "projects.json").read_text(encoding="utf-8"))
+    assert saved["projects"][0]["notify"]["enabled"] is True
+    assert saved["projects"][0]["notify"]["events"] == ["step_closed"]
+    # Файл читается заново при старте: настройка не живёт в памяти сервера.
+    with running(alpha) as (url, _httpd):
+        status, data = get(url + "/api/notify")
+    assert status == 200
+    rows = {row["id"]: row for row in data["projects"]}
+    assert rows["beta"]["enabled"] is True
+    assert rows["beta"]["events"] == ["step_closed"]
+    assert rows["alpha"]["enabled"] is False
+
+
+def test_notify_settings_atomic_and_keeps_unknown_fields(tmp_path: Path, hermes_stub: Path,
+                                                         isolated_hermes_home: Path):
+    """Чужие ключи целы, битый реестр — отказ без записи и объяснение на экране (D2)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    beta = install_project(tmp_path / "beta", board="uiboard")
+    path = isolated_hermes_home / "projects.json"
+    path.write_text(json.dumps({"panel": {"theme": "dark"},
+                                "projects": [{"id": "beta", "name": "Бета",
+                                              "root": str(beta), "custom": 42}]},
+                               ensure_ascii=False), encoding="utf-8")
+    with running(alpha) as (url, _httpd):
+        status, data = post_to(url, "/api/notify", {"project": "beta", "enabled": True})
+    assert status == 200 and data["ok"] is True
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["panel"] == {"theme": "dark"}
+    assert saved["projects"][0]["custom"] == 42
+    assert saved["projects"][0]["name"] == "Бета"
+    assert saved["projects"][0]["notify"] == {"enabled": True, "events": NOTIFY_DEFAULT}
+
+    # Одна опечатка в файле не должна стоить всех записей реестра.
+    path.write_text('{"', encoding="utf-8")
+    before = path.read_bytes()
+    with running(alpha) as (url, _httpd):
+        bad_status, bad = post_to(url, "/api/notify", {"project": "beta", "enabled": False})
+        ok_status, listing = get(url + "/api/notify")
+    assert bad_status == 400 and "реестр" in bad["error"]
+    assert path.read_bytes() == before
+    assert ok_status == 200
+    assert listing["error"] and "реестр" in listing["error"]
+    assert listing["global"]["enabled"] is False
+
+
+def test_event_kinds_filter_by_project(tmp_path: Path, hermes_stub: Path,
+                                       isolated_hermes_home: Path):
+    """Галочки одного проекта не протекают в соседний: фильтр по видам (§4.2)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    beta = install_project(tmp_path / "beta", board="uiboard")
+    notify_registry(isolated_hermes_home, [
+        {"id": "alpha", "name": "Альфа", "root": str(alpha),
+         "notify": {"enabled": True, "events": ["step_closed"]}},
+        {"id": "beta", "name": "Бета", "root": str(beta),
+         "notify": {"enabled": True, "events": NOTIFY_ALL}},
+    ])
+    now = int(time.time())
+    for root in (alpha, beta):
+        write_history({"root": root}, [
+            {"ts": now - 60, "plan": "1", "step": "S1", "action": "close_step",
+             "detail": "шаг 1-S1 закрыт", "commit": "abc1234"},
+            {"ts": now - 30, "plan": "1", "step": "S2", "action": "create_fix",
+             "detail": "правки 1-S2", "commit": ""},
+        ])
+    with running(alpha) as (url, _httpd):
+        a_status, a_data = get(url + "/api/snapshot?plan=1&project=alpha")
+        b_status, b_data = get(url + "/api/snapshot?plan=1&project=beta")
+    assert a_status == 200 and b_status == 200
+    assert a_data["notify"]["enabled"] is True
+    assert [event["kind"] for event in a_data["notify"]["events"]] == ["step_closed"]
+    assert {event["kind"] for event in b_data["notify"]["events"]} == {
+        "step_closed", "changes_requested"}
+
+
+def test_event_dedup_window(tmp_path: Path, hermes_stub: Path,
+                            isolated_hermes_home: Path):
+    """Три одинаковые попытки — одно событие: ключ «проект+план+шаг+вид» (D4)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    notify_registry(isolated_hermes_home, [
+        {"id": "alpha", "name": "Альфа", "root": str(alpha),
+         "notify": {"enabled": True, "events": NOTIFY_ALL}}])
+    now = int(time.time())
+    card = add_step_card(hermes_stub, "planloop:1:S1:step", "demo", now - 600)
+    add_runs(hermes_stub, card, [
+        {"started_at": now - 500, "ended_at": now - 490, "outcome": "rate_limited"},
+        {"started_at": now - 400, "ended_at": now - 390, "outcome": "rate_limited"},
+        {"started_at": now - 300, "ended_at": now - 290, "outcome": "rate_limited"},
+    ])
+    snapshot.clear_cache()
+    with running(alpha) as (url, _httpd):
+        status, data = get(url + "/api/snapshot?plan=1")
+    assert status == 200
+    events = [event for event in data["notify"]["events"]
+              if event["kind"] == "card_rate_limited"]
+    assert len(events) == 1
+    assert events[0]["key"].endswith(":card_rate_limited")
+    assert events[0]["card"] == card
+    assert "квот" in events[0]["text"]
+
+
+def test_notify_test_endpoint(tmp_path: Path, hermes_stub: Path,
+                              isolated_hermes_home: Path):
+    """Тестовая кнопка отвечает только браузеру: ни файла истории, ни Telegram (D9)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    history = alpha / ".pipeline" / "state" / ui_server.DELIVERY_FILE
+    with running(alpha) as (url, _httpd):
+        status, data = post_to(url, "/api/notify/test", {"project": "alpha"})
+        list_status, listing = get(url + "/api/notify")
+    assert status == 200 and data["ok"] is True and data["test"] is True
+    assert data["notice"]["test"] is True
+    assert "тест" in data["notice"]["text"].lower()
+    assert data["project"]["id"] == "alpha"
+    assert not history.exists()
+    assert list_status == 200 and listing["deliveries"] == []
+
+
+def test_notify_telegram_mirrors_feed(tmp_path: Path, hermes_stub: Path,
+                                      isolated_hermes_home: Path, monkeypatch):
+    """Одно событие — одно сообщение с префиксом; повтор и выключенный канал молчат (D8)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    notify_registry(isolated_hermes_home, [
+        {"id": "alpha", "name": "Альфа", "root": str(alpha),
+         "notify": {"enabled": True, "events": ["step_closed"]}}])
+    cfg = json.loads((alpha / "pipeline.json").read_text(encoding="utf-8"))
+    cfg["notify"] = {**(cfg.get("notify") or {}), "enabled": True, "prefix": "[3-S1] "}
+    (alpha / "pipeline.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                                        encoding="utf-8")
+    now = int(time.time())
+    write_history({"root": alpha}, [
+        {"ts": now - 60, "plan": "1", "step": "S1", "action": "close_step",
+         "detail": "шаг 1-S1 закрыт", "commit": "abc1234"}])
+    calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(ui_server.telegram, "send_message",
+                        lambda token, chat, text: calls.append((token, chat, text)))
+    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_BOT_TOKEN", "token-тест")
+    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_CHAT_ID", "42")
+
+    state = ui_server.State(alpha, project_id="alpha", name="Альфа")
+    state.notify_primed = True      # кадр прошёл: доставка не первый (D7)
+    feed = ui_server.notify_feed(state, "1")
+    assert len(feed["events"]) == 1
+    event = feed["events"][0]
+    delivered = ui_server.notify_deliver(state, feed)
+    assert len(delivered) == 1 and len(calls) == 1
+    token, chat, text = calls[0]
+    assert (token, chat) == ("token-тест", "42")
+    assert text == "[3-S1] " + event["text"]
+
+    # Тот же ключ повторно не отправляется: отметка живёт в состоянии сервера.
+    assert ui_server.notify_deliver(state, ui_server.notify_feed(state, "1")) == []
+    assert len(calls) == 1
+    rows = (alpha / ".pipeline" / "state" / ui_server.DELIVERY_FILE).read_text(
+        encoding="utf-8").splitlines()
+    assert len(rows) == 1 and "шаг S1 закрыт" in rows[0]
+
+    # Канал без токена: событие есть, вызовов нет.
+    monkeypatch.delenv("STEP_PIPELINE_TELEGRAM_BOT_TOKEN")
+    state.notified.clear()
+    state.notified_project.clear()
+    calls.clear()
+    assert ui_server.notify_deliver(state, ui_server.notify_feed(state, "1")) == []
+    assert calls == []
+
+
+def test_index_notify_screen_markup():
+    """Экран «Уведомления»: выключатель, разрешение браузера, строки, тест и история (§4.4)."""
+    html = index_html()
+    for anchor in ('id="tab-btn-notify"', 'data-tab="notify"', 'id="tab-notify"',
+                   'id="notify-master"', 'id="notify-permission"', 'id="notify-note"',
+                   'id="notify-projects"', 'id="notify-test"', 'id="notify-events"',
+                   'id="notify-history"', "Notification.requestPermission",
+                   "Notification.permission", "data.notify", "/api/notify/test",
+                   "X-Pipeline-Panel"):
+        assert anchor in html, anchor
+    # Виды внимания приходят с сервера: страница не держит свой список галочек.
+    assert "kind.label" in html
+    assert "/api/notify" in html

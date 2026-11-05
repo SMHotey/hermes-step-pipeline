@@ -171,6 +171,117 @@ def _write_registry(container: dict[str, Any] | None, entries: list) -> None:
                 pass
 
 
+# ─── уведомления панели (план 3 S10): настройки в реестре, а не в pipeline.json ───
+# Два `notify` в проекте — разные вещи: `pipeline.json notify` описывает канал Telegram
+# (токен, чат, префикс), `projects.json notify` — что и куда шлёт панель. Держим их
+# порознь, чтобы правка настроек панели не уезжала в поставку проекта.
+NOTIFY_KEY = "notify"
+
+# Девять видов внимания: порядок задаёт и порядок галочек на экране, и порядок в файле.
+NOTIFY_KINDS = ("step_started", "step_closed", "changes_requested", "plan_stopped",
+                "card_crashed", "card_timed_out", "card_rate_limited", "tick_action",
+                "plan_idle")
+
+# Набор по умолчанию при включении проекта: семь «внимательных» видов. `tick_action` и
+# `plan_idle` шумят на каждом тике и простое, поэтому включаются только вручную.
+NOTIFY_DEFAULT_EVENTS = ("step_started", "step_closed", "changes_requested", "plan_stopped",
+                         "card_crashed", "card_timed_out", "card_rate_limited")
+
+
+def _notify_events(raw) -> list[str]:
+    """Набор видов из файла: неизвестные id отбрасываются, порядок — как в `NOTIFY_KINDS`.
+
+    Не список и не кортеж — набор по умолчанию: угадывать смысл чужого значения нельзя.
+    """
+    if not isinstance(raw, (list, tuple, set)):
+        return list(NOTIFY_DEFAULT_EVENTS)
+    wanted = {str(item) for item in raw}
+    return [kind for kind in NOTIFY_KINDS if kind in wanted]
+
+
+def read_notify() -> dict[str, Any]:
+    """Настройки уведомлений из реестра: глобальный переключатель и записи проектов.
+
+    Битый файл не роняет панель: `error` объясняет причину, дальше — «всё выключено».
+    Отсутствие ключа `notify` — это «выключено», а не «включено по умолчанию»:
+    разрешение на всплывающие окна даёт пользователь, а не файл.
+    """
+    out: dict[str, Any] = {"global": False, "projects": {}, "error": ""}
+    try:
+        container, entries = _read_registry_raw()
+    except ValueError as exc:
+        out["error"] = f"файл реестра не разбирается: {exc}"
+        return out
+    if isinstance(container, dict):
+        raw = container.get(NOTIFY_KEY)
+        out["global"] = bool(raw.get("enabled")) if isinstance(raw, dict) else False
+    for _index, item, project_id, _root, _name in _displayed_entries(entries):
+        raw = item.get(NOTIFY_KEY)
+        enabled = bool(raw.get("enabled")) if isinstance(raw, dict) else False
+        events = (_notify_events(raw.get("events"))
+                  if isinstance(raw, dict) and "events" in raw
+                  else list(NOTIFY_DEFAULT_EVENTS))
+        out["projects"][project_id] = {"enabled": enabled, "events": events}
+    return out
+
+
+def write_notify(project_id: str = "", global_enabled: bool | None = None,
+                 enabled: bool | None = None, events: list[str] | None = None) -> dict[str, Any]:
+    """Записать настройки уведомлений — сразу в файл, атомарно (`_write_registry`).
+
+    Правится только ключ `notify`: чужие ключи записи и контейнера остаются как были,
+    иначе панель стирала бы то, чего не понимает. Битая запись — `ValueError`, и тогда
+    файл не трогается вовсе: затирать реестр из-за одной опечатки нельзя.
+    """
+    try:
+        container, entries = _read_registry_raw()
+    except ValueError as exc:
+        # Битый JSON приходит текстом разборщика («Expecting property name…»), а ответ
+        # панели обязан называть файл: иначе пользователь ищет ошибку в конвейере.
+        message = str(exc)
+        raise ValueError(message if "реестр" in message
+                         else f"реестр не разбирается: {message}") from exc
+    if global_enabled is not None:
+        if container is None:
+            raise ValueError("реестр в форме списка: глобальный переключатель некуда писать, "
+                             "добавь контейнер projects")
+        raw = container.get(NOTIFY_KEY)
+        notify = dict(raw) if isinstance(raw, dict) else {}
+        notify["enabled"] = bool(global_enabled)
+        container = {**container, NOTIFY_KEY: notify}
+    changed = ""
+    if project_id:
+        wanted = str(project_id).strip()
+        visible = _displayed_entries(entries)
+        match = next((item for item in visible if item[2] == wanted), None)
+        if match is None:
+            available = ", ".join(item[2] for item in visible) or "—"
+            raise ValueError(f"неизвестный проект: {wanted}; доступные: {available}")
+        index = match[0]
+        entry = {**entries[index]}
+        raw = entry.get(NOTIFY_KEY)
+        notify = dict(raw) if isinstance(raw, dict) else {}
+        if enabled is not None:
+            notify["enabled"] = bool(enabled)
+        elif "enabled" not in notify:
+            notify["enabled"] = False
+        if events is not None:
+            notify["events"] = _notify_events(events)
+        else:
+            notify["events"] = _notify_events(notify.get("events"))
+        entry[NOTIFY_KEY] = notify
+        entries = [*entries[:index], entry, *entries[index + 1:]]
+        changed = wanted
+    if global_enabled is None and not changed:
+        raise ValueError("нечего менять: нужен global_enabled или project")
+    _write_registry(container, entries)
+    state = read_notify()
+    result: dict[str, Any] = {"ok": True, "global": state["global"]}
+    if changed:
+        result["project"] = {"id": changed, **(state["projects"].get(changed) or {})}
+    return result
+
+
 def add_project(root: Path | str, name: str = "") -> dict[str, Any]:
     """Добавить проект в реестр панели: запись `{"id", "name", "root"}` (D1).
 

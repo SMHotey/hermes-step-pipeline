@@ -301,6 +301,8 @@
             aria-selected="false" aria-controls="tab-checks">Проверки</button>
     <button class="tab" data-tab="setup" id="tab-btn-setup" role="tab"
             aria-selected="false" aria-controls="tab-setup">Установка</button>
+    <button class="tab" data-tab="notify" id="tab-btn-notify" role="tab"
+            aria-selected="false" aria-controls="tab-notify">Уведомления</button>
   </nav>
 
   <div class="tab-panel active" id="tab-overview">
@@ -474,6 +476,45 @@
       <div class="ov-reason" id="events-empty">истории ещё нет</div>
       <ul class="events" id="events-rows"><li class="muted">—</li></ul>
     </section>
+  </div>
+  <!-- Уведомления (план 3 S10): мастер-выключатель, таблица проектов реестра и тестовая
+       кнопка. Разрешение на всплывающие окна даёт браузер, а не панель. -->
+  <div class="tab-panel" id="tab-notify">
+    <div class="cols">
+      <div>
+        <section>
+          <h2>Уведомления</h2>
+          <label class="muted"><input type="checkbox" id="notify-master"> Уведомления включены</label>
+          <div class="step-actions">
+            <button id="notify-permission">Разрешить уведомления в браузере</button>
+            <span class="muted" id="notify-permission-state">разрешение: не спрашивали</span>
+          </div>
+          <div class="ov-reason" id="notify-note">уведомления приходят, только когда вкладка
+            панели открыта; при закрытой вкладке события остаются в ленте. Настройки здесь —
+            про панель; <span class="mono">notify</span> в pipeline.json — это канал Telegram
+            (токен, чат, префикс), а не эти галочки.</div>
+          <div class="ov-badge" id="notify-error" hidden></div>
+        </section>
+        <section style="margin-top:16px">
+          <h2>Проекты</h2>
+          <div id="notify-projects"><span class="muted">загрузка…</span></div>
+        </section>
+      </div>
+      <div>
+        <section>
+          <h2>Проверка</h2>
+          <div class="step-actions">
+            <button id="notify-test">Показать тестовое уведомление</button>
+          </div>
+          <h2 style="margin-top:14px">События внимания</h2>
+          <ul class="events" id="notify-events"><li class="muted">—</li></ul>
+        </section>
+        <section style="margin-top:16px">
+          <h2>История доставок</h2>
+          <ul class="events" id="notify-history"><li class="muted">доставок ещё не было</li></ul>
+        </section>
+      </div>
+    </div>
   </div>
   <!-- Проверки (план 3 S5): doctor и линтер всех планов, номера строк, переход к шагу.
        Блоки и id — постановка §4.2: шапка, «не проверяли», «всё в порядке», doctor, линтер. -->
@@ -685,6 +726,9 @@ function switchProject(id) {
   window.__steps = [];
   window.__nextStep = null;
   window.__configLoaded = false;
+  notifyRows = [];
+  seenNotify.clear();
+  for (const key of Object.keys(lastNotifyAt)) delete lastNotifyAt[key];
   if (stream) { stream.close(); stream = null; }
   refresh();
   startEvents();
@@ -1095,6 +1139,10 @@ function showTab(name) {
   if (name === "step") loadStep();
   if (name === "setup") loadSetup();
   if (name === "checks") loadChecks(false);
+  if (name === "notify") {
+    permissionState();
+    loadNotify();
+  }
 }
 
 function fillStepPicker() {
@@ -1578,6 +1626,7 @@ function render(data) {
 
   renderOverview(data);
   renderEvents(data);
+  collectNotify(data.notify);
 
   const plans = data.plans || [];
   $("plans").innerHTML = plans.map((p) => `
@@ -1685,6 +1734,224 @@ async function refresh() {
   }
 }
 
+// ── уведомления (план 3 S10): события внимания из кадра потока ──
+// Настройки (мастер-выключатель и виды по проектам) живут в projects.json и правятся
+// сервером; страница только показывает и сохраняет. Всплытие возможно лишь после
+// разрешения браузера: пока Notification.permission !== "granted", текст уходит в toast,
+// а не в системный уголок — панель не просит разрешение за пользователя.
+const NOTIFY_GAP_MS = 30000;      // не чаще одного всплытия на проект в 30 с
+const NOTIFY_SEEN_LIMIT = 200;    // потолок запомненных ключей страницы
+const NOTIFY_ROW_LIMIT = 50;      // потолок списка событий на вкладке
+let notifyState = null;           // последний ответ /api/notify
+const seenNotify = new Set();     // ключи, о которых страница уже знает
+const lastNotifyAt = {};          // проект → время последнего всплытия
+let notifyRows = [];              // события для вкладки: свежие сверху
+
+function rememberNotify(key) {
+  if (!key) return;
+  seenNotify.add(key);
+  while (seenNotify.size > NOTIFY_SEEN_LIMIT) {
+    // Set помнит порядок вставки: первым уходит самый старый ключ.
+    seenNotify.delete(seenNotify.values().next().value);
+  }
+}
+
+function permissionState() {
+  const el = $("notify-permission-state");
+  if (!el) return;
+  if (!("Notification" in window)) {
+    el.textContent = "разрешение: браузер не поддерживает";
+    return;
+  }
+  const names = {granted: "разрешено", denied: "запрещено", "default": "не спрашивали"};
+  el.textContent = "разрешение: " + (names[Notification.permission] || Notification.permission);
+}
+
+function requestPermission() {
+  if (!("Notification" in window)) {
+    permissionState();
+    return;
+  }
+  // Разрешение спрашивает браузер, а не панель: без ответа пользователя всплытий нет.
+  Notification.requestPermission().then(() => permissionState()).catch(() => permissionState());
+}
+
+function showNotification(notice) {
+  if (!notice) return;
+  const master = $("notify-master");
+  const allowed = ("Notification" in window) && Notification.permission === "granted"
+                  && master && master.checked;
+  if (!allowed) {
+    // Тихо: текст всё равно виден на вкладке «Уведомления» и в ленте.
+    toast(notice.text || "уведомление");
+    return;
+  }
+  try {
+    new Notification(notice.title || "Конвейер", {body: notice.text || "",
+                                                 tag: notice.key || "pipeline-test"});
+  } catch (err) {
+    toast(notice.text || String(err));
+  }
+}
+
+function pushNotifyRows(events) {
+  // Дедупликация и здесь: кадр и снимок приносят одни и те же события в разном порядке.
+  const known = new Set(notifyRows.map((row) => row.key));
+  const fresh = (events || []).filter((event) => event && event.key && !known.has(event.key));
+  if (!fresh.length) return [];
+  notifyRows = [...fresh, ...notifyRows].slice(0, NOTIFY_ROW_LIMIT);
+  if ($("tab-notify").classList.contains("active")) drawNotifyEvents();
+  return fresh;
+}
+
+function collectNotify(feed) {
+  // Снимок наполняет список вкладки, но не всплывает: всплытие — только из кадра потока.
+  pushNotifyRows((feed || {}).events);
+}
+
+function notifyFromFrame(data, first) {
+  const feed = (data && data.notify) || null;
+  if (!feed || !Array.isArray(feed.events)) return;
+  const fresh = [];
+  feed.events.forEach((event) => {
+    if (!event || !event.key || seenNotify.has(event.key)) return;
+    rememberNotify(event.key);
+    fresh.push(event);
+  });
+  pushNotifyRows(fresh);
+  // Первый кадр потока только запоминает ключи (D7): открытие панели не всплывает
+  // старыми событиями, которые владелец уже видел.
+  if (first) return;
+  fresh.slice().reverse().forEach((event) => {
+    const project = String(event.project || "");
+    const now = Date.now();
+    if (now - (lastNotifyAt[project] || 0) < NOTIFY_GAP_MS) return;
+    lastNotifyAt[project] = now;
+    showNotification({title: "Конвейер: " + (event.label || event.kind || ""),
+                      text: event.text, key: event.key});
+  });
+}
+
+function drawNotifyEvents() {
+  const box = $("notify-events");
+  if (!box) return;
+  box.innerHTML = notifyRows.map((row) => `
+    <li class="event ${esc(row.flag || "")}">
+      <div class="row1"><span class="mono muted">${esc(row.at || "—")}</span>
+        <span class="title">${esc(row.label || row.kind || "")}</span>
+        <span class="muted">план ${esc(row.plan || "—")} · шаг ${esc(row.step || "—")}</span></div>
+      <div class="detail">${esc(row.text || "")}</div>
+    </li>`).join("") || '<li class="muted">событий внимания пока нет</li>';
+}
+
+function projectKinds(project) {
+  return Array.from(document.querySelectorAll(
+    `#notify-projects .notify-kind[data-project="${project}"]:checked`)).map((n) => n.dataset.kind);
+}
+
+function renderNotify(data) {
+  notifyState = data;
+  const err = $("notify-error");
+  if (data.error) {
+    err.textContent = "projects.json: " + data.error;
+    err.hidden = false;
+  } else {
+    err.textContent = "";
+    err.hidden = true;
+  }
+  const master = $("notify-master");
+  master.checked = !!((data.global || {}).enabled);
+  master.disabled = !((data.global || {}).editable);
+  master.title = master.disabled
+    ? "реестр в форме списка: глобальный переключатель некуда писать" : "";
+  permissionState();
+  const kinds = data.kinds || [];
+  const rows = data.projects || [];
+  $("notify-projects").innerHTML = `<table>
+    <thead><tr><th>Проект</th><th>Уведомлять</th><th>Канал</th></tr></thead>
+    <tbody>${rows.map((row) => {
+      const tg = (row.channels || {}).telegram || {};
+      const events = new Set(row.events || []);
+      const off = row.editable ? "" : "disabled";
+      return `<tr data-project="${esc(row.id)}">
+        <td><b>${esc(row.name)}</b><div class="muted mono">${esc(row.id)}</div>
+          ${row.editable ? "" : '<div class="muted">нет в projects.json — настройка недоступна</div>'}</td>
+        <td><input type="checkbox" class="notify-enabled" data-project="${esc(row.id)}"
+              ${row.enabled ? "checked" : ""} ${off}></td>
+        <td>${tg.available ? "канал доступен" : (tg.enabled ? "канал без токена" : "не настроен")}</td>
+      </tr>
+      <tr><td colspan="3"><div class="notify-kinds">${kinds.map((kind) =>
+        `<label class="muted"><input type="checkbox" class="notify-kind"
+            data-project="${esc(row.id)}" data-kind="${esc(kind.id)}"
+            ${events.has(kind.id) ? "checked" : ""} ${off}> ${esc(kind.label)}</label>`).join("")}</div></td></tr>`;
+    }).join("") || '<tr><td colspan="3" class="muted">проектов нет</td></tr>'}</tbody></table>`;
+  document.querySelectorAll("#notify-projects .notify-enabled").forEach((node) => {
+    node.onchange = () => saveNotify({project: node.dataset.project, enabled: node.checked});
+  });
+  document.querySelectorAll("#notify-projects .notify-kind").forEach((node) => {
+    node.onchange = () => saveNotify({project: node.dataset.project, enabled: true,
+                                      events: projectKinds(node.dataset.project)});
+  });
+  const deliveries = data.deliveries || [];
+  $("notify-history").innerHTML = deliveries.map((row) => `
+    <li class="event"><div class="row1"><span class="mono muted">${esc(row.at || "—")}</span>
+      <span class="title">${esc(row.channel || "канал")}</span>
+      <span class="muted">план ${esc(row.plan || "—")} · шаг ${esc(row.step || "—")}</span></div>
+      <div class="detail">${esc(row.text || "")}</div></li>`).join("")
+    || '<li class="muted">доставок ещё не было</li>';
+  drawNotifyEvents();
+}
+
+async function loadNotify() {
+  let data;
+  try {
+    data = await api(withProject("/api/notify"));
+  } catch (err) {
+    toast(String(err), true);
+    return;
+  }
+  if (!data.ok) {
+    $("notify-error").textContent = data.error || "не удалось прочитать настройки уведомлений";
+    $("notify-error").hidden = false;
+    return;
+  }
+  renderNotify(data);
+}
+
+async function saveNotify(payload) {
+  let data;
+  try {
+    data = await api("/api/notify", {method: "POST", headers: PANEL_HEADERS,
+                                     body: JSON.stringify(payload)});
+  } catch (err) {
+    toast(String(err), true);
+    loadNotify();
+    return;
+  }
+  if (!data.ok) {
+    toast(data.error || "не удалось сохранить настройки уведомлений", true);
+    loadNotify();      // форма возвращается к тому, что реально записано в файле
+    return;
+  }
+  renderNotify(data);
+}
+
+async function testNotify() {
+  let data;
+  try {
+    data = await api("/api/notify/test", {method: "POST", headers: PANEL_HEADERS,
+                                          body: JSON.stringify({})});
+  } catch (err) {
+    toast(String(err), true);
+    return;
+  }
+  if (!data.ok) {
+    toast(data.error || "тестовое уведомление не прошло", true);
+    return;
+  }
+  showNotification(data.notice || {});
+}
+
 function startEvents() {
   // Поток зависит от проекта и плана: при их смене старый закрываем и открываем новый.
   if (stream) { stream.close(); stream = null; }
@@ -1692,6 +1959,7 @@ function startEvents() {
   const projectAtOpen = currentProject;
   const query = currentPlan ? `?plan=${encodeURIComponent(currentPlan)}` : "";
   stream = new EventSource(withProject("/api/events" + query));
+  let firstFrame = true;   // первый кадр потока не всплывает (S10, D7)
   const onFrame = (event) => {
     // Кадр прошлого проекта/плана: страница уже другая.
     if (planAtOpen !== currentPlan || projectAtOpen !== currentProject) return;
@@ -1699,6 +1967,8 @@ function startEvents() {
     try { data = JSON.parse(event.data); } catch (e) { return; }
     etag = null;   // следующий refresh обязан получить тело целиком, а не 304
     render(data);
+    notifyFromFrame(data, firstFrame);
+    firstFrame = false;
   };
   // Сервер шлёт кадры с именем события snapshot — их ловит addEventListener;
   // onmessage оставлен на случай кадра без имени.
@@ -1999,6 +2269,10 @@ $("save-tg").onclick = () => {
   act("save_telegram", {token, chat}).then(() => { $("tg-token").value = ""; });
 };
 $("test-tg").onclick = () => act("test_telegram");
+// Уведомления (S10): мастер-выключатель пишется сразу, галочки видов — тем же POST.
+$("notify-master").onchange = (event) => saveNotify({global: true, enabled: event.target.checked});
+$("notify-permission").onclick = requestPermission;
+$("notify-test").onclick = testNotify;
 $("plan-mode").onchange = (event) => {
   // Одно идемпотентное действие: ни второй кнопки, ни подтверждения.
   const pm = $("plan-mode");

@@ -13,6 +13,8 @@
                            ?plan=<N> — только один план); действий не выполняют
     GET  /api/projects     сводка реестра: проект, план, следующий шаг, закрыто, стоп, простой,
                            занятость слотов (capacity: лимиты, running, очередь)
+    GET  /api/notify       уведомления панели: глобальный выключатель, строки проектов реестра
+                           с видами событий и каналом Telegram, история доставок; только чтение
     GET  /api/setup        мастер установки: шаги, следующий шаг, значения формы (без токена)
     GET  /api/config       конфигурация проекта: pipeline.json, ошибки его разбора и
                            резервная копия (?project=<id> — проект реестра); только чтение
@@ -23,6 +25,10 @@
                            preview_config, save_config, revert_config,
                            save_telegram, test_telegram
     POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
+    POST /api/notify       настройки уведомлений: {"global": true, "enabled": ...} или
+                           {"project": id, "enabled": ..., "events": [...]}; запись в projects.json
+    POST /api/notify/test  тестовое уведомление: {"project": id}; только ответ браузеру,
+                           в историю доставок и в Telegram ничего не пишет
     POST /api/projects     подключить проект: {"path": ..., "name": ...}, заголовок
                            X-Pipeline-Panel; запись в projects.json профиля
     DELETE /api/projects?id=<id>
@@ -119,6 +125,25 @@ EVENTS_POLL = 0.5
 EVENTS_PING_SECONDS = 10
 EVENTS_MAX_SECONDS = 25
 
+# Уведомления панели (план 3 S10). Это не канал Telegram из `pipeline.json`: здесь только
+# то, что всплывает в браузере и зеркалится в уже настроенный канал.
+NOTIFY_GAP = 30            # секунд: не чаще одного уведомления на проект
+NOTIFY_LIMIT = 50          # потолок событий в ответе и строк истории доставок
+DELIVERY_FILE = "notify_deliveries.jsonl"   # файл истории доставок в state_dir проекта
+NOTIFY_DEFAULT_HOURS = 3   # порог простоя, как WATCHDOG_DEFAULT_HOURS движка
+NOTIFY_LABELS = {"step_started": "шаг в работе", "step_closed": "шаг закрыт (APPROVE)",
+                 "changes_requested": "ревью вернуло правки", "plan_stopped": "стоп или инцидент плана",
+                 "card_crashed": "карточка упала", "card_timed_out": "лимит времени",
+                 "card_rate_limited": "упёрся в квоту", "tick_action": "тик сделал действие",
+                 "plan_idle": "простой плана"}
+NOTIFY_BAD = ("plan_stopped", "card_crashed")
+NOTIFY_WARN = ("changes_requested", "card_timed_out", "card_rate_limited")
+# Действия стража, которые считаются «тик сделал действие»: `idle` — это «ничего не делал».
+NOTIFY_TICK_ACTIONS = ("create_step", "create_prompt", "create_prompt_review", "create_prompt_fix",
+                       "create_review", "retry_pending", "hold_risk", "tg_dialog")
+# Ключ карточки: `planloop:{план}:{шаг}:...`; шаг приводится к верхнему регистру.
+CARD_KEY_RE = re.compile(r"planloop:([^:]+):([^:]+):")
+
 
 def _allowed_origins(port: int) -> set[str]:
     """Источники, с которых панель вправе звать действия: только петля и свой порт."""
@@ -177,6 +202,14 @@ class State:
         # Сводка реестра (план 3 S6): кэш на CACHE_TTL, чтобы переключение вкладок
         # не запускало `gate.py --plans` по каждому проекту (D8).
         self.projects_cache: tuple[float, dict] | None = None
+        # Уведомления (план 3 S10): отметки доставки живут в памяти сервера — после
+        # перезапуска событие может напомнить о себе ещё раз, зато не нужен второй файл
+        # состояния и нет риска «потерять» отправку при падении.
+        self.notified: dict[str, float] = {}
+        self.notified_project: dict[str, float] = {}
+        # Первый кадр потока ничего не доставляет: иначе каждое открытие панели заново
+        # всплывало бы старые события (D7).
+        self.notify_primed = False
 
     def note(self, text: str) -> None:
         with self.lock:
@@ -908,6 +941,291 @@ def _missing_snapshot(state: State) -> dict:
             "errors": [f"конвейер не установлен в проект: нет {root / '.pipeline' / 'gate.py'}"]}
 
 
+# ───────────────────── уведомления панели (план 3 S10) ─────────────────────
+
+
+def _notify_event(project: str, plan_id: str, step_id: str, kind: str,
+                  ts: float | None, text: str, card: str = "") -> dict[str, Any]:
+    """Событие внимания в форме ответа: ключ дедупликации, поля адреса и текст.
+
+    `key` — «проект+план+шаг+вид» (D4): одна запись истории и три одинаковые попытки
+    дают одно событие, а не три.
+    """
+    step = str(step_id or "").upper()
+    flag = ("bad" if kind in NOTIFY_BAD else
+            "warn" if kind in NOTIFY_WARN else "")
+    return {"key": f"{project}:{plan_id}:{step}:{kind}", "project": project,
+            "plan": str(plan_id or ""), "step": step, "kind": kind,
+            "label": NOTIFY_LABELS.get(kind, kind), "text": text,
+            "ts": ts, "at": snap._fmt_ts(ts, with_seconds=True),
+            "card": str(card or ""), "flag": flag}
+
+
+def _notify_stop_text(plan_id: str, stop: Any) -> str:
+    """Текст стопа: «стоп плана» для владельческого флага, «инцидент» для остальных."""
+    data = stop if isinstance(stop, dict) else {}
+    kind = str(data.get("kind") or "owner")
+    reason = str(data.get("reason") or "").strip()
+    label = "стоп" if kind == "owner" else "инцидент"
+    head = f"{label} плана {plan_id}"
+    return f"{head}: {reason}" if reason else head
+
+
+def _stop_mtime(state: State, plan_id: str) -> float | None:
+    """Время файла стоп-флага: стоп без строки истории всё равно имеет дату."""
+    path = proj.state_dir(state.project) / f"plan_{plan_id}_stop.json"
+    try:
+        return float(path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _watchdog_hours(project: Path) -> float:
+    """Порог простоя из `pipeline.json notify.watchdog_hours`; нет числа — умолчание движка."""
+    raw = ((proj.read_config(project).get("notify") or {}).get("watchdog_hours"))
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return float(NOTIFY_DEFAULT_HOURS)
+    return float(raw) if raw > 0 else float(NOTIFY_DEFAULT_HOURS)
+
+
+def _notify_candidates(state: State, data: dict, allowed: set[str], now: float) -> list[dict]:
+    """События из уже собранного снимка: карточки, попытки, история, стоп и простой.
+
+    Второго источника нет (C2/D6): всё, что нужно, снимок уже прочитал сам — движок
+    здесь не запускается ни разу.
+    """
+    project = state.id
+    out: list[dict] = []
+    cards = data.get("cards") or []
+    # Попытки карточек — одно чтение `task_runs` по карточкам снимка; правило
+    # `rate_limited` берём готовым из `snap._attempts`.
+    ids = [str(card.get("id")) for card in cards if card.get("id")]
+    runs = snap._card_runs(proj.board_db(state.project, state.board), ids) if ids else {}
+    for card in cards:
+        key = str(card.get("idempotency_key") or "")
+        match = CARD_KEY_RE.match(key)
+        if not match:
+            continue
+        card_plan, step_id = match.group(1), match.group(2)
+        card_id = str(card.get("id") or "")
+        started = snap._ts(card.get("started_at"))
+        if key.endswith(":step") and started is not None and "step_started" in allowed:
+            out.append(_notify_event(project, card_plan, step_id, "step_started", started,
+                                     f"шаг {step_id.upper()} пошёл в работу "
+                                     f"(план {card_plan})"))
+        if not {"card_crashed", "card_timed_out", "card_rate_limited"} & allowed:
+            continue
+        for attempt in snap._attempts(card, runs.get(card_id) or [], now):
+            at = snap._ts(attempt.get("started_at"))
+            outcome = str(attempt.get("outcome") or "")
+            if outcome == "crashed" and "card_crashed" in allowed:
+                out.append(_notify_event(project, card_plan, step_id, "card_crashed", at,
+                                         f"карточка упала: шаг {step_id.upper()} ({card_id})",
+                                         card_id))
+            if outcome == "timed_out" and "card_timed_out" in allowed:
+                out.append(_notify_event(project, card_plan, step_id, "card_timed_out", at,
+                                         f"карточка упёрлась в лимит времени: "
+                                         f"шаг {step_id.upper()}", card_id))
+            if attempt.get("rate_limited") and "card_rate_limited" in allowed:
+                out.append(_notify_event(project, card_plan, step_id, "card_rate_limited", at,
+                                         f"упёрся в квоту провайдера: шаг {step_id.upper()}",
+                                         card_id))
+
+    stops = {str(row.get("id")): row.get("stop") for row in (data.get("plans") or [])
+             if isinstance(row, dict)}
+    seen_stop: set[str] = set()
+    rows = ((data.get("events") or {}).get("rows") or [])
+    for row in rows:
+        kind = str(row.get("kind") or "")
+        plan = str(row.get("plan") or "")
+        if not plan:
+            continue
+        step = str(row.get("step") or "")
+        ts = snap._ts(row.get("ts"))
+        if kind == "close_step" and "step_closed" in allowed:
+            out.append(_notify_event(project, plan, step, "step_closed", ts,
+                                     f"шаг {step.upper()} закрыт: APPROVE", row.get("card")))
+        if kind in ("create_fix", "create_rereview") and "changes_requested" in allowed:
+            out.append(_notify_event(project, plan, step, "changes_requested", ts,
+                                     f"ревью вернуло правки: шаг {step.upper()}",
+                                     row.get("card")))
+        if kind == "stop" and "plan_stopped" in allowed:
+            seen_stop.add(plan)
+            out.append(_notify_event(project, plan, step, "plan_stopped", ts,
+                                     _notify_stop_text(plan, stops.get(plan)), row.get("card")))
+        if kind in NOTIFY_TICK_ACTIONS and "tick_action" in allowed:
+            label = str(row.get("label") or kind)
+            text = f"тик: {label} — план {plan} {step.upper()}".strip()
+            out.append(_notify_event(project, plan, step, "tick_action", ts, text,
+                                     row.get("card")))
+
+    # Стоп без строки в истории: флаг есть, действие ещё не записано — дата по файлу.
+    for stop_plan, stop in stops.items():
+        if not isinstance(stop, dict) or not stop or stop_plan in seen_stop:
+            continue
+        if "plan_stopped" not in allowed:
+            continue
+        out.append(_notify_event(project, stop_plan, "", "plan_stopped",
+                                 _stop_mtime(state, stop_plan) or now,
+                                 _notify_stop_text(stop_plan, stop)))
+
+    if "plan_idle" in allowed:
+        hours = _watchdog_hours(state.project)
+        for row in (data.get("plans") or []):
+            if not isinstance(row, dict):
+                continue
+            idle_plan = str(row.get("id") or "")
+            since = snap._ts(snap._plan_state(state.project, idle_plan).get("waiting_since"))
+            if since is None or now - since < hours * 3600:
+                continue
+            out.append(_notify_event(project, idle_plan, "", "plan_idle", since,
+                                     f"план {idle_plan} простаивает "
+                                     f"{snap._duration(int(now - since))}"))
+    return out
+
+
+def notify_settings(state: State) -> dict[str, Any]:
+    """Настройки уведомлений для одного проекта реестра плюс состояние канала Telegram."""
+    stored = proj.read_notify()
+    project = stored["projects"].get(state.id) or {"enabled": False,
+                                                   "events": list(proj.NOTIFY_DEFAULT_EVENTS)}
+    channel = snap.telegram_state(state.project)
+    telegram_row = {"enabled": bool(channel.get("enabled")),
+                    "available": bool(channel.get("enabled") and channel.get("token_set")
+                                      and channel.get("chat")),
+                    "chat": str(channel.get("chat") or "")}
+    return {"global": bool(stored.get("global")),
+            "error": stored.get("error", ""),
+            "project": {"id": state.id, "name": state.name,
+                        "enabled": bool(project.get("enabled")),
+                        "events": list(project.get("events") or [])},
+            "channel": {"telegram": telegram_row},
+            # `on` — вид включён именно у этого проекта: страница рисует галочки по нему,
+            # не сверяя список видов с набором событий второй раз.
+            "kinds": [{"id": kind, "label": NOTIFY_LABELS.get(kind, kind),
+                       "on": kind in set(project.get("events") or [])}
+                      for kind in proj.NOTIFY_KINDS]}
+
+
+def notify_feed(state: State, plan: str | None = None, data: dict | None = None) -> dict[str, Any]:
+    """События внимания проекта — ЧИСТАЯ функция: ни записи на диск, ни запуска движка.
+
+    `data` — уже собранный снимок: `_snapshot_body` передаёт его, чтобы не звать сборку
+    второй раз (D6). Тело ответа обязано быть детерминированным при неизменных данных —
+    поэтому отметки доставки и «N минут назад» сюда не попадают (D5).
+    """
+    settings = notify_settings(state)
+    feed: dict[str, Any] = {"ok": True, "global_enabled": settings["global"],
+                            "enabled": bool(settings["project"]["enabled"]),
+                            "project": {"id": state.id, "name": state.name},
+                            "kinds": settings["kinds"], "events": [],
+                            "note": settings["error"]}
+    if settings["error"]:
+        return feed
+    if not (settings["global"] and feed["enabled"]):
+        return feed
+    try:
+        snapshot = data if data is not None else snap.snapshot(
+            state.project, plan, preview=state.preview, board=state.board)
+    except Exception as exc:                                    # noqa: BLE001
+        feed["note"] = f"снимок не собран: {type(exc).__name__}: {exc}"
+        return feed
+    allowed = set(settings["project"]["events"])
+    if not allowed:
+        return feed
+    now = time.time()
+    candidates = _notify_candidates(state, snapshot, allowed, now)
+    best: dict[str, dict] = {}
+    for event in candidates:
+        current = best.get(event["key"])
+        if current is None or (event.get("ts") or 0) > (current.get("ts") or 0):
+            best[event["key"]] = event
+    feed["events"] = sorted(best.values(), key=lambda item: item.get("ts") or 0,
+                            reverse=True)[:NOTIFY_LIMIT]
+    return feed
+
+
+def _append_deliveries(root: Path, rows: list[dict]) -> None:
+    """Дописать историю доставок: одна строка JSON на доставку (D9)."""
+    if not rows:
+        return
+    path = proj.state_dir(root) / DELIVERY_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        # История — удобство, а не условие доставки: сбой записи не рвёт поток.
+        return
+
+
+def _read_deliveries(root: Path) -> list[dict]:
+    """Последние доставки проекта: битые строки пропускаются, свежие сверху."""
+    path = proj.state_dir(root) / DELIVERY_FILE
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    rows: list[dict] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and snap._ts(record.get("ts")) is not None:
+            rows.append(record)
+    return list(reversed(rows[-NOTIFY_LIMIT:]))
+
+
+def notify_deliver(state: State, feed: dict | None) -> list[dict]:
+    """Зеркалить события в Telegram — одна точка доставки, вызывается из `_events` (D8).
+
+    Отправляется только при включённом глобальном и проектном переключателе и готовом
+    канале. Отметки — в памяти: ключ, помеченный один раз, повторно не отправляется,
+    троттлинг держит не больше одного сообщения на проект в `NOTIFY_GAP` секунд.
+    """
+    if not isinstance(feed, dict) or not feed.get("global_enabled") or not feed.get("enabled"):
+        return []
+    channel = snap.telegram_state(state.project)
+    token = os.environ.get(str(channel.get("token_env") or ""), "")
+    chat = str(channel.get("chat") or "")
+    if not (channel.get("enabled") and token and chat):
+        return []
+    prefix = str(channel.get("prefix") or "")
+    project = str((feed.get("project") or {}).get("id") or state.id)
+    delivered: list[dict] = []
+    for event in feed.get("events") or []:
+        key = str(event.get("key") or "")
+        if not key:
+            continue
+        now = time.time()
+        with state.lock:
+            if key in state.notified:
+                continue
+            if now - state.notified_project.get(project, 0.0) < NOTIFY_GAP:
+                continue        # событие не помечено — уйдёт следующим кадром
+            state.notified[key] = now       # бронь: параллельный поток его не отправит
+        text = f"{prefix}{event.get('text') or ''}"
+        try:
+            telegram.send_message(token, chat, text)
+        except telegram.TelegramError as exc:
+            with state.lock:
+                state.notified.pop(key, None)
+            state.note(f"уведомление не отправлено: {exc}")
+            continue
+        with state.lock:
+            state.notified_project[project] = now
+        row = {"ts": now, "at": snap._fmt_ts(now, with_seconds=True), "project": project,
+               "plan": str(event.get("plan") or ""), "step": str(event.get("step") or ""),
+               "kind": str(event.get("kind") or ""), "text": text, "channel": "telegram"}
+        delivered.append(row)
+    _append_deliveries(state.project, delivered)
+    return delivered
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "StepPipelineUI/1.0"
     state: State  # задаётся в serve()
@@ -1113,6 +1431,112 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:                                # noqa: BLE001
             self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
+    # ── уведомления (план 3 S10) ──
+    def _notify_payload(self) -> dict:
+        """Экран «Уведомления»: глобальный выключатель, строки реестра и история доставок.
+
+        Правится только `projects.json`: проект по умолчанию и разовый путь из командной
+        строки в файле не живут, поэтому у них `editable: false` — иначе панель обещала
+        бы сохранить то, что некуда писать.
+        """
+        stored = proj.read_notify()
+        try:
+            container, _entries = proj._read_registry_raw()
+        except ValueError:
+            container = None
+        rows = []
+        deliveries: list[dict] = []
+        for row in self.registry:
+            state = self._state_of(row)
+            settings = notify_settings(state)
+            telegram = settings["channel"]["telegram"]
+            rows.append({"id": row["id"], "name": row["name"], "root": str(row["root"]),
+                         "installed": _installed(Path(row["root"])),
+                         "source": row["source"],
+                         "editable": row["source"] == "registry",
+                         "enabled": settings["project"]["enabled"],
+                         "events": settings["project"]["events"],
+                         "channels": {"telegram": {
+                             "enabled": telegram["enabled"],
+                             "available": telegram["available"],
+                             "chat": telegram["chat"]}}})
+            deliveries.extend(_read_deliveries(Path(row["root"])))
+        deliveries.sort(key=lambda item: item.get("ts") or 0, reverse=True)
+        return {"ok": True,
+                "global": {"enabled": bool(stored.get("global")),
+                           "editable": isinstance(container, dict)},
+                "kinds": [{"id": kind, "label": NOTIFY_LABELS.get(kind, kind)}
+                          for kind in proj.NOTIFY_KINDS],
+                "projects": rows,
+                "deliveries": deliveries[:NOTIFY_LIMIT],
+                "note": "", "error": stored.get("error", "")}
+
+    def _get_notify(self) -> None:
+        """Настройки уведомлений: только чтение, ничего не пишет и не отправляет."""
+        if not self._local_only():
+            self._json(403, {"ok": False, "error": "только localhost"})
+            return
+        try:
+            self._json(200, self._notify_payload())
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    def _post_notify(self) -> None:
+        """Записать настройки: глобальный выключатель или запись проекта реестра."""
+        if getattr(self.state, "preview", False):
+            self._json(403, {"ok": False,
+                             "error": "предпросмотр только читает: уведомления не настраиваются"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            self._json(400, {"ok": False, "error": "нужно поле enabled: true или false"})
+            return
+        events = payload.get("events")
+        if events is not None and not isinstance(events, list):
+            self._json(400, {"ok": False, "error": "поле events должно быть списком id"})
+            return
+        try:
+            if payload.get("global"):
+                proj.write_notify(global_enabled=enabled)
+            else:
+                project_id = str(payload.get("project") or "").strip() or self.state.id
+                proj.write_notify(project_id=project_id, enabled=enabled,
+                                  events=[str(item) for item in events] if events is not None
+                                  else None)
+        except ValueError as exc:
+            self._json(400, {"ok": False, "error": str(exc)})
+            return
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        self.state.projects_cache = None
+        self._json(200, self._notify_payload())
+
+    def _post_notify_test(self) -> None:
+        """Тестовое уведомление: только ответ браузеру — ни файла истории, ни Telegram."""
+        if getattr(self.state, "preview", False):
+            self._json(403, {"ok": False,
+                             "error": "предпросмотр только читает: тест не отправляется"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        state = self._choose_project(payload.get("project"))
+        if state is None:
+            return
+        notice = {"title": "Проект: тест уведомлений",
+                  "text": "🧪 Тестовое уведомление панели (проверка доставки)",
+                  "test": True, "at": snap._fmt_ts(time.time(), with_seconds=True)}
+        self._json(200, {"ok": True, "test": True, "notice": notice,
+                         "project": {"id": state.id, "name": state.name}})
+
     def _reload_registry(self) -> None:
         """Пересобрать реестр в памяти после подключения или отключения проекта (D4).
 
@@ -1170,6 +1594,9 @@ class Handler(BaseHTTPRequestHandler):
         data["plan_mode"] = plan_mode.read_mode(state.project)
         data["installed"] = _installed(state.project)
         data["project_id"] = state.id
+        # События внимания (S10): считаются по уже собранному снимку — движок здесь
+        # не запускается второй раз (D6), а отметки доставки в тело не попадают (D5).
+        data["notify"] = notify_feed(state, plan, data=data)
         data["ok"] = True
         return _json_bytes(data)
 
@@ -1177,6 +1604,24 @@ class Handler(BaseHTTPRequestHandler):
         """Один кадр SSE: имя события `snapshot` и JSON в строке `data:`."""
         self.wfile.write(b"event: snapshot\ndata: " + body + b"\n\n")
         self.wfile.flush()
+
+    def _deliver_frame(self, state: State, body: bytes) -> None:
+        """Зеркало кадра в Telegram: первый кадр потока только помечает (D7).
+
+        Иначе каждое открытие панели заново всплывало бы старые события. Ошибка доставки
+        живёт в журнале сервера и поток не рвёт.
+        """
+        if not state.notify_primed:
+            state.notify_primed = True
+            return
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        try:
+            notify_deliver(state, data.get("notify") or {})
+        except Exception as exc:                                # noqa: BLE001
+            state.note(f"уведомления: {type(exc).__name__}: {exc}")
 
     def _events(self, plan: str | None, state: State | None = None) -> None:
         """Поток событий: первый кадр сразу, дальше — по изменению отпечатка.
@@ -1200,7 +1645,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             stamp = snap.fingerprint(state.project, plan, state.preview,
                                      state.board)
-            self._event_frame(self._snapshot_with_version(plan, state))
+            body = self._snapshot_with_version(plan, state)
+            self._event_frame(body)
+            self._deliver_frame(state, body)
             started = last_ping = time.monotonic()
             while time.monotonic() - started < EVENTS_MAX_SECONDS:
                 time.sleep(EVENTS_POLL)
@@ -1209,7 +1656,9 @@ class Handler(BaseHTTPRequestHandler):
                                            state.board)
                 if current != stamp:
                     stamp = current
-                    self._event_frame(self._snapshot_with_version(plan, state))
+                    body = self._snapshot_with_version(plan, state)
+                    self._event_frame(body)
+                    self._deliver_frame(state, body)
                     last_ping = now
                 elif now - last_ping >= EVENTS_PING_SECONDS:
                     self.wfile.write(b": ping\n\n")
@@ -1255,6 +1704,9 @@ class Handler(BaseHTTPRequestHandler):
             if state is None:
                 return
             self._events(self._plan_param(), state)
+            return
+        if path == "/api/notify":
+            self._get_notify()
             return
         if path == "/api/projects":
             self._get_projects()
@@ -1572,6 +2024,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/setup":
             self._post_setup()
+            return
+        if path == "/api/notify":
+            self._post_notify()
+            return
+        if path == "/api/notify/test":
+            self._post_notify_test()
             return
         if path == "/api/projects":
             self._post_projects()
