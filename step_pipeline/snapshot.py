@@ -36,7 +36,8 @@ except ImportError:  # pragma: no cover
     import project as proj  # type: ignore[no-redef]
 
 CARD_COLUMNS = ("id", "title", "status", "assignee", "idempotency_key", "created_at",
-                "completed_at", "result", "last_failure_error", "tenant", "max_runtime")
+                "started_at", "completed_at", "last_heartbeat_at", "current_run_id",
+                "result", "last_failure_error", "tenant", "max_runtime", "max_runtime_seconds")
 STAGE_LABELS = {"create_step": "заказ постановки", "create_review": "ревью",
                 "create_fix": "правки после ревью", "close_step": "журнал и коммит",
                 "create_rereview": "повторное ревью", "idle": "ждёт",
@@ -44,7 +45,14 @@ STAGE_LABELS = {"create_step": "заказ постановки", "create_review
 ACTION_LABELS = {"create_step": "шаг", "create_prompt": "постановка", "create_review": "ревью",
                  "create_fix": "правки", "create_rereview": "ревью", "close_step": "журнал",
                  "idle": "ждёт", "stop": "стоп", "retry_pending": "довыкладка",
-                 "hold_risk": "ручной допуск"}
+                 "hold_risk": "ручной допуск", "create_prompt_review": "ревью постановки",
+                 "create_prompt_fix": "переписывание постановки", "tg_dialog": "диалог в Telegram"}
+
+# ─── лента действий (план 3 S9): история тиков из `state/history.jsonl` ───
+HISTORY_FILE = "history.jsonl"      # файл истории пишет страж, панель только читает
+EVENTS_LIMIT = 200                  # строк ленты в снимке: свежие сверху
+CARD_ID_RE = re.compile(r"t_[0-9a-f]{6,}")     # карточка в тексте действия
+EVENT_FLAGS = {"stop": "bad", "create_fix": "warn"}   # подсветка строки ленты (D4)
 
 CACHE_TTL = 2.5          # секунд: снимок не старше этого отдаётся из памяти
 CACHE_LIMIT = 8          # ключей: проект × план × предпросмотр × борда
@@ -150,6 +158,98 @@ def journal_tail(project: Path, plan_file: str | None, limit: int = 8) -> list[l
             continue
         rows.append(cells)
     return rows[-int(limit):]
+
+
+# ──────────────────────── лента действий (план 3 S9, D2-D4) ────────────────────────
+
+def _ts(value) -> float | None:
+    """Числовая метка времени или None: `bool`, строки и мусор меткой не считаются."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _fmt_ts(ts, with_seconds: bool = False) -> str:
+    """Метка времени по-русски: «05.11.2026 12:47»; нет метки — пусто, а не нули (D10)."""
+    value = _ts(ts)
+    if value is None:
+        return ""
+    try:
+        return time.strftime("%d.%m.%Y %H:%M:%S" if with_seconds else "%d.%m.%Y %H:%M",
+                             time.localtime(value))
+    except (ValueError, OSError, OverflowError):
+        return ""
+
+
+def _history_file(root: Path, cfg: dict) -> Path:
+    """Файл истории тиков: `<state_dir>/history.jsonl` (пишет страж, панель читает)."""
+    return proj.state_dir(Path(root)) / HISTORY_FILE
+
+
+def events(root: Path, cfg: dict) -> dict:
+    """Лента действий стража: окно строк, счётчики и объяснение пустоты (D2).
+
+    Движок не запускается и не импортируется (он вендорится в проект отдельно), поэтому
+    правила валидности строки повторены здесь, как в `gate.history_lines`: объект JSON,
+    числовой `ts`, непустой `action`. `total` — число ВАЛИДНЫХ записей всего файла,
+    `bad` — битых, всего непустых строк в файле `total + bad`; окно `rows` — последние
+    `EVENTS_LIMIT` валидных в обратном порядке (свежие сверху).
+    """
+    path = _history_file(root, cfg)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"rows": [], "total": 0, "bad": 0, "limit": EVENTS_LIMIT,
+                "note": ("истории ещё нет — страж запишет первую строку на первом "
+                         "действии, лента появится сама")}
+    valid: list[dict] = []
+    bad = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            bad += 1
+            continue
+        if not isinstance(record, dict) or _ts(record.get("ts")) is None \
+                or not str(record.get("action") or ""):
+            bad += 1
+            continue
+        valid.append(record)
+    rows = [_event_row(record, root, cfg) for record in reversed(valid[-EVENTS_LIMIT:])]
+    note = ""
+    if not rows:
+        note = (f"истории нет: файл есть, но валидных строк в нём нет (битых: {bad}) — "
+                "страж перезапишет его на следующем действии"
+                if text.strip() else
+                "истории ещё нет — страж запишет первую строку на первом действии")
+    return {"rows": rows, "total": len(valid), "bad": bad, "limit": EVENTS_LIMIT,
+            "note": note}
+
+
+def _event_row(record: dict, root: Path, cfg: dict) -> dict:
+    """Строка ленты по D3: план, шаг, вид, подпись, текст, коммит, карточка, отчёт, флаг."""
+    kind = str(record.get("action") or "")
+    plan = str(record.get("plan") or "")
+    step = str(record.get("step") or "")
+    detail = str(record.get("detail") or "")
+    card = CARD_ID_RE.search(detail)
+    review = ""
+    if plan and step:
+        rel = (f"{((cfg.get('paths') or {}).get('reviews') or 'docs/reviews').rstrip('/')}"
+               f"/{plan}-{step}.md")
+        if (Path(root) / rel).is_file():
+            review = rel
+    return {"ts": _ts(record.get("ts")),
+            "at": str(record.get("at") or _fmt_ts(record.get("ts"), with_seconds=True)),
+            "plan": plan, "step": step, "kind": kind,
+            "label": ACTION_LABELS.get(kind, kind or "—"),
+            "detail": detail,
+            "commit": str(record.get("commit") or ""),
+            "card": card.group(0) if card else "",
+            "review": review,
+            "flag": EVENT_FLAGS.get(kind, "")}
 
 
 def telegram_state(project: Path) -> dict:
@@ -846,6 +946,297 @@ def _git_show(root: Path, sha: str, limit: int = STEP_LINES, timeout: int = 30) 
     return rows
 
 
+# ──────────────── время шага, этапы ролей и история попыток (план 3 S9, D6-D9) ────────────────
+
+HEARTBEAT_STALE = 300        # секунд без heartbeat: карточка «молчит», а не «идёт» (D6)
+ROLE_LABELS = {"prompter": "постановщик", "reviewer": "ревьюер",
+               "executor": "исполнитель", "unknown": "—"}
+ROLE_ORDER = ("prompter", "executor", "reviewer", "unknown")
+# Подписи этапов: точное совпадение суффикса ключа, у остальных — номер через двоеточие (D7).
+STAGE_TITLES = {"prompt": "Постановка", "promptreview": "Ревью постановки",
+                "step": "Исполнение"}
+STAGE_TITLES_NUMBERED = {"review": "Ревью", "rereview": "Повторное ревью",
+                         "fix": "Правки", "promptfix": "Переписывание постановки"}
+RUN_LABELS = {"completed": "завершена", "blocked": "заблокирована", "crashed": "упала",
+              "timed_out": "лимит времени", "gave_up": "сдалась",
+              "spawn_failed": "не запустилась", "reclaimed": "перехвачена",
+              "rate_limited": "квота провайдера"}
+RUN_BAD = {"crashed", "timed_out", "gave_up", "spawn_failed", "rate_limited"}
+
+
+def _stage_title(stage: str) -> tuple[str, str]:
+    """(этап, подпись) по суффиксу ключа `planloop:<план>:<шаг>:<этап>` (D7)."""
+    base, _, number = str(stage or "").partition(":")
+    if base in STAGE_TITLES:
+        return stage, STAGE_TITLES[base]
+    if base in STAGE_TITLES_NUMBERED:
+        title = STAGE_TITLES_NUMBERED[base]
+        return stage, f"{title} {number}" if number else title
+    return stage, stage or "—"
+
+
+def _stage_of(card: dict) -> tuple[str, str]:
+    """Этап карточки по ключу идемпотентности: `planloop:<план>:<шаг>:<этап>`."""
+    parts = str(card.get("idempotency_key") or "").split(":")
+    return _stage_title(":".join(parts[3:]) if len(parts) > 3 else "")
+
+
+def _role_of(assignee, cfg: dict) -> tuple[str, str]:
+    """(роль, подпись) по `assignee` карточки, а не по тексту её заголовка (D7).
+
+    Карточки правок создаёт движок с исполнителем шага (`create_fix`), поэтому их роль —
+    «исполнитель», хотя план и называл правки ревьюером (Р2).
+    """
+    name = str(assignee or "")
+    if not name:
+        return "unknown", ROLE_LABELS["unknown"]
+    profiles = cfg.get("profiles") or {}
+    if name == str(profiles.get("prompter") or ""):
+        return "prompter", ROLE_LABELS["prompter"]
+    if name == str(profiles.get("reviewer") or ""):
+        return "reviewer", ROLE_LABELS["reviewer"]
+    return "executor", ROLE_LABELS["executor"]
+
+
+def _card_start(card: dict, runs: list[dict]) -> float | None:
+    """Начало карточки: `started_at`, иначе первая попытка, иначе `created_at` (D6)."""
+    started = _ts(card.get("started_at"))
+    if started is not None:
+        return started
+    starts = [_ts(run.get("started_at")) for run in runs or []]
+    starts = [value for value in starts if value is not None]
+    return min(starts) if starts else _ts(card.get("created_at"))
+
+
+def _current_run(runs: list[dict]) -> dict:
+    """Текущая попытка карточки: последняя без `ended_at` (D6)."""
+    for run in reversed(runs or []):
+        if _ts(run.get("ended_at")) is None:
+            return run
+    return {}
+
+
+def _step_times(cards: list[dict], runs: dict, now: float) -> dict:
+    """Начало, окончание и длительность шага по карточкам и попыткам (D6, D10).
+
+    Закрытый шаг — от первой карточки до последнего `completed_at`; открытый — от первой
+    карточки до «сейчас» плюс длительность текущей попытки. Дата журнала в расчёте не
+    участвует: она знает только день (тест 8).
+    """
+    ordered = sorted((card for card in cards or [] if _ts(card.get("created_at")) is not None),
+                     key=lambda card: _ts(card.get("created_at")) or 0.0)
+    if not ordered:
+        return {"live": False, "start_ts": None, "end_ts": None, "start": "", "end": "",
+                "seconds": None, "duration": "", "attempt_ts": None, "attempt_seconds": None,
+                "attempt": "", "note": "карточек шага нет — время считать не из чего"}
+    start_ts = _ts(ordered[0].get("created_at"))
+    last = ordered[-1]
+    finishes = [_ts(card.get("completed_at")) for card in ordered]
+    finishes = [value for value in finishes if value is not None]
+    live = _ts(last.get("completed_at")) is None
+    attempt_ts, attempt_seconds = None, None
+    note = ""
+    if live:
+        end_ts = None
+        seconds = max(0, int(now - start_ts)) if start_ts is not None else None
+        attempt_ts = _ts(_current_run(runs.get(str(last.get("id") or "")) or []).get("started_at"))
+        if attempt_ts is not None:
+            attempt_seconds = max(0, int(now - attempt_ts))
+        else:
+            note = "текущей попытки нет — длительность попытки неизвестна"
+    else:
+        end_ts = max(finishes) if finishes else start_ts
+        seconds = (max(0, int(end_ts - start_ts))
+                   if start_ts is not None and end_ts is not None else None)
+    return {"live": live, "start_ts": start_ts, "end_ts": end_ts,
+            "start": _fmt_ts(start_ts), "end": _fmt_ts(end_ts),
+            "seconds": seconds, "duration": "" if seconds is None else _duration(seconds),
+            "attempt_ts": attempt_ts, "attempt_seconds": attempt_seconds,
+            "attempt": _fmt_ts(attempt_ts), "note": note}
+
+
+def _stages(cards: list[dict], runs: dict, cfg: dict, times: dict, now: float) -> list[dict]:
+    """Этапы шага по карточкам (D7): роль, начало, конец, длительность и живость.
+
+    Этапы идут по началу и схлопываются: начало — не раньше конца предыдущего, конец — не
+    позже границы шага. Поэтому сумма этапов не превышает длительность шага по построению.
+    «Идёт» — только последняя карточка открытого шага (D6): карточка без `completed_at`
+    внутри закрытого шага или перед следующей карточкой — давно отработавший этап, её конец
+    берётся из следующей карточки, иначе она съедала бы весь шаг как «идущая».
+    """
+    boundary = _ts(times.get("end_ts"))
+    if boundary is None:
+        boundary = now
+    floor = _ts(times.get("start_ts"))
+    step_live = bool(times.get("live"))
+    prepared: list[tuple[float, float | None, dict, list[dict]]] = []
+    for card in cards or []:
+        card_runs = runs.get(str(card.get("id") or "")) or []
+        start_ts = _card_start(card, card_runs)
+        prepared.append((start_ts if start_ts is not None else now,
+                         _ts(card.get("completed_at")), card, card_runs))
+    prepared.sort(key=lambda item: item[0])
+    stages: list[dict] = []
+    previous_end: float | None = None
+    for index, (start_ts, end_ts, card, card_runs) in enumerate(prepared):
+        stage, title = _stage_of(card)
+        role, role_label = _role_of(card.get("assignee"), cfg)
+        last = index == len(prepared) - 1
+        live = end_ts is None and step_live and last
+        if end_ts is not None:
+            eff_end = min(end_ts, boundary)
+        elif live:
+            eff_end = boundary
+        elif not last:
+            eff_end = min(prepared[index + 1][0], boundary)
+        else:
+            eff_end = boundary
+        eff_start = start_ts if floor is None else max(start_ts, floor)
+        if previous_end is not None:
+            eff_start = max(eff_start, previous_end)
+        eff_end = max(eff_end, eff_start)
+        seconds = max(0, int(eff_end - eff_start))
+        heartbeat_ts = _ts(card.get("last_heartbeat_at"))
+        heartbeat_age = max(0, int(now - heartbeat_ts)) if heartbeat_ts is not None else None
+        stale = bool(heartbeat_age is not None and heartbeat_age > HEARTBEAT_STALE)
+        note = ""
+        if live:
+            note = (f"идёт (молчит {_duration(heartbeat_age)})" if stale
+                    else "идёт")
+        stages.append({
+            "stage": stage, "title": title, "role": role, "role_label": role_label,
+            "card": str(card.get("id") or ""), "key": str(card.get("idempotency_key") or ""),
+            "status": str(card.get("status") or ""),
+            "start_ts": eff_start, "end_ts": None if live else eff_end,
+            "start": _fmt_ts(eff_start), "end": "" if live else _fmt_ts(eff_end),
+            "seconds": seconds, "duration": _duration(seconds),
+            "live": live, "heartbeat_ts": heartbeat_ts, "heartbeat_age": heartbeat_age,
+            "stale": stale, "note": note})
+        previous_end = eff_end
+    return stages
+
+
+def _role_rows(stages: list[dict]) -> list[dict]:
+    """Строки «роль / этапов / сумма времени» из списка этапов; порядок ролей постоянный."""
+    totals: dict[str, dict] = {}
+    for stage in stages or []:
+        role = str(stage.get("role") or "unknown")
+        row = totals.setdefault(role, {"role": role, "label": str(stage.get("role_label") or ""),
+                                       "stages": 0, "seconds": 0})
+        row["stages"] += 1
+        row["seconds"] += int(stage.get("seconds") or 0)
+    rows = [totals[role] for role in ROLE_ORDER if role in totals]
+    for role, row in totals.items():
+        if role not in ROLE_ORDER:
+            rows.append(row)
+    for row in rows:
+        row["duration"] = _duration(row["seconds"])
+    return rows
+
+
+def _step_roles(stages: list[dict]) -> list[dict]:
+    """Свод по самому шагу: только его этапы (ключ `step_roles`, D8)."""
+    return _role_rows(stages)
+
+
+def _plan_roles(cards: list[dict], cfg: dict, runs: dict, now: float) -> list[dict]:
+    """Свод по плану: все шаги, каждый со своим временем и схлопыванием (ключ `roles`, D8).
+
+    `runs` нужен, чтобы плановый свод применял D6 так же, как шаговый: иначе длительности
+    идущей карточки в двух таблицах разошлись бы.
+    """
+    groups: dict[str, list[dict]] = {}
+    for card in cards or []:
+        parts = str(card.get("idempotency_key") or "").split(":")
+        if len(parts) < 4:
+            continue
+        groups.setdefault(parts[2].upper(), []).append(card)
+    merged: list[dict] = []
+    for step_cards in groups.values():
+        times = _step_times(step_cards, runs, now)
+        merged.extend(_stages(step_cards, runs, cfg, times, now))
+    return _role_rows(merged)
+
+
+def _card_runs(db: Path, card_ids: list[str]) -> dict[str, list[dict]]:
+    """Попытки карточек из `task_runs`; таблицы нет — пустой список на каждую (D9).
+
+    Схема читается по факту (`PRAGMA table_info`), как у `_capacity` из S8: в борде старой
+    версии колонок и таблиц может не быть, и это не ошибка экрана.
+    """
+    wanted = [str(card_id) for card_id in card_ids or [] if card_id]
+    result: dict[str, list[dict]] = {card_id: [] for card_id in wanted}
+    con = _ro(db)
+    if con is None or not wanted:
+        return result
+    try:
+        present = {row[1] for row in con.execute("PRAGMA table_info(task_runs)")}
+        if not present:
+            return result
+        cols = [name for name in ("id", "task_id", "profile", "status", "started_at", "ended_at",
+                                  "outcome", "summary", "metadata", "error",
+                                  "last_heartbeat_at", "max_runtime_seconds")
+                if name in present]
+        order = "started_at" if "started_at" in present else "rowid"
+        # IN-список режется на куски: у SQLite исторический предел числа параметров — 999.
+        for start in range(0, len(wanted), 400):
+            chunk = wanted[start:start + 400]
+            marks = ", ".join("?" * len(chunk))
+            rows = con.execute(f"SELECT {', '.join(cols)} FROM task_runs"
+                               f" WHERE task_id IN ({marks}) ORDER BY {order}", chunk).fetchall()
+            for row in rows:
+                item = dict(zip(cols, row))
+                result.setdefault(str(item.get("task_id") or ""), []).append(item)
+    except sqlite3.Error:
+        return result
+    finally:
+        con.close()
+    return result
+
+
+def _attempts(card: dict, runs: list[dict], now: float) -> list[dict]:
+    """История исполнения карточки: попытка, начало, длительность, исход, ожидание (D9).
+
+    `waited` — сколько карточка ждала слота: от создания до старта попытки. `rate_limited`
+    ставится по значению исхода или по тексту вывода (`rate`, `429`): в комментарии схемы
+    борды такого исхода нет, а живая борда его пишет (Р3).
+    """
+    created = _ts(card.get("created_at"))
+    rows: list[dict] = []
+    for index, run in enumerate(runs or [], start=1):
+        started = _ts(run.get("started_at"))
+        ended = _ts(run.get("ended_at"))
+        outcome = str(run.get("outcome") or "")
+        text = "\n".join(part for part in (str(run.get("summary") or ""),
+                                           str(run.get("error") or "")) if part.strip())
+        clipped = _clip_chars(text, CARD_TEXT_LIMIT) if text else {"text": "", "shown": 0,
+                                                                   "total": 0, "truncated": False,
+                                                                   "note": ""}
+        rate_limited = (outcome == "rate_limited" or "rate" in text.lower()
+                        or "429" in text)
+        waited = (max(0, int(started - created))
+                  if started is not None and created is not None else None)
+        rows.append({
+            "index": index, "id": str(run.get("id") or ""),
+            "started_at": started, "ended_at": ended,
+            "start": _fmt_ts(started, with_seconds=True),
+            "end": _fmt_ts(ended, with_seconds=True),
+            "seconds": (max(0, int((ended if ended is not None else now) - started))
+                        if started is not None else None),
+            "duration": ("" if started is None else
+                         _duration(max(0, (ended if ended is not None else now) - started))),
+            "outcome": outcome,
+            "label": RUN_LABELS.get(outcome) or ("идёт" if ended is None else outcome or "—"),
+            "bad": outcome in RUN_BAD,
+            "rate_limited": rate_limited,
+            "waited": waited,
+            "waited_text": "" if waited is None else _duration(waited),
+            "current": ended is None and index == len(runs),
+            "output": clipped["text"], "output_note": clipped["note"],
+        })
+    return rows
+
+
 def step_detail(project: Path | str | None = None, plan_id: str | int = "",
                 step_id: str = "", limit: int = STEP_LINES,
                 board: str | None = None) -> dict:
@@ -880,9 +1271,14 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
     stop = _plan_stop(root, plan)
     db = proj.board_db(root, board)
     prefix = f"planloop:{plan}:{step}:"
-    step_cards: list[dict] = []
+    now = time.time()
     # Карточки — запросом по префиксу ключа: окно «последние N задач» теряло старый шаг.
-    for card in cards(db, limit=100, key_prefix=prefix):
+    raw_cards = cards(db, limit=100, key_prefix=prefix)
+    runs = _card_runs(db, [str(card.get("id") or "") for card in raw_cards])
+    times = _step_times(raw_cards, runs, now)
+    stages = _stages(raw_cards, runs, cfg, times, now)
+    step_cards: list[dict] = []
+    for card in raw_cards:
         card_id = str(card.get("id") or "")
         result = _clip_chars(str(card.get("result") or ""), CARD_TEXT_LIMIT)
         shown_comments = comments(db, card_id)
@@ -894,14 +1290,22 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
                            "result": result["text"], "result_note": result["note"],
                            "result_truncated": result["truncated"],
                            "completed_at": card.get("completed_at"),
+                           "attempts": _attempts(card, runs.get(card_id) or [], now),
                            "comments": shown_comments,
                            "comments_note": (f"показаны первые {len(shown_comments)} "
                                              f"комментариев, всего {total_comments}"
                                              if total_comments > len(shown_comments) else "")})
+    # Свод по плану — по всем его карточкам: свод по шагу (`step_roles`) и по плану (`roles`)
+    # отвечают на разные вопросы, поэтому это два ключа, а не один (D8).
+    plan_cards = cards(db, limit=1000, key_prefix=f"planloop:{plan}:")
+    plan_runs = _card_runs(db, [str(card.get("id") or "") for card in plan_cards])
     return {"ok": True, "plan": plan, "step": step, "title": contract.get("title") or "",
             "contract": contract, "prompt": prompt, "review": review,
             "commit": _git_show(root, review.get("commit") or "", cap),
             "cards": step_cards,
+            "times": times, "stages": stages,
+            "roles": _plan_roles(plan_cards, cfg, plan_runs, now),
+            "step_roles": _step_roles(stages),
             # `allowed` — правило «стоп-флаг допуск не гасит» в снимке, а не в разметке:
             # так его проверяет тест, а страница только рисует.
             "hold": {"steps": held, "held": step in held, "allowed": step not in held,
@@ -933,6 +1337,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         "decision": None,
         "status": "",
         "metrics": {},
+        "events": {"rows": [], "total": 0, "bad": 0, "limit": EVENTS_LIMIT, "note": ""},
         "cards": cards(proj.board_db(root, board)),
         "journal": [],
         "errors": [],
@@ -978,6 +1383,8 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
     out["stage"] = ACTION_LABELS.get(decision.get("action") or "", decision.get("action") or "")
     out["stop"] = any((p.get("stop") for p in out["plans"]))
     out["overview"] = _overview(root, cfg, out)
+    # Лента действий — отдельным чтением history.jsonl: движок ради неё не запускается (D2).
+    out["events"] = events(root, cfg)
     return out
 
 

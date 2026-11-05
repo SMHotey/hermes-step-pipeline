@@ -1937,3 +1937,376 @@ def test_index_contrast_from_styles():
             assert front in palette and back in palette, (selector, front, back)
             ratio = _contrast(palette[front], palette[back])
             assert ratio >= 4.5, f"{selector} {front}/{back}: {ratio:.2f}"
+
+
+# ─────────────────── лента действий, время шагов и этапы ролей (план 3 S9) ───────────────────
+# Всё сидируется в tmp-проекте и tmp-борде фикстур: настоящая борда, профили и сеть не нужны.
+# Карточки шагов вставляются напрямую: страж ведёт только следующий шаг плана.
+
+RUNS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS task_runs (
+    id TEXT PRIMARY KEY, task_id TEXT, profile TEXT, status TEXT, started_at INTEGER,
+    ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT, error TEXT,
+    last_heartbeat_at INTEGER, max_runtime_seconds INTEGER
+);
+"""
+
+
+def write_history(server, rows) -> Path:
+    """История тиков в tmp-проекте: словари пишутся JSONL, строки — как есть (битые)."""
+    path = server["root"] / ".pipeline" / "state" / "history.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [row if isinstance(row, str) else json.dumps(row, ensure_ascii=False) for row in rows]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    snapshot.clear_cache()      # снимок кэшируется на 2.5 с: иначе тест увидит прежний
+    return path
+
+
+def ensure_card_columns(db: Path) -> None:
+    """Колонки времени в тестовой борде: снимок читает их по факту наличия (D6)."""
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(KANBAN_SCHEMA)
+        present = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+        for name, kind in (("started_at", "INTEGER"), ("last_heartbeat_at", "INTEGER"),
+                           ("current_run_id", "TEXT"), ("max_runtime_seconds", "INTEGER")):
+            if name not in present:
+                con.execute(f"ALTER TABLE tasks ADD COLUMN {name} {kind}")
+        con.commit()
+    finally:
+        con.close()
+
+
+def add_step_card(db: Path, key: str, assignee: str, created: int, status: str = "ready",
+                  card_id: str | None = None) -> str:
+    """Карточка шага в тестовой борде. Заголовок намеренно общий: этап берётся из ключа."""
+    ensure_card_columns(db)
+    card_id = card_id or "t_" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    con = sqlite3.connect(db)
+    try:
+        con.execute("INSERT OR REPLACE INTO tasks (id, title, status, assignee, idempotency_key,"
+                    " created_at, result, tenant) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (card_id, "карточка шага", status, assignee, key, int(created), "", "plan"))
+        con.commit()
+    finally:
+        con.close()
+    return card_id
+
+
+def set_card_times(db: Path, suffix: str, created: int | None = None,
+                   started: int | None = None, completed: int | None = None) -> None:
+    """Метки времени карточки по хвосту ключа идемпотентности."""
+    sets, args = [], []
+    for column, value in (("created_at", created), ("started_at", started),
+                          ("completed_at", completed)):
+        if value is not None:
+            sets.append(f"{column} = ?")
+            args.append(int(value))
+    if not sets:
+        return
+    con = sqlite3.connect(db)
+    try:
+        con.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE idempotency_key LIKE ?",
+                    (*args, f"%{suffix}"))
+        con.commit()
+    finally:
+        con.close()
+
+
+def set_heartbeat(db: Path, suffix: str, ts: int) -> None:
+    con = sqlite3.connect(db)
+    try:
+        con.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE idempotency_key LIKE ?",
+                    (int(ts), f"%{suffix}"))
+        con.commit()
+    finally:
+        con.close()
+
+
+def add_runs(db: Path, card_id: str, runs: list[dict]) -> None:
+    """Попытки карточки в `task_runs`: в тестовой схеме этой таблицы нет."""
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(RUNS_SCHEMA)
+        for index, run in enumerate(runs, start=1):
+            con.execute("INSERT INTO task_runs (id, task_id, profile, status, started_at,"
+                        " ended_at, outcome, summary, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (run.get("id") or f"r_{card_id}_{index}", card_id,
+                         run.get("profile") or "demo", run.get("status") or "done",
+                         int(run["started_at"]), run.get("ended_at"), run.get("outcome"),
+                         run.get("summary") or "", run.get("error") or ""))
+        con.commit()
+    finally:
+        con.close()
+
+
+def index_html() -> str:
+    return (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+
+
+def test_events_filter_by_plan_step_and_kind(server):
+    """Лента: окно строк, счётчики, поля для фильтров и разметка фильтров (C1)."""
+    now = int(time.time())
+    write_history(server, [
+        {"ts": now - 60, "at": "05.11.2026 12:47:00", "plan": "1", "step": "S1",
+         "action": "create_step", "duration_s": 1.2, "detail": "карточка шага: t_40bbe197",
+         "commit": ""},
+        {"ts": now - 50, "plan": "1", "step": "S2", "action": "stop",
+         "detail": "план 1: инцидент", "commit": ""},
+        {"ts": now - 40, "plan": "2", "step": "S1", "action": "create_prompt",
+         "detail": "постановка S1 заказана", "commit": ""},
+        {"ts": now - 30, "plan": "2", "step": "S2", "action": "create_step",
+         "detail": "шаг 2-S2", "commit": "abc1234"},
+        {"ts": now - 20, "plan": "1", "step": "S3", "action": "create_step",
+         "detail": "шаг 1-S3", "commit": ""},
+        {"ts": now - 10, "plan": "2", "step": "S3", "action": "create_step",
+         "detail": "шаг 2-S3", "commit": ""},
+        "{битая строка",
+    ])
+    status, data = get(server["url"] + "/api/snapshot")
+    assert status == 200
+    events = data["events"]
+    assert events["total"] == 6 and events["bad"] == 1
+    assert events["limit"] == 200
+    assert len(events["rows"]) == 6
+    # Свежие сверху; поля, по которым фильтрует страница, заполнены у каждой строки.
+    assert events["rows"][0]["ts"] == now - 10
+    assert {row["plan"] for row in events["rows"]} == {"1", "2"}
+    assert "stop" in {row["kind"] for row in events["rows"]}
+    for row in events["rows"]:
+        assert row["plan"] and row["step"] and row["kind"] and row["label"] and row["at"]
+    assert events["rows"][0]["commit"] == ""
+
+    html = index_html()
+    for anchor in ("function filterEvents", 'id="events-plan"', 'id="events-step"',
+                   'id="events-kind"', 'id="events-search"', 'id="events-count"',
+                   'id="events-empty"', "показано", "renderEvents(data)"):
+        assert anchor in html, anchor
+
+
+def test_events_search_matches_reason(server):
+    """Причина стопа ищется по `detail`, а строка подсвечена флагом `bad` (C2)."""
+    now = int(time.time())
+    write_history(server, [{"ts": now, "plan": "1", "step": "S1", "action": "stop",
+                            "detail": "план 1: контракт шага не найден — инцидент",
+                            "commit": ""}])
+    status, data = get(server["url"] + "/api/snapshot")
+    assert status == 200
+    row = data["events"]["rows"][0]
+    assert row["flag"] == "bad"
+    assert "контракт шага не найден" in row["detail"]
+    html = index_html()
+    assert 'id="events-search"' in html
+    # Поиск идёт по тексту действия, а не по заголовку карточки.
+    assert "[row.detail, row.label, row.step]" in html
+
+
+def test_events_empty_state_text(server):
+    """Пустая история объясняется текстом, а не пустым экраном (C1)."""
+    status, data = get(server["url"] + "/api/snapshot")
+    assert status == 200
+    events = data["events"]
+    assert events["rows"] == [] and events["total"] == 0 and events["bad"] == 0
+    assert events["note"] and "истории" in events["note"]
+    html = index_html()
+    assert 'id="events-empty"' in html
+    assert "истории" in html
+
+
+def test_step_times_closed_and_open(server):
+    """Закрытый шаг: начало, окончание и длительность; открытый — от первой карточки (C3)."""
+    now = int(time.time())
+    t0 = now - 7200
+    t1 = t0 + 3600
+    add_step_card(server["db"], "planloop:1:S1:prompt", "prompter", t0, status="done")
+    add_step_card(server["db"], "planloop:1:S1:step", "demo", t0 + 60, status="done")
+    set_card_times(server["db"], "planloop:1:S1:step", completed=t1)
+    add_step_card(server["db"], "planloop:1:S2:prompt", "prompter", now - 600,
+                  status="running")
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    times = data["times"]
+    assert times["live"] is False
+    assert times["start"] == snapshot._fmt_ts(t0)
+    assert times["end"] == snapshot._fmt_ts(t1)
+    assert times["seconds"] == 3600
+    assert times["duration"] and times["note"] == ""
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S2")
+    assert status == 200
+    times = data["times"]
+    assert times["live"] is True
+    assert times["end"] == ""
+    assert times["seconds"] >= 600
+    # Попыток нет: «—», а не ноль, и это не «Invalid Date».
+    assert times["attempt_seconds"] is None
+    assert times["attempt"] == ""
+
+
+def test_step_stage_breakdown_by_role(server):
+    """Этапы по карточкам: роль из `assignee`, этап из ключа, сумма не больше шага (C4)."""
+    now = int(time.time())
+    base = now - 9000
+    plan = [("prompt", "prompter", 0, 600), ("step", "demo", 600, 5400),
+            ("review:1", "reviewer", 5400, 6000), ("fix:1", "demo", 6000, 6900)]
+    for suffix, assignee, offset, finish in plan:
+        key = f"planloop:1:S1:{suffix}"
+        add_step_card(server["db"], key, assignee, base + offset, status="done")
+        set_card_times(server["db"], key, created=base + offset,
+                       started=base + offset + 10, completed=base + finish)
+    # Второй шаг плана: в свод по шагу он попасть не должен.
+    add_step_card(server["db"], "planloop:1:S2:prompt", "prompter", base + 7200, status="done")
+    set_card_times(server["db"], "planloop:1:S2:prompt", created=base + 7200,
+                   completed=base + 7300)
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    stages = {stage["title"]: stage for stage in data["stages"]}
+    assert stages["Постановка"]["role_label"] == "постановщик"
+    assert stages["Исполнение"]["role_label"] == "исполнитель"
+    assert stages["Ревью 1"]["role_label"] == "ревьюер"
+    assert stages["Правки 1"]["role_label"] == "исполнитель"
+    for stage in data["stages"]:
+        assert stage["seconds"] >= 0 and stage["start"]
+    assert sum(stage["seconds"] for stage in data["stages"]) <= data["times"]["seconds"]
+
+    roles = {row["label"]: row for row in data["step_roles"]}
+    assert roles["постановщик"]["stages"] == 1
+    assert roles["исполнитель"]["stages"] == 2
+    assert roles["ревьюер"]["stages"] == 1
+    assert sum(row["seconds"] for row in data["step_roles"]) == sum(
+        stage["seconds"] for stage in data["stages"])
+    # Ключи не перепутаны: свод по плану шире, чем свод по шагу.
+    assert sum(row["stages"] for row in data["roles"]) > sum(
+        row["stages"] for row in data["step_roles"])
+
+
+def test_open_step_stage_live(server):
+    """Идущий этап: длительность от начала попытки, heartbeat — признак живости (C4, C6)."""
+    now = int(time.time())
+    started = now - 900
+    add_step_card(server["db"], "planloop:1:S1:step", "demo", started, status="running")
+    set_card_times(server["db"], "planloop:1:S1:step", created=started, started=started)
+    set_heartbeat(server["db"], "planloop:1:S1:step", now - 60)
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    stage = next(item for item in data["stages"] if item["stage"] == "step")
+    assert stage["live"] is True
+    assert stage["end_ts"] is None
+    assert stage["seconds"] >= 900
+    assert stage["start_ts"] == started
+    assert stage["heartbeat_ts"] == now - 60
+    assert stage["stale"] is False
+
+    html = index_html()
+    for anchor in ("tickTimes", "setInterval(tickTimes, 1000)", "data-live", "liveText"):
+        assert anchor in html, anchor
+
+
+def test_plan_role_totals(server):
+    """Сумма по ролям за план равна сумме длительностей этапов всех шагов (C5)."""
+    base = int(time.time()) - 20000
+    plan = [("planloop:1:S1:prompt", "prompter", 0, 300),
+            ("planloop:1:S1:step", "demo", 300, 1500),
+            ("planloop:1:S1:review:1", "reviewer", 1500, 600),
+            ("planloop:1:S2:prompt", "prompter", 2100, 200),
+            ("planloop:1:S2:step", "demo", 2300, 1700),
+            ("planloop:1:S2:review:1", "reviewer", 4000, 500)]
+    for key, assignee, offset, length in plan:
+        add_step_card(server["db"], key, assignee, base + offset, status="done")
+        set_card_times(server["db"], key, created=base + offset, started=base + offset,
+                       completed=base + offset + length)
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    roles = {row["label"]: row for row in data["roles"]}
+    assert roles["постановщик"]["stages"] == 2
+    assert roles["исполнитель"]["stages"] == 2
+    assert roles["ревьюер"]["stages"] == 2
+    for row in data["roles"]:
+        assert row["seconds"] > 0 and row["duration"]
+
+    total = 0
+    for step in ("S1", "S2"):
+        status, payload = get(server["url"] + f"/api/step?plan=1&id={step}")
+        assert status == 200
+        total += sum(stage["seconds"] for stage in payload["stages"])
+    assert sum(row["seconds"] for row in data["roles"]) == total
+
+
+def test_time_source_is_card_not_journal(server):
+    """Время берётся из карточек, а не из даты журнала; нет карточек — «—» и пояснение (C3)."""
+    plan_path = server["root"] / "docs" / "plans" / "1-demo.md"
+    text = plan_path.read_text(encoding="utf-8")
+    plan_path.write_text(text.replace("| — | S1 | — | — | открыт |",
+                                      "| 01.01.2020 | S1 | 01.01.2020 | — | открыт |"),
+                         encoding="utf-8")
+    t0 = int(time.time()) - 3600
+    add_step_card(server["db"], "planloop:1:S1:step", "demo", t0, status="done")
+    set_card_times(server["db"], "planloop:1:S1:step", created=t0, completed=t0 + 1200)
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    times = data["times"]
+    assert times["start"] == snapshot._fmt_ts(t0)
+    assert times["seconds"] == 1200
+    assert "01.01.2020" not in json.dumps(times, ensure_ascii=False)
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S2")
+    assert status == 200
+    times = data["times"]
+    assert times["start_ts"] is None and times["end_ts"] is None
+    assert times["seconds"] is None and times["start"] == ""
+    assert times["note"]
+
+
+def test_runs_history_for_card(server):
+    """История исполнения карточки: две попытки, исход, ожидание слота, вывод (C7)."""
+    now = int(time.time())
+    created = now - 5000
+    key = "planloop:1:S1:step"
+    card_id = add_step_card(server["db"], key, "demo", created, status="done")
+    set_card_times(server["db"], key, created=created, started=now - 4000,
+                   completed=now - 1000)
+    t2, t3, t4, t5 = now - 4000, now - 3500, now - 3000, now - 2000
+    add_runs(server["db"], card_id, [
+        {"started_at": t2, "ended_at": t3, "outcome": "completed", "summary": "шаг сдан"},
+        {"started_at": t4, "ended_at": t5, "outcome": "crashed", "error": "упал на импорте"},
+    ])
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    card = next(item for item in data["cards"] if item["key"] == key)
+    attempts = card["attempts"]
+    assert [run["outcome"] for run in attempts] == ["completed", "crashed"]
+    assert attempts[0]["label"] == "завершена"
+    assert attempts[0]["seconds"] == t3 - t2
+    assert attempts[0]["waited"] == t2 - created
+    assert attempts[0]["bad"] is False and attempts[1]["bad"] is True
+    assert "упал на импорте" in attempts[1]["output"]
+
+
+def test_runs_history_marks_timeout_and_quota(server):
+    """Лимит времени и квота провайдера: исход, подпись и вывод попытки (C7)."""
+    now = int(time.time())
+    created = now - 4000
+    key = "planloop:1:S1:step"
+    card_id = add_step_card(server["db"], key, "demo", created, status="done")
+    set_card_times(server["db"], key, created=created, completed=now - 100)
+    add_runs(server["db"], card_id, [
+        {"started_at": now - 3000, "ended_at": now - 2000, "outcome": "timed_out",
+         "summary": "лимит 2 ч исчерпан"},
+        {"started_at": now - 1500, "ended_at": now - 500, "outcome": "rate_limited",
+         "error": "429 Too Many Requests"},
+    ])
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    attempts = next(item for item in data["cards"] if item["key"] == key)["attempts"]
+    assert attempts[0]["bad"] is True and attempts[0]["label"] == "лимит времени"
+    assert attempts[1]["bad"] is True and attempts[1]["rate_limited"] is True
+    assert attempts[1]["label"] == "квота провайдера"
+    assert "лимит 2 ч" in attempts[0]["output"]
+    assert "429" in attempts[1]["output"]

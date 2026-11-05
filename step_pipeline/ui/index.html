@@ -221,11 +221,30 @@
   /* Находка без шага — обычный текст: ни курсора, ни акцентной стрелки. */
   .checks-lint .finding:not(.goto) .where { color: inherit; }
   .checks-problem { font-size: 12.5px; color: var(--bad); margin: 4px 0; }
+  /* Лента действий (план 3 S9): фильтры строкой, стопы и правки подсвечены (D4). */
+  .events-filters { display: grid; grid-template-columns: auto minmax(120px, 1fr) auto
+                    minmax(100px, .7fr) auto minmax(140px, 1fr) auto minmax(160px, 1.2fr);
+                    gap: 8px; align-items: center; margin-bottom: 10px; }
+  .events-filters label { font-size: 11.5px; color: var(--muted); }
+  ul.events { list-style: none; margin: 8px 0 0; padding: 0; }
+  ul.events li.event { border-left: 3px solid var(--line); padding: 6px 10px; margin: 5px 0;
+                       border-radius: 0 8px 8px 0; background: var(--panel-2); }
+  ul.events li.event.bad { border-left-color: var(--bad); }
+  ul.events li.event.warn { border-left-color: var(--warn); }
+  ul.events li.event .detail { font-size: 12.5px; margin: 3px 0; white-space: pre-wrap; }
+  button.link { background: transparent; border: none; padding: 0 8px 0 0; color: var(--accent);
+                font-size: 12px; text-decoration: underline; }
+  .step-times { display: grid; grid-template-columns: repeat(2, minmax(120px, 1fr)); gap: 8px;
+                margin-bottom: 12px; }
+  .attempts { margin-top: 6px; }
+  .attempts summary { cursor: pointer; font-size: 11.5px; color: var(--accent); }
+  .attempt { border-left: 2px solid var(--line); padding: 4px 8px; margin: 5px 0; }
+  .attempt pre { max-height: 120px; margin: 4px 0 0; }
   @media (max-width: 980px) { .cols { grid-template-columns: 1fr; } .flow { grid-template-columns: 1fr 1fr; }
                               .ov-grid { grid-template-columns: 1fr 1fr; } }
   /* Узкий экран (S8, D11): без горизонтального скролла страницы — таблицы скроллятся сами. */
   @media (max-width: 380px) {
-    .cols, .flow, .ov-grid { grid-template-columns: 1fr; }
+    .cols, .flow, .ov-grid, .events-filters, .step-times { grid-template-columns: 1fr; }
     header { flex-wrap: wrap; gap: 8px; padding: 10px 12px; }
     main { padding: 12px 10px 20px; }
     table { display: block; overflow-x: auto; }
@@ -276,6 +295,8 @@
             aria-selected="true" aria-controls="tab-overview">Обзор</button>
     <button class="tab" data-tab="step" id="tab-btn-step" role="tab"
             aria-selected="false" aria-controls="tab-step">Шаг</button>
+    <button class="tab" data-tab="events" id="tab-btn-events" role="tab"
+            aria-selected="false" aria-controls="tab-events">Лента</button>
     <button class="tab" data-tab="checks" id="tab-btn-checks" role="tab"
             aria-selected="false" aria-controls="tab-checks">Проверки</button>
     <button class="tab" data-tab="setup" id="tab-btn-setup" role="tab"
@@ -400,12 +421,59 @@
         </section>
       </div>
       <div>
+        <!-- Время шага, этапы ролей и история попыток (S9, D6-D10): метки отдаёт сервер,
+             тикает страница. Источники таблиц разные: `step_roles` — этот шаг, `roles` — план. -->
+        <section>
+          <h2>Время и этапы</h2>
+          <div class="step-times" id="step-times"><span class="muted">—</span></div>
+          <table>
+            <thead><tr><th>Этап</th><th>Роль</th><th>Начало</th><th>Конец</th>
+                       <th>Длительность</th><th>Статус</th></tr></thead>
+            <tbody id="step-stages"><tr><td colspan="6" class="muted">—</td></tr></tbody>
+          </table>
+          <h3>Роли по шагу</h3>
+          <table>
+            <thead><tr><th>Роль</th><th>Этапов</th><th>Сумма времени</th></tr></thead>
+            <tbody id="step-roles"><tr><td colspan="3" class="muted">—</td></tr></tbody>
+          </table>
+          <h3 id="plan-roles-title">Этапы по ролям за план</h3>
+          <table>
+            <thead><tr><th>Роль</th><th>Этапов</th><th>Сумма времени</th></tr></thead>
+            <tbody id="plan-roles"><tr><td colspan="3" class="muted">—</td></tr></tbody>
+          </table>
+        </section>
         <section>
           <h2>Карточки шага и правок</h2>
           <ul id="step-cards"><li class="muted">—</li></ul>
         </section>
       </div>
     </div>
+  </div>
+  <!-- Лента действий (план 3 S9, D1): история тиков стража из `history.jsonl`. Фильтры и
+       поиск клиентские (D5): сервер отдаёт готовые поля строк, страница только фильтрует. -->
+  <div class="tab-panel" id="tab-events">
+    <section>
+      <h2>Лента действий</h2>
+      <div class="events-filters">
+        <label for="events-plan">План</label>
+        <select id="events-plan" aria-label="Фильтр ленты по плану">
+          <option value="">все планы</option>
+        </select>
+        <label for="events-step">Шаг</label>
+        <input type="text" id="events-step" autocomplete="off" placeholder="S1"
+               aria-label="Фильтр ленты по шагу">
+        <label for="events-kind">Вид действия</label>
+        <select id="events-kind" aria-label="Фильтр ленты по виду действия">
+          <option value="">все виды</option>
+        </select>
+        <label for="events-search">Поиск</label>
+        <input type="text" id="events-search" autocomplete="off"
+               placeholder="текст действия" aria-label="Поиск по тексту ленты">
+      </div>
+      <div class="muted" id="events-count">показано 0 из 0</div>
+      <div class="ov-reason" id="events-empty">истории ещё нет</div>
+      <ul class="events" id="events-rows"><li class="muted">—</li></ul>
+    </section>
   </div>
   <!-- Проверки (план 3 S5): doctor и линтер всех планов, номера строк, переход к шагу.
        Блоки и id — постановка §4.2: шапка, «не проверяли», «всё в порядке», doctor, линтер. -->
@@ -635,6 +703,46 @@ function duration(seconds) {
   return "меньше минуты";
 }
 
+// Живое время (S9, D11): сервер отдаёт метки, страница тикает раз в секунду. Часы —
+// только при ненулевых, секунды всегда двузначные; закрытые значения тик не трогает.
+const HEARTBEAT_STALE = 300;
+
+function liveText(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = String(total % 60).padStart(2, "0");
+  if (hours) return hours + " ч " + String(minutes).padStart(2, "0") + " мин " + secs + " с";
+  return minutes + " мин " + secs + " с";
+}
+
+// Пересчёт ролей: каждая идущая карточка добавляет секунду в секунду (D11). База и число
+// живых этапов приходят атрибутами — ссылки на узлы не храним, их перезаписывает render.
+function tickRoles() {
+  document.querySelectorAll("tr[data-role-seconds]").forEach((row) => {
+    const base = Number(row.dataset.roleSeconds) || 0;
+    const live = Number(row.dataset.roleLive) || 0;
+    const since = Number(row.dataset.roleStart) || 0;
+    const cell = row.querySelector("[data-role-value]");
+    if (!live || !since || !cell) return;
+    const grown = base + Math.max(0, Math.floor(Date.now() / 1000 - since)) * live;
+    cell.textContent = liveText(grown);
+  });
+}
+
+function tickTimes() {
+  const now = Math.floor(Date.now() / 1000);
+  document.querySelectorAll("[data-live]").forEach((node) => {
+    const start = Number(node.dataset.start);
+    if (!start) return;
+    let text = liveText(now - start);
+    const beat = Number(node.dataset.heartbeat || 0);
+    if (beat && now - beat > HEARTBEAT_STALE) text += " (молчит " + duration(now - beat) + ")";
+    node.textContent = text;
+  });
+  tickRoles();
+}
+
 // Хвост ячейки «Сейчас» (S8, D5): очередь, пометка дефолтов, идущие карточки.
 function capacityDetails(capacity) {
   const note = capacity.limit_default || capacity.per_profile_default
@@ -794,6 +902,112 @@ function stageOf(cards, planId, stepId) {
   ];
 }
 
+// ── лента действий (S9, D1/D5): строки снимка фильтруются на клиенте ──
+let eventsRows = [];     // строки последнего снимка: фильтры перерисовывают их без запроса
+
+function filterEvents(rows, flt) {
+  const plan = String((flt || {}).plan || "");
+  const step = String((flt || {}).step || "").trim().toLowerCase();
+  const kind = String((flt || {}).kind || "");
+  const search = String((flt || {}).search || "").trim().toLowerCase();
+  return (rows || []).filter((row) => {
+    if (plan && String(row.plan || "") !== plan) return false;
+    if (kind && String(row.kind || "") !== kind) return false;
+    if (step && String(row.step || "").toLowerCase().indexOf(step) < 0) return false;
+    if (search) {
+      // Поиск идёт по тексту действия, подписи и номеру шага: причина стопа — в `detail`.
+      const hay = [row.detail, row.label, row.step].join(" ").toLowerCase();
+      if (hay.indexOf(search) < 0) return false;
+    }
+    return true;
+  });
+}
+
+// Строка ленты открывает экран «Шаг» на нужном блоке: отчёт ревью, коммит или карточку.
+function eventOpen(plan, step, anchor) {
+  if (!plan || !step) { toast("у строки ленты нет плана или шага", true); return; }
+  gotoSighting(plan, step);
+  if (!anchor) return;
+  let tries = 0;
+  const poll = setInterval(() => {
+    tries += 1;
+    const node = $(anchor);
+    if (node) {
+      clearInterval(poll);
+      if (node.tagName === "DETAILS") node.open = true;
+      node.scrollIntoView({block: "center"});
+    } else if (tries > 20) {
+      clearInterval(poll);      // блок не появился — переход к шагу уже сделан
+    }
+  }, 250);
+}
+
+function drawEvents() {
+  const rows = filterEvents(eventsRows, {
+    plan: $("events-plan").value, step: $("events-step").value,
+    kind: $("events-kind").value, search: $("events-search").value});
+  $("events-count").textContent = `показано ${rows.length} из ${eventsRows.length}`;
+  $("events-rows").innerHTML = rows.map((row) => {
+    const nav = [];
+    if (row.review) nav.push(`<button class="link" data-open="step-review">отчёт ревью</button>`);
+    if (row.commit) nav.push(`<button class="link" data-open="step-commit">коммит</button>`);
+    if (row.card) nav.push(`<button class="link" data-open="card-${esc(row.card)}">` +
+                           `карточка ${esc(row.card)}</button>`);
+    return `<li class="event ${esc(row.flag || "")}" data-plan="${esc(row.plan)}"` +
+           ` data-step="${esc(row.step || "")}">
+      <div class="row1"><span class="mono muted">${esc(row.at || "—")}</span>
+        <span class="title">${esc(row.label)}</span>
+        <span class="muted">план ${esc(row.plan || "—")} · шаг ${esc(row.step || "—")}</span></div>
+      <div class="detail">${esc(row.detail)}</div>
+      <div class="row1 mono muted">${row.commit ? esc(row.commit) : "коммита нет"}
+        ${row.card ? " · " + esc(row.card) : ""}</div>
+      <div class="row1">${nav.join("") || '<span class="muted">открывать нечего</span>'}
+        ${row.step ? '<button class="link" data-goto="1">шаг</button>' : ""}</div>
+    </li>`;
+  }).join("") || `<li class="muted">ничего не найдено</li>`;
+  document.querySelectorAll("#events-rows [data-open]").forEach((button) => {
+    button.onclick = () => {
+      const row = button.closest(".event");
+      eventOpen(row.dataset.plan, row.dataset.step, button.dataset.open);
+    };
+  });
+  document.querySelectorAll("#events-rows [data-goto]").forEach((button) => {
+    button.onclick = () => {
+      const row = button.closest(".event");
+      gotoSighting(row.dataset.plan, row.dataset.step);
+    };
+  });
+}
+
+function renderEvents(data) {
+  const events = data.events || {};
+  eventsRows = events.rows || [];
+  // План — из снимка, вид — только встреченные в ленте: список видов не выдумывается.
+  const plans = (data.plans || []).map((row) => String(row.id));
+  const planSel = $("events-plan");
+  if (planSel.dataset.plans !== plans.join(",")) {
+    planSel.dataset.plans = plans.join(",");
+    planSel.innerHTML = '<option value="">все планы</option>' + plans.map((id) =>
+      `<option value="${esc(id)}">план ${esc(id)}</option>`).join("");
+  }
+  const kinds = [];
+  eventsRows.forEach((row) => {
+    if (row.kind && !kinds.some((item) => item.kind === row.kind)) {
+      kinds.push({kind: row.kind, label: row.label});
+    }
+  });
+  const kindSel = $("events-kind");
+  if (kindSel.dataset.kinds !== kinds.map((item) => item.kind).join(",")) {
+    kindSel.dataset.kinds = kinds.map((item) => item.kind).join(",");
+    kindSel.innerHTML = '<option value="">все виды</option>' + kinds.map((item) =>
+      `<option value="${esc(item.kind)}">${esc(item.label || item.kind)}</option>`).join("");
+  }
+  $("events-empty").textContent = eventsRows.length ? "" : (events.note || "истории нет");
+  $("events-empty").hidden = !!eventsRows.length;
+  if (!eventsRows.length) $("events-rows").innerHTML = `<li class="muted">—</li>`;
+  drawEvents();
+}
+
 function renderOverview(data) {
   // Блок «Обзор» целиком из снимка: страница ничего не додумывает и не повторяет правила
   // стража. Значения приходят готовыми строками — подпись, причина, простой, прогресс.
@@ -941,6 +1155,70 @@ function clipNote(el, block, fallback) {
   el.className = "clip" + (/нет|не прочитан|недоступ|git/i.test(note) ? " bad" : "");
 }
 
+// Время и этапы шага (S9, D6-D11): метки считает сервер, идущие значения тикают на клиенте.
+// Нет метки — «—» с пояснением в title, а не нули и не «Invalid Date» (D10).
+function renderTimes(data) {
+  const times = data.times || {};
+  const stages = data.stages || [];
+  const stamp = Math.floor(Date.now() / 1000);
+  const has = (value) => value !== null && value !== undefined && value !== "";
+  const cell = (label, value, note) =>
+    `<div class="ov-item"><span>${esc(label)}</span>` +
+    `<b class="mono" title="${esc(note || "")}">${value}</b></div>`;
+  const liveSpan = (startTs, seconds, heartbeat) =>
+    `<span data-live="1" data-start="${Number(startTs) || ""}"` +
+    `${heartbeat ? ` data-heartbeat="${Number(heartbeat)}"` : ""}>` +
+    `${esc(liveText(seconds || 0))}</span>`;
+
+  const attemptEmpty = times.attempt_seconds === null || times.attempt_seconds === undefined;
+  $("step-times").innerHTML = [
+    cell("начало", has(times.start) ? esc(times.start) : esc("—"),
+         has(times.start) ? "" : (times.note || "карточек шага нет")),
+    cell("окончание", times.live ? "идёт" : (has(times.end) ? esc(times.end) : esc("—")),
+         has(times.end) || times.live ? "" : (times.note || "")),
+    cell("длительность",
+         times.live && times.start_ts ? liveSpan(times.start_ts, times.seconds)
+           : (has(times.seconds) ? esc(times.duration || "—") : esc("—")),
+         has(times.seconds) ? "" : (times.note || "")),
+    cell("текущая попытка",
+         times.live && times.attempt_ts ? liveSpan(times.attempt_ts, times.attempt_seconds)
+           : (has(times.attempt) ? esc(times.attempt) : esc("—")),
+         attemptEmpty ? "текущей попытки нет — длительность неизвестна" : ""),
+  ].join("");
+
+  $("step-stages").innerHTML = stages.map((stage) => {
+    const duration = stage.live
+      ? liveSpan(stage.start_ts, stage.seconds, stage.heartbeat_ts)
+      : esc(stage.duration || "—");
+    return `<tr class="${stage.live ? "current" : ""}">
+      <td>${esc(stage.title || stage.stage)}</td>
+      <td>${esc(stage.role_label || "—")}</td>
+      <td class="mono">${esc(stage.start || "—")}</td>
+      <td class="mono">${stage.live ? "—" : esc(stage.end || "—")}</td>
+      <td class="mono">${duration}</td>
+      <td>${esc(stage.live ? (stage.note || "идёт") : "закрыт")}</td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="muted">этапов нет — карточек шага нет</td></tr>`;
+
+  // Таблиц две, источники разные: `step_roles` — этот шаг, `roles` — весь план (D8).
+  const liveCounts = {};
+  stages.forEach((stage) => {
+    if (stage.live) liveCounts[stage.role] = (liveCounts[stage.role] || 0) + 1;
+  });
+  const roleRows = (rows) => (rows || []).map((row) => {
+    const live = liveCounts[row.role] || 0;
+    const attrs = live
+      ? ` data-role-seconds="${Number(row.seconds) || 0}" data-role-live="${live}"` +
+        ` data-role-start="${stamp}"` : "";
+    return `<tr${attrs}><td>${esc(row.label || row.role)}</td>
+      <td class="mono">${esc(row.stages)}</td>
+      <td class="mono" data-role-value>${esc(live ? liveText(row.seconds || 0)
+                                                 : (row.duration || "—"))}</td></tr>`;
+  }).join("") || `<tr><td colspan="3" class="muted">—</td></tr>`;
+  $("step-roles").innerHTML = roleRows(data.step_roles);
+  $("plan-roles").innerHTML = roleRows(data.roles);
+  $("plan-roles-title").textContent = `Этапы по ролям за план ${data.plan || "—"}`;
+}
+
 function renderStep(data) {
   const contract = data.contract || {};
   $("step-id").textContent = data.step || "—";
@@ -994,10 +1272,13 @@ function renderStep(data) {
   $("btn-hold").disabled = !!window.__preview || !holdAllowed;
   $("btn-unhold").disabled = !!window.__preview || !hold.held;
 
+  renderTimes(data);
+
   $("step-cards").innerHTML = (data.cards || []).map((card) => {
     const cls = card.status === "done" ? "ok"
       : (["crashed", "blocked", "timed_out", "gave_up"].includes(card.status) ? "bad" : "run");
     const list = card.comments || [];
+    const runs = card.attempts || [];
     return `<li class="step-card" id="card-${esc(card.id)}">
       <div class="row1"><span class="title">${esc(card.title)}</span>
         <span class="pill ${cls}">${esc(card.status)}</span></div>
@@ -1011,8 +1292,31 @@ function renderStep(data) {
         ${list.map((msg) => `<div class="comment"><div class="muted">${esc(msg.author || "—")}</div>${esc(msg.body)}</div>`).join("")
           || `<div class="muted">комментариев нет</div>`}
         ${card.comments_note ? `<div class="clip">${esc(card.comments_note)}</div>` : ""}
-      </details></li>`;
+      </details>
+      ${runs.length ? `<details class="attempts" id="attempts-${esc(card.id)}">
+        <summary>попытки (${runs.length})</summary>
+        ${runs.map((run) => `<div class="attempt" id="attempt-${esc(card.id)}-${esc(run.index)}">
+          <div class="row1"><span class="mono muted">попытка ${esc(run.index)} · начало ${esc(run.start || "—")}</span>
+            <span class="pill ${run.bad ? "bad" : (run.current ? "run" : "ok")}">${esc(run.label)}</span></div>
+          <div class="muted">длительность ${esc(run.duration || "—")}
+            ${run.current ? `<span data-live="1" data-start="${Number(run.started_at) || ""}">${esc(liveText(run.seconds || 0))}</span>` : ""}
+            · ожидание слота ${esc(run.waited_text || "—")}</div>
+          ${run.output ? `<pre id="output-${esc(card.id)}-${esc(run.index)}">${esc(run.output)}</pre>`
+                       : `<div class="muted">вывода нет</div>`}
+          ${run.output_note ? `<div class="clip">${esc(run.output_note)}</div>` : ""}
+          <a href="#output-${esc(card.id)}-${esc(run.index)}"
+             data-output="output-${esc(card.id)}-${esc(run.index)}">вывод попытки</a>
+        </div>`).join("")}
+      </details>` : `<div class="muted">попыток в борде нет</div>`}
+    </li>`;
   }).join("") || `<li class="muted">карточек шага нет</li>`;
+  document.querySelectorAll("[data-output]").forEach((link) => {
+    link.onclick = (event) => {
+      event.preventDefault();
+      const node = $(link.dataset.output);
+      if (node) node.scrollIntoView({block: "center"});
+    };
+  });
   document.querySelectorAll("[data-comments]").forEach((link) => {
     link.onclick = (event) => {
       event.preventDefault();
@@ -1273,6 +1577,7 @@ function render(data) {
   if (data.preview && $("tab-setup").classList.contains("active")) showTab("overview");
 
   renderOverview(data);
+  renderEvents(data);
 
   const plans = data.plans || [];
   $("plans").innerHTML = plans.map((p) => `
@@ -1714,9 +2019,21 @@ $("plan-mode").onchange = (event) => {
     .finally(() => { pm.disabled = false; });
 };
 
+// Фильтры ленты перерисовывают её строки без запроса к серверу (S9, D5).
+["events-plan", "events-kind"].forEach((id) => {
+  const node = $(id);
+  if (node) node.addEventListener("change", drawEvents);
+});
+["events-step", "events-search"].forEach((id) => {
+  const node = $(id);
+  if (node) node.addEventListener("input", drawEvents);
+});
+
 refresh();
 startEvents();
 timer = setInterval(refresh, 30000);
+// Секундный тик живого времени: отдельно от 30-секундного снимка и потока SSE (S9, D11).
+setInterval(tickTimes, 1000);
 document.addEventListener("visibilitychange", () => {
   clearInterval(timer);
   if (!document.hidden) { startEvents(); refresh(); timer = setInterval(refresh, 30000); }
