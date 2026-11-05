@@ -474,22 +474,24 @@ def act_save_config(state: State, payload: dict) -> dict:
         return {"ok": False, "error": "config должен быть объектом"}
     root = Path(state.project)
     path = root / proj.MARKER
-    cfg, current_bytes, problem = _read_config_file(path)
-    if cfg is None:
-        return {"ok": False, "error": _refusal(problem or ("missing", ""))}
-    candidate, errors, _notes = _validate_patch(cfg, patch, root)
-    if errors:
-        return {"ok": False, "error": "\n".join(errors)}
-    content = json.dumps(candidate, ensure_ascii=False, indent=2) + "\n"
-    new_bytes = _as_written(content).encode("utf-8")
-    backup = _backup_path(root)
-    if new_bytes == current_bytes:
-        # Текст не изменился — ни записи, ни копии: повторное сохранение не должно
-        # трогать файл (D6).
-        return {"ok": True, "changed": [], "noop": True, "note": "изменений нет",
-                "config": candidate, "backup": _backup_info(root)}
     error = ""
     with state.lock:
+        # Чтение, проверка и запись — одной критической секцией (§6.3): иначе копия (D5)
+        # получит байты, прочитанные до чужой записи, и откат уйдёт дальше, чем просили.
+        cfg, current_bytes, problem = _read_config_file(path)
+        if cfg is None:
+            return {"ok": False, "error": _refusal(problem or ("missing", ""))}
+        candidate, errors, _notes = _validate_patch(cfg, patch, root)
+        if errors:
+            return {"ok": False, "error": "\n".join(errors)}
+        content = json.dumps(candidate, ensure_ascii=False, indent=2) + "\n"
+        new_bytes = _as_written(content).encode("utf-8")
+        backup = _backup_path(root)
+        if new_bytes == current_bytes:
+            # Текст не изменился — ни записи, ни копии: повторное сохранение не должно
+            # трогать файл (D6).
+            return {"ok": True, "changed": [], "noop": True, "note": "изменений нет",
+                    "config": candidate, "backup": _backup_info(root)}
         backup.parent.mkdir(parents=True, exist_ok=True)
         backup.write_bytes(current_bytes)
         proj.write_config(root, candidate)
@@ -498,11 +500,11 @@ def act_save_config(state: State, payload: dict) -> dict:
         except (OSError, ValueError):
             path.write_bytes(current_bytes)
             error = "записал и не смог прочитать — вернул прежний файл"
+        info = _backup_info(root)
     if error:
         return {"ok": False, "error": error}
     state.note("pipeline.json обновлён: " + ", ".join(patch))
-    return {"ok": True, "changed": list(patch), "config": candidate,
-            "backup": _backup_info(root)}
+    return {"ok": True, "changed": list(patch), "config": candidate, "backup": info}
 
 
 def act_revert_config(state: State, payload: dict) -> dict:
@@ -513,16 +515,18 @@ def act_revert_config(state: State, payload: dict) -> dict:
     """
     root = Path(state.project)
     backup = _backup_path(root)
-    if not backup.is_file():
-        return {"ok": False, "error": "резервной копии нет — откатывать нечего"}
-    try:
-        raw = backup.read_bytes()
-        data = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return {"ok": False, "error": "резервная копия не разбирается — откат не выполнен, файл не тронут"}
-    if not isinstance(data, dict):
-        return {"ok": False, "error": "резервная копия не конфигурация — откат не выполнен, файл не тронут"}
     with state.lock:
+        # Копию читаем под тем же замком, что и пишем файл: иначе между проверкой и
+        # записью чужое сохранение успело бы подменить копию (§6.4, D5).
+        if not backup.is_file():
+            return {"ok": False, "error": "резервной копии нет — откатывать нечего"}
+        try:
+            raw = backup.read_bytes()
+            data = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return {"ok": False, "error": "резервная копия повреждена — откат не выполнен, файл не тронут"}
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "резервная копия не конфигурация — откат не выполнен, файл не тронут"}
         (root / proj.MARKER).write_bytes(raw)
     state.note(f"pipeline.json возвращён из копии ({len(raw)} байт)")
     return {"ok": True, "restored": True, "bytes": len(raw),

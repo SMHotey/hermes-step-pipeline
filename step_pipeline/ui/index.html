@@ -1226,6 +1226,11 @@ function configError(text) {
   $("config-error").textContent = text || "";
 }
 
+// Версия формы: растёт при каждой правке поля и при перезагрузке формы из файла.
+// Ответ проверки применяется, только если версия не изменилась, пока он шёл, — иначе
+// на экране оказался бы дифф уже не тех значений (C3, §6.6).
+let configVersion = 0;
+
 function clearConfigDiff() {
   // Дифф относится к прежним значениям: любая правка поля его обнуляет и гасит
   // «Сохранить» — кнопка снова зажжётся только после новой проверки.
@@ -1299,6 +1304,7 @@ async function loadConfigForm() {
   form.path_reviews.value = paths.reviews || "";
   form.path_prompts.value = paths.prompts || "";
   form.path_state.value = paths.state || "";
+  configVersion += 1;   // форма перерисована: ответы прежних проверок уже не про неё
   clearConfigDiff();
   // Ошибок файла на форме не скрываем: пользователь должен понимать, что правка
   // не пройдёт и почему (D7).
@@ -1335,15 +1341,25 @@ $("btn-resume").onclick = () => act("resume");
 $("btn-settings").onclick = () => { $("settings").showModal(); loadConfigForm(); };
 $("close-settings").onclick = () => $("settings").close();
 // Любая правка поля обнуляет проверку: сохранён будет ровно тот дифф, что видели.
-$("form-config").addEventListener("input", () => { clearConfigDiff(); configError(""); });
+$("form-config").addEventListener("input", () => {
+  configVersion += 1;   // проверка, отправленная до этой правки, устарела
+  clearConfigDiff();
+  configError("");
+});
 $("config-check").onclick = async () => {
   // Проверка — не действие: через api(), без тоста «готово» и без перезагрузки
   // снимка (§6.6): файл она не меняет.
   const button = $("config-check");
   button.disabled = true;
   configError("");
+  const version = configVersion;   // версия на момент отправки патча
   try {
     const data = await configAction("preview_config", {config: configPatch()});
+    if (version !== configVersion) {
+      // Пока шёл запрос, форму правили (или перерисовали из файла): дифф относится
+      // к прежним значениям, «Сохранить» зажигать нельзя (§6.6, C3).
+      return;
+    }
     if (!data.ok) {
       clearConfigDiff();
       configError(data.error || "не удалось проверить конфигурацию");
@@ -1352,6 +1368,7 @@ $("config-check").onclick = async () => {
     renderConfigDiff(data);
     $("save-config").disabled = false;
   } catch (err) {
+    if (version !== configVersion) return;   // ответ устарел — и ошибка тоже
     clearConfigDiff();
     configError(String(err));
   } finally {
