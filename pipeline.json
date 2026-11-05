@@ -37,9 +37,9 @@
   ],
   "require_prompt": true,
   "runtimes": {
-    "step": "3h",
-    "review": "150m",
-    "prompt": "45m"
+    "step": "270m",
+    "review": "225m",
+    "prompt": "68m"
   },
   "kanban": {
     "tenant": "plan"
