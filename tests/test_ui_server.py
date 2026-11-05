@@ -2,6 +2,7 @@
 """UI-сервер: снимок, действия, настройки. Без модели и без настоящей борды."""
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -1388,4 +1389,204 @@ def test_index_has_project_registry_markup():
     for call in ('withProject("/api/snapshot"', 'withProject("/api/events"',
                  'withProject("/api/step?', 'withProject("/api/checks"',
                  'withProject("/api/setup"'):
+        assert call in html, call
+
+
+# ───────────────────── правка конфигурации (план 3 S7) ─────────────────────
+
+def config_file(server) -> Path:
+    """Конфигурация tmp-проекта: тот самый файл, что читает и пишет панель."""
+    return server["root"] / "pipeline.json"
+
+
+def test_config_preview_returns_diff_and_writes_nothing(server):
+    """Предпросмотр отдаёт дифф со старым и новым значением и файл не трогает (D4)."""
+    path = config_file(server)
+    before = path.read_bytes()
+    status, data = post(server["url"], {"action": "preview_config",
+                                       "config": {"runtimes": {"step": "45m"}}})
+    assert status == 200 and data["ok"] and data["changed"] == ["runtimes"]
+    assert '"step": "3h"' in data["diff"], data["diff"]
+    assert '"step": "45m"' in data["diff"], data["diff"]
+    assert data["content"].endswith("\n") and data["notes"] == []
+    assert path.read_bytes() == before, "предпросмотр файл не пишет"
+
+
+def test_config_preview_matches_saved_bytes(server):
+    """Дифф не врёт: `content` предпросмотра равен записанному тексту (D4)."""
+    patch = {"board": "newboard", "runtimes": {"step": "45m"}}
+    preview_status, preview = post(server["url"], {"action": "preview_config", "config": patch})
+    save_status, saved = post(server["url"], {"action": "save_config", "config": patch})
+    assert preview_status == 200 and save_status == 200
+    assert preview["ok"] and saved["ok"]
+    assert preview["content"] == config_file(server).read_text(encoding="utf-8")
+    assert json.loads(preview["content"])["board"] == "newboard"
+
+
+def test_save_config_rejects_bad_runtime(server):
+    """Некорректный таймаут отклоняется с объяснением по ключу, файл не меняется (D2)."""
+    path = config_file(server)
+    before = path.read_bytes()
+    for bad in ("5 часов", "45", "3ч", "0m", "-5m", ""):
+        status, data = post(server["url"], {"action": "save_config",
+                                            "config": {"runtimes": {"step": bad}}})
+        assert status == 400 and not data["ok"], bad
+        assert data["error"].startswith("runtimes.step"), (bad, data["error"])
+    assert path.read_bytes() == before
+    # Годное значение той же формы проходит.
+    ok, saved = post(server["url"], {"action": "save_config",
+                                     "config": {"runtimes": {"step": "45m"}}})
+    assert ok == 200 and saved["ok"] and saved["changed"] == ["runtimes"]
+
+
+def test_save_config_rejects_path_outside_project(server):
+    """Некорректный путь отклоняется с объяснением по ключу, корректный проходит (D3)."""
+    path = config_file(server)
+    before = path.read_bytes()
+    for bad in ("../outside", "/etc", "C:/Windows", "docs/../../.."):
+        status, data = post(server["url"], {"action": "save_config",
+                                            "config": {"paths": {"plans": bad}}})
+        assert status == 400 and not data["ok"], bad
+        assert data["error"].startswith("paths.plans"), (bad, data["error"])
+        assert "корня" in data["error"] or ".." in bad, (bad, data["error"])
+    assert path.read_bytes() == before
+    ok, saved = post(server["url"], {"action": "save_config",
+                                     "config": {"paths": {"plans": "docs/plans"}}})
+    assert ok == 200 and saved["ok"] and saved["changed"] == ["paths"]
+    assert json.loads(path.read_text(encoding="utf-8"))["paths"]["plans"] == "docs/plans"
+
+
+def test_save_config_accepts_hidden_state_path(server):
+    """`.pipeline/state` — законное умолчание движка, а не выход за корень (D3, факт 12)."""
+    status, data = post(server["url"], {"action": "save_config",
+                                        "config": {"paths": {"state": ".pipeline/state"}}})
+    assert status == 200 and data["ok"]
+    cfg = json.loads(config_file(server).read_text(encoding="utf-8"))
+    assert cfg["paths"]["state"] == ".pipeline/state"
+    assert cfg["paths"]["plans"] == "docs/plans", "соседние пути не тронуты"
+
+
+def test_save_config_keeps_unknown_keys(server):
+    """Неизвестные панели ключи файла и лишние подключи не теряются (C6, D1)."""
+    path = config_file(server)
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    cfg["custom_x"] = {"a": 1}
+    cfg["profiles"]["driver"] = "так-так"
+    cfg["runtimes"]["extra"] = "9m"
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    status, data = post(server["url"], {"action": "save_config",
+                                        "config": {"board": "newboard",
+                                                   "runtimes": {"step": "45m"}}})
+    assert status == 200 and data["ok"]
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert after["custom_x"] == {"a": 1}
+    assert after["profiles"]["driver"] == "так-так"
+    assert after["runtimes"]["extra"] == "9m"
+    assert after["runtimes"]["step"] == "45m" and after["board"] == "newboard"
+
+
+def test_save_config_refuses_broken_json(server):
+    """Битый `pipeline.json` — отказ с объяснением, файл байт в байт не тронут (D7)."""
+    path = config_file(server)
+    path.write_text("{битый", encoding="utf-8")
+    before = path.read_bytes()
+    status, data = post(server["url"], {"action": "save_config",
+                                        "config": {"board": "newboard"}})
+    assert status == 400 and not data["ok"]
+    assert "не разбирается" in data["error"], data["error"]
+    assert path.read_bytes() == before
+
+
+def test_revert_config_restores_bytes(server):
+    """Откат возвращает прежний файл побайтово: в исходнике нет перевода строки (D5)."""
+    path = config_file(server)
+    original = path.read_bytes()
+    save_status, saved = post(server["url"], {"action": "save_config",
+                                              "config": {"board": "newboard"}})
+    assert save_status == 200 and saved["ok"] and path.read_bytes() != original
+    status, data = post(server["url"], {"action": "revert_config"})
+    assert status == 200 and data["ok"] and data["bytes"] == len(original)
+    assert data["sha256"] == hashlib.sha256(original).hexdigest()
+    assert path.read_bytes() == original, "откат побайтовый"
+
+
+def test_revert_config_without_backup(server):
+    """Без сохранений копии нет: отказ понятный, а не 500 (§6.4)."""
+    status, data = post(server["url"], {"action": "revert_config"})
+    assert status == 400 and not data["ok"]
+    assert "копии нет" in data["error"], data["error"]
+
+
+def test_save_config_noop_keeps_file(server):
+    """Повтор с теми же значениями: файл и копию не трогаем (D6)."""
+    path = config_file(server)
+    # Файл приводим к канону сериализации: иначе правкой стал бы один перевод строки.
+    path.write_text(json.dumps(json.loads(path.read_text(encoding="utf-8")),
+                               ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    before = path.read_bytes()
+    stamp = path.stat().st_mtime_ns
+    patch = {"board": "uiboard", "runtimes": {"step": "3h"}}
+    preview_status, preview = post(server["url"], {"action": "preview_config", "config": patch})
+    status, data = post(server["url"], {"action": "save_config", "config": patch})
+    assert preview_status == 200 and preview["diff"] == "", preview["diff"]
+    assert status == 200 and data["ok"] and data["noop"] is True
+    assert data["changed"] == [] and data["note"] == "изменений нет"
+    assert data["backup"]["exists"] is False, "копия при пустой правке не создаётся"
+    assert path.read_bytes() == before and path.stat().st_mtime_ns == stamp
+
+
+def test_config_endpoint_serves_config_and_backup(server):
+    """`GET /api/config`: конфигурация формы и состояние резервной копии (§6.5)."""
+    path = config_file(server)
+    size_before = path.stat().st_size
+    status, data = get(server["url"] + "/api/config")
+    assert status == 200 and data["ok"]
+    assert data["config"]["board"] == "uiboard" and data["errors"] == []
+    assert data["backup"] == {"exists": False, "path": ".pipeline/state/pipeline.json.bak",
+                              "bytes": 0, "saved_at": ""}
+    save_status, saved = post(server["url"], {"action": "save_config",
+                                              "config": {"board": "newboard"}})
+    assert save_status == 200 and saved["ok"]
+    status, after = get(server["url"] + "/api/config")
+    assert after["backup"]["exists"] is True and after["backup"]["bytes"] == size_before
+    assert after["backup"]["path"] == ".pipeline/state/pipeline.json.bak"
+    assert after["config"]["board"] == "newboard"
+    assert after["project"]["name"], "ответ подписан проектом"
+
+
+def test_config_endpoint_addresses_project(tmp_path: Path, hermes_stub: Path,
+                                           isolated_hermes_home: Path):
+    """Конфигурация адресуется проектом: свой файл, и 400 на неизвестный id (C8, D9)."""
+    first = install_project(tmp_path / "alpha", board="alpha-board")
+    second = install_project(tmp_path / "beta", board="beta-board")
+    write_registry(isolated_hermes_home,
+                   [{"id": "beta", "name": "Бета", "root": str(second)}])
+    with running(first) as (url, _httpd):
+        own_status, own = get(url + "/api/config")
+        other_status, other = get(url + "/api/config?project=beta")
+        bad_status, bad = get(url + "/api/config?project=nope")
+        act_status, body = post(url, {"action": "save_config", "project": "nope",
+                                      "config": {"board": "новая"}})
+    assert own_status == 200 and own["config"]["board"] == "alpha-board"
+    assert own["project"]["id"] == "alpha"
+    assert other_status == 200 and other["config"]["board"] == "beta-board"
+    assert other["project"]["id"] == "beta"
+    assert bad_status == 400 and "неизвестный проект" in bad["error"]
+    assert bad["projects"] == ["alpha", "beta"]
+    # Действие по неизвестному id отказывает, а не уходит в файл серверного проекта.
+    assert act_status == 400 and "неизвестный проект" in body["error"]
+    assert json.loads((first / "pipeline.json").read_text(encoding="utf-8"))["board"] == \
+        "alpha-board"
+
+
+def test_index_has_config_diff_and_rollback_markup():
+    """Опоры задачи в диалоге: дифф, проверка, откат, каталоги и проект (§6.6)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    for anchor in ('id="config-diff"', 'id="config-check"', 'id="config-revert"',
+                   'id="config-error"', 'id="config-hint"', 'id="form-config"',
+                   'name="path_plans"', 'name="path_reviews"', 'name="path_prompts"',
+                   'name="path_state"', 'id="save-config" disabled'):
+        assert anchor in html, anchor
+    for call in ('/api/config', 'withProject("/api/config")', "preview_config",
+                 "revert_config", 'addEventListener("input"', "clearConfigDiff()"):
         assert call in html, call

@@ -106,6 +106,19 @@
   label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
   input[type=text], input[type=password] { width: 100%; padding: 8px 10px; border-radius: 8px;
       border: 1px solid var(--line); background: var(--bg); color: var(--text); font-size: 13px; }
+  /* Правка конфигурации (S7): дифф перед сохранением, заметки и отказ валидации. */
+  .config-preview { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .config-preview-head { display: flex; justify-content: space-between; gap: 10px;
+                         font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  #config-diff { background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+                 padding: 8px 10px; max-height: 200px; }
+  #config-diff .add { color: var(--ok); }
+  #config-diff .del { color: var(--bad); }
+  #config-diff .plain { color: var(--muted); }
+  #config-notes { margin: 6px 0 0; padding-left: 20px; color: var(--warn); font-size: 12.5px; }
+  #config-notes li { list-style: disc; }
+  #config-error { color: var(--bad); font-size: 12.5px; white-space: pre-wrap; margin: 8px 0 0; }
+  #config-error:empty { display: none; }
   .row { display: flex; gap: 10px; }
   .row > div { flex: 1; }
   .ov-head { font-size: 17px; font-weight: 600; letter-spacing: .2px;
@@ -394,9 +407,29 @@
       <div><label>Таймаут ревью</label><input type="text" name="review"></div>
       <div><label>Таймаут постановки</label><input type="text" name="prompt"></div>
     </div>
+    <label>Каталоги проекта (пути относительно корня)</label>
+    <div class="row">
+      <div><label for="path-plans">Планы</label><input type="text" id="path-plans" name="path_plans"></div>
+      <div><label for="path-reviews">Ревью</label><input type="text" id="path-reviews" name="path_reviews"></div>
+    </div>
+    <div class="row">
+      <div><label for="path-prompts">Постановки</label><input type="text" id="path-prompts" name="path_prompts"></div>
+      <div><label for="path-state">Состояние</label><input type="text" id="path-state" name="path_state"></div>
+    </div>
     <label><input type="checkbox" name="require_prompt"> шаг без постановки не начинается</label>
-    <div style="display:flex;gap:10px;margin-top:16px">
-      <button type="button" class="primary" id="save-config">Сохранить</button>
+    <div class="config-preview">
+      <div class="config-preview-head">
+        <b>Дифф конфигурации</b>
+        <span class="muted" id="config-hint">не проверяли</span>
+      </div>
+      <pre id="config-diff">—</pre>
+      <ul id="config-notes"></ul>
+      <p id="config-error"></p>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:16px">
+      <button type="button" id="config-check">Проверить</button>
+      <button type="button" class="primary" id="save-config" disabled>Сохранить</button>
+      <button type="button" id="config-revert" disabled>Вернуть как было</button>
       <button type="button" id="close-settings">Закрыть</button>
     </div>
   </form>
@@ -498,6 +531,8 @@ function switchProject(id) {
   refresh();
   startEvents();
   loadProjects();
+  // Диалог настроек перечитывает конфигурацию уже выбранного проекта (§6.6).
+  loadConfigForm();
 }
 
 function renderProjects(data, current) {
@@ -1184,6 +1219,98 @@ function startEvents() {
   stream.onerror = () => {};   // переподключение делает браузер, резервный опрос работает
 }
 
+// ── правка конфигурации (план 3 S7): дифф, проверка, откат ──
+function configError(text) {
+  // Причина отказа живёт в диалоге, а не в тосте: тост исчезает, а рядом с диффом
+  // объяснение остаётся, пока пользователь не поправит форму.
+  $("config-error").textContent = text || "";
+}
+
+function clearConfigDiff() {
+  // Дифф относится к прежним значениям: любая правка поля его обнуляет и гасит
+  // «Сохранить» — кнопка снова зажжётся только после новой проверки.
+  $("config-diff").textContent = "—";
+  $("config-notes").innerHTML = "";
+  $("config-hint").textContent = "не проверяли";
+  $("save-config").disabled = true;
+}
+
+function configPatch() {
+  // Тот же патч для проверки и для сохранения: проверенный дифф обязан совпасть
+  // с записываемым файлом байт в байт (D4).
+  const form = $("form-config");
+  return {
+    board: form.board.value.trim(),
+    driven_plans: form.driven_plans.value,
+    require_prompt: form.require_prompt.checked,
+    runtimes: {step: form.step.value.trim(), review: form.review.value.trim(),
+               prompt: form.prompt.value.trim()},
+    paths: {plans: form.path_plans.value.trim(), reviews: form.path_reviews.value.trim(),
+            prompts: form.path_prompts.value.trim(), state: form.path_state.value.trim()},
+  };
+}
+
+function configAction(action, payload) {
+  // Проект — телом, как у всех действий (§4.4): форма правит конфигурацию уже
+  // выбранного в шапке проекта, а не того, с которым запущен сервер.
+  return api("/api/action", {
+    method: "POST",
+    headers: PANEL_HEADERS,
+    body: JSON.stringify({action, ...(currentProject ? {project: currentProject} : {}),
+                          ...payload}),
+  });
+}
+
+function renderConfigDiff(data) {
+  const diff = String(data.diff || "");
+  $("config-diff").innerHTML = diff
+    ? diff.split("\n").map((line) => {
+        const cls = line.startsWith("+") ? "add" : (line.startsWith("-") ? "del" : "plain");
+        return `<span class="${cls}">${esc(line)}</span>`;
+      }).join("\n")
+    : '<span class="plain">изменений нет</span>';
+  $("config-notes").innerHTML = (data.notes || []).map((note) => `<li>${esc(note)}</li>`).join("");
+  $("config-hint").textContent = diff
+    ? `строк диффа: ${diff.split("\n").length}` : "изменений нет";
+}
+
+async function loadConfigForm() {
+  // Значения формы — из файла, а не из снимка: `paths` в снимок не попадают (факт 7).
+  let data;
+  try {
+    data = await api(withProject("/api/config"));
+  } catch (err) {
+    configError(String(err));
+    return;
+  }
+  if (!data.ok) { configError(data.error || "не удалось прочитать конфигурацию"); return; }
+  const cfg = data.config || {};
+  const form = $("form-config");
+  form.board.value = cfg.board || "";
+  form.driven_plans.value = Array.isArray(cfg.driven_plans)
+    ? cfg.driven_plans.join(", ") : String(cfg.driven_plans || "");
+  const rt = cfg.runtimes || {};
+  form.step.value = rt.step || "";
+  form.review.value = rt.review || "";
+  form.prompt.value = rt.prompt || "";
+  form.require_prompt.checked = cfg.require_prompt !== false;
+  const paths = cfg.paths || {};
+  form.path_plans.value = paths.plans || "";
+  form.path_reviews.value = paths.reviews || "";
+  form.path_prompts.value = paths.prompts || "";
+  form.path_state.value = paths.state || "";
+  clearConfigDiff();
+  // Ошибок файла на форме не скрываем: пользователь должен понимать, что правка
+  // не пройдёт и почему (D7).
+  configError((data.errors || []).join("\n"));
+  const backup = data.backup || {};
+  const revert = $("config-revert");
+  revert.disabled = !backup.exists;
+  revert.textContent = backup.exists
+    ? `Вернуть как было (${backup.saved_at || "дата неизвестна"})`
+    : "Вернуть как было";
+}
+
 $("btn-tick").onclick = () => act("tick", currentPlan ? {plan: currentPlan} : {});
 $("project-switch").onchange = (event) => switchProject(event.target.value);
 document.querySelectorAll(".tab").forEach((tab) => {
@@ -1205,17 +1332,83 @@ $("btn-stop").onclick = () => {
   if (reason !== null) act("stop", {reason});
 };
 $("btn-resume").onclick = () => act("resume");
-$("btn-settings").onclick = () => $("settings").showModal();
+$("btn-settings").onclick = () => { $("settings").showModal(); loadConfigForm(); };
 $("close-settings").onclick = () => $("settings").close();
-$("save-config").onclick = () => {
-  const form = $("form-config");
-  act("save_config", {config: {
-    board: form.board.value.trim(),
-    driven_plans: form.driven_plans.value,
-    require_prompt: form.require_prompt.checked,
-    runtimes: {step: form.step.value.trim(), review: form.review.value.trim(),
-               prompt: form.prompt.value.trim()},
-  }}).then(() => { window.__configLoaded = false; });
+// Любая правка поля обнуляет проверку: сохранён будет ровно тот дифф, что видели.
+$("form-config").addEventListener("input", () => { clearConfigDiff(); configError(""); });
+$("config-check").onclick = async () => {
+  // Проверка — не действие: через api(), без тоста «готово» и без перезагрузки
+  // снимка (§6.6): файл она не меняет.
+  const button = $("config-check");
+  button.disabled = true;
+  configError("");
+  try {
+    const data = await configAction("preview_config", {config: configPatch()});
+    if (!data.ok) {
+      clearConfigDiff();
+      configError(data.error || "не удалось проверить конфигурацию");
+      return;
+    }
+    renderConfigDiff(data);
+    $("save-config").disabled = false;
+  } catch (err) {
+    clearConfigDiff();
+    configError(String(err));
+  } finally {
+    button.disabled = false;
+  }
+};
+$("save-config").onclick = async () => {
+  const button = $("save-config");
+  button.disabled = true;
+  configError("");
+  let data;
+  try {
+    data = await configAction("save_config", {config: configPatch()});
+  } catch (err) {
+    configError(String(err));
+    button.disabled = false;
+    return;
+  }
+  const who = data.project && data.project.name ? " · " + data.project.name : "";
+  if (!data.ok) {
+    // Форма не менялась, проверка ещё верна — кнопку возвращаем, причину оставляем.
+    configError(data.error || "не удалось сохранить");
+    button.disabled = false;
+    return;
+  }
+  toast((data.noop ? "Изменений нет" : "Сохранено") + who);
+  clearConfigDiff();
+  window.__configLoaded = false;   // снимок обязан отдать уже новые значения
+  etag = null;
+  startEvents();
+  await refresh();
+  await loadConfigForm();          // форма и дата копии — уже новые
+};
+$("config-revert").onclick = async () => {
+  const button = $("config-revert");
+  button.disabled = true;
+  configError("");
+  let data;
+  try {
+    data = await configAction("revert_config", {});
+  } catch (err) {
+    configError(String(err));
+    button.disabled = false;
+    return;
+  }
+  if (!data.ok) {
+    configError(data.error || "не удалось вернуть прежний файл");
+    button.disabled = false;
+    return;
+  }
+  toast(`Прежний файл восстановлен: ${data.bytes} байт`);
+  clearConfigDiff();
+  window.__configLoaded = false;
+  etag = null;
+  startEvents();
+  await refresh();
+  await loadConfigForm();
 };
 $("save-tg").onclick = () => {
   const token = $("tg-token").value.trim();

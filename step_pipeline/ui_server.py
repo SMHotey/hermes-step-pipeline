@@ -13,16 +13,20 @@
                            ?plan=<N> — только один план); действий не выполняют
     GET  /api/projects     сводка реестра: проект, план, следующий шаг, закрыто, стоп, простой
     GET  /api/setup        мастер установки: шаги, следующий шаг, значения формы (без токена)
+    GET  /api/config       конфигурация проекта: pipeline.json, ошибки его разбора и
+                           резервная копия (?project=<id> — проект реестра); только чтение
     POST /api/setup        один шаг мастера: {"step": ..., "values": {...}},
                            заголовок X-Pipeline-Panel; токен уходит в .env профиля
                            и обратно в браузер не возвращается
     POST /api/action       действия: tick, stop, resume, hold, unhold,
-                           save_config, save_telegram, test_telegram
+                           preview_config, save_config, revert_config,
+                           save_telegram, test_telegram
     POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
 Слушает только localhost: это операторский инструмент владельца, без авторизации.
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -82,7 +86,19 @@ def busy_version(host: str, port: int, timeout: float = 0.5) -> str | None:
         return None
     return str(data.get("version") or "?")
 
+# Ключи конфигурации, которыми форма настроек управляет на верхнем уровне (6.6).
 CONFIG_KEYS = ("project", "board", "driven_plans", "require_prompt")
+# Значения таймаутов движка: только `45m`/`3h` (D2). Единица обязательна, дробных
+# и нулевых нет: `0m` — тот же вечный ожидатель, что и `-5m` (только под видом времени).
+RUNTIME_RE = re.compile(r"^\d+[mh]$")
+RUNTIME_KEYS = ("step", "review", "prompt")
+# Каталоги, которые панель ведёт (D3): только эти подключи `paths` проверяются на
+# выход за корень; остальные сохраняются как есть.
+CONFIG_PATH_KEYS = ("plans", "reviews", "prompts", "state")
+# Резервная копия: один файл на проект, внутри `.pipeline/state` рядом со стоп-флагами.
+BACKUP_NAME = "pipeline.json.bak"
+# Потолок строк диффа в ответе: длинный файл не должен загромождать ответ и панель.
+CONFIG_DIFF_LINES = 300
 CSP = ("default-src 'none'; script-src 'self' 'unsafe-inline'; "
        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
        "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
@@ -210,39 +226,307 @@ def act_unhold(state: State, payload: dict) -> dict:
     return _run_engine(state, "--unhold", step, *extra)
 
 
-def act_save_config(state: State, payload: dict) -> dict:
-    """Правка pipeline.json из формы: только известные ключи, значения валидируются."""
-    patch = payload.get("config") or {}
+def _backup_path(root: Path) -> Path:
+    """Резервная копия конфигурации: байты файла до последнего сохранения (D5)."""
+    return Path(root) / ".pipeline" / "state" / BACKUP_NAME
+
+
+def _backup_info(root: Path) -> dict:
+    """Структура копии для ответа: одна и та же у сохранения и у `GET /api/config` (§6.5)."""
+    path = _backup_path(root)
+    info = {"exists": path.is_file(), "path": f".pipeline/state/{BACKUP_NAME}",
+            "bytes": 0, "saved_at": ""}
+    if info["exists"]:
+        stat = path.stat()
+        info["bytes"] = stat.st_size
+        info["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime))
+    return info
+
+
+def _read_config_file(path: Path) -> tuple[dict | None, bytes, tuple[str, str] | None]:
+    """Прочитать `pipeline.json` байтами: (словарь, байты, беда или None).
+
+    Байты нужны предпросмотру и откату: кириллица и отсутствующий в конце перевод
+    строки обязаны пережить круговой рейс без пересборки (D4, D5). Читает файл сам,
+    а не `proj.read_config`: тот глотает ошибку разбора и отдаёт `{}` — сохранение
+    затёрло бы битый файл молча.
+
+    Беды: `("missing", "")` — файла нет, `("encoding", "")` — не UTF-8,
+    `("json", текст ошибки)` — не разбирается, `("shape", "")` — не объект.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, b"", ("missing", "")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, raw, ("encoding", "")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, raw, ("json", str(exc))
+    if not isinstance(data, dict):
+        return None, raw, ("shape", "")
+    return data, raw, None
+
+
+def _refusal(problem: tuple[str, str]) -> str:
+    """Почему правку отклонили (D7): файл не тронут, объяснение — пользователю."""
+    kind, detail = problem
+    if kind == "json":
+        return f"pipeline.json не разбирается как JSON: {detail} — правка отклонена, файл не тронут"
+    if kind == "missing":
+        return "pipeline.json не найден — правка отклонена, файл не тронут"
+    if kind == "encoding":
+        return "pipeline.json не в кодировке UTF-8 — правка отклонена, файл не тронут"
+    return "pipeline.json должен содержать объект — правка отклонена, файл не тронут"
+
+
+def _view_errors(problem: tuple[str, str] | None) -> list[str]:
+    """Ошибки для `GET /api/config` (§6.5): панель показывает их рядом с формой.
+
+    Файла, которого нет, это ещё не беда: форма отдаётся пустой, а откажет
+    сохранение — так «нет файла» и «файл битый» остаются разными состояниями.
+    """
+    if problem is None:
+        return []
+    kind, detail = problem
+    if kind == "json":
+        return [f"pipeline.json не разбирается: {detail}"]
+    if kind == "encoding":
+        return ["pipeline.json не в кодировке UTF-8"]
+    if kind == "shape":
+        return ["pipeline.json должен содержать объект"]
+    return []
+
+
+def _path_error(root: Path, raw: object) -> str:
+    """Пустая строка, если путь годен, иначе объяснение (D3, §6.1).
+
+    Скрытые каталоги разрешены: `.pipeline/state` — умолчание движка, а отбор части,
+    начинающейся с точки, записал бы в файл путь не тот. Помощник свой, а не
+    `snapshot.safe_path`: тот зарезал бы законное умолчание (факт 12).
+    """
+    text = str(raw if raw is not None else "").strip().replace("\\", "/")
+    if not text:
+        return "путь не может быть пустым"
+    if text.startswith(("/", "~")) or re.match(r"^[A-Za-z]:", text) or Path(text).is_absolute():
+        return "нужен путь относительно корня проекта"
+    parts = text.split("/")
+    if ".." in parts:
+        return "путь вне корня проекта"
+    base = Path(root).resolve()
+    target = (base / Path(*parts)).resolve()
+    if target != base and base not in target.parents:
+        return "путь вне корня проекта"
+    return ""
+
+
+def _validate_patch(cfg: dict, patch: dict, root: Path) -> tuple[dict, list[str], list[str]]:
+    """Кандидат конфигурации под патч формы: (словарь, ошибки, заметки) (D1, §6.1).
+
+    Судятся только ключи патча: файловые чужие ключи проходят без изменений, а
+    неизвестный панели ключ, если её прислали, пишется как есть — ни валидации, ни
+    потери (D1). Лишние подключи `runtimes`/`paths` сохраняются. Любая ошибка
+    отклоняет весь патч, но панель получает их все сразу и показывает списком.
+    """
+    errors: list[str] = []
+    notes: list[str] = []
+    candidate = dict(cfg)
+    for key in patch:
+        value = patch[key]
+        if key in ("project", "board"):
+            text = str(value if value is not None else "").strip()
+            if not text:
+                errors.append(f"{key}: значение не может быть пустым")
+                continue
+            candidate[key] = text
+        elif key == "require_prompt":
+            candidate[key] = bool(value)
+        elif key == "driven_plans":
+            items = value
+            if isinstance(items, str):
+                items = [v.strip() for v in items.split(",") if v.strip()]
+            if not isinstance(items, list):
+                errors.append("driven_plans: список или строка через запятую")
+                continue
+            plans: list[str] = []
+            for item in items:
+                text = str(item).strip()
+                if text != "*" and not text.isdigit():
+                    errors.append("driven_plans: элемент должен быть * или номером плана")
+                    break
+                plans.append(text)
+            else:
+                candidate["driven_plans"] = plans
+                if not plans:
+                    notes.append("driven_plans пуст — страж не поведёт ни одного плана")
+        elif key == "runtimes":
+            if not isinstance(value, dict):
+                errors.append("runtimes: нужен объект вида {\"step\": \"3h\"}")
+                continue
+            old = candidate.get("runtimes")
+            merged = dict(old) if isinstance(old, dict) else {}
+            bad = False
+            for name, raw in value.items():
+                if name not in RUNTIME_KEYS:
+                    merged[name] = raw
+                    continue
+                text = str(raw if raw is not None else "").strip()
+                if not RUNTIME_RE.match(text):
+                    errors.append(f"runtimes.{name}: ожидается формат Nm или Nh (например, 45m, 3h)")
+                    bad = True
+                elif int(text[:-1]) <= 0:
+                    errors.append(f"runtimes.{name}: время должно быть больше нуля")
+                    bad = True
+                else:
+                    merged[name] = text
+            if not bad:
+                candidate["runtimes"] = merged
+        elif key == "paths":
+            if not isinstance(value, dict):
+                errors.append("paths: нужен объект вида {\"plans\": \"docs/plans\"}")
+                continue
+            old = candidate.get("paths")
+            merged = dict(old) if isinstance(old, dict) else {}
+            bad = False
+            for name, raw in value.items():
+                if name not in CONFIG_PATH_KEYS:
+                    merged[name] = raw
+                    continue
+                problem = _path_error(root, raw)
+                if problem:
+                    errors.append(f"paths.{name}: {problem}")
+                    bad = True
+                    continue
+                text = str(raw).strip().replace("\\", "/")
+                merged[name] = text
+                if not (Path(root) / text).exists():
+                    notes.append(f"каталог {text} не существует — файлов в нём не найдётся")
+            if not bad:
+                candidate["paths"] = merged
+        else:
+            # CONFIG_KEYS перечисляет только валидируемые верхние ключи: остальное
+            # (profiles, skills, git, notify, ...) панель не судит и не теряет (D1).
+            candidate[key] = value
+    if "project" not in patch and not str(cfg.get("project") or "").strip():
+        notes.append("project не задан ни в файле, ни в патче")
+    return candidate, errors, notes
+
+
+def _as_written(content: str) -> str:
+    """Текст, который реально ляжет на диск (D4, D6).
+
+    `proj.write_config` пишет через `write_text`, а тот переводит перевод строки ОС:
+    на Windows файл получается CRLF, хотя сериализация даёт LF. Без этой
+    приводки предпросмотр судил бы о файле по всем строкам сразу, а «изменений нет»
+    не срабатывало бы вовсе.
+    """
+    return content.replace("\n", os.linesep)
+
+
+def _config_diff(current_text: str, content: str) -> str:
+    """Дифф «сейчас → после сохранения»; длинный обрезается с пометкой (D4, §6.2).
+
+    Перевод строк — не предмет диффа: сравниваются тексты, а не соглашения ОС.
+    """
+    left = current_text.replace("\r\n", "\n")
+    right = content.replace("\r\n", "\n")
+    lines = list(difflib.unified_diff(left.splitlines(True), right.splitlines(True),
+                                      fromfile="pipeline.json (сейчас)",
+                                      tofile="pipeline.json (после сохранения)", n=3))
+    if len(lines) <= CONFIG_DIFF_LINES:
+        return "".join(lines)
+    return "".join(lines[:CONFIG_DIFF_LINES]) + f"\nдифф обрезан: всего {len(lines)} строк\n"
+
+
+def act_preview_config(state: State, payload: dict) -> dict:
+    """Предпросмотр правки: дифф и точный текст файла после сохранения, без записи.
+
+    Панель обязана увидеть, что именно уйдёт в файл, до того как уйдёт; поэтому
+    ответ несёт `content` — ровно те байты, которые запишет `act_save_config`.
+    """
+    patch = payload.get("config")
     if not isinstance(patch, dict):
         return {"ok": False, "error": "config должен быть объектом"}
-    cfg = proj.read_config(state.project)
-    changed: list[str] = []
-    for key in CONFIG_KEYS:
-        if key not in patch:
-            continue
-        value = patch[key]
-        if key == "board":
-            value = str(value).strip()
-            if not value:
-                return {"ok": False, "error": "борда не может быть пустой"}
-        if key == "driven_plans":
-            if isinstance(value, str):
-                value = [v.strip() for v in value.split(",") if v.strip()]
-            if not isinstance(value, list):
-                return {"ok": False, "error": "driven_plans — список или строка через запятую"}
-        if key == "require_prompt":
-            value = bool(value)
-        cfg[key] = value
-        changed.append(key)
-    runtimes = patch.get("runtimes")
-    if isinstance(runtimes, dict):
-        cfg["runtimes"] = {**((cfg.get("runtimes") or {})), **{k: str(v) for k, v in runtimes.items()}}
-        changed.append("runtimes")
-    if not changed:
-        return {"ok": False, "error": "нечего менять"}
-    proj.write_config(state.project, cfg)
-    state.note("pipeline.json обновлён: " + ", ".join(changed))
-    return {"ok": True, "changed": changed, "config": cfg}
+    cfg, raw, problem = _read_config_file(Path(state.project) / proj.MARKER)
+    if cfg is None:
+        return {"ok": False, "error": _refusal(problem or ("missing", ""))}
+    candidate, errors, notes = _validate_patch(cfg, patch, Path(state.project))
+    if errors:
+        return {"ok": False, "error": "\n".join(errors)}
+    content = json.dumps(candidate, ensure_ascii=False, indent=2) + "\n"
+    diff = _config_diff(raw.decode("utf-8"), content)
+    return {"ok": True, "changed": list(patch), "diff": diff, "content": content,
+            "notes": notes}
+
+
+def act_save_config(state: State, payload: dict) -> dict:
+    """Правка `pipeline.json` из формы: та же валидация, что в предпросмотре, плюс запись.
+
+    Копия (D5) делается до записи: кнопка «вернуть как была» обязана возвращать
+    прежний файл побайтово, вместе с отсутствующим переводом строки и кириллицей.
+    Чтение, проверка и запись — под `state.lock`; журнал пополняется уже после.
+    """
+    patch = payload.get("config")
+    if not isinstance(patch, dict):
+        return {"ok": False, "error": "config должен быть объектом"}
+    root = Path(state.project)
+    path = root / proj.MARKER
+    cfg, current_bytes, problem = _read_config_file(path)
+    if cfg is None:
+        return {"ok": False, "error": _refusal(problem or ("missing", ""))}
+    candidate, errors, _notes = _validate_patch(cfg, patch, root)
+    if errors:
+        return {"ok": False, "error": "\n".join(errors)}
+    content = json.dumps(candidate, ensure_ascii=False, indent=2) + "\n"
+    new_bytes = _as_written(content).encode("utf-8")
+    backup = _backup_path(root)
+    if new_bytes == current_bytes:
+        # Текст не изменился — ни записи, ни копии: повторное сохранение не должно
+        # трогать файл (D6).
+        return {"ok": True, "changed": [], "noop": True, "note": "изменений нет",
+                "config": candidate, "backup": _backup_info(root)}
+    error = ""
+    with state.lock:
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_bytes(current_bytes)
+        proj.write_config(root, candidate)
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            path.write_bytes(current_bytes)
+            error = "записал и не смог прочитать — вернул прежний файл"
+    if error:
+        return {"ok": False, "error": error}
+    state.note("pipeline.json обновлён: " + ", ".join(patch))
+    return {"ok": True, "changed": list(patch), "config": candidate,
+            "backup": _backup_info(root)}
+
+
+def act_revert_config(state: State, payload: dict) -> dict:
+    """Откат: прежние байты из резервной копии, минуя разбор (D5, §6.4).
+
+    Копия кладётся до каждой записи, поэтому она всегда — состояние до последнего
+    сохранения; откат её не удаляет, чтобы его можно было повторить.
+    """
+    root = Path(state.project)
+    backup = _backup_path(root)
+    if not backup.is_file():
+        return {"ok": False, "error": "резервной копии нет — откатывать нечего"}
+    try:
+        raw = backup.read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {"ok": False, "error": "резервная копия не разбирается — откат не выполнен, файл не тронут"}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "резервная копия не конфигурация — откат не выполнен, файл не тронут"}
+    with state.lock:
+        (root / proj.MARKER).write_bytes(raw)
+    state.note(f"pipeline.json возвращён из копии ({len(raw)} байт)")
+    return {"ok": True, "restored": True, "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest()}
 
 
 def act_save_telegram(state: State, payload: dict) -> dict:
@@ -388,7 +672,9 @@ ACTIONS = {
     "resume": act_resume,
     "hold": act_hold,
     "unhold": act_unhold,
+    "preview_config": act_preview_config,
     "save_config": act_save_config,
+    "revert_config": act_revert_config,
     "save_telegram": act_save_telegram,
     "test_telegram": act_test_telegram,
 }
@@ -788,6 +1074,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/setup":
             self._get_setup()
             return
+        if path == "/api/config":
+            self._get_config()
+            return
         if path == "/api/health":
             self._json(200, {"ok": True, "root": str(self.state.project),
                                    "version": plugin_version(), "ui_sha": ui_sha()})
@@ -888,6 +1177,32 @@ class Handler(BaseHTTPRequestHandler):
                          "project": str(state.project),
                          "steps": data["steps"], "next": data["next"],
                          "values": data["values"]})
+
+    # ── конфигурация проекта (план 3 S7) ──
+    def _get_config(self) -> None:
+        """Конфигурация проекта для формы: файл, ошибки разбора и резервная копия (§6.5).
+
+        Только чтение и только по уже выбранному проекту (D9): панель берёт отсюда
+        значения формы, поэтому адресуется запросом проекта реестра, а не проектом
+        сервера. Битый файл отдаётся как `config: {}` с объяснением в `errors`, а не
+        как 500 — форма обязана нарисоваться и сказать, почему правка не пройдёт (D7).
+        """
+        if not self._local_only():
+            self._json(403, {"ok": False, "error": "только localhost"})
+            return
+        state = self._choose_project(self._query().get("project"))
+        if state is None:
+            return
+        root = Path(state.project)
+        path = root / proj.MARKER
+        cfg, _raw, problem = _read_config_file(path)
+        self._json(200, {"ok": True,
+                         "project": {"id": state.id, "name": state.name},
+                         "preview": bool(state.preview),
+                         "path": str(path),
+                         "config": cfg if cfg is not None else {},
+                         "errors": _view_errors(problem),
+                         "backup": _backup_info(root)})
 
     def _drain_body(self) -> None:
         """Дочитать тело POST перед отказом: иначе клиент видит RST вместо ответа."""
