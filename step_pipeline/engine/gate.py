@@ -1152,17 +1152,17 @@ def _prompt_review_of_round(ctx: dict, sid: str, round_no: int) -> dict | None:
 
 
 def _report_written_after(verdict: dict | None, card: dict) -> bool:
-    """Отчёт переписан после закрытия карточки: иначе прочитан вердикт прошлого круга."""
+    """Отчёт переписан в этом круге: иначе прочитан вердикт прошлого круга."""
     if not verdict:
         return False
     try:
         path = Path(str(verdict["path"]))
-        done = float(card.get("completed_at") or 0)
+        started = float(card.get("started_at") or card.get("created_at") or 0)
     except (KeyError, TypeError, ValueError):
         return True
-    if done <= 0 or not path.is_file():
+    if started <= 0 or not path.is_file():
         return True
-    return path.stat().st_mtime >= done - 1.0
+    return path.stat().st_mtime >= started - 1.0
 
 
 def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
