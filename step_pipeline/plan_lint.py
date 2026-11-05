@@ -84,6 +84,19 @@ class LintResult:
     problems: list[Problem]
 
 
+_INDEX_NAMES = {"index.md", "00-index.md"}
+
+
+def _is_index_file(path: Path) -> bool:
+    """Файл-реестр каталога планов (`00-INDEX.md`) — не план: шагов и журнала в нём нет.
+
+    Линтер проверяет формат плана, а реестр им не является; иначе каждая проверка
+    проекта добавляла бы заведомую находку «нет раздела со словом-маркером шагов».
+    """
+    name = path.name.lower()
+    return name in _INDEX_NAMES or name.startswith("00-")
+
+
 def _plans_dir(project: Path) -> Path:
     """Каталог планов проекта из `pipeline.json` (умолчание — `docs/plans`)."""
     cfg = proj.read_config(Path(project))
@@ -397,7 +410,7 @@ def lint_project(project: Path, plan: str = "") -> LintResult:
     else:
         if not plans_dir.is_dir():
             return LintResult(files=[], problems=[])
-        paths = sorted(plans_dir.glob("*.md"))
+        paths = [p for p in sorted(plans_dir.glob("*.md")) if not _is_index_file(p)]
     files: list[Path] = []
     problems: list[Problem] = []
     for path in paths:

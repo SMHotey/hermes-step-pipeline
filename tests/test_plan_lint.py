@@ -85,6 +85,18 @@ def test_file_name_and_broken_regex_are_reported(project: Path):
     assert broken.files == []
 
 
+def test_index_file_is_not_linted_in_catalog(project: Path):
+    """Реестр `00-INDEX.md` — не план: при проверке каталога линтер его пропускает."""
+    (project / "docs" / "plans" / "00-INDEX.md").write_text(
+        "# 00. Реестр планов\n\n| План | Статус |\n|---|---|\n| 2 | в работе |\n",
+        encoding="utf-8")
+    (project / "docs" / "plans" / "2-ok.md").write_text(helpers.PLAN, encoding="utf-8")
+    result = plan_lint.lint_project(project, "")
+    names = [p.name for p in result.files]
+    assert "00-INDEX.md" not in names and "2-ok.md" in names
+    assert result.problems == []
+
+
 def test_second_steps_section_is_reported_but_step_titles_are_not(project: Path):
     text = """# 1. Два раздела шагов
 

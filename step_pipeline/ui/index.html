@@ -1169,8 +1169,13 @@ function renderChecks(data) {
     notes.map((text) => `<div class="muted">· ${esc(text)}</div>`).join("")
     + (problems.map((text) => `<div class="checks-problem">✗ ${esc(text)}</div>`).join("")
        || (checked ? "" : `<div class="muted">доктор ещё не запускался</div>`));
+  // Активный план отдельно от архива: находки в закрытых планах — долг линтера, не авария.
+  const activeCount = lint.active ?? findings.length;
+  const archiveCount = lint.archive ?? 0;
   $("checks-lint-note").textContent = checked
-    ? "файлов планов: " + (lint.files ?? 0) + ", находок: " + findings.length
+    ? `файлов планов: ${lint.files ?? 0}, находок: ${findings.length}`
+      + ` · активный план ${lint.active_plan || "—"}: ${activeCount}`
+      + ` · архив: ${archiveCount}`
     : "не проверяли";
   $("checks-lint").innerHTML = findings.map((item) => {
     const step = item.step || "";

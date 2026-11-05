@@ -601,7 +601,9 @@ def set_plan_mode(state: State, on: bool) -> dict:
 def _blank_checks() -> dict:
     """Пустая форма проверок: «не проверяли» отличается от «проверено, чисто»."""
     return {"ok": True, "checked_at": "", "busy": False, "critical": None,
-            "notes": [], "problems": [], "lint": {"files": 0, "problems": []}}
+            "notes": [], "problems": [],
+            "lint": {"files": 0, "problems": [], "active_plan": "", "active": 0,
+                     "archive": 0}}
 
 
 def plan_id_of(file: str) -> str:
@@ -613,11 +615,32 @@ def plan_id_of(file: str) -> str:
     return str(int(match.group(1))) if match else ""
 
 
+def active_plan_id(state: State, plan: str = "") -> str:
+    """Номер плана, который панель считает текущим: явный аргумент либо снимок проекта.
+
+    Снимок выбирает план так же, как страница: по открытым шагам и состоянию журнала.
+    """
+    explicit = str(plan or "").strip()
+    if explicit:
+        return explicit
+    try:
+        payload = snap.snapshot(state.project, None, preview=state.preview,
+                               board=state.board or "")
+    except Exception:  # noqa: BLE001 — без номера плана проверки не падают
+        return ""
+    current = payload.get("plan") or {}
+    return str(current.get("id") or "")
+
+
 def collect_checks(state: State, plan: str = "") -> dict:
     """Проверки панели: doctor без своего линтера плюс структурный линтер планов.
 
     Действий конвейера здесь нет и файлов проект не получает. Движок запускается только
     на чтение — снимок для строки «решение стража» (как в `hermes pipeline doctor`).
+
+    Счётчик `critical` считает только находки активного плана: замечания линтера в
+    закрытых планах — исторический долг, и падать из-за них бейдж не должен. Полное
+    число остаётся в `lint.problems`, разбивка — в `lint.active`/`lint.archive`.
     """
     report = doctor.collect(state.project, plan, with_lint=False,
                             preview=state.preview, board=state.board or "")
@@ -625,10 +648,17 @@ def collect_checks(state: State, plan: str = "") -> dict:
     findings = [{"plan": plan_id_of(problem.file), "step": problem.step,
                  "file": problem.file, "line": problem.line, "text": problem.text}
                 for problem in lint.problems]
+    active = active_plan_id(state, plan)
+    if active:
+        active_findings = [item for item in findings if item["plan"] == active]
+    else:
+        active_findings = list(findings)
     return {"ok": True, "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "busy": False,
-            "critical": len(report.problems) + len(findings),
+            "critical": len(report.problems) + len(active_findings),
             "notes": list(report.notes), "problems": list(report.problems),
-            "lint": {"files": len(lint.files), "problems": findings}}
+            "lint": {"files": len(lint.files), "problems": findings,
+                     "active_plan": active, "active": len(active_findings),
+                     "archive": len(findings) - len(active_findings)}}
 
 
 def checks(state: State, plan: str = "", refresh: bool = False) -> dict:

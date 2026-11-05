@@ -969,6 +969,24 @@ def _line_of(text: str, needle: str) -> int:
     raise AssertionError(f"в тексте нет строки с {needle!r}")
 
 
+def test_checks_count_only_active_plan_findings(server, monkeypatch):
+    """Находки закрытых планов уходят в архив: бейдж считает только текущий план."""
+    from step_pipeline import ui_server as ui
+    # Активный план задаём явно: в тестовом проекте номер выводится из снимка,
+    # а проверяем мы именно разбивку, а не выбор плана.
+    monkeypatch.setattr(ui, "active_plan_id", lambda *args, **kwargs: "3")
+    root = server["root"]
+    (root / "docs" / "plans" / "3-broken.md").write_text(BROKEN_PLAN, encoding="utf-8")
+    (root / "docs" / "plans" / "5-old.md").write_text(BROKEN_PLAN, encoding="utf-8")
+    status, data = get(server["url"] + "/api/checks?refresh=1")
+    assert status == 200 and data["ok"] is True
+    lint = data["lint"]
+    assert lint["active_plan"] == "3"
+    assert len(lint["problems"]) == 2
+    assert lint["active"] == 1 and lint["archive"] == 1
+    assert data["critical"] == len(data["problems"]) + 1
+
+
 def test_checks_start_in_not_checked_state(server):
     """«Не проверяли» — отдельное состояние, а не пустой список находок."""
     status, data = get(server["url"] + "/api/checks")
@@ -976,7 +994,8 @@ def test_checks_start_in_not_checked_state(server):
     assert data["checked_at"] == "" and data["critical"] is None
     assert data["busy"] is False
     assert data["notes"] == [] and data["problems"] == []
-    assert data["lint"] == {"files": 0, "problems": []}
+    assert data["lint"] == {"files": 0, "problems": [], "active_plan": "", "active": 0,
+                            "archive": 0}
 
 
 def test_checks_refresh_reports_line_plan_and_step(server):
@@ -993,8 +1012,8 @@ def test_checks_refresh_reports_line_plan_and_step(server):
     assert finding["plan"] == "3" and finding["step"] == "S1"
     assert finding["line"] == _line_of(BROKEN_PLAN, "### S1. Шаг без критерия")
     assert "нет критерия «Готово =»" in finding["text"]
-    # Критичные = проблемы доктора (здесь их заведомо больше нуля) + находки линтера.
-    assert data["critical"] == len(data["problems"]) + len(findings) > 0
+    # Критичные = проблемы доктора плюс находки только активного плана (архив не в счёт).
+    assert data["critical"] == len(data["problems"]) + data["lint"]["active"] > 0
     # Доктор сюда свой линтер не подмешивает: находки живут в одном месте.
     assert not any("Готово" in problem for problem in data["problems"])
 
