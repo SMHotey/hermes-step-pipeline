@@ -18,6 +18,8 @@
     шаг done                  → карточка ревью       (профиль ревьюера)
     вердикт APPROVE           → строка в журнал плана + коммит/пуш
     вердикт REQUEST_CHANGES   → карточка правок (1-й раз), стоп + уведомление (2-й раз)
+    ревью постановки: REQUEST_CHANGES → карточка промптеру «переписать» + повторное ревью,
+                                        стоп только по исчерпании `max_fix_rounds`
     шаг упал/ревью упало      → стоп + уведомление
     план не утверждён         → карточки нет: причина в выводе, одно уведомление владельцу
     план изменён после утв.   → то же: sha256 файла не совпал с записью утверждения
@@ -668,7 +670,7 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
 
 
 def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
-                            prompt: str | None) -> str:
+                            prompt: str | None, round_no: int = 1) -> str:
     """Тело карточки ревью постановки: постановка против текущего HEAD (правило 3)."""
     plan_id = p.plan_id
     plan_rel = p.cfg.rel(Path(p.plan_file))
@@ -682,9 +684,12 @@ def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
         "",
         f"Постановка: {prompt_line}",
         f"Снята на: recon_commit `{recon or '—'}`; текущий HEAD: `{head}`.",
-        "Постановка старше кода: проверить, не разъехалась ли она с фактом.",
-        "Файлы уже существуют, поведение уже сделано, гейты не совпадают с реальными —",
-        "это находки, а не повод согласиться «на глаз».",
+        *([f"Постановка переписана после REQUEST_CHANGES (круг {round_no}) — проверь, что",
+           "находки прошлого отчёта закрыты и что правка не принесла новых расхождений."]
+          if round_no > 1 else
+          ["Постановка старше кода: проверить, не разъехалась ли она с фактом.",
+           "Файлы уже существуют, поведение уже сделано, гейты не совпадают с реальными —",
+           "это находки, а не повод согласиться «на глаз»."]),
         "",
         "ИСТОЧНИКИ — РОВНО ТРИ: (1) постановка; (2) раздел шага в плане",
         f"`{plan_rel}` §{step['id']}; (3) код — `git show`, файлы и тесты на HEAD.",
@@ -711,6 +716,52 @@ def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
         "",
         "Закрыть карточку через kanban_complete: вердикт одной строкой + путь отчёта.",
     ])
+
+
+def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -> str:
+    """Тело карточки «переписать постановку»: закрыть находки ревью, код не трогать."""
+    sid = step["id"]
+    plan_id = p.plan_id
+    plan_rel = p.cfg.rel(Path(p.plan_file))
+    prompt_path = prompt_rel(p, sid) or ""
+    head = head_commit(p) or "—"
+    recon = prompt_recon(Path(p.repo) / prompt_path) if prompt_path else None
+    lines = [
+        f"ПОСТАНОВКУ ШАГА {sid} плана {plan_id} ПЕРЕПИСАТЬ — {step['title']} (круг {round_no})",
+        "",
+        f"Ревью постановки вернуло REQUEST_CHANGES. Отчёт: `{report_rel}`.",
+        f"Постановка: `{prompt_path}` (recon_commit `{recon or '—'}`, текущий HEAD `{head}`).",
+        f"Контракт шага — `{plan_rel}` §{sid}.",
+        "",
+        "ЧТО ДЕЛАТЬ",
+        "- Прочитать отчёт целиком и закрыть КАЖДУЮ блокирующую находку правкой постановки.",
+        "- Значимые находки — по существу, а не косметикой; «уточнить» и «при необходимости» не годятся.",
+        "- Сверить факты с текущим HEAD: адреса `path:line`, имена символов, числа тестов, пути.",
+        "- Решения D-блока не пересматривать; если находка требует иного — назвать цену.",
+        f"- Обновить в шапке `recon_commit:` на текущий HEAD (`{head}`).",
+        f"- Прогнать `python .pipeline/check_task_prompt.py {prompt_path}` → PASS 8/8.",
+        "- Коммит и пуш ТОЛЬКО файла постановки, сообщение на русском.",
+        "",
+        "ЗАПРЕТЫ",
+        "- Не менять код, тесты, план и журнал; «ЗАКРЫТ» не ставить.",
+        "- Не расширять объём шага и не смягчать гейты.",
+        "",
+    ]
+    blocking = _blocking_findings(Path(p.repo) / report_rel, FINDINGS_LIMIT)
+    if blocking:
+        lines.append("БЛОКИРУЮЩИЕ НАХОДКИ — закрыть полностью, ответить на каждую:")
+        lines += [f"{num}. {finding}" for num, finding in enumerate(blocking, 1)]
+    else:
+        others = _review_findings(Path(p.repo) / report_rel, 5)
+        lines.append("Блокирующих пометок в отчёте нет — замечания ревьюера:")
+        lines += [f"{num}. {finding}" for num, finding in enumerate(others, 1)] or ["- (отчёт пуст)"]
+    lines += [
+        "",
+        "ЗАВЕРШЕНИЕ",
+        "kanban_complete: какие находки закрыты (по номерам), вывод проверки постановки, sha коммита.",
+        "Следующий круг ревью постановки ставит страж — ревью сам не заказывай.",
+    ]
+    return "\n".join(lines)
 
 
 def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -> str:
@@ -1071,30 +1122,91 @@ def _prompt_review_needed(ctx: dict) -> bool:
     return not bool(ctx.get("prompt_fresh"))
 
 
+def _prompt_review_cards(ctx: dict, sid: str) -> list[dict]:
+    """Карточки ревью постановки шага: `:promptreview` и повторные `:promptreview:{N}`."""
+    pat = f":{sid}:promptreview"
+    return [c for c in (ctx.get("cards") or []) if pat in (c.get("key") or "")]
+
+
+def _prompt_fix_cards(ctx: dict, sid: str) -> list[dict]:
+    """Круги автопереписывания постановки `:promptfix:{N}` по возрастанию номера."""
+    pat = f":{sid}:promptfix:"
+    cards = [c for c in (ctx.get("cards") or []) if pat in (c.get("key") or "")]
+
+    def _num(card: dict) -> int:
+        try:
+            return int((card.get("key") or "").rsplit(":", 1)[-1])
+        except ValueError:
+            return 0
+
+    return sorted(cards, key=_num)
+
+
+def _prompt_review_of_round(ctx: dict, sid: str, round_no: int) -> dict | None:
+    """Карточка ревью именно этого круга: первый круг — ключ без номера (так жили до правки)."""
+    suffix = f":{sid}:promptreview" + ("" if round_no <= 1 else f":{round_no}")
+    for card in _prompt_review_cards(ctx, sid):
+        if (card.get("key") or "").endswith(suffix):
+            return card
+    return None
+
+
+def _report_written_after(verdict: dict | None, card: dict) -> bool:
+    """Отчёт переписан после закрытия карточки: иначе прочитан вердикт прошлого круга."""
+    if not verdict:
+        return False
+    try:
+        path = Path(str(verdict["path"]))
+        done = float(card.get("completed_at") or 0)
+    except (KeyError, TypeError, ValueError):
+        return True
+    if done <= 0 or not path.is_file():
+        return True
+    return path.stat().st_mtime >= done - 1.0
+
+
 def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
-    """Ревью постановки до старта шага (правило 3): заказ, ожидание, стоп или None."""
+    """Ревью постановки до старта шага (правило 3): заказ, автопереписывание, стоп или None.
+
+    REQUEST_CHANGES не останавливает конвейер: постановку переписывает роль prompter
+    (`:promptfix:{N}`), после каждого круга ревью повторяется. Стоп — только когда круги
+    исчерпаны (`max_fix_rounds`), упала карточка или вердикт не про эту версию.
+    """
     sid = step["id"]
     if not ctx.get("prompt"):
         return None                        # постановки нет: решает обычная ветка create_step
-    if not _prompt_review_needed(ctx):
-        return None
     report_rel = ctx.get("prompt_report") or prompt_review_rel_of(ctx, sid)
-    reports = [c for c in (ctx.get("cards") or [])
-               if (c.get("key") or "").endswith(":promptreview")]
-    if not reports:
-        return {"action": "create_prompt_review", "step": sid, "data": step,
-                "reason": (f"постановка {sid} устарела относительно HEAD "
-                           f"(recon_commit: {ctx.get('prompt_recon') or '—'}) — нужно ревью "
-                           f"постановки, отчёт {report_rel}")}
-    last = reports[-1]
-    if last["status"] not in TERMINAL:
+    fixes = _prompt_fix_cards(ctx, sid)
+    mode = str(ctx.get("prompt_review") or "auto").strip().lower()
+    if mode == "never" and not fixes:
+        return None                        # владелец выключил ревью постановок
+    if fixes:
+        last_fix = fixes[-1]
+        if last_fix["status"] not in TERMINAL:
+            return {"action": "idle", "step": sid,
+                    "reason": (f"постановка {sid} переписывается: карточка "
+                               f"{last_fix['id']} ({last_fix['status']})")}
+        if last_fix["status"] != "done":
+            detail = (last_fix.get("error") or last_fix.get("result") or "")[:300]
+            return {"action": "stop", "step": sid,
+                    "reason": (f"переписывание постановки {sid} упало "
+                               f"({last_fix['status']}): {detail}")}
+    round_no = len(fixes) + 1
+    need = _prompt_review_needed(ctx) or round_no > 1
+    card = _prompt_review_of_round(ctx, sid, round_no)
+    if card is None:
+        if not need:
+            return None
+        return {"action": "create_prompt_review", "step": sid, "data": step, "round": round_no,
+                "reason": (f"постановка {sid} требует ревью (круг {round_no}, "
+                           f"recon_commit: {ctx.get('prompt_recon') or '—'}), отчёт {report_rel}")}
+    if card["status"] not in TERMINAL:
         return {"action": "idle", "step": sid,
-                "reason": f"ревью постановки {sid} идёт: карточка {last['id']} "
-                          f"({last['status']})"}
-    if last["status"] != "done":
-        detail = (last.get("error") or last.get("result") or "")[:300]
+                "reason": f"ревью постановки {sid} идёт: карточка {card['id']} ({card['status']})"}
+    if card["status"] != "done":
+        detail = (card.get("error") or card.get("result") or "")[:300]
         return {"action": "stop", "step": sid,
-                "reason": f"ревью постановки {sid} упало ({last['status']}): {detail}"}
+                "reason": f"ревью постановки {sid} упало ({card['status']}): {detail}"}
     verdict = ctx.get("prompt_verdict")
     if verdict is None:
         return {"action": "stop", "step": sid,
@@ -1104,10 +1216,21 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
         return {"action": "stop", "step": sid,
                 "reason": f"вердикт ревью постановки {sid} не распознан ({what}): "
                           f"{Path(verdict['path']).name}"}
-    if verdict["verdict"] != "APPROVE":
+    if not _report_written_after(verdict, card):
         return {"action": "stop", "step": sid,
+                "reason": (f"ревью постановки {sid} закрыто, но отчёт {report_rel} не обновлён "
+                           f"после карточки {card['id']} — вердикт может быть от прошлого круга")}
+    if verdict["verdict"] != "APPROVE":
+        max_rounds = int(ctx.get("max_fix_rounds") or DEFAULT_FIX_ROUNDS)
+        if len(fixes) >= max_rounds:
+            return {"action": "stop", "step": sid,
+                    "reason": (f"ревью постановки {sid} вернуло REQUEST_CHANGES, круги "
+                               f"автопереписывания исчерпаны ({len(fixes)}) — решает владелец: "
+                               f"{Path(verdict['path']).name}")}
+        return {"action": "create_prompt_fix", "step": sid, "data": step, "round": round_no,
                 "reason": (f"ревью постановки {sid} вернуло REQUEST_CHANGES — постановку "
-                           f"надо переписать: {Path(verdict['path']).name}")}
+                           f"переписываю автоматически (круг {round_no}): "
+                           f"{Path(verdict['path']).name}")}
     # D6: без строки `recon_commit:` в отчёте сверять нечего — не принимаем, даже если
     # и в постановке отметки нет: так ловится APPROVE, написанный до переписывания постановки.
     if not verdict.get("recon"):
@@ -2297,20 +2420,42 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         return result
     if action == "create_prompt_review":
         step = decision["data"]
+        round_no = int(decision.get("round") or 1)
         key = f"planloop:{plan_id}:{step['id']}:promptreview"
+        if round_no > 1:
+            key += f":{round_no}"
         report_rel = prompt_review_rel(p, step["id"])
         cid = create_card(p, f"[ревью постановки {plan_id} {step['id']}] {step['title']}",
                           prompt_review_card_body(p, step, report_rel,
-                                                  ctx.get("prompt") or prompt_rel(p, step["id"])),
+                                                  ctx.get("prompt") or prompt_rel(p, step["id"]),
+                                                  round_no=round_no),
                           p.cfg.reviewer, key, p.cfg.review_skills,
                           max_runtime=p.cfg.review_runtime)
         result.update(applied=bool(cid), detail=f"карточка ревью постановки: {cid}")
         touch(f"create_prompt_review:{cid}")
         if cid:
-            say(f"план {plan_id}: постановка шага {step['id']} старше кода — поставил ревью "
+            why = "старше кода" if round_no <= 1 else f"переписана, круг {round_no}"
+            say(f"план {plan_id}: постановка шага {step['id']} {why} — поставил ревью "
                 f"постановки (карточка {cid}), шаг не начинаю")
         else:
             say(f"план {plan_id}: не смог поставить ревью постановки шага {step['id']}")
+        return result
+    if action == "create_prompt_fix":
+        step = decision["data"]
+        round_no = int(decision.get("round") or 1)
+        key = f"planloop:{plan_id}:{step['id']}:promptfix:{round_no}"
+        report_rel = prompt_review_rel(p, step["id"])
+        cid = create_card(p, f"[переписать постановку {plan_id} {step['id']}] {step['title']}",
+                          prompt_fix_card_body(p, step, round_no, report_rel),
+                          p.cfg.prompter, key, p.cfg.prompt_skills,
+                          max_runtime=p.cfg.prompt_runtime)
+        result.update(applied=bool(cid), detail=f"карточка переписывания постановки: {cid}")
+        touch(f"create_prompt_fix:{cid}")
+        if cid:
+            say(f"план {plan_id}: ревью постановки шага {step['id']} вернуло REQUEST_CHANGES — "
+                f"переписываю постановку автоматически, круг {round_no} (карточка {cid})")
+        else:
+            say(f"план {plan_id}: не смог поставить переписывание постановки шага {step['id']}")
         return result
     if action == "create_rereview":
         prev_id = decision["step"]

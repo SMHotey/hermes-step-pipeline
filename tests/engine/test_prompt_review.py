@@ -169,7 +169,12 @@ def test_stale_prompt_waits_for_prompt_review(stand):
 
 
 def test_prompt_review_verdict_controls_start(stand):
-    """REQUEST_CHANGES и чужой recon версии — стоп; APPROVE по той же версии — старт."""
+    """REQUEST_CHANGES → автопереписывание постановки и повторное ревью; APPROVE — старт.
+
+    Автоматика (правило 3, дополнение): постановку переписывает роль prompter карточкой
+    `:promptfix:{N}`, после правки ревью ставится заново (`:promptreview:{N}`). Стоп —
+    только когда вердикт не про эту версию.
+    """
     root, p, db = stand
     write_plan(root, plan_body(3))
     write_prompt(root, "S1", recon="1111111")
@@ -177,14 +182,23 @@ def test_prompt_review_verdict_controls_start(stand):
     complete(db, ":promptreview")
 
     write_report(root, "REQUEST_CHANGES")
-    stopped = gate.run_gate(p, execute=True, notify_fn=quiet)
-    assert stopped["decision"]["action"] == "stop", stopped["decision"]
-    assert "переписать" in stopped["detail"]
+    fixing = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert fixing["decision"]["action"] == "create_prompt_fix", fixing["decision"]
+    assert fixing["decision"]["round"] == 1
+    assert "planloop:1:S1:promptfix:1" in keys_of(db)
     assert "planloop:1:S1:step" not in keys_of(db)
-    assert gate.load_stop(p)["kind"] == "incident"      # инцидентный, снимется сам
+    assert gate.load_stop(p) is None                    # конвейер не встал
+    row = next(c for c in cards(db) if c["key"] == "planloop:1:S1:promptfix:1")
+    assert row["assignee"] == "prompter"
+    assert "переписать постановку" in row["title"]
 
-    # Снимаем стоп-флаг вручную: инцидент ждёт устранения причины, а причина — в отчёте.
-    Path(p.stop_file).unlink()
+    complete(db, ":promptfix:1")
+    again = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert again["decision"]["action"] == "create_prompt_review", again["decision"]
+    assert again["decision"]["round"] == 2
+    assert "planloop:1:S1:promptreview:2" in keys_of(db)
+    complete(db, ":promptreview:2")
+
     write_report(root, "APPROVE", recon="2222222")      # ревью не про эту версию (D6)
     mismatched = gate.run_gate(p, execute=True, notify_fn=quiet)
     assert mismatched["decision"]["action"] == "stop", mismatched["decision"]
@@ -196,6 +210,34 @@ def test_prompt_review_verdict_controls_start(stand):
     started = gate.run_gate(p, execute=True, notify_fn=quiet)
     assert started["decision"]["action"] == "create_step", started["decision"]
     assert "planloop:1:S1:step" in keys_of(db)
+
+
+def test_prompt_fix_rounds_exhausted_stops(stand):
+    """Третий REQUEST_CHANGES постановки — стоп: круги автопереписывания исчерпаны."""
+    root, p, db = stand
+    write_plan(root, plan_body(3))
+    write_prompt(root, "S1", recon="1111111")
+    write_report(root, "REQUEST_CHANGES")
+    gate.run_gate(p, execute=True, notify_fn=quiet)     # ревью круга 1
+    complete(db, ":promptreview")
+
+    gate.run_gate(p, execute=True, notify_fn=quiet)     # круг 1: переписать
+    complete(db, ":promptfix:1")
+    gate.run_gate(p, execute=True, notify_fn=quiet)     # ревью круга 2
+    write_report(root, "REQUEST_CHANGES")               # ревьюер переписал отчёт
+    complete(db, ":promptreview:2")
+
+    gate.run_gate(p, execute=True, notify_fn=quiet)     # круг 2: переписать
+    complete(db, ":promptfix:2")
+    gate.run_gate(p, execute=True, notify_fn=quiet)     # ревью круга 3
+    write_report(root, "REQUEST_CHANGES")
+    complete(db, ":promptreview:3")
+
+    stopped = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert stopped["decision"]["action"] == "stop", stopped["decision"]
+    assert "исчерпаны" in stopped["detail"]
+    assert "planloop:1:S1:step" not in keys_of(db)
+    assert "planloop:1:S1:promptfix:3" not in keys_of(db)
 
 
 def test_prompt_review_modes(stand):
