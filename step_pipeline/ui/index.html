@@ -10,6 +10,31 @@
     --text: #dbe4f0; --muted: #8492a8; --accent: #5eead4; --ok: #4ade80;
     --warn: #fbbf24; --bad: #f87171; --run: #60a5fa;
   }
+  /* Светлая тема (S8, D9): те же переменные, палитра проходит контраст 4.5:1. */
+  [data-theme="light"] {
+    --bg: #f7f9fc; --panel: #ffffff; --panel-2: #eef2f8; --line: #c3cfdd;
+    --text: #12181f; --muted: #4a5563; --accent: #0f6f63; --ok: #15803d;
+    --warn: #8a5a00; --bad: #b42318; --run: #1d4ed8;
+  }
+  [data-theme="light"] .badge.on, [data-theme="light"] button.primary {
+    color: #ffffff;
+  }
+  [data-theme="light"] tr.current td { background: #e6eefb; }
+  [data-theme="light"] td, [data-theme="light"] .card,
+  [data-theme="light"] .step-card { border-bottom-color: var(--line); }
+  [data-theme="light"] .pill.ok { background: #e8f7ee; border-color: #bfe3cb; }
+  [data-theme="light"] .pill.run { background: #e8efff; border-color: #c4d4f8; }
+  [data-theme="light"] .pill.wait { background: #fdf6e3; border-color: #ead9a8; }
+  [data-theme="light"] .pill.bad { background: #fdeaea; border-color: #f0c4c4; }
+  [data-theme="light"] #config-diff, [data-theme="light"] input[type=text],
+  [data-theme="light"] input[type=password] { background: var(--bg); }
+  /* Видимый фокус (S8, D11): клавиатура обязана показывать, где она стоит. */
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* Компактный режим (S8, D9): плотнее таблицы и карточки. */
+  body.compact table { font-size: 12px; }
+  body.compact td, body.compact th { padding: 3px 6px; }
+  body.compact .card, body.compact .step-card { padding: 3px 6px; }
+  body.compact pre { max-height: 170px; }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
@@ -121,6 +146,16 @@
   #config-error:empty { display: none; }
   .row { display: flex; gap: 10px; }
   .row > div { flex: 1; }
+  /* Подключение проекта из панели (S8): путь, кнопка и объяснение отказа под вводом. */
+  .project-add { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+  #projects-error { font-size: 12.5px; color: var(--bad); white-space: pre-wrap; margin-top: 6px; }
+  #projects-error:empty { display: none; }
+  .row-remove { padding: 2px 8px; font-size: 12px; }
+  /* Подсказка по клавишам (S8, D8). */
+  .hotkeys { list-style: none; padding: 0; margin: 0 0 12px; font-size: 13px; }
+  .hotkeys li { padding: 4px 0; border-bottom: 1px solid var(--line); }
+  .hotkeys kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px;
+                 padding: 1px 6px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
   .ov-head { font-size: 17px; font-weight: 600; letter-spacing: .2px;
              border-left: 3px solid var(--accent); padding: 6px 0 6px 10px; }
   .ov-reason { margin-top: 4px; font-size: 13px; color: var(--muted); }
@@ -188,7 +223,27 @@
   .checks-problem { font-size: 12.5px; color: var(--bad); margin: 4px 0; }
   @media (max-width: 980px) { .cols { grid-template-columns: 1fr; } .flow { grid-template-columns: 1fr 1fr; }
                               .ov-grid { grid-template-columns: 1fr 1fr; } }
+  /* Узкий экран (S8, D11): без горизонтального скролла страницы — таблицы скроллятся сами. */
+  @media (max-width: 380px) {
+    .cols, .flow, .ov-grid { grid-template-columns: 1fr; }
+    header { flex-wrap: wrap; gap: 8px; padding: 10px 12px; }
+    main { padding: 12px 10px 20px; }
+    table { display: block; overflow-x: auto; }
+    pre { max-height: 180px; overflow-x: auto; }
+    .row { flex-wrap: wrap; }
+  }
 </style>
+<script>
+// Тема применяется до отрисовки (S8, D9): иначе страница мигает чужой палитрой.
+(function () {
+  try {
+    var saved = localStorage.getItem("pipeline.theme");
+    if (saved === "light" || saved === "dark") {
+      document.documentElement.dataset.theme = saved;
+    }
+  } catch (e) { /* приватный режим: тема остаётся тёмной по умолчанию */ }
+})();
+</script>
 </head>
 <body>
 <header>
@@ -207,18 +262,24 @@
   </label>
   <span class="muted" id="plan-mode-hint">действует со следующей сессии</span>
   <span class="spacer"></span>
-  <button id="btn-tick" class="primary">Тик</button>
-  <button id="btn-stop" class="danger">Стоп</button>
-  <button id="btn-resume">Продолжить</button>
-  <button id="btn-settings">Настройки</button>
+  <button id="btn-tick" class="primary" aria-label="Тик: один шаг стража (клавиша T)">Тик</button>
+  <button id="btn-stop" class="danger" aria-label="Стоп: остановиться после текущего шага (клавиша S)">Стоп</button>
+  <button id="btn-resume" aria-label="Продолжить: снять остановку (клавиша R)">Продолжить</button>
+  <button id="btn-theme" aria-label="Переключить светлую и тёмную тему" aria-pressed="false">Светлая тема</button>
+  <button id="btn-density" aria-label="Переключить компактный и обычный вид таблиц" aria-pressed="false">Компактный вид</button>
+  <button id="btn-settings" aria-label="Настройки конвейера">Настройки</button>
 </header>
 
 <main>
-  <nav class="tabs">
-    <button class="tab active" data-tab="overview" id="tab-btn-overview">Обзор</button>
-    <button class="tab" data-tab="step" id="tab-btn-step">Шаг</button>
-    <button class="tab" data-tab="checks" id="tab-btn-checks">Проверки</button>
-    <button class="tab" data-tab="setup" id="tab-btn-setup">Установка</button>
+  <nav class="tabs" role="tablist" aria-label="Разделы панели">
+    <button class="tab active" data-tab="overview" id="tab-btn-overview" role="tab"
+            aria-selected="true" aria-controls="tab-overview">Обзор</button>
+    <button class="tab" data-tab="step" id="tab-btn-step" role="tab"
+            aria-selected="false" aria-controls="tab-step">Шаг</button>
+    <button class="tab" data-tab="checks" id="tab-btn-checks" role="tab"
+            aria-selected="false" aria-controls="tab-checks">Проверки</button>
+    <button class="tab" data-tab="setup" id="tab-btn-setup" role="tab"
+            aria-selected="false" aria-controls="tab-setup">Установка</button>
   </nav>
 
   <div class="tab-panel active" id="tab-overview">
@@ -228,6 +289,18 @@
     <section id="projects-summary">
       <h2>Проекты</h2>
       <div id="projects-table"><span class="muted">реестр не загружен</span></div>
+      <!-- Подключение проекта из панели (S8, D2): путь проверяет сервер, каталог не трогаем. -->
+      <div class="project-add">
+        <label for="new-project-path">Путь к каталогу проекта</label>
+        <div class="row">
+          <div><input type="text" id="new-project-path" autocomplete="off"
+                      placeholder="C:/path/to/project"></div>
+          <div style="flex:0 0 auto">
+            <button id="add-project" aria-label="Подключить проект по пути">Подключить</button>
+          </div>
+        </div>
+        <div class="muted" id="projects-error"></div>
+      </div>
     </section>
     <section id="overview">
       <h2>Обзор</h2>
@@ -246,6 +319,9 @@
       <h2>Поток текущего шага</h2>
       <div class="flow" id="flow"></div>
       <div class="plans" id="plans"></div>
+      <!-- Поиск по шагам (S8, D8): «/» ставит фокус сюда. -->
+      <label for="steps-filter">Поиск по шагам</label>
+      <input type="text" id="steps-filter" autocomplete="off" placeholder="/ — фильтр по тексту строки">
       <table>
         <thead><tr><th>Шаг</th><th>Название</th><th>Дни</th><th>Исполнитель</th><th>Статус</th></tr></thead>
         <tbody id="steps"><tr><td colspan="5" class="muted">загрузка…</td></tr></tbody>
@@ -397,7 +473,7 @@
 
 <div class="toast" id="toast"></div>
 
-<dialog id="settings">
+<dialog id="settings" aria-label="Настройки конвейера">
   <h2 style="margin-top:0">Настройки конвейера</h2>
   <form method="dialog" id="form-config">
     <label>Борда</label><input type="text" name="board">
@@ -442,6 +518,20 @@
     <button type="button" class="primary" id="save-tg">Подключить</button>
     <button type="button" id="test-tg">Тест</button>
   </div>
+</dialog>
+
+<!-- Подсказка по клавишам (S8, D8): открывается «?», закрывается Esc. -->
+<dialog id="hotkeys-help" aria-label="Горячие клавиши панели">
+  <h2 style="margin-top:0">Горячие клавиши</h2>
+  <ul class="hotkeys">
+    <li><kbd>T</kbd> — тик: один шаг стража</li>
+    <li><kbd>S</kbd> — стоп: остановиться после текущего шага</li>
+    <li><kbd>R</kbd> — продолжить: снять остановку</li>
+    <li><kbd>/</kbd> — поиск по шагам плана</li>
+    <li><kbd>Esc</kbd> — закрыть окно или снять фокус</li>
+    <li><kbd>?</kbd> — эта подсказка</li>
+  </ul>
+  <button type="button" id="close-hotkeys">Закрыть</button>
 </dialog>
 
 <script>
@@ -535,6 +625,31 @@ function switchProject(id) {
   loadConfigForm();
 }
 
+// Длительность по-русски для «прошло/лимит»: сервер отдаёт секунды, экран — текст.
+function duration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600), minutes = Math.floor((total % 3600) / 60);
+  if (hours && minutes) return hours + " ч " + minutes + " мин";
+  if (hours) return hours + " ч";
+  if (minutes) return minutes + " мин";
+  return "меньше минуты";
+}
+
+// Хвост ячейки «Сейчас» (S8, D5): очередь, пометка дефолтов, идущие карточки.
+function capacityDetails(capacity) {
+  const note = capacity.limit_default || capacity.per_profile_default
+    ? '<div class="muted">по умолчанию</div>' : "";
+  const running = (capacity.running || []).map((row) =>
+    `<div class="muted">${esc(row.id)} · pid ${esc(row.pid ?? "—")} · молчит ${
+      esc(row.heartbeat || "—")} · прошло ${esc(row.elapsed_text || "—")}${
+      row.limit ? " из " + esc(duration(row.limit)) : ""}</div>`).join("");
+  const queue = (capacity.queue || []).map((row) =>
+    `<div class="muted">${esc(row.id)} · ${esc(row.assignee || "—")}: ${esc(row.reason)}</div>`
+  ).join("");
+  const tail = `<div class="muted">в очереди: ${(capacity.queue || []).length}</div>`;
+  return tail + note + running + queue;
+}
+
 function renderProjects(data, current) {
   const box = $("projects-table");
   const rows = data.projects || [];
@@ -553,7 +668,8 @@ function renderProjects(data, current) {
     switcher.hidden = rows.length < 2;
   }
   box.innerHTML = `<table><thead><tr><th>Проект</th><th>Установлен</th><th>План</th>
-      <th>Следующий шаг</th><th>Закрыто</th><th>Стоп</th><th>Простой</th></tr></thead><tbody>` +
+      <th>Следующий шаг</th><th>Закрыто</th><th>Сейчас</th><th>Стоп</th><th>Простой</th>
+      <th></th></tr></thead><tbody>` +
     rows.map((p) => {
       const stop = p.stop
         ? `${esc(p.stop.kind || "стоп")}: ${esc(p.stop.reason || "причина не записана")}`
@@ -568,13 +684,71 @@ function renderProjects(data, current) {
         <td class="mono">${esc(p.plan || "—")}</td>
         <td class="mono">${esc(p.next || "—")}</td>
         <td class="mono">${esc(p.closed)} / ${esc(p.total)}</td>
+        <td class="capacity">${p.capacity
+          ? `<b class="mono">${p.capacity.occupied}/${p.capacity.limit}</b>${capacityDetails(p.capacity)}`
+          : "—"}</td>
         <td>${stop}</td>
         <td class="mono">${esc((p.idle || {}).text || "—")}</td>
+        <td><button class="row-remove" data-remove-project="${esc(p.id)}"
+                    aria-label="Отключить проект ${esc(p.name)}">✕</button></td>
       </tr>`;
     }).join("") + `</tbody></table>`;
   box.querySelectorAll("tbody tr").forEach((tr) => {
     tr.onclick = () => switchProject(tr.dataset.project);
   });
+  // Удаление не должно уводить на проект: всплытие клика гасим (D3, §6.4).
+  box.querySelectorAll("[data-remove-project]").forEach((button) => {
+    button.onclick = (event) => {
+      event.stopPropagation();
+      removeProject(button.dataset.removeProject);
+    };
+  });
+}
+
+// Подключение проекта из панели (S8, D2): путь проверяет сервер, объяснение — под вводом.
+async function addProject() {
+  const input = $("new-project-path");
+  const box = $("projects-error");
+  const path = (input.value || "").trim();
+  box.textContent = "";
+  if (!path) { box.textContent = "укажи путь к каталогу проекта"; return; }
+  const button = $("add-project");
+  button.disabled = true;
+  try {
+    const data = await api("/api/projects", {method: "POST", headers: PANEL_HEADERS,
+                                            body: JSON.stringify({path})});
+    if (!data.ok) {
+      // 400 объясняет причину длинно: и под вводом (остаётся), и тостом (заметно).
+      box.textContent = data.error || "не удалось подключить проект";
+      toast(box.textContent, true);
+      return;
+    }
+    input.value = "";
+    toast("Проект подключён: " + data.project.name);
+    await loadProjects();
+  } catch (err) {
+    box.textContent = String(err);
+    toast(String(err), true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+// Отключение проекта (S8, D3): убирается запись реестра, каталог остаётся на диске.
+async function removeProject(id) {
+  if (!id) return;
+  let data;
+  try {
+    data = await api("/api/projects?id=" + encodeURIComponent(id),
+                     {method: "DELETE", headers: PANEL_HEADERS});
+  } catch (err) {
+    toast(String(err), true);
+    return;
+  }
+  if (!data.ok) { toast(data.error || "не удалось отключить проект", true); return; }
+  toast("Проект отключён: " + data.removed);
+  if (currentProject === id) switchProject("");   // серверный проект остаётся всегда
+  await loadProjects();
 }
 
 async function loadProjects() {
@@ -696,7 +870,10 @@ function stepPairOf() {
 
 function showTab(name) {
   document.querySelectorAll(".tab").forEach((tab) => {
-    tab.classList.toggle("active", tab.dataset.tab === name);
+    const active = tab.dataset.tab === name;
+    tab.classList.toggle("active", active);
+    // aria-selected держим в согласии с классом: скринридер читает именно его (S8, D8).
+    tab.setAttribute("aria-selected", active ? "true" : "false");
   });
   document.querySelectorAll(".tab-panel").forEach((panel) => {
     panel.classList.toggle("active", panel.id === "tab-" + name);
@@ -1116,6 +1293,7 @@ function render(data) {
       <td>${closed.has(s.id) ? '<span class="pill ok">закрыт</span>'
             : (s.id === nextId ? '<span class="pill run">сейчас</span>' : '<span class="pill">открыт</span>')}</td>
     </tr>`).join("") || `<tr><td colspan="5" class="muted">${esc(plan.note || "шаги не распознаны")}</td></tr>`;
+  filterSteps();     // перерисовка таблицы не должна снимать введённый фильтр (S8, D8)
 
   const stepId = nextId || (plan.steps || [])[0]?.id;
   $("flow").innerHTML = (stepId ? stageOf(data.cards || [], plan.id, stepId) : []).map((s) => `
@@ -1316,6 +1494,83 @@ async function loadConfigForm() {
     ? `Вернуть как было (${backup.saved_at || "дата неизвестна"})`
     : "Вернуть как было";
 }
+
+// ── тема, плотность, поиск по шагам и клавиатура (план 3 S8) ──
+function applyTheme(theme) {
+  const value = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = value;
+  try { localStorage.setItem("pipeline.theme", value); } catch (e) { /* приватный режим */ }
+  $("btn-theme").textContent = value === "light" ? "Тёмная тема" : "Светлая тема";
+  $("btn-theme").setAttribute("aria-pressed", value === "light" ? "true" : "false");
+}
+
+function applyDensity(compact) {
+  document.body.classList.toggle("compact", Boolean(compact));
+  try { localStorage.setItem("pipeline.density", compact ? "compact" : "normal"); }
+  catch (e) { /* приватный режим */ }
+  $("btn-density").textContent = compact ? "Обычный вид" : "Компактный вид";
+  $("btn-density").setAttribute("aria-pressed", compact ? "true" : "false");
+}
+
+// Фильтр строк таблицы шагов: пустой ввод возвращает все строки (S8, D8).
+function filterSteps() {
+  const input = $("steps-filter");
+  const body = $("steps");
+  if (!input || !body) return;
+  const needle = (input.value || "").trim().toLowerCase();
+  body.querySelectorAll("tr").forEach((row) => {
+    row.hidden = Boolean(needle) && !row.textContent.toLowerCase().includes(needle);
+  });
+}
+
+function currentTheme() {
+  return document.documentElement.dataset.theme === "light" ? "light" : "dark";
+}
+
+$("btn-theme").onclick = () => applyTheme(currentTheme() === "light" ? "dark" : "light");
+$("btn-density").onclick = () => applyDensity(!document.body.classList.contains("compact"));
+$("add-project").onclick = () => addProject();
+$("new-project-path").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); addProject(); }
+});
+$("steps-filter").addEventListener("input", () => filterSteps());
+$("close-hotkeys").onclick = () => $("hotkeys-help").close();
+applyDensity(document.body.classList.contains("compact")
+             || (function () { try { return localStorage.getItem("pipeline.density") === "compact"; }
+                              catch (e) { return false; } })());
+applyTheme(currentTheme());   // подпись кнопки — по фактической теме
+
+// Один обработчик на всю страницу (D8): клавиши не срабатывают внутри полей ввода.
+document.addEventListener("keydown", (event) => {
+  const node = event.target;
+  const tag = String((node && node.tagName) || "").toLowerCase();
+  const typing = tag === "input" || tag === "textarea" || tag === "select"
+                 || Boolean(node && node.isContentEditable);
+  const modal = document.querySelector("dialog[open]");
+  if (event.key === "Escape") {
+    if (modal) { modal.close(); return; }
+    if (typing && node.blur) node.blur();
+    return;
+  }
+  if (typing || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.key === "?") {
+    event.preventDefault();
+    if (!modal) $("hotkeys-help").showModal();
+    return;
+  }
+  // Пока открыт диалог, действия «под» ним не запускаются (D8).
+  if (modal) return;
+  if (event.key === "/") {
+    event.preventDefault();
+    const filter = $("steps-filter");
+    if (filter) { filter.focus(); filter.select(); }
+    return;
+  }
+  const key = String(event.key || "").toLowerCase();
+  if (key === "t") { event.preventDefault(); $("btn-tick").click(); return; }
+  if (key === "s") { event.preventDefault(); $("btn-stop").click(); return; }
+  if (key === "r") { event.preventDefault(); $("btn-resume").click(); return; }
+});
 
 $("btn-tick").onclick = () => act("tick", currentPlan ? {plan: currentPlan} : {});
 $("project-switch").onchange = (event) => switchProject(event.target.value);

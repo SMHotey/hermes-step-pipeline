@@ -11,7 +11,8 @@
     GET  /api/file         текст файла проекта, только внутри корня (?path=<...>)
     GET  /api/checks       проверки: doctor и линтер планов (?refresh=1 — перепроверить,
                            ?plan=<N> — только один план); действий не выполняют
-    GET  /api/projects     сводка реестра: проект, план, следующий шаг, закрыто, стоп, простой
+    GET  /api/projects     сводка реестра: проект, план, следующий шаг, закрыто, стоп, простой,
+                           занятость слотов (capacity: лимиты, running, очередь)
     GET  /api/setup        мастер установки: шаги, следующий шаг, значения формы (без токена)
     GET  /api/config       конфигурация проекта: pipeline.json, ошибки его разбора и
                            резервная копия (?project=<id> — проект реестра); только чтение
@@ -22,6 +23,10 @@
                            preview_config, save_config, revert_config,
                            save_telegram, test_telegram
     POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
+    POST /api/projects     подключить проект: {"path": ..., "name": ...}, заголовок
+                           X-Pipeline-Panel; запись в projects.json профиля
+    DELETE /api/projects?id=<id>
+                           отключить проект: запись убирается, каталог остаётся
 Слушает только localhost: это операторский инструмент владельца, без авторизации.
 """
 from __future__ import annotations
@@ -31,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 import webbrowser
@@ -725,6 +731,137 @@ def _registry_rows(project: Path, extra_projects: list[str | Path] | None) -> li
     return rows
 
 
+KANBAN_DEFAULT_LIMIT = 3   # план пинит «по умолчанию, 3» (D6, расхождение 4)
+
+
+def _hermes_kanban_limits() -> dict[str, Any]:
+    """Лимиты диспетчера из секции `kanban` файла config.yaml home профиля (D6).
+
+    Без PyYAML (его нет в CI): строка `kanban:` в нулевой колонке открывает секцию,
+    дальше читаются пары `ключ: значение` с отступом до следующего ключа верхнего
+    уровня. Ключа нет, значение не число или файл не читается — лимит по умолчанию
+    с пометкой: панель следует плану, а не «без лимита» диспетчера (расхождение 4).
+    Читается главный конфиг своего home, чужие профили не подмешиваются.
+    """
+    values: dict[str, int] = {}
+    try:
+        text = (proj.hermes_home() / "config.yaml").read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    inside = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not line[0].isspace():
+            inside = stripped == "kanban:"
+            continue
+        if not inside:
+            continue
+        name, _, raw = stripped.partition(":")
+        value = re.split(r"\s+#", raw.strip(), maxsplit=1)[0].strip().strip("'\"")
+        try:
+            values[name.strip()] = int(value)
+        except ValueError:
+            continue            # не число — ключ считается отсутствующим
+    limit = values.get("max_in_progress")
+    per_profile = values.get("max_in_progress_per_profile")
+    return {"limit": KANBAN_DEFAULT_LIMIT if limit is None else limit,
+            "limit_default": limit is None,
+            "per_profile": KANBAN_DEFAULT_LIMIT if per_profile is None else per_profile,
+            "per_profile_default": per_profile is None}
+
+
+def _capacity(root: Path, state: State) -> dict[str, Any] | None:
+    """Занятость слотов борды проекта: running, очередь и время попытки (D5-D7).
+
+    Одно открытие только-для-чтения того же файла, что читают карточки (`snap._ro`),
+    тексты времени — `snap._duration`: `snapshot.py` не правится. Колонки читаются по
+    факту (`PRAGMA table_info`): в тестовой борде их нет — тогда поля NULL, как пропуск
+    колонок в `snap.cards`. Время работы меряется от начала текущей попытки
+    (`task_runs.started_at`, иначе `tasks.started_at`), `created_at` не участвует.
+    """
+    db = proj.board_db(root, state.board)
+    con = snap._ro(db)
+    if con is None:
+        return None
+    try:
+        present = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+        if "status" not in present:
+            return None
+        cols = [name for name in ("id", "title", "status", "assignee", "worker_pid",
+                                  "last_heartbeat_at", "started_at", "max_runtime_seconds",
+                                  "created_at")
+                if name in present]
+        order = "created_at" if "created_at" in present else cols[0]
+        rows = con.execute(f"SELECT {', '.join(cols)} FROM tasks"
+                           " WHERE status IN ('running', 'ready')"
+                           f" ORDER BY {order}").fetchall()
+        attempt: dict[str, float] = {}
+        if "current_run_id" in present:
+            try:
+                for task_id, started in con.execute(
+                        "SELECT t.id, r.started_at FROM tasks t"
+                        " JOIN task_runs r ON r.id = t.current_run_id"
+                        " WHERE t.status = 'running'"):
+                    if isinstance(started, (int, float)) and not isinstance(started, bool):
+                        attempt[str(task_id)] = float(started)
+            except sqlite3.Error:
+                attempt = {}    # таблицы task_runs нет — остаётся tasks.started_at
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+
+    now = time.time()
+    limits = _hermes_kanban_limits()
+    running: list[dict[str, Any]] = []
+    ready: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        assignee = str(item.get("assignee") or "")
+        if item.get("status") == "ready":
+            ready.append({"id": str(item.get("id") or ""),
+                          "title": str(item.get("title") or ""), "assignee": assignee})
+            continue
+        beat = item.get("last_heartbeat_at")
+        beat_age = (max(0, int(now - float(beat)))
+                    if isinstance(beat, (int, float)) and not isinstance(beat, bool) else None)
+        started = attempt.get(str(item.get("id")) or "")
+        if started is None:
+            started = item.get("started_at")
+        elapsed = (max(0, int(now - float(started)))
+                   if isinstance(started, (int, float)) and not isinstance(started, bool) else None)
+        runtime = item.get("max_runtime_seconds")
+        pid = item.get("worker_pid")
+        running.append({
+            "id": str(item.get("id") or ""), "title": str(item.get("title") or ""),
+            "assignee": assignee,
+            "pid": pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+            "heartbeat_age": beat_age,
+            "heartbeat": "" if beat_age is None else snap._duration(beat_age),
+            "elapsed": elapsed,
+            "elapsed_text": "" if elapsed is None else snap._duration(elapsed),
+            "limit": (int(runtime) if isinstance(runtime, (int, float))
+                      and not isinstance(runtime, bool) else None),
+        })
+
+    occupied = len(running)
+    per_assignee: dict[str, int] = {}
+    for item in running:
+        per_assignee[item["assignee"]] = per_assignee.get(item["assignee"], 0) + 1
+    queue: list[dict[str, Any]] = []
+    for item in ready:
+        if occupied >= limits["limit"]:
+            reason = "общий лимит"
+        elif per_assignee.get(item["assignee"], 0) >= limits["per_profile"]:
+            reason = "профиль занят"
+        else:
+            continue    # слот есть: карточка ждёт тика диспетчера, а не лимита (D7)
+        queue.append({**item, "reason": reason})
+    return {**limits, "occupied": occupied, "running": running, "queue": queue}
+
+
 def _missing_snapshot(state: State) -> dict:
     """Снимок проекта без конвейера: 200 и объяснение в `errors`, а не 500.
 
@@ -747,6 +884,9 @@ class Handler(BaseHTTPRequestHandler):
     # Реестр проектов (S6) задаётся в make_server: записи реестра и их состояния.
     registry: list[dict] = []
     states: dict[str, State] = {}
+    # Аргументы сборки реестра (S8, D4): без них пересборка после add/remove невозможна.
+    _base_project: Path | None = None
+    _extra_projects: list[str | Path] = []
 
     protocol_version = "HTTP/1.1"
 
@@ -886,9 +1026,16 @@ class Handler(BaseHTTPRequestHandler):
         summary = {"id": row["id"], "name": row["name"], "root": str(root),
                    "source": row["source"], "installed": _installed(root),
                    "plan": "", "next": "—", "closed": 0, "total": 0,
-                   "stop": None, "idle": None, "error": ""}
+                   "stop": None, "idle": None, "error": "", "capacity": None}
         if not summary["installed"] and not state.preview:
             return summary
+        # Занятость слотов от плана не зависит: считается до ранних выходов ниже (D5).
+        if summary["installed"]:
+            try:
+                summary["capacity"] = _capacity(root, state)
+            except Exception as exc:                            # noqa: BLE001
+                summary["capacity"] = None
+                summary["error"] = f"{type(exc).__name__}: {exc}"
         try:
             cfg = proj.read_config(root)
             plans = self._summary_plans(state)
@@ -935,6 +1082,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, self._projects_payload())
         except Exception as exc:                                # noqa: BLE001
             self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    def _reload_registry(self) -> None:
+        """Пересобрать реестр в памяти после подключения или отключения проекта (D4).
+
+        `registry` — атрибут класса, один список на все потоки: свежие строки кладутся
+        внутрь него (`[:]`), состояния проектов сохраняются по id. Без этого строка
+        появилась бы только через TTL кэша сводки или после перезапуска сервера.
+        """
+        base = self._base_project or self.state.project
+        rows = _registry_rows(base, self._extra_projects)
+        for row in rows:
+            state = self.states.get(row["id"])
+            if state is not None:
+                row["state"] = state
+        self.registry[:] = rows
+        self.state.projects_cache = None
 
     @staticmethod
     def _line_limit(query: dict[str, str], default: int = snap.STEP_LINES) -> int:
@@ -1268,6 +1431,106 @@ class Handler(BaseHTTPRequestHandler):
             body["error"] = error
         self._json(200 if body["ok"] else 400, body)
 
+    # ── реестр проектов: подключение и отключение (план 3 S8) ──
+    def _post_projects(self) -> None:
+        """Подключить проект из панели: проверка каталога и конвейера, запись реестра (D2).
+
+        Проверки идут от дешёвых к дорогим и каждая объясняет отказ текстом: 400 —
+        кривой ввод или проект без конвейера, 409 — путь уже в реестре, 403 — чтение.
+        """
+        if getattr(self.state, "preview", False):
+            self._drain_body()
+            self._json(403, {"ok": False,
+                             "error": "предпросмотр только читает: добавление проектов недоступно"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        raw_path = str(payload.get("path") or "").strip()
+        if not raw_path:
+            self._json(400, {"ok": False, "error": "нужен параметр path — путь к каталогу проекта"})
+            return
+        try:
+            root = Path(raw_path).expanduser().resolve()
+        except OSError as exc:
+            self._json(400, {"ok": False, "error": f"путь не разбирается: {exc}"})
+            return
+        if not root.is_dir():
+            self._json(400, {"ok": False, "error": f"каталог не найден: {root}"})
+            return
+        missing = [name for name, present in ((".pipeline/gate.py", _installed(root)),
+                                              (proj.MARKER,
+                                               (root / proj.MARKER).is_file())) if not present]
+        if missing:
+            self._json(400, {"ok": False,
+                             "error": f"проект без конвейера: {root} — нет {', '.join(missing)}"})
+            return
+        try:
+            entries = proj.raw_projects()
+        except ValueError:
+            self._json(400, {"ok": False,
+                             "error": "файл реестра не разбирается — поправь его вручную"})
+            return
+        # Дубль ищем и по памяти сервера (проект по умолчанию, разовые пути), и по файлу.
+        seen_roots = [Path(row["root"]) for row in self.registry]
+        for item in entries:
+            raw_root = item.get("root") or item.get("path")
+            if raw_root and str(raw_root).strip():
+                seen_roots.append(Path(str(raw_root)).expanduser().resolve())
+        if any(candidate == root for candidate in seen_roots):
+            self._json(409, {"ok": False, "error": f"проект уже в реестре: {root}"})
+            return
+        name = str(payload.get("name") or "").strip() or _display_name(root)
+        try:
+            created = proj.add_project(root, name)
+        except ValueError:
+            self._json(400, {"ok": False,
+                             "error": "файл реестра не разбирается — поправь его вручную"})
+            return
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        self._reload_registry()
+        self._json(200, {"ok": True, "project": {"id": created["id"], "name": created["name"],
+                                                 "root": created["root"]}})
+
+    def do_DELETE(self) -> None:                                # noqa: N802 - stdlib API
+        """Отключить проект от панели: запись реестра убирается, каталог не трогается (D3)."""
+        if not self._local_only():
+            self._json(403, {"ok": False, "error": "только localhost"})
+            return
+        if self.path.split("?")[0] != "/api/projects":
+            self._json(404, {"ok": False, "error": "нет такого маршрута"})
+            return
+        if getattr(self.state, "preview", False):
+            self._json(403, {"ok": False,
+                             "error": "предпросмотр только читает: отключение проектов недоступно"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        project_id = str(self._query().get("id") or "").strip()
+        if not project_id:
+            self._json(400, {"ok": False, "error": "нет параметра id"})
+            return
+        try:
+            removed = proj.remove_project(project_id)
+        except ValueError:
+            self._json(400, {"ok": False,
+                             "error": "файл реестра не разбирается — поправь его вручную"})
+            return
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        if not removed:
+            # Проект сервера и разовый путь из командной строки в файле не живут.
+            self._json(400, {"ok": False,
+                             "error": f"нет записи в {proj.projects_file().name} с id: {project_id}"})
+            return
+        self._reload_registry()
+        self._json(200, {"ok": True, "removed": project_id})
+
     # ── POST ──
     def do_POST(self) -> None:                                  # noqa: N802 - stdlib API
         if not self._local_only():
@@ -1279,6 +1542,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/setup":
             self._post_setup()
+            return
+        if path == "/api/projects":
+            self._post_projects()
             return
         if path != "/api/action":
             self._json(404, {"ok": False, "error": "нет такого маршрута"})
@@ -1365,7 +1631,9 @@ def make_server(project: Path, host: str = "127.0.0.1", port: int = 8770,
                   project_id=rows[0]["id"], name=rows[0]["name"])
     rows[0]["state"] = state
     handler = type("BoundHandler", (Handler,),
-                   {"state": state, "registry": rows, "states": {state.id: state}})
+                   {"state": state, "registry": rows, "states": {state.id: state},
+                    "_base_project": rows[0]["root"],
+                    "_extra_projects": list(extra_projects or [])})
     return ThreadingHTTPServer((host, port), handler)
 
 

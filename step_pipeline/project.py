@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,33 @@ def projects_file() -> Path:
     return Path(env).expanduser() if env else hermes_home() / "projects.json"
 
 
+def _displayed_entries(raw: list) -> list[tuple[int, dict[str, Any], str, Path, str]]:
+    """Видимые панели записи реестра: (индекс, запись, id, корень, имя).
+
+    Один разбор на чтение, добавление и удаление: id обязан совпадать во всех трёх
+    местах, иначе панель удалит не ту запись (D1).
+    """
+    out: list[tuple[int, dict[str, Any], str, Path, str]] = []
+    taken: list[str] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        raw_root = item.get("root") or item.get("path")
+        if not raw_root or not str(raw_root).strip():
+            continue
+        root = Path(str(raw_root)).expanduser().resolve()
+        if not root.is_dir():
+            continue            # каталога нет — запись нечего показывать (§4.1)
+        name = str(item.get("name") or "").strip() or root.name
+        base = str(item.get("id") or "").strip() or slug(name)
+        project_id, number = base, 2
+        while project_id in taken:
+            project_id, number = f"{base}-{number}", number + 1
+        taken.append(project_id)
+        out.append((index, item, project_id, root, name))
+    return out
+
+
 def read_projects() -> list[dict[str, Any]]:
     """Записи реестра: `{"id", "name", "root"}`; битый файл — пустой список.
 
@@ -82,23 +110,109 @@ def read_projects() -> list[dict[str, Any]]:
     raw = data.get("projects") if isinstance(data, dict) else data
     if not isinstance(raw, list):
         return []
-    out: list[dict[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        raw_root = item.get("root") or item.get("path")
-        if not raw_root or not str(raw_root).strip():
-            continue
-        root = Path(str(raw_root)).expanduser().resolve()
-        if not root.is_dir():
-            continue            # каталога нет — запись нечего показывать (§4.1)
-        name = str(item.get("name") or "").strip() or root.name
-        base = str(item.get("id") or "").strip() or slug(name)
-        project_id, number = base, 2
-        while any(row["id"] == project_id for row in out):
-            project_id, number = f"{base}-{number}", number + 1
-        out.append({"id": project_id, "name": name, "root": root})
-    return out
+    return [{"id": project_id, "name": name, "root": root}
+            for _index, _item, project_id, root, name in _displayed_entries(raw)]
+
+
+def _read_registry_raw() -> tuple[dict[str, Any] | None, list]:
+    """Сырой реестр: контейнер (`None` — форма-список) и список записей.
+
+    Нет файла — пустой реестр формы-словаря: добавление создаёт файл. Битый JSON —
+    `ValueError`: писатель обязан отказать, а не затереть чужие записи (D2).
+    """
+    try:
+        text = projects_file().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"projects": []}, []
+    except OSError as exc:
+        raise ValueError(f"файл реестра не читается: {exc}") from exc
+    if not text.strip():
+        return {"projects": []}, []
+    data = json.loads(text)
+    if isinstance(data, list):
+        return None, data
+    if isinstance(data, dict):
+        raw = data.get("projects")
+        return data, raw if isinstance(raw, list) else []
+    raise ValueError("файл реестра не разбирается: ожидался список или словарь с projects")
+
+
+def raw_projects() -> list[dict[str, Any]]:
+    """Сырые записи файла реестра — для проверок перед записью; битый файл — `ValueError`."""
+    _container, raw = _read_registry_raw()
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _write_registry(container: dict[str, Any] | None, entries: list) -> None:
+    """Записать реестр атомарно: временный файл рядом, затем `os.replace` (D1).
+
+    Чужие ключи контейнера сохраняются: панель правит только список `projects`.
+    """
+    path = projects_file()
+    payload = entries if container is None else {**container, "projects": entries}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(path.parent),
+                                         prefix=".projects-", suffix=".tmp",
+                                         delete=False) as handle:
+            temp = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        temp = None
+    finally:
+        if temp is not None:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+
+
+def add_project(root: Path | str, name: str = "") -> dict[str, Any]:
+    """Добавить проект в реестр панели: запись `{"id", "name", "root"}` (D1).
+
+    id вычисляется по правилам `read_projects` и уникален среди всех сырых записей —
+    включая те, что панель не показывает (несуществующий каталог). Битый файл —
+    `ValueError`, вызывающий отдаёт 400 и файл не трогает.
+    """
+    container, entries = _read_registry_raw()
+    target = Path(root).expanduser().resolve()
+    label = str(name or "").strip() or target.name
+    taken = {project_id for _i, _e, project_id, _r, _n in _displayed_entries(entries)}
+    for item in entries:                    # id из невидимых записей тоже занят
+        if isinstance(item, dict):
+            explicit = str(item.get("id") or "").strip()
+            if explicit:
+                taken.add(explicit)
+    base = slug(label)
+    project_id, number = base, 2
+    while project_id in taken:
+        project_id, number = f"{base}-{number}", number + 1
+    entry = {"id": project_id, "name": label, "root": str(target)}
+    _write_registry(container, [*entries, entry])
+    return entry
+
+
+def remove_project(project_id: str) -> bool:
+    """Убрать запись реестра по id панели; False — такой записи нет (D1).
+
+    Каталог проекта не читается и не меняется: панель отключает проект, а не удаляет
+    его с диска (C2). Записи, которых панель не показывает, не удаляются: их id
+    никому не адресуем.
+    """
+    wanted = str(project_id or "").strip()
+    if not wanted:
+        return False
+    container, entries = _read_registry_raw()
+    for index, _item, current_id, _root, _name in _displayed_entries(entries):
+        if current_id == wanted:
+            _write_registry(container, [item for position, item in enumerate(entries)
+                                        if position != index])
+            return True
+    return False
 
 
 def _yaml_scalar(value: str) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -1590,3 +1591,330 @@ def test_index_has_config_diff_and_rollback_markup():
     for call in ('/api/config', 'withProject("/api/config")', "preview_config",
                  "revert_config", 'addEventListener("input"', "clearConfigDiff()"):
         assert call in html, call
+
+
+# ─────────────── подключение проектов (план 3 S8) ───────────────
+
+def post_to(url: str, route: str, payload: dict | None = None,
+            headers: dict | None = None) -> tuple[int, dict]:
+    """POST произвольного маршрута панели: JSON-тело и метка панели (D2/D3)."""
+    data = json.dumps(payload or {}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{url}{route}", data=data,
+        headers={"Content-Type": "application/json", "X-Pipeline-Panel": "1",
+                 **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
+
+
+def delete(url: str, route: str, headers: dict | None = None) -> tuple[int, dict]:
+    """DELETE маршрута панели: тела нет, метка панели есть (D3)."""
+    request = urllib.request.Request(
+        f"{url}{route}", method="DELETE",
+        headers={"Content-Type": "application/json", "X-Pipeline-Panel": "1",
+                 **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
+
+
+CAPACITY_COLUMNS = (("worker_pid", "INTEGER"), ("last_heartbeat_at", "INTEGER"),
+                    ("max_runtime_seconds", "INTEGER"), ("started_at", "INTEGER"))
+
+
+def seed_tasks(db: Path, rows: list[dict]) -> None:
+    """Карточки в борду теста: недостающие колонки capacity досыпаются (D10)."""
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(KANBAN_SCHEMA)
+        present = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+        for name, kind in CAPACITY_COLUMNS:
+            if name not in present:
+                con.execute(f"ALTER TABLE tasks ADD COLUMN {name} {kind}")
+        for item in rows:
+            fields = dict(item)
+            fields.setdefault("title", fields["id"])
+            fields.setdefault("status", "running")
+            fields.setdefault("assignee", "driver")
+            fields.setdefault("created_at", int(time.time()))
+            columns = ", ".join(fields)
+            marks = ", ".join("?" for _ in fields)
+            con.execute(f"INSERT INTO tasks ({columns}) VALUES ({marks})",
+                        tuple(fields.values()))
+        con.commit()
+    finally:
+        con.close()
+
+
+def default_row(data: dict) -> dict:
+    """Строка сводки проекта сервера (`default`) — по ней проверяется capacity."""
+    return next(row for row in data["projects"] if row["id"] == data["default"])
+
+
+def test_projects_add_and_persist(tmp_path: Path, hermes_stub: Path,
+                                  isolated_hermes_home: Path):
+    """Проект из панели виден сразу и остаётся после перезапуска сервера (C1)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    gamma = install_project(tmp_path / "gamma", board="uiboard")
+    with running(first) as (url, _httpd):
+        status, data = post_to(url, "/api/projects", {"path": str(gamma)})
+        assert status == 200 and data["ok"] is True, data
+        assert Path(data["project"]["root"]) == gamma.resolve()
+        # Без паузы: кэш сводки обязан сброситься самим действием (D4).
+        _, listed = get(url + "/api/projects")
+        roots = [Path(row["root"]) for row in listed["projects"]]
+        assert gamma.resolve() in roots
+    # Второй сервер читает уже файл реестра, а не память первого.
+    with running(first) as (url, _httpd):
+        _, again = get(url + "/api/projects")
+    assert gamma.resolve() in [Path(row["root"]) for row in again["projects"]]
+    saved = json.loads((isolated_hermes_home / "projects.json").read_text(encoding="utf-8"))
+    entry = next(item for item in saved["projects"] if Path(item["root"]) == gamma.resolve())
+    assert set(entry) == {"id", "name", "root"}
+    assert entry["id"] and entry["name"]
+
+
+def test_projects_add_rejects_missing_pipeline(tmp_path: Path, hermes_stub: Path,
+                                               isolated_hermes_home: Path):
+    """Каталог без конвейера и проект без pipeline.json — 400, файл реестра не меняется (C3)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    beta = install_project(tmp_path / "beta", board="uiboard")
+    registry = write_registry(isolated_hermes_home,
+                              [{"id": "beta", "name": "Бета", "root": str(beta)}])
+    before = registry.read_bytes()
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    half = tmp_path / "half"
+    (half / ".pipeline").mkdir(parents=True)
+    (half / ".pipeline" / "gate.py").write_text("# заглушка\n", encoding="utf-8")
+    with running(first) as (url, _httpd):
+        bare_status, bare_body = post_to(url, "/api/projects", {"path": str(bare)})
+        half_status, half_body = post_to(url, "/api/projects", {"path": str(half)})
+    assert bare_status == 400 and "конвейер" in bare_body["error"]
+    assert half_status == 400 and "pipeline.json" in half_body["error"]
+    assert registry.read_bytes() == before
+
+
+def test_projects_add_duplicate_path(tmp_path: Path, hermes_stub: Path,
+                                     isolated_hermes_home: Path):
+    """Повторный путь — 409, и в файле по-прежнему одна запись (C3)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    gamma = install_project(tmp_path / "gamma", board="uiboard")
+    with running(first) as (url, _httpd):
+        first_status, _ = post_to(url, "/api/projects", {"path": str(gamma)})
+        status, data = post_to(url, "/api/projects", {"path": str(gamma)})
+    assert first_status == 200
+    assert status == 409 and data["ok"] is False and "уже в реестре" in data["error"]
+    saved = json.loads((isolated_hermes_home / "projects.json").read_text(encoding="utf-8"))
+    assert len(saved["projects"]) == 1
+    # Путь проекта по умолчанию тоже занят, хотя в файле его нет.
+    with running(first) as (url, _httpd):
+        own_status, own = post_to(url, "/api/projects", {"path": str(first)})
+    assert own_status == 409 and "уже в реестре" in own["error"]
+
+
+def test_projects_add_refused_in_preview(tmp_path: Path, hermes_stub: Path,
+                                         isolated_hermes_home: Path):
+    """Предпросмотр только читает: POST проектов — 403, файл реестра не создаётся (C3)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    gamma = install_project(tmp_path / "gamma", board="uiboard")
+    registry = isolated_hermes_home / "projects.json"
+    with running(first, preview=True) as (url, _httpd):
+        status, data = post_to(url, "/api/projects", {"path": str(gamma)})
+        del_status, del_data = delete(url, "/api/projects?id=gamma")
+    assert status == 403 and "предпросмотр" in data["error"]
+    assert del_status == 403 and "предпросмотр" in del_data["error"]
+    assert not registry.exists()
+
+
+def test_projects_delete_keeps_directory(tmp_path: Path, hermes_stub: Path,
+                                         isolated_hermes_home: Path):
+    """Отключение убирает строку реестра, каталог и его файлы остаются целы (C2)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    gamma = install_project(tmp_path / "gamma", board="uiboard")
+    config = gamma / "pipeline.json"
+    before = hashlib.sha256(config.read_bytes()).hexdigest()
+    with running(first) as (url, _httpd):
+        added_status, added = post_to(url, "/api/projects",
+                                      {"path": str(gamma), "name": "gamma"})
+        assert added_status == 200, added
+        assert added["project"]["id"] == "gamma"
+        status, data = delete(url, "/api/projects?id=gamma")
+        _, listed = get(url + "/api/projects")
+    assert status == 200 and data["ok"] is True and data["removed"] == "gamma"
+    assert gamma.resolve() not in [Path(row["root"]) for row in listed["projects"]]
+    assert gamma.is_dir()
+    assert hashlib.sha256(config.read_bytes()).hexdigest() == before
+    saved = json.loads((isolated_hermes_home / "projects.json").read_text(encoding="utf-8"))
+    assert saved["projects"] == []
+
+
+def test_projects_delete_unknown_id_is_error(tmp_path: Path, hermes_stub: Path,
+                                             isolated_hermes_home: Path):
+    """Неизвестный id, проект сервера и пустой параметр — 400 с объяснением (C3)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    with running(first) as (url, httpd):
+        unknown_status, unknown = delete(url, "/api/projects?id=nope")
+        own_status, own = delete(url, "/api/projects?id=alpha")
+        empty_status, empty = delete(url, "/api/projects")
+        default_id = httpd.RequestHandlerClass.state.id
+    assert unknown_status == 400 and "нет записи" in unknown["error"]
+    assert own_status == 400 and "нет записи" in own["error"]
+    assert empty_status == 400 and "id" in empty["error"]
+    assert default_id == "alpha"
+
+
+def test_capacity_counts_running_and_ready(tmp_path: Path, hermes_stub: Path,
+                                           isolated_hermes_home: Path):
+    """4 из 6, очередь с причиной, pid и «прошло/лимит» от попытки, а не от создания (C4-C5)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    (isolated_hermes_home / "config.yaml").write_text(
+        "kanban:\n  max_in_progress: 6\n  max_in_progress_per_profile: 1\n"
+        "  stale_after: 10m\n", encoding="utf-8")
+    now = int(time.time())
+    staff = ("driver", "prompter", "reviewer", "maintainer")
+    seed_tasks(hermes_stub, [
+        {"id": f"run{index}", "assignee": who, "worker_pid": 1244 + index,
+         "last_heartbeat_at": now - 120, "started_at": now - 600,
+         "max_runtime_seconds": 4080, "created_at": now - 999999}
+        for index, who in enumerate(staff)
+    ] + [
+        {"id": "wait-driver", "status": "ready", "assignee": "driver"},
+        {"id": "wait-prompter", "status": "ready", "assignee": "prompter"},
+    ])
+    with running(first) as (url, _httpd):
+        status, data = get(url + "/api/projects")
+        assert status == 200
+        row = default_row(data)
+        capacity = row["capacity"]
+        assert capacity["limit"] == 6 and capacity["limit_default"] is False
+        assert capacity["per_profile"] == 1 and capacity["per_profile_default"] is False
+        assert capacity["occupied"] == 4
+        assert f"{capacity['occupied']}/{capacity['limit']}" == "4/6"
+        assert len(capacity["running"]) == 4
+        for index, item in enumerate(capacity["running"]):
+            assert item["pid"] == 1244 + index
+            assert item["assignee"] == staff[index]
+            assert 115 <= item["heartbeat_age"] <= 125, item
+            # created_at отстоит на 999999 с: попав в расчёт, он сломал бы границу.
+            assert 600 <= item["elapsed"] <= 100000, item
+            assert item["limit"] == 4080
+            assert item["heartbeat"] and item["elapsed_text"]
+        assert len(capacity["queue"]) == 2
+        assert {item["reason"] for item in capacity["queue"]} == {"профиль занят"}
+        # Глобально 4 из 6 — свободно: причина считается от самих чисел.
+        html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+        assert "${p.capacity.occupied}/${p.capacity.limit}" in html
+        # Досеиваем два чужих профиля: занято 6 из 6 — причина меняется на общий лимит.
+        time.sleep(snapshot.CACHE_TTL + 0.3)     # сводка кэшируется на TTL
+        seed_tasks(hermes_stub, [
+            {"id": "run-extra-1", "assignee": "writer", "worker_pid": 1300,
+             "last_heartbeat_at": now - 60, "started_at": now - 60,
+             "max_runtime_seconds": 4080},
+            {"id": "run-extra-2", "assignee": "qa", "worker_pid": 1301,
+             "last_heartbeat_at": now - 60, "started_at": now - 60,
+             "max_runtime_seconds": 4080},
+        ])
+        _, crowded = get(url + "/api/projects")
+    full = default_row(crowded)["capacity"]
+    assert full["occupied"] == 6
+    assert len(full["queue"]) == 2
+    assert {item["reason"] for item in full["queue"]} == {"общий лимит"}
+
+
+def test_capacity_falls_back_to_defaults(tmp_path: Path, hermes_stub: Path,
+                                         isolated_hermes_home: Path):
+    """Ключей конфигурации нет — 3 и 3 с пометкой «по умолчанию» (C4)."""
+    first = install_project(tmp_path / "alpha", board="uiboard")
+    assert not (isolated_hermes_home / "config.yaml").exists()
+    now = int(time.time())
+    seed_tasks(hermes_stub, [{"id": "run1", "assignee": "driver", "worker_pid": 2001,
+                              "last_heartbeat_at": now - 30, "started_at": now - 300,
+                              "max_runtime_seconds": 1800}])
+    with running(first) as (url, _httpd):
+        _, data = get(url + "/api/projects")
+    capacity = default_row(data)["capacity"]
+    assert capacity["limit"] == 3 and capacity["limit_default"] is True
+    assert capacity["per_profile"] == 3 and capacity["per_profile_default"] is True
+    assert capacity["occupied"] == 1
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    assert "по умолчанию" in html
+
+
+def test_index_hotkeys_markup():
+    """Клавиши страницы: один обработчик, поиск, подсказка, Esc и «/» (C6)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    for anchor in ('document.addEventListener("keydown"', 'id="hotkeys-help"',
+                   'id="steps-filter"', '"Escape"', '"/"', '$("btn-tick").click()',
+                   '$("btn-stop").click()', '$("btn-resume").click()'):
+        assert anchor in html, anchor
+
+
+def test_index_theme_and_density_markup():
+    """Тема и плотность: переменные светлой палитры, dataset и localStorage (C6)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    for anchor in ('dataset.theme', '[data-theme="light"]',
+                   'localStorage.getItem("pipeline.theme")',
+                   'localStorage.getItem("pipeline.density")',
+                   'id="btn-theme"', 'id="btn-density"', "compact"):
+        assert anchor in html, anchor
+
+
+def test_index_focus_and_aria_markup():
+    """Видимый фокус и aria-метки на кнопках и вкладках (C6)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    for anchor in (":focus-visible", 'role="tab"', "aria-selected"):
+        assert anchor in html, anchor
+    assert html.count("aria-label=") >= 5
+
+
+def test_index_responsive_380_markup():
+    """На 380 px: одна колонка у сеток и свои скролл-контейнеры у таблиц (C6)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    assert "@media (max-width: 380px)" in html
+    block = html[html.index("@media (max-width: 380px)"):]
+    assert "grid-template-columns: 1fr" in block
+    assert "overflow-x" in block
+
+
+def _luminance(color: str) -> float:
+    """Относительная яркость WCAG для `#rrggbb`."""
+    def channel(value: int) -> float:
+        part = value / 255
+        return part / 12.92 if part <= 0.03928 else ((part + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = (int(color[index:index + 2], 16) for index in (1, 3, 5))
+    return 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+
+
+def _contrast(first: str, second: str) -> float:
+    """Отношение контраста двух цветов по формуле WCAG."""
+    high, low = sorted((_luminance(first), _luminance(second)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+def _palette(html: str, selector: str) -> dict[str, str]:
+    """Переменные палитры из блока селектора: `--имя: #hex`."""
+    start = html.index(selector + " {")
+    end = html.index("}", start)
+    return dict(re.findall(r"(--[a-z0-9-]+):\s*(#[0-9a-fA-F]{6})", html[start:end]))
+
+
+def test_index_contrast_from_styles():
+    """Тексты обеих тем проходят контраст 4.5:1 по вычисленным цветам стилей (C7)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    pairs = [("text", "bg"), ("text", "panel"), ("text", "panel-2"),
+             ("muted", "bg"), ("muted", "panel"), ("muted", "panel-2"),
+             ("accent", "panel-2")]
+    for selector in (":root", '[data-theme="light"]'):
+        palette = _palette(html, selector)
+        for foreground, background in pairs:
+            front, back = f"--{foreground}", f"--{background}"
+            assert front in palette and back in palette, (selector, front, back)
+            ratio = _contrast(palette[front], palette[back])
+            assert ratio >= 4.5, f"{selector} {front}/{back}: {ratio:.2f}"
