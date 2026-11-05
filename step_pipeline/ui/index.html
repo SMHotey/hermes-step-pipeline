@@ -1742,7 +1742,9 @@ async function refresh() {
 const NOTIFY_GAP_MS = 30000;      // не чаще одного всплытия на проект в 30 с
 const NOTIFY_SEEN_LIMIT = 200;    // потолок запомненных ключей страницы
 const NOTIFY_ROW_LIMIT = 50;      // потолок списка событий на вкладке
-let notifyState = null;           // последний ответ /api/notify
+// Состояние переключателей из ответа сервера: всплытие гейтится им, а не чекбоксом
+// notify-master — тот выставляется только при открытии вкладки «Уведомления» (ревью 3-S10).
+let notifyGate = {global: false, project: false};
 const seenNotify = new Set();     // ключи, о которых страница уже знает
 const lastNotifyAt = {};          // проект → время последнего всплытия
 let notifyRows = [];              // события для вкладки: свежие сверху
@@ -1778,9 +1780,10 @@ function requestPermission() {
 
 function showNotification(notice) {
   if (!notice) return;
-  const master = $("notify-master");
+  // Мастер-выключатель и флаг проекта — из ответа сервера: DOM-чекбокс до открытия
+  // вкладки не загружен, и после перезагрузки панель молчала (находка ревью 3-S10).
   const allowed = ("Notification" in window) && Notification.permission === "granted"
-                  && master && master.checked;
+                  && notifyGate.global && notifyGate.project;
   if (!allowed) {
     // Тихо: текст всё равно виден на вкладке «Уведомления» и в ленте.
     toast(notice.text || "уведомление");
@@ -1804,14 +1807,23 @@ function pushNotifyRows(events) {
   return fresh;
 }
 
+function applyNotifyGate(feed) {
+  // Сервер — единственный источник правды: глобальный переключатель реестра и флаг проекта.
+  if (!feed) return;
+  if (typeof feed.global_enabled === "boolean") notifyGate.global = feed.global_enabled;
+  if (typeof feed.enabled === "boolean") notifyGate.project = feed.enabled;
+}
+
 function collectNotify(feed) {
   // Снимок наполняет список вкладки, но не всплывает: всплытие — только из кадра потока.
+  applyNotifyGate(feed);
   pushNotifyRows((feed || {}).events);
 }
 
 function notifyFromFrame(data, first) {
   const feed = (data && data.notify) || null;
   if (!feed || !Array.isArray(feed.events)) return;
+  applyNotifyGate(feed);
   const fresh = [];
   feed.events.forEach((event) => {
     if (!event || !event.key || seenNotify.has(event.key)) return;
@@ -1850,7 +1862,6 @@ function projectKinds(project) {
 }
 
 function renderNotify(data) {
-  notifyState = data;
   const err = $("notify-error");
   if (data.error) {
     err.textContent = "projects.json: " + data.error;
@@ -1860,6 +1871,8 @@ function renderNotify(data) {
     err.hidden = true;
   }
   const master = $("notify-master");
+  // Ответ на сохранение — тоже источник правды: иначе всплытие ждало бы следующего кадра.
+  notifyGate.global = !!((data.global || {}).enabled);
   master.checked = !!((data.global || {}).enabled);
   master.disabled = !((data.global || {}).editable);
   master.title = master.disabled
@@ -2304,6 +2317,8 @@ $("plan-mode").onchange = (event) => {
 });
 
 refresh();
+// Подпись «разрешение: …» верна и до открытия вкладки «Уведомления» (ревью 3-S10).
+permissionState();
 startEvents();
 timer = setInterval(refresh, 30000);
 // Секундный тик живого времени: отдельно от 30-секундного снимка и потока SSE (S9, D11).

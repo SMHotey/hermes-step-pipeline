@@ -2361,15 +2361,23 @@ def test_notify_settings_persist(tmp_path: Path, hermes_stub: Path,
     alpha = install_project(tmp_path / "alpha", board="uiboard")
     beta = install_project(tmp_path / "beta", board="uiboard")
     write_registry(isolated_hermes_home,
-                   [{"id": "beta", "name": "Бета", "root": str(beta)}])
+                   [{"id": "alpha", "name": "Альфа", "root": str(alpha)},
+                    {"id": "beta", "name": "Бета", "root": str(beta)}])
     with running(alpha) as (url, _httpd):
         status, data = post_to(url, "/api/notify",
                                {"project": "beta", "enabled": True,
                                 "events": ["step_closed"]})
+        # Тело без `project` и без `global` адресата не описывает: 400, а не молчаливая
+        # запись проекту по умолчанию (находка ревью 3-S10).
+        bad_status, bad = post_to(url, "/api/notify", {"enabled": True})
     assert status == 200 and data["ok"] is True
+    assert bad_status == 400 and "project" in bad["error"]
     saved = json.loads((isolated_hermes_home / "projects.json").read_text(encoding="utf-8"))
-    assert saved["projects"][0]["notify"]["enabled"] is True
-    assert saved["projects"][0]["notify"]["events"] == ["step_closed"]
+    entries = {row["id"]: row for row in saved["projects"]}
+    assert entries["beta"]["notify"]["enabled"] is True
+    assert entries["beta"]["notify"]["events"] == ["step_closed"]
+    # Проект по умолчанию правкой чужой записи не задет: ключа `notify` у него нет.
+    assert "notify" not in entries["alpha"]
     # Файл читается заново при старте: настройка не живёт в памяти сервера.
     with running(alpha) as (url, _httpd):
         status, data = get(url + "/api/notify")
@@ -2544,3 +2552,7 @@ def test_index_notify_screen_markup():
     # Виды внимания приходят с сервера: страница не держит свой список галочек.
     assert "kind.label" in html
     assert "/api/notify" in html
+    # Всплытие гейтится состоянием сервера, а не чекбоксом notify-master: тот выставляется
+    # только при открытии вкладки, и после F5 панель молчала (находка ревью 3-S10).
+    assert "notifyGate.global && notifyGate.project" in html
+    assert "applyNotifyGate" in html

@@ -27,6 +27,7 @@
     POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
     POST /api/notify       настройки уведомлений: {"global": true, "enabled": ...} или
                            {"project": id, "enabled": ..., "events": [...]}; запись в projects.json
+                           (ровно одна из двух форм, иначе 400)
     POST /api/notify/test  тестовое уведомление: {"project": id}; только ответ браузеру,
                            в историю доставок и в Telegram ничего не пишет
     POST /api/projects     подключить проект: {"path": ..., "name": ...}, заголовок
@@ -1504,7 +1505,13 @@ class Handler(BaseHTTPRequestHandler):
             if payload.get("global"):
                 proj.write_notify(global_enabled=enabled)
             else:
-                project_id = str(payload.get("project") or "").strip() or self.state.id
+                project_id = str(payload.get("project") or "").strip()
+                if not project_id:
+                    # Две формы тела (§4.3.8): без `project` и без `global` писать некуда.
+                    # Иначе забытое поле молча меняло бы настройки проекта по умолчанию.
+                    self._json(400, {"ok": False,
+                                     "error": "нужен project (id проекта) или global: true"})
+                    return
                 proj.write_notify(project_id=project_id, enabled=enabled,
                                   events=[str(item) for item in events] if events is not None
                                   else None)
