@@ -34,7 +34,9 @@
   "default_plan": null,
   "driven_plans": [
     "2",
-    "3"
+    "3",
+    "4",
+    "5"
   ],
   "require_prompt": true,
   "runtimes": {
