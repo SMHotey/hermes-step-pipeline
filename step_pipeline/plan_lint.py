@@ -333,25 +333,49 @@ def _constitution_line(lines: list[str],
     return None
 
 
-def _research_section(found: list[tuple[int, int, str]]) -> tuple[int, int, int] | None:
-    """Первый раздел `## Разведка`: (позиция среди заголовков, строка заголовка, уровень)."""
+def _steps_span(lines: list[str], found: list[tuple[int, int, str]],
+                settings: Settings) -> tuple[int, int] | None:
+    """Границы раздела шагов: (строка заголовка, конец раздела) или None (§3)."""
+    for idx, level, title in found:
+        if level >= 2 and settings.steps_marker in title.lower():
+            return idx, _content_end(found, idx, level, len(lines))
+    return None
+
+
+def _research_section(lines: list[str], found: list[tuple[int, int, str]],
+                      settings: Settings) -> tuple[int, int, int] | None:
+    """Первый раздел `## Разведка`: (позиция среди заголовков, строка заголовка, уровень).
+
+    Заголовок шага разделом не считается: `### S1. Разведка рынка` — шаг, а не раздел
+    плана, и находки Л19 про его поля были бы ложью. Наивный выбор «первый заголовок
+    с маркером» перехватил бы его — та же причина, по которой `_journal_section`
+    смотрит ещё и на строки таблицы.
+    """
+    steps = _steps_span(lines, found, settings)
     for pos, (idx, level, title) in enumerate(found):
-        if level >= 2 and _RESEARCH_MARKER in title.lower():
-            return pos, idx, level
+        if level < 2 or _RESEARCH_MARKER not in title.lower():
+            continue
+        if settings.step_regex is not None and settings.step_regex.match(title):
+            continue  # заголовок начинается с идентификатора шага
+        if steps is not None and steps[0] < idx < steps[1]:
+            continue  # внутри раздела шагов — шаг, а не раздел плана
+        return pos, idx, level
     return None
 
 
 def _research_problems(shown: str, lines: list[str],
-                       found: list[tuple[int, int, str]]) -> list[Problem]:
-    """Л18 и Л19 (§5a): нет раздела у плана действующего формата, в разделе нет поля.
+                       found: list[tuple[int, int, str]], settings: Settings) -> list[Problem]:
+    """Л18 и Л19 (§5a) — только у плана действующего формата.
 
+    Дискриминатор — строка `Конституция:` в шапке (D1): без неё план legacy, линтер
+    молчит и про раздел, и про его поля, счётчики ведомых планов не растут (§5a).
     Поля — слова-маркеры §5a (D2): таблица, проза и списки равны, важны слова. Число
     находок — по числу отсутствующих полей: ревьюер читает, какого поля не хватает.
     """
-    section = _research_section(found)
+    if _constitution_line(lines, found) is None:
+        return []  # legacy-план: ни Л18, ни Л19 не срабатывают (§5a, D1)
+    section = _research_section(lines, found, settings)
     if section is None:
-        if _constitution_line(lines, found) is None:
-            return []  # legacy-план: строки `Конституция:` нет — терпим (D1)
         heading = next((idx for idx, level, _title in found if level == 1), 0)
         return [Problem(shown, heading + 1, _PROBLEM_NO_RESEARCH)]
     _pos, start, level = section
@@ -393,7 +417,7 @@ def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
     found = _headings(lines)
     # Уровень плана (Л18, Л19): до разделов шагов и журнала — у плана действующего
     # формата разведка обязательна, даже если остальной формат сломан и там своя находка.
-    problems.extend(_research_problems(shown, lines, found))
+    problems.extend(_research_problems(shown, lines, found, settings))
     sections = [(idx, level) for idx, level, title in found
                 if level >= 2 and settings.steps_marker in title.lower()]
     if not sections:

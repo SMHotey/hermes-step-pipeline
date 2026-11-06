@@ -399,7 +399,7 @@ FULL_RESEARCH = """## Разведка
 """
 
 
-def test_research_section_missing_is_named_for_new_format_plan(project: Path):
+def test_research_missing_named_for_new_format_plan(project: Path):
     """Л18: план с `Конституция:` в шапке обязан иметь `## Разведка` — находка называет раздел."""
     path = project / "docs" / "plans" / "6-demo.md"
     path.write_text(NEW_FORMAT, encoding="utf-8")
@@ -457,3 +457,49 @@ def test_repo_plans_lint_clean():
 
     assert result.problems == []
     assert len(result.files) >= 5
+
+
+RESEARCH_STEP = "### S1. Разведка рынка (1 дн)"
+"""Заголовок шага со словом «разведка» — ловушка наивного поиска раздела."""
+
+
+def test_step_heading_is_not_research_section(project: Path):
+    """Заголовок шага разделом не считается: у плана действующего формата одна Л18, не Л19."""
+    path = project / "docs" / "plans" / "6-demo.md"
+    path.write_text(NEW_FORMAT.replace("### S1. Таблица счетов (1 дн)", RESEARCH_STEP, 1),
+                    encoding="utf-8")
+
+    problems = plan_lint.lint_project(project, "6").problems
+    assert len(problems) == 1
+    assert "нет раздела «Разведка»" in problems[0].text
+    assert problems[0].step == ""
+
+
+def test_legacy_plan_with_research_step_is_tolerated(project: Path):
+    """Тот же шаг в legacy-плане (без `Конституция:`): ни Л18, ни Л19 — шаг остаётся шагом."""
+    path = project / "docs" / "plans" / "6-demo.md"
+    path.write_text(helpers.PLAN.replace("### S1. Таблица счетов (1 дн)", RESEARCH_STEP, 1),
+                    encoding="utf-8")
+
+    assert plan_lint.lint_project(project, "6").problems == []
+
+
+def test_legacy_plan_with_research_section_is_tolerated(project: Path):
+    """Раздел `## Разведка` в legacy-плане линтер не проверяет: ни Л18, ни Л19 (§5a)."""
+    path = project / "docs" / "plans" / "6-demo.md"
+    path.write_text(helpers.PLAN.replace("## Шаги", EMPTY_RESEARCH + "\n## Шаги", 1),
+                    encoding="utf-8")
+
+    assert plan_lint.lint_project(project, "6").problems == []
+
+
+def test_research_section_after_steps_is_found(project: Path):
+    """Раздел после раздела шагов — всё ещё раздел: пустой даёт четыре Л19."""
+    path = project / "docs" / "plans" / "6-demo.md"
+    path.write_text(
+        NEW_FORMAT.replace("## Журнал выполнения", EMPTY_RESEARCH + "\n## Журнал выполнения", 1),
+        encoding="utf-8")
+
+    texts = " | ".join(problem.text for problem in plan_lint.lint_project(project, "6").problems)
+    for field in ("ссылки на артефакт", "кандидатов", "лицензий", "решения/вердикта"):
+        assert field in texts
