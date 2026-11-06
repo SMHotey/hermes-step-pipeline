@@ -48,6 +48,20 @@ _BULLET_RE = re.compile(r"^(?:[-*+]|\d+\.)\s+(?P<text>.*)$")
 _EMPTY_GATES = ("", "—", "-", "−")
 _PLANS_DEFAULT = "docs/plans"
 _STEP_HEADING_HINT = "заголовок шага не по формату «### S1. Название»"
+# Раздел разведки плана действующего формата (§5a). Константа, а не ключ конфига (D6):
+# линтер называет нарушение так же, как оно записано в формате, — ведение формата
+# переопределило бы и §5a, и строки Л18/Л19.
+_RESEARCH_MARKER = "разведка"
+# Дискриминатор действующего формата: строка `Конституция:` в шапке плана (D1).
+_CONSTITUTION_PREFIX = "конституция:"
+# Признаки полей раздела — слова-маркеры из §5a (D2): линтер ищет слово, не оформление.
+_RESEARCH_LINK = "prior-art"
+_RESEARCH_CANDIDATES = "кандидат"
+_RESEARCH_LICENSES = "лиценз"
+_RESEARCH_VERDICT = ("решение", "вердикт")
+# Тексты находок — так же в §11.1, колонка «Что проверяется».
+_PROBLEM_NO_RESEARCH = ("нет раздела «Разведка» — план действующего формата обязан "
+                        "содержать раздел со ссылкой на артефакт, кандидатами и решением")
 
 
 @dataclass(frozen=True)
@@ -297,6 +311,65 @@ def _row_step(cells: list[str], step_regex: re.Pattern) -> str | None:
     return m.group("id").upper() if m else None
 
 
+def _constitution_line(lines: list[str],
+                       found: list[tuple[int, int, str]]) -> int | None:
+    """Строка `Конституция:` в шапке плана (1-based) или None — план legacy.
+
+    Шапка — между `# `-заголовком и первым заголовком уровня 2+ (§5a). Заголовка
+    уровня 1 нет — шапки в этом смысле тоже нет, дискриминатор не срабатывает:
+    линтер терпит такой план, а не выдумывает ему формат.
+    """
+    start = next((idx for idx, level, _title in found if level == 1), None)
+    if start is None:
+        return None
+    end = len(lines)
+    for idx, level, _title in found:
+        if idx > start and level >= 2:
+            end = idx
+            break
+    for i in range(start + 1, end):
+        if lines[i].strip().lower().startswith(_CONSTITUTION_PREFIX):
+            return i + 1
+    return None
+
+
+def _research_section(found: list[tuple[int, int, str]]) -> tuple[int, int, int] | None:
+    """Первый раздел `## Разведка`: (позиция среди заголовков, строка заголовка, уровень)."""
+    for pos, (idx, level, title) in enumerate(found):
+        if level >= 2 and _RESEARCH_MARKER in title.lower():
+            return pos, idx, level
+    return None
+
+
+def _research_problems(shown: str, lines: list[str],
+                       found: list[tuple[int, int, str]]) -> list[Problem]:
+    """Л18 и Л19 (§5a): нет раздела у плана действующего формата, в разделе нет поля.
+
+    Поля — слова-маркеры §5a (D2): таблица, проза и списки равны, важны слова. Число
+    находок — по числу отсутствующих полей: ревьюер читает, какого поля не хватает.
+    """
+    section = _research_section(found)
+    if section is None:
+        if _constitution_line(lines, found) is None:
+            return []  # legacy-план: строки `Конституция:` нет — терпим (D1)
+        heading = next((idx for idx, level, _title in found if level == 1), 0)
+        return [Problem(shown, heading + 1, _PROBLEM_NO_RESEARCH)]
+    _pos, start, level = section
+    end = _content_end(found, start, level, len(lines))
+    text = _norm(" ".join(lines[start + 1:end])).lower()
+    out: list[Problem] = []
+    if _RESEARCH_LINK not in text:
+        out.append(Problem(shown, start + 1,
+                           "в разделе «Разведка» нет ссылки на артефакт"))
+    if _RESEARCH_CANDIDATES not in text:
+        out.append(Problem(shown, start + 1, "в разделе «Разведка» нет кандидатов"))
+    if _RESEARCH_LICENSES not in text:
+        out.append(Problem(shown, start + 1, "в разделе «Разведка» нет лицензий"))
+    if not any(marker in text for marker in _RESEARCH_VERDICT):
+        out.append(Problem(shown, start + 1, "в разделе «Разведка» нет решения/вердикта"))
+    return out
+
+
 def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
     """Все проверки одного файла плана; строки — 1-based, «весь файл» — 0."""
     path = Path(path)
@@ -318,6 +391,9 @@ def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
     if step_regex is None:  # pragma: no cover - отсекается в lint_project
         return problems
     found = _headings(lines)
+    # Уровень плана (Л18, Л19): до разделов шагов и журнала — у плана действующего
+    # формата разведка обязательна, даже если остальной формат сломан и там своя находка.
+    problems.extend(_research_problems(shown, lines, found))
     sections = [(idx, level) for idx, level, title in found
                 if level >= 2 and settings.steps_marker in title.lower()]
     if not sections:

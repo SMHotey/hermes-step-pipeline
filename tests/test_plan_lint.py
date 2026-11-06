@@ -11,6 +11,7 @@ import pytest
 import helpers  # noqa: F401  (загружает плагин и алиасы модулей)
 from step_pipeline import plan_lint
 from step_pipeline import doctor
+from step_pipeline import plan_accept
 import cli
 import project as proj
 
@@ -375,3 +376,84 @@ def test_preview_reports_missing_engine_and_writes_nothing(tmp_path: Path, monke
     assert "конвейер не установлен" in text
     assert not (root / ".pipeline").exists()
     assert not (root / "pipeline.json").exists()
+
+
+# ── План действующего формата: раздел «Разведка» (§5a, шаг 5-S1). ──────────────
+
+NEW_FORMAT = helpers.PLAN.replace(
+    "# 1. Демо-план конвейера",
+    "# 1. Демо-план конвейера\n\nКонституция: docs/CONSTITUTION.md", 1)
+"""Тот же демо-план, но со строкой `Конституция:` в шапке — формат действует."""
+
+EMPTY_RESEARCH = "## Разведка\n\nСекция без единого поля.\n"
+
+FULL_RESEARCH = """## Разведка
+
+Артефакт: `docs/research/6-prior-art.md`
+
+| Кандидат | Ссылка | Лицензия | Вердикт |
+|---|---|---|---|
+| spec-kit | https://example.com | MIT | берём |
+
+Решение: go — готовый каркас, своё не пишем.
+"""
+
+
+def test_research_section_missing_is_named_for_new_format_plan(project: Path):
+    """Л18: план с `Конституция:` в шапке обязан иметь `## Разведка` — находка называет раздел."""
+    path = project / "docs" / "plans" / "6-demo.md"
+    path.write_text(NEW_FORMAT, encoding="utf-8")
+
+    problems = plan_lint.lint_project(project, "6").problems
+    assert len(problems) == 1
+    assert "Разведка" in problems[0].text
+    assert problems[0].step == ""
+    assert problems[0].line == 1  # строка заголовка плана — зафиксировано в §11.1
+
+
+def test_legacy_plan_without_research_is_tolerated(project: Path):
+    """Тот же план без строки `Конституция:` — legacy: линтер молчит, счётчики не растут."""
+    path = project / "docs" / "plans" / "6-demo.md"
+    path.write_text(helpers.PLAN, encoding="utf-8")
+
+    assert plan_lint.lint_project(project, "6").problems == []
+
+
+def test_research_section_names_missing_fields(project: Path):
+    """Л19: раздел без полей — находка на каждое отсутствующее поле, каждая называет поле."""
+    path = project / "docs" / "plans" / "6-demo.md"
+    path.write_text(NEW_FORMAT.replace("## Шаги", EMPTY_RESEARCH + "\n## Шаги", 1),
+                    encoding="utf-8")
+
+    problems = plan_lint.lint_project(project, "6").problems
+    texts = " | ".join(problem.text for problem in problems)
+    assert problems
+    for field in ("ссылки на артефакт", "кандидатов", "лицензий", "решения/вердикта"):
+        assert field in texts
+
+    path.write_text(NEW_FORMAT.replace("## Шаги", FULL_RESEARCH + "\n## Шаги", 1),
+                    encoding="utf-8")
+    assert plan_lint.lint_project(project, "6").problems == []
+
+
+def test_draft_without_research_fails_acceptance(project: Path):
+    """Утверждение (`--accept`) не пропускает черновик действующего формата без разведки."""
+    folder = project / "docs" / "plans" / "drafts"
+    folder.mkdir(parents=True, exist_ok=True)
+    draft = folder / "7-demo.md"
+    draft.write_text(NEW_FORMAT, encoding="utf-8")
+
+    errors = plan_accept.check_draft(project, draft)
+    assert errors
+    assert "Разведка" in " ".join(errors)
+
+    draft.write_text(helpers.PLAN, encoding="utf-8")
+    assert plan_accept.check_draft(project, draft) == []
+
+
+def test_repo_plans_lint_clean():
+    """Планы 1-4 (legacy) и план 5 (с разделом) — без находок: линтер существующие не ломает."""
+    result = plan_lint.lint_project(helpers.REPO)
+
+    assert result.problems == []
+    assert len(result.files) >= 5
