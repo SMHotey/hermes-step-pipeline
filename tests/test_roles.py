@@ -50,7 +50,7 @@ def test_roles_have_skill_and_category():
         assert skill.is_file(), f"{name}: нет SKILL.md"
         assert top_level(skill).get("name") == name, f"{name}: name не совпадает с каталогом"
     assert set(roles) == set(setup_flow.SKILL_CATEGORIES), "роли и SKILL_CATEGORIES разошлись"
-    assert len(roles) == len(setup_flow.SKILL_CATEGORIES) == 6
+    assert len(roles) == len(setup_flow.SKILL_CATEGORIES) == 7
 
 
 def test_frontmatter_is_yaml_subset():

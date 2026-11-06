@@ -132,6 +132,23 @@ VERDICT_RE = re.compile(r"^#{0,4}\s*ВЕРДИКТ\s*:\s*(APPROVE|REQUEST_CHANGE
                         re.IGNORECASE | re.MULTILINE)
 COMMIT_RE = re.compile(r"коммит\S*\s*`([0-9a-f]{7,40})`", re.IGNORECASE)
 
+# ── Разведка готовых решений (план 5, S2) ────────────────────────────────────
+# Роль разведки живёт в конфиге ключом `scout`: `skills.scout` и `runtimes.scout` пишет
+# шаг, `profiles.scout` — только владелец (`AGENTS.md`). Поэтому ключи читаются сырым
+# словарём конфига с умолчаниями, а не создаются: правка владельца не должна теряться,
+# а её отсутствие не должно валить тик.
+SCOUT_KEY = "scout"
+SCOUT_PROFILE_DEFAULT = "scout"
+SCOUT_SKILLS_DEFAULT = ("pipeline-scout",)
+SCOUT_RUNTIME_DEFAULT = "30m"
+RESEARCH_DIR_DEFAULT = "docs/research"
+# Признак валидного исхода «готового нет» (D7): ищется в результате/ошибке карточки без
+# учёта регистра — провал без этой фразы останавливает конвейер, с ней — нет.
+SCOUT_NO_READY = "готового нет"
+# Строка шапки плана действующего формата (`docs/PLAN-FORMAT.md:196`). Без неё планы 2-4
+# и фикстуры тестов разведку не заказывают (D1).
+CONSTITUTION_MARK = "Конституция:"
+
 # Предел действий за тик: ключ `max_actions` в pipeline.json проекта, умолчание 1 (D1).
 MAX_ACTIONS_DEFAULT = 1
 # Сколько кругов правок по ревью разрешено автоматически, если в pipeline.json не задано
@@ -481,6 +498,51 @@ def prompt_recon(path: Path | str | None) -> str | None:
     return found.group(1).lower() if found else None
 
 
+def scout_research_dir(cfg: config_mod.Config) -> Path:
+    """Каталог артефактов разведки: `paths.research`, умолчание `docs/research` (D2).
+
+    Относительный путь разрешается от корня проекта; конфиг читается сырым словарём,
+    `config.py` не правится.
+    """
+    raw = _config_section(cfg, "paths").get("research")
+    value = raw.strip() if isinstance(raw, str) else ""
+    path = Path(value or RESEARCH_DIR_DEFAULT)
+    return path if path.is_absolute() else Path(cfg.repo) / path
+
+
+def scout_artifact(p: Paths) -> Path:
+    """Артефакт разведки плана: `<research>/<номер>-prior-art.md` (§5a, D2).
+
+    Для плана 5 это `docs/research/5-prior-art.md`; существование файла и означает
+    «разведка уже есть».
+    """
+    return scout_research_dir(p.cfg) / f"{p.plan_id}-prior-art.md"
+
+
+def plan_has_constitution(p: Paths) -> bool:
+    """План действующего формата: строка `Конституция:` в шапке до первого `## ` (D1).
+
+    Дискриминатор, а не украшение: планы 2-4 и фикстуры тестов строки не имеют и карточку
+    разведки получать не должны. Файла нет или он не читается — `False`, без исключения.
+    """
+    try:
+        text = Path(p.plan_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            return False
+        if stripped.startswith(CONSTITUTION_MARK):
+            return True
+    return False
+
+
+def scout_needed(p: Paths) -> bool:
+    """Разведка нужна: план действующего формата и артефакта разведки ещё нет (D1+D2)."""
+    return plan_has_constitution(p) and not scout_artifact(p).is_file()
+
+
 def head_commit(p: Paths) -> str:
     """sha текущего HEAD; git недоступен или не репозиторий — пустая строка."""
     try:
@@ -581,6 +643,49 @@ def _step_assignee(p: Paths, step: dict) -> str:
         if re.fullmatch(r"[a-z][a-z0-9_-]{1,30}", token):
             return token
     return p.cfg.driver
+
+
+def scout_card_body(p: Paths, steps: list[dict]) -> str:
+    """Тело карточки разведки: план, вопрос, состав шагов, границы и приёмка (C6).
+
+    Шаги приходят из `ctx["steps"]` — сборщик второй раз не вызывается; пустой список
+    печатает пустой блок, без исключения.
+    """
+    plan_rel = p.cfg.rel(Path(p.plan_file))
+    artifact = p.cfg.rel(scout_artifact(p))
+    lines = [
+        f"РАЗВЕДКА ПЛАНА {p.plan_id} — готовые решения и практики",
+        "",
+        f"План: `{plan_rel}`",
+        "",
+        "СОСТАВ ШАГОВ",
+    ]
+    for step in steps or []:
+        lines.append(f"- {step.get('id', '')}. {step.get('title', '')}".rstrip(". "))
+    lines += [
+        "",
+        "ВОПРОС РАЗВЕДКИ",
+        "Есть ли готовое решение (продукт, библиотека, практика) для целей этого плана?",
+        "Что берём, что форкаем, а что делаем своим?",
+        "",
+        "ЧТО СДЕЛАТЬ",
+        f"- Положить артефакт `{artifact}` по §5a формата (`docs/PLAN-FORMAT.md:191-229`).",
+        "- Кандидат — строкой таблицы: название, ссылка, звёзды, дата последнего коммита,",
+        "  лицензия, что даёт, чего стоит в днях, вердикт «берём / форкаем / своё».",
+        "- Исход разведки — `go`, `needs-clarification` или `kill`.",
+        "",
+        "ГРАНИЦЫ",
+        "- Таймбокс 30 минут на карточку: по истечении артефакт сдаётся как есть.",
+        "- Код чужих проектов не копируется; лицензия «своя»/NOASSERTION — только идеи.",
+        "- План не править (это отдельный шаг), код приложения не писать, ничего не коммитить.",
+        "- «Готового нет» — валидный исход, а не провал: артефакт с обоснованием всё равно",
+        "  кладётся, а первая строка результата — `Итог: Готового нет — …`.",
+        "",
+        "ПРИЁМКА КАРТОЧКИ",
+        "- Закрыть карточку результатом, первая строка — `Итог: …`",
+        "  (например, `Итог: берём X — 2 дня на интеграцию`).",
+    ]
+    return "\n".join(lines)
 
 
 def prompt_order_body(p: Paths, step: dict) -> str:
@@ -860,7 +965,10 @@ def build_ctx(p: Paths) -> dict:
                    # не считаем, иначе решение пропустило бы обязательное ревью.
                    steps=[], prompt=None, prompt_recon=None, prompt_fresh=False,
                    prompt_report=None, prompt_verdict=None, next_step=None,
-                   next_prompt=None, next_cards=[])
+                   next_prompt=None, next_cards=[],
+                   # Та же форма `ctx`, что и в нормальной ветке (D4): решение разведки
+                   # не должно падать `NameError` на сбое сборщика.
+                   scout_needed=False, scout_cards=[], scout_profile="", scout_note="")
         return ctx
     step = pkg.get("next")
     ctx["next"] = step
@@ -889,6 +997,13 @@ def build_ctx(p: Paths) -> dict:
     ctx["next_step"] = nxt
     ctx["next_prompt"] = prompt_rel(p, nxt["id"]) if nxt else None
     ctx["next_cards"] = (read_cards(p, f"planloop:{p.plan_id}:{nxt['id']}:") if nxt else [])
+    # Разведка готовых решений (план 5, S2): признаки плана, карточки роли, профиль и
+    # пояснение «готового нет». Всё, что входит в текст причины решения, обязано лежать
+    # в `ctx` — `decide` получает только его (D4). Файл плана читается здесь один раз.
+    ctx["scout_cards"] = read_cards(p, f"planloop:{p.plan_id}:{SCOUT_KEY}")
+    ctx["scout_needed"] = scout_needed(p)
+    ctx["scout_profile"] = scout_profile(p.cfg)
+    ctx["scout_note"] = scout_note(ctx["scout_cards"])
     return ctx
 
 
@@ -946,6 +1061,12 @@ def _decide_base(ctx: dict) -> dict:
         return {"action": "idle", "step": sid,
                 "reason": approval.get("reason") or "план не утверждён",
                 "approval": approval.get("state"), "approval_blocked": True}
+    # Разведка — такое же предусловие плана, как утверждение (D6): проверяется сразу после
+    # него и до ветки прошлого шага. При уже идущем шаге карточка разведки существует,
+    # и проверка бездействует.
+    scout = _scout_decision(ctx)
+    if scout:
+        return scout
     prev, prev_verdict = ctx.get("prev_closed"), ctx.get("prev_verdict")
     if prev and prev_verdict and prev_verdict["verdict"] == "REQUEST_CHANGES":
         # Журнал закрыл шаг, а ревью говорит «нужны правки»: вперёд идти нельзя.
@@ -1084,6 +1205,50 @@ def _decide_base(ctx: dict) -> dict:
 def close_block_reason(step_id: str, next_id: str) -> str:
     """Фраза гейта закрытия (правило 1): одна на решение, отказ `apply` и уведомление."""
     return f"шаг {step_id} принят, но закрыть не могу: нет постановки {next_id}"
+
+
+def _has_no_ready(card: dict) -> bool:
+    """В результате/ошибке карточки есть фраза «готового нет» (регистр не важен, D7)."""
+    text = f"{card.get('result') or ''}\n{card.get('error') or ''}".lower()
+    return SCOUT_NO_READY in text
+
+
+def scout_note(cards: list[dict]) -> str:
+    """Пояснение к карточке шага после разведки без готового решения; иначе пусто (D7)."""
+    if not cards or not _has_no_ready(cards[-1]):
+        return ""
+    return (f"разведка: готового нет — план идёт своим решением "
+            f"(карточка {cards[-1].get('id')})")
+
+
+def _scout_decision(ctx: dict) -> dict | None:
+    """Разведка как предусловие плана: карточка, ожидание, валидный исход или стоп (D6, D7).
+
+    Чистое решение: `None` — разведка не нужна либо уже позади, и план идёт обычным
+    порядком. Поля `step` в решении нет намеренно: это решение планового уровня, иначе
+    инвариант «одно действие на шаг за тик» счёл бы его действием шага (`step_key`).
+    """
+    if not ctx.get("scout_needed"):
+        return None                    # ключа нет — старые тесты решений целы (D4)
+    plan_id = ctx.get("plan_id")
+    cards = ctx.get("scout_cards") or []
+    if not cards:
+        profile = ctx.get("scout_profile") or SCOUT_PROFILE_DEFAULT
+        return {"action": "create_scout",
+                "reason": (f"разведка плана {plan_id} не проводилась — ставится карточка "
+                           f"роли {profile}")}
+    card = cards[-1]
+    status = str(card.get("status") or "")
+    if status not in TERMINAL:
+        return {"action": "idle", "scout": True,
+                "reason": (f"ждёт разведку плана {plan_id}: карточка {card.get('id')} "
+                           f"({status})")}
+    if status == "done" or _has_no_ready(card):
+        return None                    # разведка состоялась — план идёт дальше (C8, C9)
+    detail = " ".join(str(card.get("error") or card.get("result") or "").split())[:300]
+    return {"action": "stop",
+            "reason": (f"разведка плана {plan_id} упала: карточка {card.get('id')} "
+                       f"в статусе {status}: {detail}")}
 
 
 def _prefetch_decision(ctx: dict) -> dict | None:
@@ -1521,6 +1686,42 @@ def max_actions_of(cfg: config_mod.Config) -> int:
     except (TypeError, ValueError):
         return MAX_ACTIONS_DEFAULT
     return value if value >= 1 else MAX_ACTIONS_DEFAULT
+
+
+def _config_section(cfg: config_mod.Config, name: str) -> dict:
+    """Раздел сырого `pipeline.json` словарём; нет раздела или он не словарь — пусто (D3)."""
+    value = (cfg.state or {}).get(name)
+    return value if isinstance(value, dict) else {}
+
+
+def _config_text(cfg: config_mod.Config, section: str) -> str:
+    """Непустая строка из раздела конфига; битое значение — пустая строка (D3)."""
+    raw = _config_section(cfg, section).get(SCOUT_KEY)
+    return raw.strip() if isinstance(raw, str) else ""
+
+
+def scout_profile(cfg: config_mod.Config) -> str:
+    """Профиль исполнителя разведки: `profiles.scout`, умолчание `scout` (D3).
+
+    Ключ принадлежит владельцу (`AGENTS.md`) — шаг его только читает. Пустое или
+    нестроковое значение даёт умолчание, без исключений (сравни `max_actions_of`).
+    """
+    return _config_text(cfg, "profiles") or SCOUT_PROFILE_DEFAULT
+
+
+def scout_skills(cfg: config_mod.Config) -> tuple[str, ...]:
+    """Скиллы карточки разведки: `skills.scout`; не список, пустые элементы — умолчание (D3)."""
+    raw = _config_section(cfg, "skills").get(SCOUT_KEY)
+    if not isinstance(raw, (list, tuple)):
+        return SCOUT_SKILLS_DEFAULT
+    items = tuple(str(item).strip() for item in raw
+                  if isinstance(item, str) and str(item).strip())
+    return items or SCOUT_SKILLS_DEFAULT
+
+
+def scout_runtime(cfg: config_mod.Config) -> str:
+    """Лимит времени карточки разведки: `runtimes.scout`, умолчание `30m` (D3)."""
+    return _config_text(cfg, "runtimes") or SCOUT_RUNTIME_DEFAULT
 
 
 def _digest_at(cfg: config_mod.Config) -> tuple[int, int]:
@@ -2364,6 +2565,10 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             summary = _step_summary(step)
             lines = [f"план {plan_id}, шаг {step['id']} взят в работу — {step['title']}",
                      f"  что делаем: {summary}"]
+            # Разведка закрылась исходом «готового нет»: владелец должен видеть, что план
+            # идёт своим решением, а не по найденному готовому (D7).
+            if ctx.get("scout_note"):
+                lines.insert(0, ctx["scout_note"])
             dod = " ".join(str(step.get("dod") or "").split())
             if dod and dod[:60] != summary[:60]:
                 lines.append(f"  готово, когда: {dod[:240]}")
@@ -2371,6 +2576,24 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             say(chr(10).join(lines))
         else:
             say(f"не смог создать карточку шага {step['id']} — проверь `hermes kanban ls`")
+        return result
+    if action == "create_scout":
+        # Разведка планового уровня: ключ без шага, `--parent` не ставится. Форма ключа та же,
+        # что у соседей: `planloop:<план>:scout` (C4, C5).
+        key = f"planloop:{plan_id}:{SCOUT_KEY}"
+        profile = scout_profile(p.cfg)
+        cid = create_card(p, f"[разведка {plan_id}] Разведка плана: готовые решения",
+                          scout_card_body(p, ctx.get("steps") or []), profile, key,
+                          scout_skills(p.cfg), max_runtime=scout_runtime(p.cfg))
+        result.update(applied=bool(cid),
+                      detail=(f"карточка разведки: {cid} (профиль {profile})" if cid
+                              else "карточку разведки создать не удалось"))
+        touch(f"create_scout:{cid}")
+        if cid:
+            say(f"план {plan_id}: разведка готовых решений — карточка {cid} "
+                f"(профиль {profile}), план ждёт её результата")
+        else:
+            say("карточку разведки создать не удалось, проверь `hermes kanban ls`")
         return result
     if action == "create_prompt":
         # Постановка N+1: заказ заранее (правило 2) и заказ вместо закрытия (правило 1).

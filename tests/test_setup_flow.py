@@ -94,6 +94,22 @@ def test_setup_is_idempotent_and_keeps_user_config(tmp_path: Path, fake_hermes):
     assert ignore.count(".pipeline/state/") == 1
 
 
+def test_setup_keeps_owner_profile_keys(tmp_path: Path, fake_hermes):
+    """Ключ владельца в `profiles` переживает повторный setup (D9)."""
+    target = tmp_path / "shop"
+    target.mkdir()
+    setup_flow.run_setup(args(project=str(target), board="shopboard", driver="shop"))
+    path = target / "pipeline.json"
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    cfg["profiles"]["scout"] = "scout"
+    path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+
+    assert setup_flow.run_setup(args(project=str(target), yes=True)) == 0
+    again = json.loads(path.read_text(encoding="utf-8"))
+    assert again["profiles"]["scout"] == "scout"
+    assert again["profiles"]["driver"] == "shop"
+
+
 def test_setup_telegram_writes_env_and_enables_notify(tmp_path: Path, monkeypatch, fake_hermes):
     target = tmp_path / "shop"
     target.mkdir()

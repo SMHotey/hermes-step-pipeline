@@ -71,6 +71,7 @@ SKILL_CATEGORIES = {
     "pipeline-reviewer": "software-development",
     "pipeline-orchestrator": "software-development",
     "pipeline-plan-authoring": "software-development",
+    "pipeline-scout": "software-development",
     "agent-prompt-authoring": "autonomous-ai-agents",
 }
 TOKEN_ENV = "STEP_PIPELINE_TELEGRAM_BOT_TOKEN"
@@ -528,7 +529,14 @@ def build_config(project: Path, board: str, driver: str, prompter: str, reviewer
     cfg = {**base, **(existing or {})}
     cfg["project"] = (existing or {}).get("project") or project.name
     cfg["board"] = board
-    cfg["profiles"] = {"driver": driver, "prompter": prompter, "reviewer": reviewer}
+    profiles = {"driver": driver, "prompter": prompter, "reviewer": reviewer}
+    # `profiles` принадлежит владельцу (`AGENTS.md`): мастер меняет только три роли,
+    # остальные ключи (например, `scout`) обязаны пережить повторный `setup` и шаг
+    # мастера «Проект» (D9).
+    previous = cfg.get("profiles")
+    for key, value in (previous.items() if isinstance(previous, dict) else ()):
+        profiles.setdefault(key, value)
+    cfg["profiles"] = profiles
     notify = dict(cfg.get("notify") or {})
     notify.update({"token_env": TOKEN_ENV, "chat_env": CHAT_ENV,
                "owner_env": OWNER_ENV, "dialog": {"enabled": True}})

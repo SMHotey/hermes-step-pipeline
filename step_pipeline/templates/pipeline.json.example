@@ -10,7 +10,8 @@
   "skills": {
     "step": ["pipeline-next-step"],
     "review": ["pipeline-reviewer"],
-    "prompt": ["pipeline-prompter", "agent-prompt-authoring"]
+    "prompt": ["pipeline-prompter", "agent-prompt-authoring"],
+    "scout": ["pipeline-scout"]
   },
   "paths": {
     "plans": "docs/plans",
@@ -33,7 +34,8 @@
   "runtimes": {
     "step": "3h",
     "review": "150m",
-    "prompt": "45m"
+    "prompt": "45m",
+    "scout": "30m"
   },
   "kanban": {
     "tenant": "plan"

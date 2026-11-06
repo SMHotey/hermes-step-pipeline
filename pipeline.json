@@ -18,6 +18,9 @@
     "prompt": [
       "pipeline-prompter",
       "agent-prompt-authoring"
+    ],
+    "scout": [
+      "pipeline-scout"
     ]
   },
   "paths": {
@@ -42,7 +45,8 @@
   "runtimes": {
     "step": "270m",
     "review": "225m",
-    "prompt": "68m"
+    "prompt": "68m",
+    "scout": "30m"
   },
   "kanban": {
     "tenant": "plan"
