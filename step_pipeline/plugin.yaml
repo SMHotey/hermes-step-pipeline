@@ -1,5 +1,5 @@
 name: step_pipeline
-version: 0.11.0
+version: 0.12.0
 description: "Пошаговый конвейер агентов: план → постановка промптером → исполнение → независимое ревью → следующий шаг. Даёт CLI `hermes pipeline`, локальный UI с визуализацией и уведомления в Telegram."
 author: malik
 license: MIT

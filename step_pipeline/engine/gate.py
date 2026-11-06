@@ -2808,34 +2808,138 @@ def retry_pending(p: Paths, notify_fn=None) -> dict | None:
     return {"applied": False, "detail": f"pending commit всё ещё ждёт: {detail}"}
 
 
-# ───────────────────────────── CLI ─────────────────────────────
+# ───────────────────────────── обзор планов ─────────────────────────────
+
+# Подписи состояний печатает панель: страница их не придумывает (план 5 S2A, R1).
+STATE_LABELS = {"running": "идёт", "stopped": "остановлен",
+                "closed": "закрыт", "not-driven": "не ведётся"}
+CRON_JOB_NAME = "План: страж шага (конвейер)"
+NOT_DRIVEN_REASON = "план не в driven_plans — конвейер его не ведёт"
+TICK_ACTION_TEXT = "устранить причину и запустить тик"
+
+
+def _cron_command(cfg: config_mod.Config) -> str:
+    """Команда джобы стража — та же строка, что печатает мастер установки (R6)."""
+    return (f'hermes -p {cfg.driver} cron create "*/10 * * * *" --name "{CRON_JOB_NAME}" '
+            f'--no-agent --script pipeline_tick.py --deliver local --workdir "{cfg.repo}"')
+
+
+def _blocked_card(ctx: dict) -> dict | None:
+    """Карточка в статусе blocked: её владелец и разблокирует (R4)."""
+    blocked = [c for c in (list(ctx.get("cards") or []) + list(ctx.get("prev_cards") or []))
+               if str(c.get("status") or "") == "blocked"]
+    return blocked[-1] if blocked else None
+
+
+def plan_view(cfg: config_mod.Config, p: Paths, driven: set[str], cron_ok: bool) -> dict:
+    """Состояние одного плана для панели: статус, причина, пометка, одно действие.
+
+    Единственный источник статуса — решение стража (`build_ctx` + `decide`), те же вызовы,
+    что у `--status`; наличие `plan_<N>_stop.json` само по себе ничего не значит (S2A).
+    На диск функция ничего не пишет. Дополнительно отдаёт `next`, `risk`, `hold` и `stop`,
+    чтобы `plans_rows` не запускал сборщик шагов второй раз.
+    """
+    run_cmd = f"python .pipeline/gate.py --plan {p.plan_id} --run"
+    try:
+        ctx = build_ctx(p)
+        decision = decide(ctx)
+    except GateError as exc:
+        # Сбой движка не роняет весь `--plans`: строка с причиной полезнее пустого ответа.
+        return {"state": "stopped", "state_label": STATE_LABELS["stopped"],
+                "reason": str(exc), "note": "",
+                "action": {"kind": "tick", "text": TICK_ACTION_TEXT, "command": run_cmd},
+                "next": "—", "risk": "", "hold": [], "stop": None}
+    step = ctx.get("next") or None
+    sid = str(step.get("id") or "") if step else ""
+    hold = sorted({str(h).upper() for h in (ctx.get("hold") or [])})
+    stop = ctx.get("stop")
+    kind = stop_kind(stop)
+    # «Стоп держит» — это решение стража, а не файл: остаточный флаг владельца держит
+    # всегда, инцидентный — пока причина на месте. Решение `stop` без файла тоже стоп:
+    # карточка шага упала или заблокирована, и страж уже не идёт.
+    holds = (kind == "owner"
+             or (kind == "incident" and bool(decision.get("incident")))
+             or (not stop and decision.get("action") == "stop"))
+    # Порядок проверки жёсткий (R1): план 1 закрыт и не ведётся одновременно, а на панели
+    # он обязан быть «закрыт». Сбой сборщика — не «закрыт»: это стоп с причиной.
+    if not step and not ctx.get("collector_error"):
+        state = "closed"
+    elif p.plan_id not in driven:
+        state = "not-driven"
+    elif holds:
+        state = "stopped"
+    else:
+        state = "running"
+
+    note = ""
+    if state == "running" and stop and decision.get("clear_incident"):
+        note = "стоп снят (было: " + str(stop.get("reason") or "") + ")"
+
+    if state == "closed":
+        reason = str(decision.get("reason") or "")
+    elif state == "not-driven":
+        reason = NOT_DRIVEN_REASON
+    elif state == "stopped" and kind == "owner":
+        reason = str(stop.get("reason") or "")
+    else:
+        reason = str(decision.get("reason") or "")
+
+    # Приоритет сверху вниз, побеждает первое совпадение (R4).
+    if state == "stopped" and kind == "owner":
+        action = {"kind": "resume", "text": "снять стоп: Продолжить",
+                  "command": f"python .pipeline/gate.py --plan {p.plan_id} --resume"}
+    elif state == "stopped":
+        card = _blocked_card(ctx)
+        if card:
+            action = {"kind": "unblock",
+                      "text": f"решение владельца по {card['id']}, затем разблокировать",
+                      "command": f"hermes kanban --board {cfg.board} unblock {card['id']}"}
+        else:
+            action = {"kind": "tick", "text": TICK_ACTION_TEXT, "command": run_cmd}
+    elif decision.get("action") == "hold_risk" or (sid and sid.upper() in set(hold)):
+        action = {"kind": "unhold", "text": f"снять ручной допуск: unhold {sid}",
+                  "command": f"python .pipeline/gate.py --plan {p.plan_id} --unhold {sid}"}
+    elif decision.get("approval_blocked"):
+        action = {"kind": "approve", "text": "утвердить план",
+                  "command": f"hermes pipeline plan --accept {p.plan_id}"}
+    elif state == "not-driven":
+        action = {"kind": "drive", "text": "добавить план в driven_plans", "command": ""}
+    elif step and not stop and not hold and not cron_ok:
+        action = {"kind": "cron", "text": "включить джобу стража", "command": _cron_command(cfg)}
+    else:
+        action = {"kind": "none",
+                  "text": "закрыт, действий не требуется" if state == "closed" else "",
+                  "command": ""}
+    return {"state": state, "state_label": STATE_LABELS[state], "reason": reason,
+            "note": note, "action": action, "next": sid or "—",
+            # Шага нет — риска нет: пустая строка, а не «normal», иначе данные врут.
+            "risk": str(step.get("risk") or "normal") if step else "",
+            "hold": hold, "stop": ({**stop, "kind": kind} if stop else None)}
+
 
 def plans_rows(cfg: config_mod.Config) -> list[dict]:
     """Машиночитаемая таблица планов (для UI и внешних вызовов)."""
     driven = set(registry.driven_ids(cfg))
+    # Признак заведённой джобы стража — метка мастера установки, без вызова `hermes` (R6).
+    cron_ok = (Path(cfg.repo) / ".pipeline" / "cron.json").is_file()
     out: list[dict] = []
     for spec in registry.specs(cfg):
         p = resolve_paths(cfg, spec.id)
-        step_id = "—"
-        risk = ""
-        try:
-            nxt = collector(p).get("next") or {}
-            step_id = nxt.get("id") or "—"
-            # Шага нет — риска нет: пустая строка, а не «normal», иначе данные врут.
-            risk = str(nxt.get("risk") or "normal") if nxt else ""
-        except SystemExit as exc:
-            print(f"[plans] план {spec.id}: сборщик шагов не работает: {exc}", file=sys.stderr)
-        stop = load_stop(p)
-        hold = sorted({str(h).upper() for h in (load_state(p).get("hold_steps") or [])})
+        view = plan_view(cfg, p, driven, cron_ok)
         out.append({
             "id": spec.id,
             "file": cfg.rel(Path(spec.file)),
             "driven": spec.id in driven,
-            "next": step_id,
-            "risk": risk,
-            "hold": hold,
+            "next": view["next"],
+            "risk": view["risk"],
+            "hold": view["hold"],
             "closed": len(registry.closed_steps(spec, cfg)),
-            "stop": ({**stop, "kind": stop_kind(stop)} if stop else None),
+            "stop": view["stop"],
+            "state": view["state"],
+            "state_label": view["state_label"],
+            "reason": view["reason"],
+            "note": view["note"],
+            "action": view["action"],
         })
     return out
 

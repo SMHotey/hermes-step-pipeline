@@ -2556,3 +2556,65 @@ def test_index_notify_screen_markup():
     # только при открытии вкладки, и после F5 панель молчала (находка ревью 3-S10).
     assert "notifyGate.global && notifyGate.project" in html
     assert "applyNotifyGate" in html
+
+
+# ── строки планов в «Обзоре»: статус, причина и действие (план 5 S2A) ──
+
+def test_snapshot_plan_rows_carry_state_and_action(server):
+    """Строка плана знает состояние: без метки cron — действие «включить джобу»."""
+    status, data = get(server["url"] + "/api/snapshot?plan=1")
+    assert status == 200
+    row = data["plans"][0]
+    assert row["state"] == "running"
+    assert row["state_label"] == "идёт"
+    assert row["action"]["kind"] == "cron"
+    (server["root"] / ".pipeline" / "cron.json").write_text(
+        json.dumps({"driver": "demo", "name": "План: страж шага (конвейер)"},
+                   ensure_ascii=False), encoding="utf-8")
+    snapshot.clear_cache()
+    status, data = get(server["url"] + "/api/snapshot?plan=1")
+    assert status == 200
+    assert data["plans"][0]["action"]["kind"] == "none"
+
+
+def test_stop_flag_status_comes_from_decision_not_file(server):
+    """Стоп владельца — «остановлен»; инцидентный без причины — «идёт» с пометкой."""
+    path = stop_file(server)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"kind": "owner", "source": "owner",
+                                "reason": "ждём решения владельца"}, ensure_ascii=False),
+                    encoding="utf-8")
+    snapshot.clear_cache()
+    status, data = get(server["url"] + "/api/snapshot?plan=1")
+    assert status == 200
+    row = data["plans"][0]
+    assert row["state"] == "stopped"
+    assert row["action"]["kind"] == "resume"
+    assert "--plan 1 --resume" in row["action"]["command"]
+    assert data["stop"] is True and data["overview"]["stop"] is not None
+
+    # Причина инцидента исчезла (шаг открыт, борда жива): файл есть, статус — «идёт».
+    path.write_text(json.dumps({"kind": "incident", "source": "gate",
+                                "reason": "нет постановки шага S1"}, ensure_ascii=False),
+                    encoding="utf-8")
+    snapshot.clear_cache()
+    status, data = get(server["url"] + "/api/snapshot?plan=1")
+    assert status == 200
+    row = data["plans"][0]
+    assert row["state"] == "running"
+    assert row["note"].startswith("стоп снят (было:")
+    assert data["stop"] is False
+    assert data["overview"]["stop"] is None
+
+
+def test_index_plan_rows_markup():
+    """Панель рисует строки планов из снимка; чипов и своей подписи статуса нет."""
+    html = index_html()
+    for anchor in ('class="plan-row', "plan-badge", "plan-reason", "plan-note",
+                   "plan-action", "state_label"):
+        assert anchor in html, anchor
+    assert "plan-chip" not in html
+    assert "${esc(p.closed)} закрыто ·" not in html
+    # Контейнер планов — внутри секции «Обзор», до «Потока текущего шага».
+    overview = html[html.index('id="overview"'):html.index('id="flow"')]
+    assert 'id="plans"' in overview

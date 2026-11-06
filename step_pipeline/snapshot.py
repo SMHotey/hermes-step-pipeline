@@ -454,6 +454,16 @@ def _fix_rounds(card_list: list[dict], plan_id, step_id) -> int:
                if str(card.get("idempotency_key") or "").startswith(prefix))
 
 
+def _plan_stopped(row: dict) -> bool:
+    """Остановлен ли план: по решению стража (`state`), а не по остаточному стоп-файлу (S2A).
+
+    Движок копии проекта может быть старее и поля `state` не знать — тогда работает
+    прежнее правило «есть стоп-файл».
+    """
+    state = row.get("state")
+    return state == "stopped" if state else bool(row.get("stop"))
+
+
 def _overview(root: Path, cfg: dict, out: dict) -> dict:
     """Экран «Обзор»: что произойдёт при Тик — подпись, причина, доступность, простой, прогресс.
 
@@ -503,7 +513,11 @@ def _overview(root: Path, cfg: dict, out: dict) -> dict:
     # должен глушить кнопку (D3).
     chosen = next((row for row in out.get("plans") or []
                    if str(row.get("id")) == plan_id), None)
+    # Остаточный стоп-файл не делает план остановленным: статус берётся из строки плана
+    # (`state`), иначе кнопка «Тик» гасла бы там, где страж уже идёт (S2A, R7).
     stop_row = (chosen or {}).get("stop") or None
+    if not _plan_stopped(chosen or {}):
+        stop_row = None
     stop = None
     if stop_row:
         stop = {"kind": str(stop_row.get("kind") or "owner"),
@@ -542,7 +556,7 @@ def _overview(root: Path, cfg: dict, out: dict) -> dict:
             "total": _steps_total(root, cfg, str(row.get("file") or "")),
             "driven": bool(row.get("driven")),
             "next": str(row.get("next") or ""),
-            "stop": bool(row.get("stop")),
+            "stop": _plan_stopped(row),
         })
 
     return {"action": action, "step": step, "prompt": prompt_rows, "tick_label": tick_label,
@@ -1381,7 +1395,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         out["errors"].append(f"шаги: {exc}")
     decision = out.get("decision") or {}
     out["stage"] = ACTION_LABELS.get(decision.get("action") or "", decision.get("action") or "")
-    out["stop"] = any((p.get("stop") for p in out["plans"]))
+    out["stop"] = any(_plan_stopped(p) for p in out["plans"])
     out["overview"] = _overview(root, cfg, out)
     # Лента действий — отдельным чтением history.jsonl: движок ради неё не запускается (D2).
     out["events"] = events(root, cfg)

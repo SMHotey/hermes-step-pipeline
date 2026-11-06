@@ -1375,6 +1375,7 @@ class Handler(BaseHTTPRequestHandler):
         summary = {"id": row["id"], "name": row["name"], "root": str(root),
                    "source": row["source"], "installed": _installed(root),
                    "plan": "", "next": "—", "closed": 0, "total": 0,
+                   "state": "", "state_label": "",
                    "stop": None, "idle": None, "error": "", "capacity": None}
         if not summary["installed"] and not state.preview:
             return summary
@@ -1401,8 +1402,12 @@ class Handler(BaseHTTPRequestHandler):
         summary["next"] = str(chosen.get("next") or "—")
         summary["closed"] = int(chosen.get("closed") or 0)
         summary["total"] = snap._steps_total(root, cfg, str(chosen.get("file") or ""))
+        # Состояние — из строки плана: «остановлен» считает движок, а не наличие файла (S2A).
+        summary["state"] = str(chosen.get("state") or "")
+        summary["state_label"] = str(chosen.get("state_label") or "")
         stop_row = chosen.get("stop")
-        if isinstance(stop_row, dict) and stop_row:
+        stopped = summary["state"] == "stopped" if summary["state"] else bool(stop_row)
+        if isinstance(stop_row, dict) and stop_row and stopped:
             summary["stop"] = {"kind": str(stop_row.get("kind") or "owner"),
                                "reason": str(stop_row.get("reason") or "")}
         plan_state = snap._plan_state(root, plan_id)

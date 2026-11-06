@@ -105,11 +105,16 @@
   .pill.run { color: var(--run); border-color: #1e3350; background: #0f1c2e; }
   .pill.wait { color: var(--warn); border-color: #4a3b12; background: #241d09; }
   .pill.bad { color: var(--bad); border-color: #4a1f1f; background: #241010; }
-  .plans { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
-  .plan-chip { cursor: pointer; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line);
-               background: var(--panel-2); font-size: 12px; }
-  .plan-chip.active { border-color: var(--accent); color: var(--accent); }
-  .plan-chip .stop { color: var(--bad); }
+  .plans { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+  .plan-row { cursor: pointer; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+              background: var(--panel-2); font-size: 12px; }
+  .plan-row.active { border-color: var(--accent); }
+  .plan-row .row1 { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .plan-reason, .plan-note, .plan-action { margin-top: 4px; white-space: pre-wrap;
+                                           word-break: break-word; }
+  .plan-note { color: var(--warn); }
+  .plan-action { color: var(--muted); }
+  .plan-action code { display: block; margin-top: 2px; color: var(--text); }
   pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px;
         color: var(--muted); max-height: 260px; overflow: auto; }
   .cards li, .journal li { list-style: none; }
@@ -337,11 +342,12 @@
         <div class="ov-item"><span>риск шага</span><b class="mono" id="ov-risk">—</b></div>
       </div>
       <div id="ov-bars"><span class="muted">—</span></div>
+      <!-- Строки планов (S2A): статус, причина и одно действие — данные только из снимка. -->
+      <div class="plans" id="plans"></div>
     </section>
     <section style="margin-top:16px">
       <h2>Поток текущего шага</h2>
       <div class="flow" id="flow"></div>
-      <div class="plans" id="plans"></div>
       <!-- Поиск по шагам (S8, D8): «/» ставит фокус сюда. -->
       <label for="steps-filter">Поиск по шагам</label>
       <input type="text" id="steps-filter" autocomplete="off" placeholder="/ — фильтр по тексту строки">
@@ -1586,7 +1592,7 @@ function render(data) {
     }
   }
   const decision = data.decision || {};
-  const stopped = (data.plans || []).some((p) => p.stop);
+  const stopped = (data.plans || []).some((p) => p.state === "stopped");
   const mode = $("mode");
   if (data.preview) {
     mode.textContent = "ПРЕДПРОСМОТР";
@@ -1629,15 +1635,29 @@ function render(data) {
   collectNotify(data.notify);
 
   const plans = data.plans || [];
-  $("plans").innerHTML = plans.map((p) => `
-    <div class="plan-chip ${String(p.id) === String((data.plan || {}).id) ? "active" : ""}"
+  const planBadge = {running: "run", stopped: "bad", closed: "ok", "not-driven": "wait"};
+  $("plans").innerHTML = plans.map((p) => {
+    // Подпись статуса и текст бейджа приходят из снимка: страница их не вычисляет.
+    const badge = planBadge[p.state] || "wait";
+    const act = p.action || {};
+    const progress = `${esc(p.closed)} закрыто`;
+    return `
+    <div class="plan-row ${String(p.id) === String((data.plan || {}).id) ? "active" : ""}"
          data-plan="${esc(p.id)}">
-      план ${esc(p.id)} · ${esc(p.closed)} закрыто · → ${esc(p.next)}
-      ${p.stop ? `<span class="stop">⛔ ${esc(p.stop.kind || "")}</span>` : ""}
-    </div>`).join("") || `<span class="muted">планов с журналом не найдено</span>`;
-  document.querySelectorAll(".plan-chip").forEach((chip) => {
-    chip.onclick = () => { currentPlan = chip.dataset.plan; currentStep = null; etag = null;
-                           startEvents(); refresh(); };
+      <div class="row1">
+        <span class="pill ${badge} plan-badge">${esc(p.state_label)}</span>
+        <span>план ${esc(p.id)}</span>
+        <span class="muted">${progress} · → ${esc(p.next)}</span>
+      </div>
+      <div class="plan-reason">${esc(p.reason)}</div>
+      ${p.note ? `<div class="plan-note">${esc(p.note)}</div>` : ""}
+      ${act.text ? `<div class="plan-action">что сделать: ${esc(act.text)}`
+                   + (act.command ? `<code>${esc(act.command)}</code>` : "") + `</div>` : ""}
+    </div>`;
+  }).join("") || `<span class="muted">планов с журналом не найдено</span>`;
+  document.querySelectorAll(".plan-row").forEach((row) => {
+    row.onclick = () => { currentPlan = row.dataset.plan; currentStep = null; etag = null;
+                          startEvents(); refresh(); };
   });
 
   const plan = data.plan || {};
