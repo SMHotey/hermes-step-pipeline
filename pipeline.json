@@ -6,7 +6,8 @@
   "profiles": {
     "driver": "pipeline",
     "prompter": "prompter",
-    "reviewer": "reviewer"
+    "reviewer": "reviewer",
+    "scout": "scout"
   },
   "skills": {
     "step": [
