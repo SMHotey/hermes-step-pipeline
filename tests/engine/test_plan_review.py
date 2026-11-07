@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 """Ревью плана как отдельный шаг: карточка, вердикт, один круг правок, эскалация.
 
-Девять тестов шага S5 плана 5. Решение проверяется через `gate.run_gate` на временном
-проекте с поддельной бордой (`hermes_stub`), карточки читаются из sqlite, отчёт ревью —
-файлом `docs/reviews/plan-1.md`.
+Девять тестов шага S5 плана 5 плюс четыре теста круга правок: гейт не отключает себя сам
+(состояние тика не признак «план идёт»), сбой создания карточки не открывает шаги, а
+устаревший отчёт ревью не считается вердиктом. Решение проверяется через `gate.run_gate`
+на временном проекте с поддельной бордой (`hermes_stub`), карточки читаются из sqlite,
+отчёт ревью — файлом `docs/reviews/plan-1.md`.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -18,7 +22,7 @@ from engine_kit import cards, complete, make_project, write_approval
 
 # План действующего формата: конституция, оформленная разведка (P1-P3 пройдены),
 # шаг интеграции по вердикту «берём» и журнал, где ВСЕ строки открыты: закрытый шаг
-# сделал бы план «идущим» (`registry.plan_started`) и отключил бы гейт (D2).
+# сделал бы план «идущим» (`ctx["closed"]`), и тогда D2 отключил бы гейт.
 PLAN_READY = """# 1. Демо-план
 
 Конституция: docs/CONSTITUTION.md
@@ -150,15 +154,85 @@ def test_old_format_plan_gets_no_plan_review(stand):
 
 
 def test_running_plan_is_not_stopped(stand):
-    """Идущий план не останавливаем: ревью плана ему не заказывается (D2)."""
+    """Идущий план ревью плана не получает: признак «идёт» — закрытый шаг журнала (D2)."""
     root, p, db = stand
-    state = root / ".pipeline" / "state" / "plan_1_state.json"
-    state.parent.mkdir(parents=True, exist_ok=True)
-    state.write_text('{"last_actions": []}', encoding="utf-8")
+    running = PLAN_READY.replace("| — | S1 | — | — | открыт |",
+                                 "| — | S1 | — | — | закрыт |")
+    assert running != PLAN_READY
+    write_plan(root, running)
+    prompts = root / "docs" / "prompts"
+    (prompts / "2026-11-07_1-S2_prompt.md").write_text(
+        "# Постановка S2\n\n## Что сделать\n\nподключить готовое.\n", encoding="utf-8")
 
     first = gate.run_gate(p, notify_fn=quiet)
     assert first["decision"]["action"] == "create_step", first["decision"]
     assert plan_review_cards(db) == []
+
+
+def test_state_file_of_own_tick_does_not_cancel_review(stand):
+    """Путь «разведка → ревью»: состояние, записанное тиком, ревью не отменяет (находка 1)."""
+    root, p, db = stand
+    (root / "docs" / "research" / "1-prior-art.md").unlink()      # разведка не проведена
+
+    scout = gate.run_gate(p, notify_fn=quiet)
+    assert scout["decision"]["action"] == "create_scout", scout["decision"]
+    # тик сам записал файл состояния — из него признак «план идёт» брать нельзя
+    assert (root / ".pipeline" / "state" / "plan_1_state.json").is_file()
+
+    write_plate(root)                                             # разведка проведена
+    second = gate.run_gate(p, notify_fn=quiet)
+    assert second["decision"]["action"] == "create_plan_review", second["decision"]
+    assert "planloop:1:S1:step" not in keys_of(db)
+
+
+def test_research_wait_does_not_turn_into_step(stand):
+    """Путь «ожидание корректировки по разведке → ревью»: второй тик не начинает шаг."""
+    root, p, db = stand
+    write_plan(root, PLAN_READY.replace("Правки по разведке: 2\n", ""))
+
+    first = gate.run_gate(p, notify_fn=quiet)
+    assert first["decision"]["action"] == "idle", first["decision"]
+    assert "правок по разведке" in first["decision"]["reason"]
+    assert (root / ".pipeline" / "state" / "plan_1_state.json").is_file()
+
+    second = gate.run_gate(p, notify_fn=quiet)
+    decision = second["decision"]
+    assert decision["action"] == "idle", decision
+    assert "правок по разведке" in decision["reason"]
+    assert plan_review_cards(db) == []          # ни ревью, ни шага не заказано
+    assert not Path(db).exists() or not cards(db)
+
+
+def test_failed_card_creation_does_not_mark_plan_started(stand):
+    """Сбой создания карточки состояние не пишет: заказ повторяется, шаг не стартует."""
+    root, p, db = stand
+
+    failed = gate.run_gate(p, create_card=lambda *_a, **_k: None, notify_fn=quiet)
+    assert failed["decision"]["action"] == "create_plan_review", failed["decision"]
+    assert failed["applied"] is False
+
+    second = gate.run_gate(p, notify_fn=quiet)
+    assert second["decision"]["action"] == "create_plan_review", second["decision"]
+    assert "planloop:1:S1:step" not in keys_of(db)
+
+
+def test_stale_report_is_not_a_verdict(stand):
+    """Отчёт старше карточки ревью — не вердикт: стоп «отчёт не обновлён» (находка 2)."""
+    root, p, db = stand
+    report = write_report(root, "# Ревью плана 1\n\n- шаг S2 не опирается на S1\n\n"
+                                "## ВЕРДИКТ: REQUEST_CHANGES\n")
+    old = int(time.time()) - 3600          # отчёт написан до карточки (прошлый круг)
+    os.utime(report, (old, old))
+
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview")
+
+    stopped = gate.run_gate(p, notify_fn=quiet)
+    decision = stopped["decision"]
+    assert decision["action"] == "stop", decision
+    assert "не обновлён" in decision["reason"]
+    assert "plan-1.md" in decision["reason"]
+    assert "planloop:1:planfix:1" not in keys_of(db)
 
 
 def test_second_tick_waits_and_does_not_duplicate(stand):

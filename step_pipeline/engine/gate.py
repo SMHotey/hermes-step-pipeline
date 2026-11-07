@@ -457,22 +457,36 @@ def read_cards(p: Paths, key_prefix: str) -> list[dict]:
     try:
         con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
         try:
-            rows = con.execute(
-                """SELECT id, title, status, assignee, idempotency_key, completed_at,
-                          COALESCE(result,''), COALESCE(last_failure_error,'')
+            # `created_at`/`started_at` нужны проверке свежести отчёта
+            # (`_report_written_after`), но набор колонок борды от версии к версии разный:
+            # берём их такой записью, какая есть, вместо падения на «no such column».
+            have = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+            extra = "".join(
+                f", COALESCE({name}, 0) AS {name}"
+                for name in ("created_at", "started_at") if name in have)
+            cur = con.execute(
+                f"""SELECT id, title, status, assignee, idempotency_key, completed_at,
+                          COALESCE(result,'') AS result,
+                          COALESCE(last_failure_error,'') AS last_failure_error{extra}
                    FROM tasks
                    WHERE idempotency_key LIKE ? AND status <> 'archived'
                    ORDER BY created_at ASC""",
                 (key_prefix + "%",),
-            ).fetchall()
+            )
+            columns = [item[0] for item in cur.description]
+            rows = [dict(zip(columns, row)) for row in cur.fetchall()]
         finally:
             con.close()
     except (sqlite3.Error, OSError) as exc:
         # Существующая база есть, а прочитать нельзя — это сбой, а не «карточек нет»:
         # иначе тик молча теряет ход конвейера.
         raise GateError(f"борда недоступна: {db}: {exc}", plan_id=p.plan_id) from exc
-    return [{"id": r[0], "title": r[1], "status": r[2], "assignee": r[3], "key": r[4],
-             "completed_at": int(r[5] or 0), "result": r[6], "error": r[7]} for r in rows]
+    return [{"id": r["id"], "title": r["title"], "status": r["status"],
+             "assignee": r["assignee"], "key": r["idempotency_key"],
+             "completed_at": int(r["completed_at"] or 0),
+             "result": r["result"], "error": r["last_failure_error"],
+             "created_at": int(r.get("created_at") or 0),
+             "started_at": int(r.get("started_at") or 0)} for r in rows]
 
 
 def card_of(cards: list[dict], kind: str) -> list[dict]:
@@ -598,6 +612,19 @@ def plan_review_path(p: Paths) -> Path:
 
 def plan_review_rel(p: Paths) -> str:
     return p.cfg.rel(plan_review_path(p))
+
+
+def plan_review_verdict_fresh(p: Paths) -> bool:
+    """Вердикт ревью написан по текущей версии плана: отчёт не старше файла плана.
+
+    Привязка вердикта к hash плана — шаг S6; здесь только грубая проверка «план правили
+    после ревью», чтобы APPROVE не открывал шаги молча по устаревшему отчёту.
+    """
+    try:
+        return (plan_review_path(p).stat().st_mtime + 1.0
+                >= Path(p.plan_file).stat().st_mtime)
+    except OSError:
+        return False
 
 
 def prompt_verdict(p: Paths, step_id: str) -> dict | None:
@@ -1058,6 +1085,7 @@ def build_ctx(p: Paths) -> dict:
                    # без шагов всё равно не видно, а решение обязано не падать `NameError`.
                    plan_review_format=False, plan_review_ok=True, plan_review_reason="",
                    plan_review_cards=[], plan_review_verdict=None, plan_review_rel="",
+                   plan_review_verdict_fresh=False, plan_started_journal=False,
                    plan_review_profile="", plan_fix_cards=[])
         return ctx
     step = pkg.get("next")
@@ -1105,6 +1133,11 @@ def build_ctx(p: Paths) -> dict:
     ctx["plan_review_ok"], ctx["plan_review_reason"] = plan_cycle.can_review(plan_text)
     ctx["plan_review_cards"] = read_cards(p, f"planloop:{p.plan_id}:{PLAN_REVIEW_KEY}")
     ctx["plan_review_verdict"] = verdict_at(plan_review_path(p))
+    ctx["plan_review_verdict_fresh"] = plan_review_verdict_fresh(p)
+    # D2: «план идёт» для гейта ревью — закрытые шаги журнала (`ctx["closed"]`), а не файл
+    # состояния: состояние пишет сам тик, и признак «идёт» от него отключал бы гейт
+    # на втором тике любого ожидания (находка 1 ревью 5-S5).
+    ctx["plan_started_journal"] = bool(ctx.get("closed"))
     ctx["plan_review_rel"] = plan_review_rel(p)
     ctx["plan_review_profile"] = plan_review_profile(p.cfg)
     ctx["plan_fix_cards"] = read_cards(p, f"planloop:{p.plan_id}:{PLAN_FIX_KEY}")
@@ -1370,12 +1403,14 @@ def _plan_review_decision(ctx: dict) -> dict | None:
     if not ctx.get("plan_review_format"):
         return None                    # план старого формата ревью плана не получает (D1)
     cards = ctx.get("plan_review_cards") or []
-    if (ctx.get("approval") or {}).get("started") and not cards:
-        # D2: идущий план не останавливаем — ревью ему не заказывается. Признак «идёт»
-        # берётся из `registry.plan_started`, который видит и файл состояния, а первый же
-        # тик этот файл пишет (`touch`). Поэтому исключение работает только ДО первой
-        # карточки ревью: иначе гейт отключал бы сам себя на втором тике и не доводил
-        # начатое ревью до вердикта (C11, тесты 4-8).
+    if ctx.get("plan_started_journal") and not cards:
+        # D2: идущий план не останавливаем — ревью ему не заказывается. Признак «идёт» —
+        # ЗАКРЫТЫЕ ШАГИ ЖУРНАЛА, т.е. то, что писал не этот тик. Файл состояния для D2 не
+        # годится: его пишет сам страж (`touch` после create_scout, `watch_idle` на
+        # ожидании), и после первого же ожидания гейт отключил бы сам себя — в путях
+        # «разведка → ревью» и «ожидание корректировки по разведке» шаг начинался бы без
+        # вердикта (находка 1 ревью 5-S5). Как только карточка ревью заказана, гейт ведёт
+        # её до вердикта независимо от журнала.
         return None
     plan_id = ctx.get("plan_id")
     rel = ctx.get("plan_review_rel") or f"docs/reviews/plan-{plan_id}.md"
@@ -1383,7 +1418,18 @@ def _plan_review_decision(ctx: dict) -> dict | None:
     # C9: дверь к шагам — сам вердикт, а не карточка. План, прошедший ревью раньше
     # (например, идущий план или ревью задним числом), шаги не ждёт.
     if verdict is not None and verdict["verdict"] == "APPROVE":
-        return None
+        if ctx.get("plan_review_ok") or ctx.get("plan_review_verdict_fresh"):
+            # Отклонение от порядка ветвей §4.3 (названо в отчёте шага): если вердикт
+            # написан по текущей версии плана, он и есть дверь — иначе фикстура
+            # `tests/engine/test_scout.py:167` (план без раздела «Разведка» плюс
+            # готовый APPROVE) упиралась бы в предусловие разведки. Проверка вердикта по
+            # hash плана — S6, здесь только «план не правили после ревью».
+            return None
+        return {"action": "idle", "plan_review": True,
+                "reason": (f"план {plan_id} изменён после ревью плана и не прошёл "
+                           f"корректировку по разведке: "
+                           f"{ctx.get('plan_review_reason') or 'нет раздела «Разведка»'} "
+                           f"(вердикт {rel} — про прошлую версию)")}
     if not ctx.get("plan_review_ok"):
         # Разведка — предусловие ЗАКАЗА ревью (D5): план без корректировки по разведке ждёт.
         return {"action": "idle", "plan_review": True,
@@ -2861,7 +2907,11 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                           profile, key, plan_review_skills(p.cfg),
                           max_runtime=plan_review_runtime(p.cfg))
         result.update(applied=bool(cid), detail=f"карточка ревью плана: {cid}")
-        touch(f"create_plan_review:{cid}")
+        if cid:
+            # Сбой создания карточки состояние НЕ пишет: `touch` перевёл бы план в
+            # «идущие» (`registry.plan_started`) и открыл бы шаги без вердикта
+            # (находка 1 ревью 5-S5). Без отметки следующий тик честно повторит заказ.
+            touch(f"create_plan_review:{cid}")
         if cid:
             say(f"план {plan_id}: ревью плана как отдельный шаг — карточка {cid} "
                 f"(профиль {profile}, круг {round_no}); шаги не начинаются без APPROVE")
@@ -2881,7 +2931,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                           profile, key, plan_fix_skills(p.cfg),
                           max_runtime=plan_fix_runtime(p.cfg))
         result.update(applied=bool(cid), detail=f"карточка правок плана: {cid}")
-        touch(f"create_plan_fix:{cid}")
+        if cid:
+            touch(f"create_plan_fix:{cid}")
         if cid:
             say(f"план {plan_id}: ревью вернуло REQUEST_CHANGES — правим план один круг "
                 f"(карточка {cid}, профиль {profile}); после правки ревью повторится")
@@ -3076,10 +3127,15 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         touch("stop")
         if previous != reason:
             extra = decision.get("details") or ""
+            # Owner-стоп тик не снимает сам (`decide`), поэтому не обещаем самовосстановление.
+            owner_stop = (decision.get("kind") or "") == "owner"
+            tail = ("Снимает только владелец: `python .pipeline/gate.py --resume`"
+                    if owner_stop else
+                    "После устранения причины продолжится сам; снять принудительно:"
+                    " `python .pipeline/gate.py --resume`")
             say("⛔ конвейер остановлен: " + reason
                 + (chr(10) + chr(10) + extra if extra else "")
-                + chr(10) + "После устранения причины продолжится сам; снять принудительно:"
-                + " `python .pipeline/gate.py --resume`")
+                + chr(10) + tail)
         return result
     return result
 
