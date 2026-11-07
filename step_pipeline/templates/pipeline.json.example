@@ -11,7 +11,8 @@
     "step": ["pipeline-next-step"],
     "review": ["pipeline-reviewer"],
     "prompt": ["pipeline-prompter", "agent-prompt-authoring"],
-    "scout": ["pipeline-scout"]
+    "scout": ["pipeline-scout"],
+    "plan_review": ["pipeline-plan-reviewer"]
   },
   "paths": {
     "plans": "docs/plans",
@@ -35,7 +36,8 @@
     "step": "3h",
     "review": "150m",
     "prompt": "45m",
-    "scout": "30m"
+    "scout": "30m",
+    "plan_review": "45m"
   },
   "kanban": {
     "tenant": "plan"

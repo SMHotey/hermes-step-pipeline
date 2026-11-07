@@ -26,6 +26,9 @@ def write_plan(root: Path, constitution: bool = True) -> Path:
 
     `PLAN` из `engine_kit` строки не содержит, поэтому без перезаписи первый тик ушёл бы
     в `create_step`, а не в `create_scout`. Утверждение переписывается: sha файла меняется.
+    План действующего формата получает пройденное ревью плана (`docs/reviews/plan-1.md`):
+    с шага 5-S5 это предусловие карточки шага, и тесты про разведку не должны его
+    переигрывать — ожидания у них прежние.
     """
     lines = PLAN.splitlines()
     if constitution:
@@ -34,6 +37,12 @@ def write_plan(root: Path, constitution: bool = True) -> Path:
     path = Path(root) / "docs" / "plans" / "1-demo.md"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     write_approval(root, path)
+    if constitution:
+        reviews = Path(root) / "docs" / "reviews"
+        reviews.mkdir(parents=True, exist_ok=True)
+        (reviews / "plan-1.md").write_text(
+            "# Ревью плана 1\n\n- находок нет: замысел проверен\n\n## ВЕРДИКТ: APPROVE\n",
+            encoding="utf-8")
     return path
 
 

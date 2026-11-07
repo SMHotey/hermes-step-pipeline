@@ -87,6 +87,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as config_mod  # noqa: E402 - модуль рядом
 import registry  # noqa: E402 - реестр планов
 import next_step  # noqa: E402 - сборщик контракта шага
+import plan_cycle  # noqa: E402 - гейт корректировки плана по разведке (план 5, S4)
 import state_io  # noqa: E402 - атомарная запись состояния и блокировка тика
 
 # ──────────────────── целостность движка ────────────────────
@@ -148,6 +149,23 @@ SCOUT_NO_READY = "готового нет"
 # Строка шапки плана действующего формата (`docs/PLAN-FORMAT.md:196`). Без неё планы 2-4
 # и фикстуры тестов разведку не заказывают (D1).
 CONSTITUTION_MARK = "Конституция:"
+
+# ── Ревью плана как отдельный шаг (план 5, S5) ───────────────────────────────
+# Вид карточки в `idempotency_key`: номер круга правок идёт отдельным сегментом ключа
+# (`planloop:<план>:planreview:2`), поэтому вид остаётся узнаваемым для `card_of`.
+PLAN_REVIEW_KEY = "planreview"
+PLAN_FIX_KEY = "planfix"
+PLAN_REVIEW_SKILLS_DEFAULT = ("pipeline-plan-reviewer",)
+PLAN_FIX_SKILLS_DEFAULT = ("pipeline-plan-authoring",)
+PLAN_REVIEW_RUNTIME_DEFAULT = "45m"
+PLAN_FIX_RUNTIME_DEFAULT = "45m"
+# Ключ профиля ревью плана: `profiles.plan_reviewer` — владельческий, как у разведки.
+PLAN_REVIEW_PROFILE_KEY = "plan_reviewer"
+# Ключ профиля правки плана: `profiles.plan_fixer`, иначе исполнитель плана (D3).
+PLAN_FIX_PROFILE_KEY = "plan_fixer"
+# Кругов ревью плана — не больше двух: первый `REQUEST_CHANGES` даёт один круг правок,
+# второй останавливает цикл и уходит владельцу (D7). Третий раз не заказываем никогда.
+PLAN_REVIEW_MAX_ROUNDS = 2
 
 # Предел действий за тик: ключ `max_actions` в pipeline.json проекта, умолчание 1 (D1).
 MAX_ACTIONS_DEFAULT = 1
@@ -573,6 +591,15 @@ def prompt_review_rel(p: Paths, step_id: str) -> str:
     return p.cfg.rel(prompt_review_path(p, step_id))
 
 
+def plan_review_path(p: Paths) -> Path:
+    """Отчёт ревью плана: `docs/reviews/plan-<N>.md` (D4) — один файл на план."""
+    return Path(p.review_dir) / f"plan-{p.plan_id}.md"
+
+
+def plan_review_rel(p: Paths) -> str:
+    return p.cfg.rel(plan_review_path(p))
+
+
 def prompt_verdict(p: Paths, step_id: str) -> dict | None:
     """Вердикт ревью постановки + `recon` из отчёта: сверять надо ту же версию (D1)."""
     result = verdict_at(prompt_review_path(p, step_id))
@@ -684,6 +711,64 @@ def scout_card_body(p: Paths, steps: list[dict]) -> str:
         "ПРИЁМКА КАРТОЧКИ",
         "- Закрыть карточку результатом, первая строка — `Итог: …`",
         "  (например, `Итог: берём X — 2 дня на интеграцию`).",
+    ]
+    return "\n".join(lines)
+
+
+def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str) -> str:
+    """Тело карточки ревью плана: замысел до кода, чек-лист, формат вердикта (C1, C5).
+
+    Ключевые слова карточки проверяются тестом: «НЕ code review», «связность», «1.5»,
+    `plan-1.md`, `APPROVE`. Роль берёт их отсюда, а не из скилла: карточка самодостаточна.
+    """
+    return "\n".join([
+        f"# Ревью плана {p.plan_id}: замысел до кода",
+        "",
+        "Ты — роль pipeline-plan-reviewer. Это НЕ code review: код шагов ещё не написан.",
+        f"План: `{plan_rel}`. Отчёт: `{report_rel}` — ровно одна строка вердикта:",
+        "`## ВЕРДИКТ: APPROVE` либо `## ВЕРДИКТ: REQUEST_CHANGES`.",
+        "",
+        "ЧЕК-ЛИСТ",
+        "- связность шагов: каждый опирается на результат предыдущего, шагов-сирот нет;",
+        "- размер шага не больше 1.5 дней и один проверяемый результат;",
+        "- пересечение файлов между шагами: общий файл требует причины;",
+        "- риски названы, а не подразумеваются;",
+        "- разведка учтена: раздел «## Разведка», вердикты кандидатов, шаг интеграции;",
+        "- стоп-сигналы есть у каждого шага;",
+        "- проверяемость гейтов: команда и ожидаемое число, а не «тесты зелёные».",
+        "",
+        "ГРАНИЦЫ",
+        "- План не правишь, шаг не закрываешь, код шагов не пишешь.",
+        "- Вердикт — только по плану на текущем HEAD; находки — адресами `файл:строка`.",
+        "- `REQUEST_CHANGES` даёт один круг правок плана; второй уходит владельцу.",
+        "",
+        f"Профиль карточки — `{profile}`; карточка поставлена стражем конвейера.",
+    ])
+
+
+def plan_fix_card_body(p: Paths, plan_rel: str, report_rel: str,
+                       findings: list[str]) -> str:
+    """Тело карточки правки плана: один круг, только план, ревью повторится (D7)."""
+    lines = [
+        f"# Правки плана {p.plan_id} по ревью (круг 1)",
+        "",
+        f"Ревью плана вернуло REQUEST_CHANGES. План: `{plan_rel}`. Отчёт: `{report_rel}`.",
+        "",
+        "НАХОДКИ РЕВЬЮ",
+    ]
+    picked = list(findings or [])[:FINDINGS_LIMIT]
+    lines += [f"- {item}" for item in picked] or ["- Отчёт ревью без пунктов: читать целиком."]
+    lines += [
+        "",
+        "ЧТО СДЕЛАТЬ",
+        "- Правится только план: замысел, шаги, файлы, гейты, стоп-сигналы.",
+        "- Разведка остаётся учтённой: раздел «## Разведка» и отметка правок на месте.",
+        "- Код шагов в этой карточке не пишется и не правится.",
+        "- После правки ревью повторится само (круг 2); второй REQUEST_CHANGES",
+        "  останавливает цикл и уходит владельцу с разбором.",
+        "",
+        "ЗАКРЫТИЕ",
+        "- Результат карточки — первая строка `Итог: …` и перечень правок с адресами.",
     ]
     return "\n".join(lines)
 
@@ -968,7 +1053,12 @@ def build_ctx(p: Paths) -> dict:
                    next_prompt=None, next_cards=[],
                    # Та же форма `ctx`, что и в нормальной ветке (D4): решение разведки
                    # не должно падать `NameError` на сбое сборщика.
-                   scout_needed=False, scout_cards=[], scout_profile="", scout_note="")
+                   scout_needed=False, scout_cards=[], scout_profile="", scout_note="",
+                   # Ревью плана: на сбое сборщика шагов карточки не заказываем — плана
+                   # без шагов всё равно не видно, а решение обязано не падать `NameError`.
+                   plan_review_format=False, plan_review_ok=True, plan_review_reason="",
+                   plan_review_cards=[], plan_review_verdict=None, plan_review_rel="",
+                   plan_review_profile="", plan_fix_cards=[])
         return ctx
     step = pkg.get("next")
     ctx["next"] = step
@@ -1004,6 +1094,20 @@ def build_ctx(p: Paths) -> dict:
     ctx["scout_needed"] = scout_needed(p)
     ctx["scout_profile"] = scout_profile(p.cfg)
     ctx["scout_note"] = scout_note(ctx["scout_cards"])
+    # Ревью плана как отдельный шаг (план 5, S5). Дискриминатор формата и признак «план
+    # идёт» считаются здесь: у `decide` нет `Paths`, а решение обязано быть чистым (D4).
+    # Текст плана читается один раз; файла нет — `can_review("")` даёт `False`.
+    ctx["plan_review_format"] = plan_has_constitution(p)
+    try:
+        plan_text = Path(p.plan_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        plan_text = ""
+    ctx["plan_review_ok"], ctx["plan_review_reason"] = plan_cycle.can_review(plan_text)
+    ctx["plan_review_cards"] = read_cards(p, f"planloop:{p.plan_id}:{PLAN_REVIEW_KEY}")
+    ctx["plan_review_verdict"] = verdict_at(plan_review_path(p))
+    ctx["plan_review_rel"] = plan_review_rel(p)
+    ctx["plan_review_profile"] = plan_review_profile(p.cfg)
+    ctx["plan_fix_cards"] = read_cards(p, f"planloop:{p.plan_id}:{PLAN_FIX_KEY}")
     return ctx
 
 
@@ -1067,6 +1171,11 @@ def _decide_base(ctx: dict) -> dict:
     scout = _scout_decision(ctx)
     if scout:
         return scout
+    # Ревью плана — второе предусловие плана, после разведки и до карточек шагов (C9, C10):
+    # пока вердикта APPROVE нет, шаг не начинается (D5).
+    plan_review = _plan_review_decision(ctx)
+    if plan_review:
+        return plan_review
     prev, prev_verdict = ctx.get("prev_closed"), ctx.get("prev_verdict")
     if prev and prev_verdict and prev_verdict["verdict"] == "REQUEST_CHANGES":
         # Журнал закрыл шаг, а ревью говорит «нужны правки»: вперёд идти нельзя.
@@ -1249,6 +1358,92 @@ def _scout_decision(ctx: dict) -> dict | None:
     return {"action": "stop",
             "reason": (f"разведка плана {plan_id} упала: карточка {card.get('id')} "
                        f"в статусе {status}: {detail}")}
+
+
+def _plan_review_decision(ctx: dict) -> dict | None:
+    """Ревью плана: карточка, ожидание, вердикт, один круг правок, эскалация (C6, D1-D7).
+
+    Чистое решение планового уровня: `None` — ревью не нужно либо уже позади, и план идёт
+    обычным порядком. Поля `step` в решении нет намеренно: иначе инвариант «одно действие
+    на шаг за тик» (`step_key`) счёл бы его действием шага — как у решения разведки.
+    """
+    if not ctx.get("plan_review_format"):
+        return None                    # план старого формата ревью плана не получает (D1)
+    cards = ctx.get("plan_review_cards") or []
+    if (ctx.get("approval") or {}).get("started") and not cards:
+        # D2: идущий план не останавливаем — ревью ему не заказывается. Признак «идёт»
+        # берётся из `registry.plan_started`, который видит и файл состояния, а первый же
+        # тик этот файл пишет (`touch`). Поэтому исключение работает только ДО первой
+        # карточки ревью: иначе гейт отключал бы сам себя на втором тике и не доводил
+        # начатое ревью до вердикта (C11, тесты 4-8).
+        return None
+    plan_id = ctx.get("plan_id")
+    rel = ctx.get("plan_review_rel") or f"docs/reviews/plan-{plan_id}.md"
+    verdict = ctx.get("plan_review_verdict")
+    # C9: дверь к шагам — сам вердикт, а не карточка. План, прошедший ревью раньше
+    # (например, идущий план или ревью задним числом), шаги не ждёт.
+    if verdict is not None and verdict["verdict"] == "APPROVE":
+        return None
+    if not ctx.get("plan_review_ok"):
+        # Разведка — предусловие ЗАКАЗА ревью (D5): план без корректировки по разведке ждёт.
+        return {"action": "idle", "plan_review": True,
+                "reason": (f"план {plan_id} не прошёл корректировку по разведке: "
+                           f"{ctx.get('plan_review_reason') or 'нет раздела «Разведка»'}")}
+    if not cards:
+        profile = ctx.get("plan_review_profile") or PLAN_REVIEW_PROFILE_KEY
+        return {"action": "create_plan_review", "round": 1,
+                "reason": f"ревью плана {plan_id} не проводилось — карточка роли {profile}"}
+    card = cards[-1]
+    status = str(card.get("status") or "")
+    if status not in TERMINAL:
+        return {"action": "idle", "plan_review": True,
+                "reason": (f"ждёт ревью плана {plan_id}: карточка {card.get('id')} "
+                           f"({status})")}
+    if status != "done":
+        detail = " ".join(str(card.get("error") or card.get("result") or "").split())[:300]
+        return {"action": "stop",
+                "reason": (f"ревью плана {plan_id} упало: карточка {card.get('id')} "
+                           f"в статусе {status}: {detail}")}
+    if verdict is None:
+        return {"action": "stop",
+                "reason": f"ревью плана {plan_id} закрыто, но отчёта {rel} нет"}
+    if verdict["verdict"] in ("NONE", "AMBIGUOUS"):
+        return {"action": "stop",
+                "reason": (f"вердикт ревью плана {plan_id} не распознан "
+                           f"({verdict['verdict']}): {Path(verdict['path']).name}")}
+    if verdict["verdict"] == "APPROVE":
+        return None                    # замысел принят — шаг начинается обычным порядком
+    # REQUEST_CHANGES: один круг правок плана, второй отказ — решение владельца (D7).
+    if not _report_written_after(verdict, card):
+        return {"action": "stop",
+                "reason": (f"отчёт {rel} не обновлён после карточки {card.get('id')} — "
+                           f"вердикт может быть от прошлого круга")}
+    fixes = ctx.get("plan_fix_cards") or []
+    if not fixes:
+        return {"action": "create_plan_fix", "round": 1,
+                "reason": (f"ревью плана {plan_id} вернуло REQUEST_CHANGES — "
+                           f"правим план один круг: {rel}")}
+    fix = fixes[-1]
+    fix_status = str(fix.get("status") or "")
+    if fix_status not in TERMINAL:
+        return {"action": "idle", "plan_review": True,
+                "reason": (f"ждёт правку плана {plan_id}: карточка {fix.get('id')} "
+                           f"({fix_status})")}
+    if fix_status != "done":
+        detail = " ".join(str(fix.get("error") or fix.get("result") or "").split())[:300]
+        return {"action": "stop",
+                "reason": (f"правка плана {plan_id} упала: карточка {fix.get('id')} "
+                           f"в статусе {fix_status}: {detail}")}
+    if len(cards) < PLAN_REVIEW_MAX_ROUNDS:
+        return {"action": "create_plan_review", "round": 2,
+                "reason": f"план {plan_id} поправлен по ревью — повторное ревью (круг 2)"}
+    report = Path(str(verdict["path"]))
+    findings = (_blocking_findings(report, FINDINGS_LIMIT)
+                or _review_findings(report, FINDINGS_LIMIT))
+    return {"action": "stop", "kind": "owner",
+            "reason": (f"второй REQUEST_CHANGES по плану {plan_id}: решает владелец — {rel}"),
+            "details": ("\n".join(f"- {item}" for item in findings)
+                        or f"Разбор — в отчёте {rel}.")}
 
 
 def _prefetch_decision(ctx: dict) -> dict | None:
@@ -1694,9 +1889,13 @@ def _config_section(cfg: config_mod.Config, name: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _config_text(cfg: config_mod.Config, section: str) -> str:
-    """Непустая строка из раздела конфига; битое значение — пустая строка (D3)."""
-    raw = _config_section(cfg, section).get(SCOUT_KEY)
+def _config_text(cfg: config_mod.Config, section: str, key: str = SCOUT_KEY) -> str:
+    """Непустая строка из раздела конфига; битое значение — пустая строка (D3).
+
+    `key` — параметр, а не константа: у ролей плана ключ свой (D8 — разведка зовёт
+    функцию без третьего аргумента и её поведение не меняется).
+    """
+    raw = _config_section(cfg, section).get(key)
     return raw.strip() if isinstance(raw, str) else ""
 
 
@@ -1722,6 +1921,58 @@ def scout_skills(cfg: config_mod.Config) -> tuple[str, ...]:
 def scout_runtime(cfg: config_mod.Config) -> str:
     """Лимит времени карточки разведки: `runtimes.scout`, умолчание `30m` (D3)."""
     return _config_text(cfg, "runtimes") or SCOUT_RUNTIME_DEFAULT
+
+
+def _config_list(cfg: config_mod.Config, section: str, key: str,
+                 default: tuple[str, ...]) -> tuple[str, ...]:
+    """Список скиллов из раздела конфига; не список или пустые элементы — умолчание (D3).
+
+    Общий читатель для ролей ревью и правки плана: у разведки остался свой (S2),
+    чтобы шаг S5 не менял поведение закрытого шага.
+    """
+    raw = _config_section(cfg, section).get(key)
+    if not isinstance(raw, (list, tuple)):
+        return default
+    items = tuple(str(item).strip() for item in raw
+                  if isinstance(item, str) and str(item).strip())
+    return items or default
+
+
+def plan_review_profile(cfg: config_mod.Config) -> str:
+    """Профиль ревью плана: `profiles.plan_reviewer`, иначе `cfg.reviewer` (D3).
+
+    Отдельного профиля в проекте может не быть, а карточка с неизвестным assignee
+    молча висит: поэтому умолчание — штатный ревьюер, а вид ревью различает скилл.
+    """
+    return _config_text(cfg, "profiles", PLAN_REVIEW_PROFILE_KEY) or cfg.reviewer
+
+
+def plan_review_skills(cfg: config_mod.Config) -> tuple[str, ...]:
+    """Скиллы карточки ревью плана: `skills.plan_review`, умолчание — роль ревью плана."""
+    return _config_list(cfg, "skills", "plan_review", PLAN_REVIEW_SKILLS_DEFAULT)
+
+
+def plan_review_runtime(cfg: config_mod.Config) -> str:
+    """Лимит времени карточки ревью плана: `runtimes.plan_review`, умолчание `45m`."""
+    return _config_text(cfg, "runtimes", "plan_review") or PLAN_REVIEW_RUNTIME_DEFAULT
+
+
+def plan_fix_profile(cfg: config_mod.Config) -> str:
+    """Профиль правки плана: `profiles.plan_fixer`, иначе исполнитель плана (D3).
+
+    План правит тот, кто его написал: отдельного профиля в шаблоне нет, ключ владельческий.
+    """
+    return _config_text(cfg, "profiles", PLAN_FIX_PROFILE_KEY) or cfg.driver
+
+
+def plan_fix_skills(cfg: config_mod.Config) -> tuple[str, ...]:
+    """Скиллы карточки правки плана: `skills.plan_fix`, умолчание — роль автора плана."""
+    return _config_list(cfg, "skills", "plan_fix", PLAN_FIX_SKILLS_DEFAULT)
+
+
+def plan_fix_runtime(cfg: config_mod.Config) -> str:
+    """Лимит времени карточки правки плана: `runtimes.plan_fix`, умолчание `45m`."""
+    return _config_text(cfg, "runtimes", "plan_fix") or PLAN_FIX_RUNTIME_DEFAULT
 
 
 def _digest_at(cfg: config_mod.Config) -> tuple[int, int]:
@@ -2595,6 +2846,48 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         else:
             say("карточку разведки создать не удалось, проверь `hermes kanban ls`")
         return result
+    if action == "create_plan_review":
+        # Ревью плана — карточка планового уровня: ключ без шага, `--parent` не ставится.
+        # Номер круга живёт отдельным сегментом ключа: первый круг — как у соседей.
+        round_no = int(decision.get("round") or 1)
+        key = f"planloop:{plan_id}:{PLAN_REVIEW_KEY}"
+        if round_no > 1:
+            key += f":{round_no}"
+        profile = plan_review_profile(p.cfg)
+        report_rel = plan_review_rel(p)
+        cid = create_card(p, f"[ревью плана {plan_id}] Ревью плана: замысел до кода",
+                          plan_review_card_body(p, p.cfg.rel(Path(p.plan_file)), report_rel,
+                                                profile),
+                          profile, key, plan_review_skills(p.cfg),
+                          max_runtime=plan_review_runtime(p.cfg))
+        result.update(applied=bool(cid), detail=f"карточка ревью плана: {cid}")
+        touch(f"create_plan_review:{cid}")
+        if cid:
+            say(f"план {plan_id}: ревью плана как отдельный шаг — карточка {cid} "
+                f"(профиль {profile}, круг {round_no}); шаги не начинаются без APPROVE")
+        else:
+            say(f"план {plan_id}: не смог поставить ревью плана — проверь `hermes kanban ls`")
+        return result
+    if action == "create_plan_fix":
+        # Один круг правок плана (D7): ключ с номером круга, дальше — повторное ревью.
+        key = f"planloop:{plan_id}:{PLAN_FIX_KEY}:1"
+        profile = plan_fix_profile(p.cfg)
+        report_rel = plan_review_rel(p)
+        findings = (_blocking_findings(plan_review_path(p), FINDINGS_LIMIT)
+                    or _review_findings(plan_review_path(p), FINDINGS_LIMIT))
+        cid = create_card(p, f"[правки плана {plan_id}] Правки плана по ревью (круг 1)",
+                          plan_fix_card_body(p, p.cfg.rel(Path(p.plan_file)), report_rel,
+                                             findings),
+                          profile, key, plan_fix_skills(p.cfg),
+                          max_runtime=plan_fix_runtime(p.cfg))
+        result.update(applied=bool(cid), detail=f"карточка правок плана: {cid}")
+        touch(f"create_plan_fix:{cid}")
+        if cid:
+            say(f"план {plan_id}: ревью вернуло REQUEST_CHANGES — правим план один круг "
+                f"(карточка {cid}, профиль {profile}); после правки ревью повторится")
+        else:
+            say(f"план {plan_id}: не смог поставить правку плана — проверь `hermes kanban ls`")
+        return result
     if action == "create_prompt":
         # Постановка N+1: заказ заранее (правило 2) и заказ вместо закрытия (правило 1).
         step = decision["data"]
@@ -2777,7 +3070,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
     if action == "stop":
         reason = decision.get("reason", "")
         previous = (ctx.get("stop") or {}).get("reason")
-        write_stop(p, reason, "gate", kind="incident")
+        # `kind` из решения: эскалация владельцу (`owner`) не должна сниматься тиком сама (D6).
+        write_stop(p, reason, "gate", kind=decision.get("kind") or "incident")
         result.update(applied=True, detail=reason)
         touch("stop")
         if previous != reason:
