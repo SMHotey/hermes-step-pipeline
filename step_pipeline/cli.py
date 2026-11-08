@@ -16,6 +16,7 @@ try:
     from . import plan_mode
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
+    from . import stats
 except ImportError:  # pragma: no cover - отладка файлом
     import doctor  # type: ignore
     import plan_accept  # type: ignore
@@ -24,6 +25,7 @@ except ImportError:  # pragma: no cover - отладка файлом
     import setup_flow  # type: ignore
     import snapshot as snap  # type: ignore
     import telegram  # type: ignore
+    import stats  # type: ignore
 
 
 def build_parser(sp: argparse.ArgumentParser) -> None:
@@ -195,6 +197,10 @@ def render_status(data: dict) -> str:
     reason = decision.get("reason") or decision.get("step") or ""
     lines.append("")
     lines.append(f"Решение: {decision.get('action')} — {reason}")
+    cycle = data.get("cycle") or {}
+    if cycle:
+        lines.append("")
+        lines.append(stats.render_cycle(cycle))
     if data.get("status"):
         lines.append("")
         lines.append(data["status"])

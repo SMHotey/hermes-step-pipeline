@@ -345,6 +345,11 @@
       <!-- Строки планов (S2A): статус, причина и одно действие — данные только из снимка. -->
       <div class="plans" id="plans"></div>
     </section>
+    <!-- Цикл плана (S8): работает ли разведка и ревью плана — числа приходят из снимка. -->
+    <section id="cycle" style="margin-top:16px">
+      <h2>Цикл плана</h2>
+      <div class="ov-grid" id="cy-grid"><span class="muted">данных нет</span></div>
+    </section>
     <section style="margin-top:16px">
       <h2>Поток текущего шага</h2>
       <div class="flow" id="flow"></div>
@@ -1119,6 +1124,21 @@ function renderOverview(data) {
   tick.disabled = !tickAllowed || panelBusy;
 }
 
+function renderCycle(data) {
+  // Блок «Цикл плана» (S8): числа считает сервер (`stats.cycle_tiles`), страница рисует.
+  // Снимок без конвейера и начальный снимок дают `cycle: {}` — без проверки здесь
+  // страница падала бы на `tiles.length`.
+  const tiles = (data && data.cycle && data.cycle.tiles) || [];
+  const grid = $("cy-grid");
+  if (!tiles.length) {
+    grid.innerHTML = `<span class="muted">данных нет</span>`;
+    return;
+  }
+  grid.innerHTML = tiles.map((tile) => `
+    <div class="ov-item"><span>${esc(tile.label)}</span>
+      <b class="mono" title="${esc(tile.hint || "")}">${esc(tile.value)}</b></div>`).join("");
+}
+
 // ── экран «Шаг» (план 3 S3): контракт, постановка, отчёт ревью, коммит ──
 let currentStep = null;   // выбранный шаг вкладки «Шаг»
 let stepPairLoaded = "";  // пара «план + шаг», для которой блоки уже нарисованы
@@ -1631,6 +1651,7 @@ function render(data) {
   if (data.preview && $("tab-setup").classList.contains("active")) showTab("overview");
 
   renderOverview(data);
+  renderCycle(data);
   renderEvents(data);
   collectNotify(data.notify);
 

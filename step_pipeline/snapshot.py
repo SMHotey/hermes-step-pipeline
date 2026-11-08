@@ -32,8 +32,10 @@ from typing import Any
 
 try:  # обычный путь — пакет плагина; __main__ — ручная проверка файлом
     from . import project as proj
+    from . import stats
 except ImportError:  # pragma: no cover
     import project as proj  # type: ignore[no-redef]
+    import stats  # type: ignore[no-redef]
 
 CARD_COLUMNS = ("id", "title", "status", "assignee", "idempotency_key", "created_at",
                 "started_at", "completed_at", "last_heartbeat_at", "current_run_id",
@@ -1351,6 +1353,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         "decision": None,
         "status": "",
         "metrics": {},
+        "cycle": {},
         "events": {"rows": [], "total": 0, "bad": 0, "limit": EVENTS_LIMIT, "note": ""},
         "cards": cards(proj.board_db(root, board)),
         "journal": [],
@@ -1397,6 +1400,9 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
     out["stage"] = ACTION_LABELS.get(decision.get("action") or "", decision.get("action") or "")
     out["stop"] = any(_plan_stopped(p) for p in out["plans"])
     out["overview"] = _overview(root, cfg, out)
+    cycle = stats.cycle_metrics(root, cfg)
+    cycle["tiles"] = stats.cycle_tiles(cycle)
+    out["cycle"] = cycle
     # Лента действий — отдельным чтением history.jsonl: движок ради неё не запускается (D2).
     out["events"] = events(root, cfg)
     return out

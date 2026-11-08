@@ -938,7 +938,7 @@ def _missing_snapshot(state: State) -> dict:
             "profiles": {}, "runtimes": {}, "driven": [], "require_prompt": True,
             "telegram": {"enabled": False, "chat": ""},
             "preview": state.preview, "plans": [], "plan": None, "package": None,
-            "decision": None, "status": "", "metrics": {}, "cards": [], "journal": [],
+            "decision": None, "status": "", "metrics": {}, "cycle": {}, "cards": [], "journal": [],
             "errors": [f"конвейер не установлен в проект: нет {root / '.pipeline' / 'gate.py'}"]}
 
 
