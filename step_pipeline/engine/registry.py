@@ -18,12 +18,14 @@
 каталоге состояния): модуль только сверяет её с файлом плана по sha256. Пишет запись
 не он — утверждает владелец командой `hermes pipeline plan --accept N`, а страж лишь
 читает её и для уже идущих планов сам пишет унаследованную запись (см. `gate.py`).
+Сама сверка (запись плюс привязка вердикта ревью плана к версии плана) живёт в
+`approval.py`: функций в реестре — тонкие обёртки, чтобы пути проекта собирались в
+одном месте. Реестр больше не единственный читатель записи утверждения.
 
 Модуль только ЧИТАЕТ файлы планов и ничего не меняет.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import sys
@@ -32,6 +34,7 @@ from pathlib import Path
 
 # Плоский импорт: скрипт запускают файлом (`python .pipeline/gate.py`), пакетом — реже.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import approval  # noqa: E402 - модуль рядом: сверка утверждения и ревью плана
 import config as config_mod  # noqa: E402 - модуль рядом
 
 _PLAN_FILE_RE = re.compile(r"^(?P<id>\d{1,2})-")
@@ -85,56 +88,39 @@ def stop_file_for(cfg: config_mod.Config, plan_id: str) -> Path:
 
 
 # ───────────────────────────── утверждение плана ─────────────────────────────
+# Сверка записи утверждения и привязки вердикта ревью к версии плана живёт в
+# `approval.py`: страж и `plan --accept` обязаны отвечать на вопрос «можно ли начинать
+# шаги» одинаково. Здесь — только имена путей проекта (номер плана приводится к
+# каноническому виду) и тонкие обёртки, чтобы вызывающий код не собирал пути сам.
 
-APPROVAL_TEMPLATE = "plan_{}_approval.json"
+APPROVAL_TEMPLATE = approval.APPROVAL_TEMPLATE
 # Отметка стража «владельцу уже сказали, что план не ведётся» — в состоянии плана.
 APPROVAL_NOTICE_KEY = "approval_notice"
 
 
 def approval_file_for(cfg: config_mod.Config, plan_id: str) -> Path:
     """Путь записи утверждения плана в каталоге состояния проекта."""
-    return cfg.state_dir / APPROVAL_TEMPLATE.format(normalize(plan_id))
+    return approval.approval_file_for(cfg, normalize(plan_id))
 
 
 def sha256_file(path) -> str:
     """sha256 сырых байтов файла плана (без перекодирования: CRLF не мешает)."""
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return approval.sha256_file(path)
 
 
 def read_approval(cfg: config_mod.Config, plan_id: str) -> dict | None:
     """Прочитать запись утверждения; нет файла, он битый или не словарь — `None`."""
-    path = approval_file_for(cfg, plan_id)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    return approval.read_approval(cfg, normalize(plan_id))
 
 
 def approval_status(cfg: config_mod.Config, spec: PlanSpec) -> dict:
-    """Сверить запись утверждения с файлом плана.
+    """Сверить запись утверждения и вердикт ревью с файлом плана (`approval.evaluate`).
 
     `state`: `approved` | `missing` (записи нет или она не читается) | `changed`
     (запись есть, но sha256 в ней отсутствует или не совпал с фактическим).
+    `ok` — можно начинать шаги, `block_kind` — чего не хватает (`approval` | `review`).
     """
-    fact = sha256_file(spec.file)
-    record = read_approval(cfg, spec.id)
-    result = {"state": "approved", "reason": "", "record": record, "sha256": fact}
-    if record is None:
-        result["state"] = "missing"
-        result["reason"] = (
-            f"план {spec.id} не утверждён: нет записи "
-            f"{APPROVAL_TEMPLATE.format(spec.id)} (утверждает владелец: "
-            f"hermes pipeline plan --accept {spec.id})")
-        return result
-    saved = str(record.get("sha256") or "")
-    if saved != fact:
-        result["state"] = "changed"
-        result["reason"] = (
-            f"план {spec.id} изменён после утверждения: sha256 {fact[:12]} не совпал "
-            f"с записью {saved[:12] or '—'} (переутвердить: "
-            f"hermes pipeline plan --accept {spec.id})")
-    return result
+    return approval.evaluate(cfg, spec)
 
 
 def plan_started(cfg: config_mod.Config, spec: PlanSpec) -> bool:

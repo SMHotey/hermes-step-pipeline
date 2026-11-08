@@ -16,7 +16,7 @@ import pytest
 
 import config as config_mod
 import gate
-from engine_kit import PLAN, cards, complete, make_project, write_approval
+from engine_kit import PLAN, cards, complete, make_project, plan_sha256, write_approval
 
 CONSTITUTION = "Конституция: docs/CONSTITUTION.md"
 
@@ -38,10 +38,13 @@ def write_plan(root: Path, constitution: bool = True) -> Path:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     write_approval(root, path)
     if constitution:
+        # Метка `plan_sha256` привязывает вердикт к версии плана (план 5-S6): без неё
+        # вердикт считается непривязанным и шаги не открываются.
         reviews = Path(root) / "docs" / "reviews"
         reviews.mkdir(parents=True, exist_ok=True)
         (reviews / "plan-1.md").write_text(
-            "# Ревью плана 1\n\n- находок нет: замысел проверен\n\n## ВЕРДИКТ: APPROVE\n",
+            "# Ревью плана 1\n\n- находок нет: замысел проверен\n\n"
+            f"plan_sha256: {plan_sha256(path)}\n\n## ВЕРДИКТ: APPROVE\n",
             encoding="utf-8")
     return path
 

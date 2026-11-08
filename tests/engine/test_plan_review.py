@@ -18,7 +18,7 @@ import pytest
 
 import config as config_mod
 import gate
-from engine_kit import cards, complete, make_project, write_approval
+from engine_kit import cards, complete, make_project, plan_sha256, write_approval
 
 # План действующего формата: конституция, оформленная разведка (P1-P3 пройдены),
 # шаг интеграции по вердикту «берём» и журнал, где ВСЕ строки открыты: закрытый шаг
@@ -57,7 +57,11 @@ PLAN_READY = """# 1. Демо-план
 | — | S2 | — | — | открыт |
 """
 
-APPROVE_REPORT = "# Ревью плана 1\n\n- находок нет\n\n## ВЕРДИКТ: APPROVE\n"
+
+def approve_report(plan: Path) -> str:
+    """Отчёт APPROVE с меткой версии: без метки вердикт считается непривязанным (S6)."""
+    return (f"# Ревью плана 1\n\n- находок нет\n\n"
+            f"plan_sha256: {plan_sha256(plan)}\n\n## ВЕРДИКТ: APPROVE\n")
 
 
 def write_plan(root: Path, text: str = PLAN_READY) -> Path:
@@ -274,7 +278,7 @@ def test_missing_verdict_stops_and_approve_unblocks_steps(stand):
     assert "planloop:1:S1:step" not in keys_of(db)
 
     gate.clear_stop(p)
-    write_report(root, APPROVE_REPORT)
+    write_report(root, approve_report(Path(root) / "docs" / "plans" / "1-demo.md"))
     after = gate.run_gate(p, notify_fn=quiet)
     assert after["decision"]["action"] == "create_step", after["decision"]
 

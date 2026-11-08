@@ -84,6 +84,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import approval  # noqa: E402 - утверждение плана и привязка ревью к версии (S6)
 import config as config_mod  # noqa: E402 - модуль рядом
 import registry  # noqa: E402 - реестр планов
 import next_step  # noqa: E402 - сборщик контракта шага
@@ -129,9 +130,10 @@ def verify_engine_integrity(base: Path) -> tuple[bool, str]:
 
 
 TERMINAL = {"done", "blocked", "crashed", "timed_out", "gave_up"}
-VERDICT_RE = re.compile(r"^#{0,4}\s*ВЕРДИКТ\s*:\s*(APPROVE|REQUEST_CHANGES)\s*$",
-                        re.IGNORECASE | re.MULTILINE)
-COMMIT_RE = re.compile(r"коммит\S*\s*`([0-9a-f]{7,40})`", re.IGNORECASE)
+# Разбор вердикта — один шаблон на весь движок: он живёт в `approval.py`, где его читает
+# и привязка ревью плана к версии (S6). Здесь только псевдонимы для кода стража.
+VERDICT_RE = approval.VERDICT_RE
+COMMIT_RE = approval.COMMIT_RE
 
 # ── Разведка готовых решений (план 5, S2) ────────────────────────────────────
 # Роль разведки живёт в конфиге ключом `scout`: `skills.scout` и `runtimes.scout` пишет
@@ -146,9 +148,9 @@ RESEARCH_DIR_DEFAULT = "docs/research"
 # Признак валидного исхода «готового нет» (D7): ищется в результате/ошибке карточки без
 # учёта регистра — провал без этой фразы останавливает конвейер, с ней — нет.
 SCOUT_NO_READY = "готового нет"
-# Строка шапки плана действующего формата (`docs/PLAN-FORMAT.md:196`). Без неё планы 2-4
-# и фикстуры тестов разведку не заказывают (D1).
-CONSTITUTION_MARK = "Конституция:"
+# Строка шапки плана действующего формата (`docs/PLAN-FORMAT.md:196`) — та же метка,
+# что читает `approval.has_constitution`: один признак формата на движок.
+CONSTITUTION_MARK = approval.CONSTITUTION_MARK
 
 # ── Ревью плана как отдельный шаг (план 5, S5) ───────────────────────────────
 # Вид карточки в `idempotency_key`: номер круга правок идёт отдельным сегментом ключа
@@ -166,6 +168,9 @@ PLAN_FIX_PROFILE_KEY = "plan_fixer"
 # Кругов ревью плана — не больше двух: первый `REQUEST_CHANGES` даёт один круг правок,
 # второй останавливает цикл и уходит владельцу (D7). Третий раз не заказываем никогда.
 PLAN_REVIEW_MAX_ROUNDS = 2
+# Состояние вердикта «привязан к текущей версии плана» (S6): само слово живёт в
+# `approval.py`, здесь — имя для решений стража.
+PLAN_REVIEW_FRESH = approval.REVIEW_FRESH
 
 # Предел действий за тик: ключ `max_actions` в pipeline.json проекта, умолчание 1 (D1).
 MAX_ACTIONS_DEFAULT = 1
@@ -332,26 +337,12 @@ def verdict_of(p: Paths, step_id: str) -> dict | None:
 
 
 def verdict_at(path: Path) -> dict | None:
-    """Разбор файла вердикта по пути: нужен и отчёту ревью, и отчёту ревью постановки."""
-    if not path.is_file():
-        return None
-    text = path.read_text(encoding="utf-8", errors="replace")
-    found = [m.group(1).upper() for m in VERDICT_RE.finditer(text)]
-    unique = sorted(set(found))
-    if not found:
-        verdict = "NONE"
-    elif len(unique) == 1:
-        verdict = unique[0]
-    else:
-        verdict = "AMBIGUOUS"
-    commit = COMMIT_RE.search(text)
-    return {
-        "path": str(path),
-        "verdict": verdict,
-        "occurrences": len(found),
-        "sha": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
-        "commit": commit.group(1) if commit else None,
-    }
+    """Разбор файла вердикта по пути — тело переехало в `approval.verdict_at` (S6).
+
+    Один шаблон на весь движок: ревью шага, ревью постановки и ревью плана обязаны
+    читать строку вердикта одинаково. Обёртка остаётся ради вызывающего кода стража.
+    """
+    return approval.verdict_at(path)
 
 
 # ───────────────────────────── журнал плана ─────────────────────────────
@@ -555,19 +546,10 @@ def plan_has_constitution(p: Paths) -> bool:
     """План действующего формата: строка `Конституция:` в шапке до первого `## ` (D1).
 
     Дискриминатор, а не украшение: планы 2-4 и фикстуры тестов строки не имеют и карточку
-    разведки получать не должны. Файла нет или он не читается — `False`, без исключения.
+    разведки получать не должны. Тело проверки живёт в `approval.has_constitution` (S6):
+    ревью плана и утверждение обязаны видеть формат плана одинаково.
     """
-    try:
-        text = Path(p.plan_file).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            return False
-        if stripped.startswith(CONSTITUTION_MARK):
-            return True
-    return False
+    return approval.has_constitution(p.plan_file)
 
 
 def scout_needed(p: Paths) -> bool:
@@ -606,25 +588,16 @@ def prompt_review_rel(p: Paths, step_id: str) -> str:
 
 
 def plan_review_path(p: Paths) -> Path:
-    """Отчёт ревью плана: `docs/reviews/plan-<N>.md` (D4) — один файл на план."""
-    return Path(p.review_dir) / f"plan-{p.plan_id}.md"
+    """Отчёт ревью плана: `docs/reviews/plan-<N>.md` (D4) — один файл на план.
+
+    Путь собирает `approval.review_path`: тот же файл читает привязка вердикта к версии
+    плана (S6), и второй сборщик пути разошёлся бы с ним молча.
+    """
+    return approval.review_path(p.cfg, p.plan_id)
 
 
 def plan_review_rel(p: Paths) -> str:
     return p.cfg.rel(plan_review_path(p))
-
-
-def plan_review_verdict_fresh(p: Paths) -> bool:
-    """Вердикт ревью написан по текущей версии плана: отчёт не старше файла плана.
-
-    Привязка вердикта к hash плана — шаг S6; здесь только грубая проверка «план правили
-    после ревью», чтобы APPROVE не открывал шаги молча по устаревшему отчёту.
-    """
-    try:
-        return (plan_review_path(p).stat().st_mtime + 1.0
-                >= Path(p.plan_file).stat().st_mtime)
-    except OSError:
-        return False
 
 
 def prompt_verdict(p: Paths, step_id: str) -> dict | None:
@@ -754,6 +727,10 @@ def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str
         "Ты — роль pipeline-plan-reviewer. Это НЕ code review: код шагов ещё не написан.",
         f"План: `{plan_rel}`. Отчёт: `{report_rel}` — ровно одна строка вердикта:",
         "`## ВЕРДИКТ: APPROVE` либо `## ВЕРДИКТ: REQUEST_CHANGES`.",
+        "",
+        "Первая строка отчёта — метка версии: `plan_sha256:` и 64 hex-символа sha256",
+        "файла плана (`sha256sum` по файлу плана). Без метки вердикт считается",
+        "непривязанным к версии плана, и страж закажет повторное ревью.",
         "",
         "ЧЕК-ЛИСТ",
         "- связность шагов: каждый опирается на результат предыдущего, шагов-сирот нет;",
@@ -1085,7 +1062,7 @@ def build_ctx(p: Paths) -> dict:
                    # без шагов всё равно не видно, а решение обязано не падать `NameError`.
                    plan_review_format=False, plan_review_ok=True, plan_review_reason="",
                    plan_review_cards=[], plan_review_verdict=None, plan_review_rel="",
-                   plan_review_verdict_fresh=False, plan_started_journal=False,
+                   plan_review_fresh=False, plan_started_journal=False,
                    plan_review_profile="", plan_fix_cards=[])
         return ctx
     step = pkg.get("next")
@@ -1131,9 +1108,14 @@ def build_ctx(p: Paths) -> dict:
     except OSError:
         plan_text = ""
     ctx["plan_review_ok"], ctx["plan_review_reason"] = plan_cycle.can_review(plan_text)
+    # Свежесть вердикта — привязка к sha плана из утверждения (S6). Имя намеренно новое:
+    # `plan_review_ok` — про корректировку по разведке, `plan_review_verdict` — разобранный
+    # отчёт, `plan_review_fresh` — признак «вердикт про эту версию плана».
+    approval_state = ctx["approval"]
     ctx["plan_review_cards"] = read_cards(p, f"planloop:{p.plan_id}:{PLAN_REVIEW_KEY}")
     ctx["plan_review_verdict"] = verdict_at(plan_review_path(p))
-    ctx["plan_review_verdict_fresh"] = plan_review_verdict_fresh(p)
+    ctx["plan_review_fresh"] = ((approval_state.get("review") or {}).get("state")
+                                == PLAN_REVIEW_FRESH)
     # D2: «план идёт» для гейта ревью — закрытые шаги журнала (`ctx["closed"]`), а не файл
     # состояния: состояние пишет сам тик, и признак «идёт» от него отключал бы гейт
     # на втором тике любого ожидания (находка 1 ревью 5-S5).
@@ -1191,7 +1173,13 @@ def _decide_base(ctx: dict) -> dict:
         return {"action": "idle", "reason": "план закрыт — следующих шагов нет", "plan_done": True}
     sid = step["id"]
     approval = ctx.get("approval") or {}
-    if approval.get("state") in ("missing", "changed") and not approval.get("started"):
+    # S6: не хватает именно утверждения владельца. Вердикт ревью плана (`block_kind`
+    # "review") — предусловие другого рода, и его ветка своя: она заказывает повторное
+    # ревью вместо простоя, поэтому здесь такой случай пропускается вниз. Сравнение
+    # `is False`, а не `not`: синтетические `ctx` тестов решений ключа `approval` не имеют
+    # вовсе, и `None` должен остаться нейтральным.
+    if (approval.get("ok") is False and not approval.get("started")
+            and approval.get("block_kind") != "review"):
         # Неутверждённый план не заказывает карточку. Решение именно `idle`, а не
         # отдельное действие: иначе пропуск съедал бы единственное действие тика (D5)
         # и вытеснял остальные планы на каждом тике.
@@ -1418,18 +1406,40 @@ def _plan_review_decision(ctx: dict) -> dict | None:
     # C9: дверь к шагам — сам вердикт, а не карточка. План, прошедший ревью раньше
     # (например, идущий план или ревью задним числом), шаги не ждёт.
     if verdict is not None and verdict["verdict"] == "APPROVE":
-        if ctx.get("plan_review_ok") or ctx.get("plan_review_verdict_fresh"):
-            # Отклонение от порядка ветвей §4.3 (названо в отчёте шага): если вердикт
-            # написан по текущей версии плана, он и есть дверь — иначе фикстура
-            # `tests/engine/test_scout.py:167` (план без раздела «Разведка» плюс
-            # готовый APPROVE) упиралась бы в предусловие разведки. Проверка вердикта по
-            # hash плана — S6, здесь только «план не правили после ревью».
+        # Отклонение от порядка ветвей §4.3 (названо в отчёте шага): свежий вердикт,
+        # написанный по текущей версии плана, и есть дверь — иначе фикстура
+        # `tests/engine/test_scout.py:167` (план без раздела «Разведка» плюс готовый
+        # APPROVE) упиралась бы в предусловие разведки. Свежесть — привязка к sha плана
+        # (S6), а не mtime отчёта.
+        if ctx.get("plan_review_fresh"):
             return None
-        return {"action": "idle", "plan_review": True,
-                "reason": (f"план {plan_id} изменён после ревью плана и не прошёл "
-                           f"корректировку по разведке: "
-                           f"{ctx.get('plan_review_reason') or 'нет раздела «Разведка»'} "
-                           f"(вердикт {rel} — про прошлую версию)")}
+        if not ctx.get("plan_review_ok"):
+            return {"action": "idle", "plan_review": True,
+                    "reason": (f"план {plan_id} не прошёл корректировку по разведке: "
+                               f"{ctx.get('plan_review_reason') or 'нет раздела «Разведка»'} "
+                               f"(вердикт {rel} привязан к другой версии плана)")}
+        if cards:
+            # Пока идёт/упала карточка прошлого круга, новый круг не заказываем: иначе
+            # каждый тик заводил бы новый исполнитель на тот же отчёт (он остаётся
+            # устаревшим, пока ревьюер не напишет новый).
+            card = cards[-1]
+            status = str(card.get("status") or "")
+            if status not in TERMINAL:
+                return {"action": "idle", "plan_review": True,
+                        "reason": (f"ждёт повторного ревью плана {plan_id}: карточка "
+                                   f"{card.get('id')} ({status})")}
+            if status != "done":
+                detail = " ".join(str(card.get("error") or card.get("result")
+                                      or "").split())[:300]
+                return {"action": "stop",
+                        "reason": (f"ревью плана {plan_id} упало: карточка {card.get('id')} "
+                                   f"в статусе {status}: {detail}")}
+        round_no = len(cards) + 1
+        review = (ctx.get("approval") or {}).get("review") or {}
+        return {"action": "create_plan_review", "round": round_no,
+                "reason": (f"план {plan_id} правился после APPROVE: повторное ревью "
+                           f"(круг {round_no}): "
+                           f"{review.get('reason') or 'вердикт про прошлую версию'}")}
     if not ctx.get("plan_review_ok"):
         # Разведка — предусловие ЗАКАЗА ревью (D5): план без корректировки по разведке ждёт.
         return {"action": "idle", "plan_review": True,
@@ -1467,6 +1477,11 @@ def _plan_review_decision(ctx: dict) -> dict | None:
     fixes = ctx.get("plan_fix_cards") or []
     if not fixes:
         return {"action": "create_plan_fix", "round": 1,
+                # Маркер круга ревью живёт в ключе карточки правки (T3e): по нему бюджет
+                # отличается «первый отказ после круга, заказанного по устаревшему
+                # APPROVE» от настоящего второго отказа. `max(..., 1)` — отчёт, написанный
+                # руками без карточек, не должен превращать первый отказ во второй.
+                "review_round": max(len(cards), 1),
                 "reason": (f"ревью плана {plan_id} вернуло REQUEST_CHANGES — "
                            f"правим план один круг: {rel}")}
     fix = fixes[-1]
@@ -1480,16 +1495,21 @@ def _plan_review_decision(ctx: dict) -> dict | None:
         return {"action": "stop",
                 "reason": (f"правка плана {plan_id} упала: карточка {fix.get('id')} "
                            f"в статусе {fix_status}: {detail}")}
-    if len(cards) < PLAN_REVIEW_MAX_ROUNDS:
-        return {"action": "create_plan_review", "round": 2,
-                "reason": f"план {plan_id} поправлен по ревью — повторное ревью (круг 2)"}
-    report = Path(str(verdict["path"]))
-    findings = (_blocking_findings(report, FINDINGS_LIMIT)
-                or _review_findings(report, FINDINGS_LIMIT))
-    return {"action": "stop", "kind": "owner",
-            "reason": (f"второй REQUEST_CHANGES по плану {plan_id}: решает владелец — {rel}"),
-            "details": ("\n".join(f"- {item}" for item in findings)
-                        or f"Разбор — в отчёте {rel}.")}
+    # Бюджет отказов считается по маркеру круга ревью в ключе карточки правки, а не по
+    # числу карточек ревью: круг, заказанный по устаревшему `APPROVE` (S6), — тоже круг
+    # ревью, и первый отказ после него не должен выглядеть вторым.
+    review_round = int(str(fix.get("key") or "").rsplit(":", 1)[-1] or 0)
+    if len(cards) - review_round >= PLAN_REVIEW_MAX_ROUNDS - 1:
+        report = Path(str(verdict["path"]))
+        findings = (_blocking_findings(report, FINDINGS_LIMIT)
+                    or _review_findings(report, FINDINGS_LIMIT))
+        return {"action": "stop", "kind": "owner",
+                "reason": (f"второй REQUEST_CHANGES по плану {plan_id}: решает владелец — {rel}"),
+                "details": ("\n".join(f"- {item}" for item in findings)
+                            or f"Разбор — в отчёте {rel}.")}
+    return {"action": "create_plan_review", "round": len(cards) + 1,
+            "reason": (f"план {plan_id} поправлен по ревью — повторное ревью "
+                       f"(круг {len(cards) + 1})")}
 
 
 def _prefetch_decision(ctx: dict) -> dict | None:
@@ -2919,8 +2939,11 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             say(f"план {plan_id}: не смог поставить ревью плана — проверь `hermes kanban ls`")
         return result
     if action == "create_plan_fix":
-        # Один круг правок плана (D7): ключ с номером круга, дальше — повторное ревью.
-        key = f"planloop:{plan_id}:{PLAN_FIX_KEY}:1"
+        # Один круг правок плана (D7): ключ с маркером круга ревью, дальше — повторное
+        # ревью. Маркер — номер круга ревью, по которому пришёл отказ (T3e), он же делит
+        # бюджет отказов; тело карточки по-прежнему говорит «круг 1» правок.
+        review_round = int(decision.get("review_round") or 1)
+        key = f"planloop:{plan_id}:{PLAN_FIX_KEY}:{review_round}"
         profile = plan_fix_profile(p.cfg)
         report_rel = plan_review_rel(p)
         findings = (_blocking_findings(plan_review_path(p), FINDINGS_LIMIT)
