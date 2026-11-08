@@ -459,6 +459,22 @@ def test_repo_plans_lint_clean():
     assert len(result.files) >= 5
 
 
+def test_repo_plans_warn_only_legacy():
+    """Планы 1-4 (legacy) и план 5 (действующего формата) — линтер существующие не ломает.
+
+    `problems` пусто у всех; предупреждение Л20 — о каждом legacy-плане, у плана 5 его нет:
+    конституционная строка есть, и предупреждать не о чем.
+    """
+    result = plan_lint.lint_project(helpers.REPO)
+
+    assert result.problems == []
+    assert len(result.files) >= 5
+    assert len(result.warnings) == 4
+    names = sorted(Path(warning.file).name for warning in result.warnings)
+    assert names == ["1-stabilnost.md", "2-upravlenie.md", "3-panel.md", "4-planner.md"]
+    assert all("Конституция" in warning.text for warning in result.warnings)
+
+
 RESEARCH_STEP = "### S1. Разведка рынка (1 дн)"
 """Заголовок шага со словом «разведка» — ловушка наивного поиска раздела."""
 
@@ -503,3 +519,55 @@ def test_research_section_after_steps_is_found(project: Path):
     texts = " | ".join(problem.text for problem in plan_lint.lint_project(project, "6").problems)
     for field in ("ссылки на артефакт", "кандидатов", "лицензий", "решения/вердикта"):
         assert field in texts
+
+
+# ── Л20: строка `Конституция:` в шапке плана (§5a, шаг 5-S9). ─────────────────
+#
+# Л20 — предупреждение, а не проблема: legacy-планы 1-4 заведены до конституции, и
+# утверждение из-за отсутствия строки не блокируется (решение D1 шага S1).
+
+def test_legacy_plan_gets_constitution_warning(project: Path):
+    """У legacy-плана находка на `# `-заголовке и только в канале предупреждений."""
+    result = plan_lint.lint_project(project, "1")
+
+    assert result.problems == []
+    assert len(result.warnings) == 1
+    warning = result.warnings[0]
+    assert "Конституция" in warning.text
+    assert warning.file == "docs/plans/1-demo.md"
+    assert warning.line == 1                      # строка заголовка плана (1-based)
+    assert warning.step == ""                     # находка уровня файла, не шага
+
+
+def test_plan_with_constitution_line_has_no_warning(project: Path):
+    """Строка в шапке закрывает Л20: предупреждать не о чем (Л18/Л19 — свой канал)."""
+    path = project / "docs" / "plans" / "6-demo.md"
+    path.write_text(NEW_FORMAT, encoding="utf-8")
+
+    result = plan_lint.lint_project(project, "6")
+
+    assert result.warnings == []
+
+
+def test_constitution_warning_does_not_block_accept(project: Path):
+    """Черновик без строки конституции утверждается: предупреждение не ошибка."""
+    folder = project / "docs" / "plans" / "drafts"
+    folder.mkdir(parents=True, exist_ok=True)
+    draft = folder / "7-demo.md"
+    draft.write_text(helpers.PLAN, encoding="utf-8")
+
+    assert plan_accept.check_draft(project, draft) == []
+    assert plan_lint.lint_project(project, str(draft)).warnings
+
+
+def test_doctor_shows_constitution_warning(project: Path):
+    """Доктор печатает Л20 строкой «!» и зелёный итог не переворачивает."""
+    report = doctor.collect(project)
+
+    assert any("Конституция" in warning for warning in report.warnings)
+    assert not any("Конституция" in problem for problem in report.problems)
+    lines = doctor.format_report(report).splitlines()
+    assert any(line.lstrip().startswith("!") and "Конституция" in line for line in lines)
+    # Итог и код возврата считают только problems: предупреждение установку не краснит.
+    assert doctor.format_report(doctor.Report(warnings=list(report.warnings))).splitlines()[-1] \
+        == "ИТОГ: OK"

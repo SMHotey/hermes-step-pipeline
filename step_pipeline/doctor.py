@@ -25,10 +25,15 @@ except ImportError:  # pragma: no cover - отладка файлом
 
 @dataclass
 class Report:
-    """Итог диагностики: что в порядке (notes) и что сломано (problems)."""
+    """Итог диагностики: что в порядке (notes), что сломано (problems) и что заметить (warnings).
+
+    `warnings` — не блокирующие находки линтера (Л20): на код возврата `doctor` и на
+    `ИТОГ` они не влияют, но человеку видны — иначе предупреждение не прочитает никто.
+    """
 
     notes: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     lint: plan_lint.LintResult | None = None   # None — линтер не запускали
 
 
@@ -70,6 +75,10 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
             notes.append(f"планы: линтер проверил только план «{plan}», проблем нет")
         else:
             notes.append(f"планы: линтер — файлов {len(lint.files)}, проблем нет")
+        # Предупреждения — свой канал: план без строки `Конституция:` (Л20) утверждение
+        # не блокирует, но знать о нём надо (шаг 5-S9).
+        for problem in lint.warnings:
+            report.warnings.append(f"план {problem}")
     engine_ver = setup_flow.engine_version(project)
     plugin_ver = setup_flow.plugin_version()
     if engine_ver and engine_ver != plugin_ver:
@@ -156,10 +165,17 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
 
 
 def format_report(report: Report) -> str:
-    """Текст команды `doctor`: замечания «·», проблемы «✗», итог последней строкой."""
+    """Текст команды `doctor`: замечания «·», проблемы «✗», предупреждения «!», итог.
+
+    Итог и код возврата смотрят только на `problems`: предупреждения (Л20) не превращают
+    установку в «ЕСТЬ ПРОБЛЕМЫ» — legacy-план не поломка (решение D1 шага S1).
+    """
     lines = ["Диагностика конвейера:"]
     lines.extend(f"  · {note}" for note in report.notes)
     lines.extend(f"  ✗ {problem}" for problem in report.problems)
+    if report.warnings:
+        lines.append("  предупреждения:")
+        lines.extend(f"  ! {warning}" for warning in report.warnings)
     lines.append("")
     lines.append("ИТОГ: " + ("OK" if not report.problems else "ЕСТЬ ПРОБЛЕМЫ"))
     return "\n".join(lines)

@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
@@ -92,10 +92,17 @@ class Settings:
 
 @dataclass(frozen=True)
 class LintResult:
-    """Что проверено и что найдено."""
+    """Что проверено и что найдено.
+
+    `problems` — единственный блокирующий канал: на него смотрят `plan_accept.check_draft`,
+    коды возврата `doctor` и `plan --check`. `warnings` — то, что человеку показать надо, а
+    утверждение не блокирует (Л20): иначе legacy-планы 1-4 начали бы краснеть, а решение
+    S1 — «старые планы не ломаются» — было бы нарушено.
+    """
 
     files: list[Path]
     problems: list[Problem]
+    warnings: list[Problem] = field(default_factory=list)
 
 
 _INDEX_NAMES = {"index.md", "00-index.md"}
@@ -473,6 +480,33 @@ def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
 
 # ───────────────────────────── точка входа ─────────────────────────────
 
+# Л20 — единственная находка, которая не попадает в `problems`, а идёт в `warnings`:
+# план без строки `Конституция:` в шапке — legacy, а планы 1-4 заведены до конституции
+# (решение D1 шага S1: старые планы не ломаются и утверждение не блокируют).
+_CONSTITUTION_WARNING = ("нет строки «Конституция: docs/CONSTITUTION.md» в шапке "
+                         "плана — план не сослался на конституцию проекта")
+
+
+def lint_warnings(path: Path, project: Path, settings: Settings) -> list[Problem]:
+    """Предупреждения файла плана: не блокируют, но видны человеку (Л20).
+
+    Файл не читается — предупреждения нет: это уже ошибка Л2, второй находки об одном
+    и том же не нужно. Строка находки — заголовок плана (`# …`, 1-based); заголовка
+    уровня 1 нет — строка 1. `step` пустой: находка уровня файла, как у Л18.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = text.splitlines()
+    found = _headings(lines)
+    if _constitution_line(lines, found) is not None:
+        return []
+    heading = next((idx for idx, level, _title in found if level == 1), None)
+    return [Problem(_shown(Path(path), project), 1 if heading is None else heading + 1,
+                    _CONSTITUTION_WARNING)]
+
+
 def _resolve_plan(project: Path, plans_dir: Path, plan: str) -> Path | None:
     """Номер (`2` → `docs/plans/2-*.md`) или путь (абсолютный/относительно проекта)."""
     as_path = Path(plan).expanduser()
@@ -513,7 +547,9 @@ def lint_project(project: Path, plan: str = "") -> LintResult:
         paths = [p for p in sorted(plans_dir.glob("*.md")) if not _is_index_file(p)]
     files: list[Path] = []
     problems: list[Problem] = []
+    warnings: list[Problem] = []
     for path in paths:
         files.append(path)
         problems.extend(sorted(lint_file(path, project, parsed), key=lambda p: p.line))
-    return LintResult(files=files, problems=problems)
+        warnings.extend(lint_warnings(path, project, parsed))
+    return LintResult(files=files, problems=problems, warnings=warnings)

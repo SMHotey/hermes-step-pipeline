@@ -18,6 +18,7 @@ import pytest
 
 import config as config_mod
 import gate
+import registry
 from engine_kit import cards, complete, make_project, plan_sha256, write_approval
 
 # План действующего формата: конституция, оформленная разведка (P1-P3 пройдены),
@@ -59,8 +60,13 @@ PLAN_READY = """# 1. Демо-план
 
 
 def approve_report(plan: Path) -> str:
-    """Отчёт APPROVE с меткой версии: без метки вердикт считается непривязанным (S6)."""
+    """Отчёт APPROVE с меткой версии и ссылкой на конституцию (§5a, шаг 5-S9).
+
+    Без метки вердикт непривязан (`unbound`), без строки `Конституция:` — `unreferenced`:
+    оба состояния означают «шаги не открываются», поэтому фикстура несёт обе строки.
+    """
     return (f"# Ревью плана 1\n\n- находок нет\n\n"
+            f"Конституция: п.1, п.7 — нарушений нет\n"
             f"plan_sha256: {plan_sha256(plan)}\n\n## ВЕРДИКТ: APPROVE\n")
 
 
@@ -143,7 +149,8 @@ def test_card_requested_for_new_format_plan(stand):
     assert card["title"].startswith("[ревью плана 1]")
 
     body = bodies[0]
-    for anchor in ("plan-1.md", "связность", "1.5", "APPROVE", "НЕ code review"):
+    for anchor in ("plan-1.md", "связность", "1.5", "APPROVE", "НЕ code review",
+                   "Конституция"):
         assert anchor in body, anchor
 
 
@@ -368,3 +375,32 @@ def test_config_overrides_profile_skills_runtime(tmp_path, hermes_stub, monkeypa
     assert call["key"] == "planloop:1:planreview"
     assert call["parent"] is None                  # карточка планового уровня
     assert "plan-checker" in result["decision"]["reason"]
+
+
+# ── Ссылка вердикта на конституцию (§5a, шаг 5-S9). ──────────────────────────
+
+def test_review_without_constitution_reference_is_unreferenced(stand):
+    """Отчёт с меткой версии, но без строки конституции вердиктом не считается (D3)."""
+    root, p, _db = stand
+    plan = Path(root) / "docs" / "plans" / "1-demo.md"
+    write_report(root, (f"# Ревью плана 1\n\n- находок нет\n\n"
+                        f"plan_sha256: {plan_sha256(plan)}\n\n## ВЕРДИКТ: APPROVE\n"))
+
+    status = registry.approval_status(p.cfg, registry.get(p.cfg, "1"))
+    assert status["review"]["state"] == "unreferenced"
+    assert status["ok"] is False
+    assert status["block_kind"] == "review"
+    assert "нет ссылки на пункты конституции" in status["reason"]
+
+
+def test_review_with_constitution_reference_is_fresh(stand):
+    """Тот же отчёт со строкой `Конституция: п.1 — нарушений нет` — свежий вердикт."""
+    root, p, _db = stand
+    plan = Path(root) / "docs" / "plans" / "1-demo.md"
+    write_report(root, (f"# Ревью плана 1\n\n- нарушений нет\n\n"
+                        f"Конституция: п.1 — план следует принципам\n\n"
+                        f"plan_sha256: {plan_sha256(plan)}\n\n## ВЕРДИКТ: APPROVE\n"))
+
+    status = registry.approval_status(p.cfg, registry.get(p.cfg, "1"))
+    assert status["review"]["state"] == "fresh"
+    assert status["ok"] is True

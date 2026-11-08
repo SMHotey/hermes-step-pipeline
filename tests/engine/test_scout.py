@@ -44,6 +44,8 @@ def write_plan(root: Path, constitution: bool = True) -> Path:
         reviews.mkdir(parents=True, exist_ok=True)
         (reviews / "plan-1.md").write_text(
             "# Ревью плана 1\n\n- находок нет: замысел проверен\n\n"
+            # Ссылка на конституцию обязательна (шаг 5-S9): без неё вердикт — `unreferenced`.
+            "Конституция: п.1, п.7 — нарушений нет\n\n"
             f"plan_sha256: {plan_sha256(path)}\n\n## ВЕРДИКТ: APPROVE\n",
             encoding="utf-8")
     return path

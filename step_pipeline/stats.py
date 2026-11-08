@@ -27,7 +27,9 @@ R6. Ревью плана — отчёт `plan-N.md` в каталоге отч�
     ВСЕМ строкам `ВЕРДИКТ:` (две разные дают `invalid`), привязка к версии плана —
     метка `plan_sha256:` и sha256 сырых байтов файла плана. Источник:
     `approval.verdict_at`, `approval.plan_sha_of`, `approval.sha256_file`,
-    `approval.has_constitution`, `approval.review_status`.
+    `approval.has_constitution`, `approval.review_status`. Ссылка на пункт конституции
+    (`approval.CONSTITUTION_REF_RE`, состояние `unreferenced`) — часть того же правила:
+    вердикт без номера пункта не считается проверкой принципов.
 R7. Круги ревью плана — записи `create_plan_review` из истории тиков
     (`state/history.jsonl`, по строке на действие). Источник:
     `gate.remember_action`.
@@ -54,6 +56,10 @@ VERDICT_RE = re.compile(r"^#{0,4}\s*ВЕРДИКТ\s*:\s*(APPROVE|REQUEST_CHANGE
                         re.IGNORECASE | re.MULTILINE)
 #: Метка привязки вердикта к версии плана (`approval.PLAN_SHA_RE`).
 PLAN_SHA_RE = re.compile(r"plan_sha256\s*[:=]\s*`?([0-9a-f]{64})", re.IGNORECASE)
+#: Ссылка вердикта на пункты конституции — как `approval.CONSTITUTION_REF_RE`, шаг 5-S9:
+#: строка `Конституция: п.N — …` (допускается маркер списка), номер пункта обязателен.
+CONSTITUTION_REF_RE = re.compile(r"^\s*(?:[-*+]\s*)?Конституция\s*:[^\n]*\d",
+                                 re.IGNORECASE | re.MULTILINE)
 #: Номер плана — начало имени файла (`registry._PLAN_FILE_RE`); группа 1 — номер.
 PLAN_FILE_RE = re.compile(r"^(\d{1,2})-")
 #: Заголовок шага (`plan_cycle.STEP_HEADING_RE`).
@@ -279,7 +285,7 @@ def _sha256(path: Path) -> str | None:
 
 
 def _review_state(plan_text: str, plan_file: Path, report: Path) -> str:
-    """Состояние ревью плана (R6): одно из `skipped/missing/invalid/pending/unbound/stale/fresh`."""
+    """Состояние ревью плана (R6): одно из `skipped/missing/invalid/pending/unbound/unreferenced/stale/fresh`."""
     if not _has_constitution(plan_text):
         return "skipped"
     if not report.is_file():
@@ -296,6 +302,8 @@ def _review_state(plan_text: str, plan_file: Path, report: Path) -> str:
     match = PLAN_SHA_RE.search(text)
     if not match:
         return "unbound"
+    if not CONSTITUTION_REF_RE.search(text):
+        return "unreferenced"
     file_sha = _sha256(plan_file)
     return "fresh" if file_sha and match.group(1).lower() == file_sha else "stale"
 
@@ -433,6 +441,7 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
         "plan_reviews": states.count("fresh"),
         "plan_reviews_stale": states.count("stale"),
         "plan_reviews_unbound": states.count("unbound"),
+        "plan_reviews_unreferenced": states.count("unreferenced"),
         "plan_reviews_pending": states.count("pending"),
         "plan_reviews_skipped": states.count("skipped"),
         "plan_reviews_first": sum(1 for item in by_plan
@@ -473,6 +482,7 @@ def cycle_tiles(metrics: dict) -> list[dict]:
     first = int(metrics.get("plan_reviews_first") or 0)
     stale = int(metrics.get("plan_reviews_stale") or 0)
     unbound = int(metrics.get("plan_reviews_unbound") or 0)
+    unreferenced = int(metrics.get("plan_reviews_unreferenced") or 0)
     pending = int(metrics.get("plan_reviews_pending") or 0)
     skipped = int(metrics.get("plan_reviews_skipped") or 0)
     fresh = int(metrics.get("plan_reviews") or 0)
@@ -490,8 +500,9 @@ def cycle_tiles(metrics: dict) -> list[dict]:
                   else "отметок нет")},
         {"label": "ревью плана с первого раза",
          "value": f"{first} из {total}",
-         "hint": (f"свежих вердиктов {fresh}, не привязанных к текущей версии "
-                  f"{stale + unbound}, ждут {pending}, без ревью {skipped}")},
+         "hint": (f"свежих вердиктов {fresh}, непригодных {stale + unbound + unreferenced} "
+                  f"(не привязано к версии {stale + unbound}, без ссылки на конституцию "
+                  f"{unreferenced}), ждут {pending}, без ревью {skipped}")},
     ]
 
 

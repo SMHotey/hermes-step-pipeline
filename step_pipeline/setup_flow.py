@@ -1212,7 +1212,12 @@ def run_setup(args) -> int:
         for problem in lint.problems[:10]:
             log.warn(str(problem))
     else:
-        log.ok(f"линтер планов: файлов {len(lint.files)}, проблем нет")
+        # Предупреждения видны в итоге установки: иначе «проблем нет» соврёт о состоянии.
+        log.ok(f"линтер планов: файлов {len(lint.files)}, проблем нет"
+               + (f", предупреждений {len(lint.warnings)}" if lint.warnings else ""))
+    # Л20 — предупреждения, а не проблемы: план без строки `Конституция:` в шапке.
+    for warning in lint.warnings[:10]:
+        log.warn(str(warning))
 
     # Смоук: установка не «зелёная» на веру — пробная карточка на каждую роль.
     # Пропуск только там, где проверять нечего: профили и cron в этом запуске не
@@ -1590,4 +1595,9 @@ def _setup_checks(project: Path, cfg: dict[str, Any], log: Log) -> None:
         for problem in lint.problems[:10]:
             log.warn(str(problem))
     else:
-        log.ok(f"линтер планов: файлов {len(lint.files)}, проблем нет")
+        # Предупреждения видны в итоге: «проблем нет» без их числа соврало бы о состоянии.
+        log.ok(f"линтер планов: файлов {len(lint.files)}, проблем нет"
+               + (f", предупреждений {len(lint.warnings)}" if lint.warnings else ""))
+    # Л20 — предупреждения, а не проблемы: план без строки `Конституция:` в шапке.
+    for warning in lint.warnings[:10]:
+        log.warn(str(warning))

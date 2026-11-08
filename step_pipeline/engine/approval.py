@@ -12,7 +12,8 @@
 
 Порядок состояний `review_status` намеренно жёсткий: `skipped` (план старого формата,
 строки `Конституция:` нет) → `missing` (отчёта нет) → `invalid` (вердикт не распознан) →
-`unbound` (нет метки) → `stale` (метка не равна sha плана) → `fresh`. Ровно одно из них
+`unbound` (нет метки) → `unreferenced` (вердикт привязан, но ревью не сослалось на пункты
+конституции) → `stale` (метка не равна sha плана) → `fresh`. Ровно одно из них
 попадает в причину, и причина сама называет, чего не хватает.
 
 Модуль самодостаточен: только stdlib (`hashlib`, `json`, `re`, `pathlib`), импортов
@@ -36,6 +37,12 @@ VERDICT_RE = re.compile(r"^#{0,4}\s*ВЕРДИКТ\s*:\s*(APPROVE|REQUEST_CHANGE
 COMMIT_RE = re.compile(r"коммит\S*\s*`([0-9a-f]{7,40})`", re.IGNORECASE)
 # Метка привязки вердикта к версии плана: `plan_sha256: <64 hex>` в отчёте ревью.
 PLAN_SHA_RE = re.compile(r"plan_sha256\s*[:=]\s*`?([0-9a-f]{64})", re.IGNORECASE)
+# Ссылка отчёта ревью на пункты конституции (§5a, решение D4 шага 5-S9): строка
+# начинается с `Конституция:` (допускается маркер списка) и содержит хотя бы одну цифру
+# в той же строке. Признак — названный номер пункта: «план соответствует конституции»
+# без номера ссылкой не считается, и проверить находку нечем.
+CONSTITUTION_REF_RE = re.compile(r"^\s*(?:[-*+]\s*)?Конституция\s*:[^\n]*\d",
+                                 re.IGNORECASE | re.MULTILINE)
 
 # Строка шапки плана действующего формата (`docs/PLAN-FORMAT.md:196`). Дискриминатор,
 # а не украшение: планы 2-4 и фикстуры тестов строки не имеют и ревью плана не требуют.
@@ -48,6 +55,7 @@ REVIEW_SKIPPED = "skipped"
 REVIEW_MISSING = "missing"
 REVIEW_INVALID = "invalid"
 REVIEW_UNBOUND = "unbound"
+REVIEW_UNREFERENCED = "unreferenced"
 REVIEW_STALE = "stale"
 
 
@@ -175,6 +183,15 @@ def review_status(cfg, spec) -> dict:
         result["state"] = REVIEW_UNBOUND
         result["reason"] = (f"в отчёте {rel} нет метки plan_sha256: вердикт ревью плана "
                             f"{spec.id} не привязан к версии плана")
+        return result
+    if not CONSTITUTION_REF_RE.search(text):
+        # Вердикт привязан к версии плана, но соответствие принципам не проверено (§5a):
+        # шаги не открываются, пока ревьюер не назовёт номер пункта конституции.
+        result["state"] = REVIEW_UNREFERENCED
+        result["reason"] = (
+            f"в отчёте {rel} нет ссылки на пункты конституции: нужна строка "
+            f"«Конституция: п.N — …»; ревью плана {spec.id} обязано назвать пункты "
+            f"конституции проекта")
         return result
     if label != file_sha:
         result["state"] = REVIEW_STALE

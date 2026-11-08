@@ -99,9 +99,18 @@ def plan_sha(root: Path, name: str) -> str:
     return hashlib.sha256((root / "docs" / "plans" / name).read_bytes()).hexdigest()
 
 
-def report_text(verdict: str, sha: str | None = None, extra: str = "") -> str:
-    """Файл вердикта ревью плана; `plan_sha256:` — метка привязки к версии плана."""
-    text = f"# 1. Ревью плана\n\n## Вердикт шага\n\n## ВЕРДИКТ: {verdict}\n"
+def report_text(verdict: str, sha: str | None = None, extra: str = "",
+                constitution: bool = True) -> str:
+    """Файл вердикта ревью плана; `plan_sha256:` — метка привязки к версии плана.
+
+    Строка `Конституция: …` обязательна с шага 5-S9: без неё вердикт получает состояние
+    `unreferenced` и свежим не считается. `constitution=False` — только тестам про это
+    состояние.
+    """
+    text = f"# 1. Ревью плана\n\n## Вердикт шага\n"
+    if constitution:
+        text += "\nКонституция: п.1, п.7 — нарушений нет\n"
+    text += f"\n## ВЕРДИКТ: {verdict}\n"
     if sha is not None:
         text += f"\nplan_sha256: {sha}\n"
     return text + extra
@@ -258,3 +267,16 @@ def test_metrics_tiles_and_empty_project(tmp_path: Path) -> None:
     assert line.startswith("Цикл:")
     assert "с разведкой 1" in line
     assert "из 3" in line
+
+
+def test_metrics_counts_unreferenced_review(tmp_path: Path) -> None:
+    """Вердикт без строки конституции — `unreferenced`, свежим не считается (§5a, шаг S9)."""
+    root = make_project(tmp_path / "project", {"1-plan.md": plan_text("1. План 1")})
+    (root / "docs" / "reviews" / "plan-1.md").write_text(
+        report_text("APPROVE", sha=plan_sha(root, "1-plan.md"), constitution=False),
+        encoding="utf-8")
+
+    data = metrics(root)
+
+    assert data["plan_reviews_unreferenced"] == 1
+    assert data["plan_reviews"] == 0
