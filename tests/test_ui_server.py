@@ -264,6 +264,51 @@ def test_cards_and_journal_in_snapshot(server):
     assert data["plan"]["steps"][0]["closed"] is False
 
 
+def card_stamp(ts: int) -> str:
+    """Метка карточки так, как её пишет снимок: «05.11.2026 12:47» в локальной зоне."""
+    return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts))
+
+
+def test_overview_cards_show_work_start_and_end(server):
+    """Блок «Карточки ролей»: у закрытой карточки начало и окончание, у идущей — только начало.
+
+    Начало — время, когда карточку взяли в работу (`started_at`); у карточки, которая ещё
+    не начиналась, — создание, чтобы строка не осталась без времени. Окончание — только
+    `completed_at`: карточка в работе его не имеет.
+    """
+    now = int(time.time())
+    done_key = "planloop:1:S1:step"
+    live_key = "planloop:1:S1:review"
+    add_step_card(server["db"], done_key, "demo", now - 5000)
+    set_card_times(server["db"], ":step", started=now - 4000, completed=now - 600)
+    add_step_card(server["db"], live_key, "demo", now - 900, status="running")
+
+    status, data = get(server["url"] + "/api/snapshot?plan=1")
+    assert status == 200
+    shown = {card["idempotency_key"]: card for card in data["cards"]}
+    assert shown[done_key]["start"] == card_stamp(now - 4000)
+    assert shown[done_key]["end"] == card_stamp(now - 600)
+    assert shown[live_key]["start"] == card_stamp(now - 900)
+    assert shown[live_key]["end"] == ""
+
+    html = index_html()
+    assert "начало ${c.start}" in html and "окончание ${c.end}" in html
+
+
+def test_overview_card_without_times_has_no_1970(server):
+    """Пустые метки — пустые строки, а не 1970 год: нули в колонке меткой не считаются."""
+    now = int(time.time())
+    key = "planloop:1:S2:step"
+    add_step_card(server["db"], key, "demo", now - 100)
+    set_card_times(server["db"], ":step", started=0, completed=0)
+
+    status, data = get(server["url"] + "/api/snapshot?plan=1")
+    assert status == 200
+    card = next(item for item in data["cards"] if item["idempotency_key"] == key)
+    assert card["start"] == card_stamp(now - 100)     # от создания
+    assert card["end"] == ""
+
+
 def test_post_with_text_plain_is_rejected(server):
     status, data = post(server["url"], {"action": "stop", "reason": "csrf"},
                         headers={"Content-Type": "text/plain"})

@@ -103,6 +103,9 @@ def cards(db: Path, limit: int = 30, key_prefix: str | None = None) -> list[dict
     Схема читается по факту: колонки менялись между версиями. `key_prefix` — фильтр в
     SQL, а не окно «последние N задач»: иначе карточки старого шага выпадали из выборки
     (находка ревью 3-S3).
+
+    Кроме колонок борды в словаре две готовые метки времени — `start` и `end`
+    (`_card_times`): их рисует блок «Карточки ролей», страница метки не считает.
     """
     con = _ro(db)
     if con is None:
@@ -126,7 +129,13 @@ def cards(db: Path, limit: int = 30, key_prefix: str | None = None) -> list[dict
         return []
     finally:
         con.close()
-    return [dict(zip(cols, row)) for row in rows]
+    out = []
+    for row in rows:
+        card = dict(zip(cols, row))
+        # Метки для блока «Карточки ролей» — готовыми строками: страница их только рисует.
+        card["start"], card["end"] = _card_times(card)
+        out.append(card)
+    return out
 
 
 def journal_tail(project: Path, plan_file: str | None, limit: int = 8) -> list[list[str]]:
@@ -169,6 +178,19 @@ def _ts(value) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     return None
+
+
+def _card_times(card: dict) -> tuple[str, str]:
+    """Начало и окончание работы карточки для блока «Карточки ролей».
+
+    Начало — `started_at`, а у карточки, которая ещё не начиналась, — `created_at`:
+    строка блока не остаётся без времени. Окончание — только `completed_at`; у карточки
+    в работе его нет по определению, значит вторая метка пустая (D10 — пусто, не нули).
+    `0` в колонке — тоже «метки нет»: иначе страница показала бы 1970 год.
+    """
+    start = _ts(card.get("started_at")) or _ts(card.get("created_at"))
+    end = _ts(card.get("completed_at"))
+    return _fmt_ts(start or None), _fmt_ts(end or None)
 
 
 def _fmt_ts(ts, with_seconds: bool = False) -> str:

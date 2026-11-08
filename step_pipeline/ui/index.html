@@ -1715,10 +1715,17 @@ function render(data) {
 
   $("cards").innerHTML = (data.cards || []).map((c) => {
     const cls = c.status === "done" ? "ok" : (["crashed", "blocked", "timed_out", "gave_up"].includes(c.status) ? "bad" : "run");
+    // Начало и окончание работы карточки считает сервер (`start`/`end`): у карточки
+    // в работе окончания нет, поэтому вторая метка остаётся пустой, а не «сейчас».
+    const times = [
+      c.start ? `начало ${c.start}` : "",
+      c.end ? `окончание ${c.end}` : "",
+    ].filter(Boolean).join(" · ");
     return `<li class="card"><div class="row1">
       <span class="title">${esc(c.title)}</span>
       <span class="pill ${cls}">${esc(c.status)}</span></div>
-      <div class="muted mono">${esc(c.assignee || "")} · ${esc(c.id)}</div></li>`;
+      <div class="muted mono">${esc(c.assignee || "")} · ${esc(c.id)}</div>
+      ${times ? `<div class="muted mono">${esc(times)}</div>` : ""}</li>`;
   }).join("") || `<li class="muted">карточек нет</li>`;
 
   $("journal").innerHTML = (data.journal || []).map((row) => `
