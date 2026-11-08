@@ -662,14 +662,65 @@ def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
     return "\n".join(lines)
 
 
+class UnknownAssignee(Exception):
+    """Токен «Исполнитель:» — ни профиль, ни маршрут: карточку ставить некуда (план 5, S7).
+
+    Исключение, а не тихий переход к драйверу: шаг с опечаткой в профиле обязан встать
+    инцидентным стопом с перечнем того, что писать можно.
+    """
+
+    def __init__(self, step_id: str, token: str, known: set[str]) -> None:
+        self.step_id = str(step_id)
+        self.token = str(token)
+        self.known = set(known)
+        super().__init__(f"шаг {self.step_id}: неизвестный исполнитель {self.token!r}")
+
+
+def unknown_assignee_reason(p: Paths, step: dict, exc: UnknownAssignee) -> str:
+    """Текст стопа «неизвестный исполнитель»: предметки, профили и что с этим делать."""
+    subjects = ", ".join(config_mod.SUBJECT_AREAS)
+    known = ", ".join(sorted(exc.known)) or "—"
+    step_id = step.get("id") or exc.step_id
+    return (f"шаг {step_id}: исполнитель `{exc.token}` — не профиль и не предметка маршрута, "
+            f"план не начинаю; предметки: {subjects}; профили: {known}; укажи профиль из "
+            f"`profiles` или добавь предметку в `routing`")
+
+
 def _step_assignee(p: Paths, step: dict) -> str:
-    """Профиль-исполнитель карточки: владелец шага, иначе драйвер из pipeline.json."""
+    """Профиль-исполнитель карточки: явный профиль, предметка маршрута, иначе драйвер.
+
+    Порядок именно такой: имя профиля сильнее предметки (владелец мог назвать роль
+    буквально), предметка без записи в `routing` ведёт к драйверу. Токен, который не
+    профиль и не предметка, — `UnknownAssignee`, а не молчаливый драйвер (S7).
+    """
     owner = str(step.get("owner") or "").strip()
+    raw_profiles = (p.cfg._raw or {}).get("profiles")
+    profiles = ({str(value).strip() for value in raw_profiles.values()}
+                if isinstance(raw_profiles, dict) else set())
+    routing = config_mod.routing_map(p.cfg)
     for token in re.split(r"[+,/]", owner):
         token = token.strip().strip("`")
-        if re.fullmatch(r"[a-z][a-z0-9_-]{1,30}", token):
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,30}", token):
+            continue
+        if token in profiles:
             return token
+        if token in config_mod.SUBJECT_AREAS:
+            return routing.get(token, p.cfg.driver)
+        raise UnknownAssignee(str(step.get("id") or ""), token,
+                              config_mod.known_profiles(p.cfg))
     return p.cfg.driver
+
+
+def assignee_error(p: Paths, step: dict) -> str:
+    """Причина, по которой карточку шага ставить некуда, или "" (S7).
+
+    Нужна и решению (инцидентный стоп вместо повторного снятия), и тексту стопа.
+    """
+    try:
+        _step_assignee(p, step)
+    except UnknownAssignee as exc:
+        return unknown_assignee_reason(p, step, exc)
+    return ""
 
 
 def scout_card_body(p: Paths, steps: list[dict]) -> str:
@@ -1081,6 +1132,10 @@ def build_ctx(p: Paths) -> dict:
     # Постановка шага, её свежесть и постановка N+1 (правила 1-3 плана 2 S6). Стоимость:
     # один `git diff` на тик и только когда постановка есть.
     ctx["steps"] = list(pkg.get("steps") or [])
+    # S7: карточку некуда ставить, если «Исполнитель:» шага — не профиль и не предметка
+    # маршрута. Причина лежит в `ctx`, чтобы решение (`decide`) видело её без `Paths`:
+    # иначе тик «снимал» бы инцидент и ставил его заново каждые 10 минут.
+    ctx["assignee_error"] = assignee_error(p, step or {})
     prompt = prompt_rel(p, step["id"]) if step else None
     recon = prompt_recon(Path(p.repo) / prompt) if prompt else None
     ctx["prompt"] = prompt
@@ -1232,6 +1287,11 @@ def _decide_base(ctx: dict) -> dict:
     cards = ctx.get("cards") or []
     steps = card_of(cards, "step")
     if not steps:
+        if ctx.get("assignee_error"):
+            # S7: «Исполнитель:» не профиль и не предметка маршрута — карточки нет, стоп.
+            # Решение, а не отказ ветки создания: иначе тик снимал бы инцидент и ставил
+            # его заново, уведомляя владельца каждые 10 минут.
+            return {"action": "stop", "step": sid, "reason": ctx["assignee_error"]}
         # Рискованный шаг не получает НИ ОДНОЙ карточки (включая заказ постановки),
         # пока владелец не допустил: проверка стоит внутри «карточки шага ещё нет»,
         # иначе уже начатый шаг застрял бы на hold и не дошёл до ревью (D5).
@@ -2824,6 +2884,25 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             state.pop(key, None)
         save_state(p, state)
 
+    def assignee_or_stop(step: dict) -> tuple[str | None, str]:
+        """Исполнитель карточки или инцидентный стоп — одна проверка на шаг и правки (S7).
+
+        Возврат `(профиль, "")` — карточку можно ставить; `(None, причина)` — стоп уже
+        записан (или уже стоял с той же причиной: второй раз не уведомляем).
+        """
+        try:
+            return _step_assignee(p, step), ""
+        except UnknownAssignee as exc:
+            reason = unknown_assignee_reason(p, step, exc)
+            if (load_stop(p) or {}).get("reason") == reason:
+                result.update(applied=False, detail=reason)
+                return None, reason
+            write_stop(p, reason, "gate", kind="incident")
+            result.update(applied=True, detail=reason)
+            touch(f"stop:assignee:{exc.step_id}")
+            say("⛔ " + reason)
+            return None, reason
+
     action = decision["action"]
     if action == "idle":
         # Простой виден только здесь (и в tick), поэтому и записывается здесь.
@@ -2873,8 +2952,11 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             say("⛔ " + reason)
             return result
         key = f"planloop:{plan_id}:{step['id']}:step"
+        assignee, reason = assignee_or_stop(step)
+        if assignee is None:
+            return result
         cid = create_card(p, f"[план {plan_id} {step['id']}] {step['title']}",
-                          step_card_body(p, step, prompt), _step_assignee(p, step), key,
+                          step_card_body(p, step, prompt), assignee, key,
                           p.cfg.step_skills, max_runtime=p.cfg.step_runtime)
         result.update(applied=bool(cid), detail=f"карточка шага: {cid}")
         touch(f"create_step:{cid}")
@@ -3075,11 +3157,14 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         return result
     if action == "create_fix":
         step, round_no = decision["data"], decision["round"]
+        assignee, reason = assignee_or_stop(step)
+        if assignee is None:
+            return result
         key = f"planloop:{plan_id}:{step['id']}:fix:{round_no}"
         report_rel = _report_rel(p, step["id"])
         cid = create_card(p, f"[правки {plan_id} {step['id']} #{round_no}] {step['title']}",
                           fix_card_body(p, step, round_no, report_rel),
-                          _step_assignee(p, step), key, p.cfg.step_skills,
+                          assignee, key, p.cfg.step_skills,
                           parent=decision.get("parent"), max_runtime=p.cfg.step_runtime)
         result.update(applied=bool(cid), detail=f"карточка правок: {cid}")
         touch(f"create_fix:{cid}")

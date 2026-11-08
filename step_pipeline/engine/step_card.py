@@ -56,7 +56,14 @@ def main(argv: list[str] | None = None) -> int:
         print(body)
         return 0
 
-    cid = gate._create_card(p, title, body, gate._step_assignee(p, step),
+    try:
+        assignee = gate._step_assignee(p, step)
+    except gate.UnknownAssignee as exc:
+        # Тот же текст, что пишет страж в стоп-флаг: ручной толчок не должен придумывать
+        # свой формат ошибки (план 5, S7).
+        print(f"ошибка: {gate.unknown_assignee_reason(p, step, exc)}", file=sys.stderr)
+        return 2
+    cid = gate._create_card(p, title, body, assignee,
                             f"planloop:{p.plan_id}:{step['id']}:step",
                             p.cfg.step_skills, max_runtime=p.cfg.step_runtime)
     if not cid:

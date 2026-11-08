@@ -9,6 +9,13 @@
     "reviewer": "reviewer",
     "scout": "scout"
   },
+  "routing": {
+    "frontend": "pipeline",
+    "backend": "pipeline",
+    "devops": "pipeline",
+    "designer": "pipeline",
+    "security": "pipeline"
+  },
   "skills": {
     "step": [
       "pipeline-next-step"

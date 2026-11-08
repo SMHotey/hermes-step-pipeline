@@ -34,6 +34,10 @@ DEFAULTS: dict = {
     "project": "project",
     "board": "default",
     "profiles": {"driver": "default", "prompter": "prompter", "reviewer": "reviewer"},
+    # Маршрут «предметка → профиль»: `routing` в pipeline.json (план 5, S7). Пустой словарь —
+    # маршрута нет: предметка ведёт к драйверу, как до шага. Ключи владельца не трогаем —
+    # `profiles` описывает профили по ролям, а здесь предметки шага.
+    "routing": {},
     "skills": {
         "step": ["pipeline-next-step"],
         "review": ["pipeline-reviewer"],
@@ -100,6 +104,14 @@ DEFAULTS: dict = {
 # Режимы ревью постановки: иное значение в pipeline.json — ошибка конфигурации, а не
 # молчаливое «auto»: владелец должен узнать, что его настройка не подействовала.
 PROMPT_REVIEW_MODES = ("auto", "always", "never")
+
+# Предметки, которые движок знает по имени (план 5, S7). Их не надо объявлять в конфиге:
+# маршрут лишь говорит, какому профилю предметка соответствует. Предметки без записи в
+# `routing` ведут к драйверу — поведение проектов до шага сохраняется.
+SUBJECT_AREAS = ("frontend", "backend", "devops", "designer", "security")
+
+# Ключ маршрута — то же ограничение, что у токена владельца в заголовке шага.
+ROUTING_KEY_RE = re.compile(r"[a-z][a-z0-9_-]{1,30}")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -191,6 +203,50 @@ class Config:
         return self._raw
 
     _raw: dict = None  # type: ignore[assignment]
+
+
+def routing_map(cfg: Config) -> dict[str, str]:
+    """Маршрут «предметка → профиль» из слитого конфига; мусор — `ConfigError`.
+
+    Ключ — предметка шага (ограничение токена владельца), значение — непустая строка
+    (имя профиля Hermes). Молчаливого отбрасывания нет: владелец должен узнать, что его
+    маршрут не подействовал (тот же принцип, что у `_fix_rounds`).
+    """
+    raw = (cfg._raw or {}).get("routing")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"routing должен быть объектом JSON, получено: {raw!r}")
+    out: dict[str, str] = {}
+    for key, target in raw.items():
+        name = str(key).strip()
+        if not ROUTING_KEY_RE.fullmatch(name):
+            raise ConfigError(
+                f"routing: ключ {name!r} не подходит под шаблон [a-z][a-z0-9_-]{{1,30}}")
+        if not isinstance(target, str) or not target.strip():
+            raise ConfigError(
+                f"routing: значение ключа {name!r} должно быть непустой строкой, "
+                f"получено: {target!r}")
+        out[name] = target.strip()
+    return out
+
+
+def known_profiles(cfg: Config) -> set[str]:
+    """Допустимые профили: значения `profiles` плюс значения маршрута.
+
+    Идёт в текст ошибки «неизвестный исполнитель»: владельцу нужен список того, что
+    действительно можно писать в «Исполнитель:».
+    """
+    raw = cfg._raw or {}
+    names: set[str] = set()
+    profiles = raw.get("profiles")
+    if isinstance(profiles, dict):
+        for value in profiles.values():
+            name = str(value).strip()
+            if name:
+                names.add(name)
+    names.update(routing_map(cfg).values())
+    return names
 
 
 def setup_stdio() -> None:
@@ -306,4 +362,7 @@ def load(repo: Path | str | None = None) -> Config:
         kanban_db=_kanban_db(board),
     )
     object.__setattr__(cfg, "_raw", raw)
+    # Маршрут предметок проверяется на загрузке: мусор в `routing` роняет конвейер с
+    # именем ключа, а не превращается в молчаливое «маршрута нет» (S7).
+    routing_map(cfg)
     return cfg

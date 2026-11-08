@@ -7,6 +7,13 @@
     "prompter": "prompter",
     "reviewer": "reviewer"
   },
+  "routing": {
+    "frontend": "myproject",
+    "backend": "myproject",
+    "devops": "myproject",
+    "designer": "myproject",
+    "security": "myproject"
+  },
   "skills": {
     "step": ["pipeline-next-step"],
     "review": ["pipeline-reviewer"],

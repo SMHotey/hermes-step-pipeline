@@ -100,6 +100,10 @@ def make_project(root: Path, board: str = "testboard", approved: bool = True,
                       .read_text(encoding="utf-8"))
     data.update({"project": "demo", "board": board})
     data["profiles"] = {"driver": "demo", "prompter": "prompter", "reviewer": "reviewer"}
+    # Маршрут предметок (план 5, S7): все пять предметок ведут к драйверу, как раньше —
+    # тесты, которым нужен другой маршрут, перекрывают `routing=` целиком.
+    data["routing"] = {area: "demo" for area in
+                       ("frontend", "backend", "devops", "designer", "security")}
     data["git"] = {"commit": False, "push": False}
     data.update(overrides)
     (root / "pipeline.json").write_text(json.dumps(data, ensure_ascii=False, indent=2),
