@@ -179,6 +179,45 @@ def test_unknown_owner_stops_and_no_card(tmp_path, hermes_stub, monkeypatch):
     assert gate.load_stop(p)["reason"] == stop["reason"]
 
 
+def test_owner_outside_template_stops_but_file_name_does_not(tmp_path, hermes_stub, monkeypatch):
+    """Токен вне шаблона — стоп, а имя файла в кавычках — нет (спека §4, S7).
+
+    Разбор заголовка берёт первый токен в обратных кавычках, поэтому граница важна:
+    заглавная опечатка профиля (`Backend`) останавливает конвейер, а `pipeline.json`
+    в том же месте — имя файла, шаг остаётся у драйвера.
+    """
+    root = make_project(tmp_path / "outside", routing={"backend": "reviewer"})
+    rewrite_plan(root, PLAN_TEMPLATE.format(
+        step1="### S1. Таблица счетов (1 дн) `Backend`\n\n- Готово = таблица создана"))
+    (root / "docs" / "prompts" / "2026-11-01_1-S1_prompt.md").write_text(
+        "# постановка шага S1\n", encoding="utf-8")
+    monkeypatch.setenv("PIPELINE_REPO", str(root))
+    p = gate.resolve_paths(config_mod.load(root), "1")
+    init_board(p)
+
+    first = gate.run_gate(p, notify_fn=quiet)
+
+    assert first["decision"]["action"] == "stop"
+    stop = gate.load_stop(p)
+    assert stop and stop["kind"] == "incident"
+    assert "Backend" in stop["reason"]
+    assert step_cards(hermes_stub, "planloop:1:S1:step") == []
+
+    plain = make_project(tmp_path / "artifact", routing={"backend": "reviewer"})
+    rewrite_plan(plain, PLAN_TEMPLATE.format(
+        step1="### S1. Таблица счетов (1 дн) `pipeline.json`\n\n- Готово = таблица создана"))
+    (plain / "docs" / "prompts" / "2026-11-01_1-S1_prompt.md").write_text(
+        "# постановка шага S1\n", encoding="utf-8")
+    monkeypatch.setenv("PIPELINE_REPO", str(plain))
+    p2 = gate.resolve_paths(config_mod.load(plain), "1")
+
+    second = gate.run_gate(p2, notify_fn=quiet)
+
+    assert second["decision"]["action"] == "create_step"
+    rows = step_cards(hermes_stub, "planloop:1:S1:step")
+    assert [row["assignee"] for row in rows] == ["demo"]
+
+
 def test_roles_readme_lists_every_role():
     """README ролей: семь ролей, у каждой — что решает, артефакт и чего не делает."""
     readme = ROLES / "README.md"

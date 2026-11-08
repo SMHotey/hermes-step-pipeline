@@ -689,19 +689,19 @@ def unknown_assignee_reason(p: Paths, step: dict, exc: UnknownAssignee) -> str:
 def _step_assignee(p: Paths, step: dict) -> str:
     """Профиль-исполнитель карточки: явный профиль, предметка маршрута, иначе драйвер.
 
-    Порядок именно такой: имя профиля сильнее предметки (владелец мог назвать роль
-    буквально), предметка без записи в `routing` ведёт к драйверу. Токен, который не
-    профиль и не предметка, — `UnknownAssignee`, а не молчаливый драйвер (S7).
+    Порядок именно такой: имя профиля сильнее предметки, предметка без записи в `routing`
+    ведёт к драйверу. Токен, который не профиль и не предметка, — `UnknownAssignee`
+    (S7), кроме пути и фразы из кавычек: `pipeline.json` — файл, а не исполнитель.
     """
     owner = str(step.get("owner") or "").strip()
     raw_profiles = (p.cfg._raw or {}).get("profiles")
     profiles = ({str(value).strip() for value in raw_profiles.values()}
                 if isinstance(raw_profiles, dict) else set())
     routing = config_mod.routing_map(p.cfg)
-    for token in re.split(r"[+,/]", owner):
+    for token in re.split(r"[+,]", owner):
         token = token.strip().strip("`")
-        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,30}", token):
-            continue
+        if not token or "." in token or "/" in token or " " in token:
+            continue          # пусто, путь или фраза из кавычек — не исполнитель
         if token in profiles:
             return token
         if token in config_mod.SUBJECT_AREAS:
@@ -2952,6 +2952,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             say("⛔ " + reason)
             return result
         key = f"planloop:{plan_id}:{step['id']}:step"
+        # Страховка: при текущем порядке решений тот же шаг уже остановлен в `_decide_base`
+        # (`assignee_error`), поэтому здесь проверка срабатывает только для правок.
         assignee, reason = assignee_or_stop(step)
         if assignee is None:
             return result
