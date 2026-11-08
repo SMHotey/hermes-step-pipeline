@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - запуск файлом при от�
 
 ENGINE_FILES = ("__init__.py", "config.py", "registry.py", "next_step.py", "gate.py",
                 "step_card.py", "check_task_prompt.py", "scout_report.py", "plan_cycle.py",
-                "approval.py", "tick.py",
+                "approval.py", "tick.py", "analyze.py",
                 "state_io.py")
 #: Маркер целостности: хеш содержимого движка, а не только номер версии.
 #: Без него копия в проекте может молча разойтись с плагином при равном VERSION

@@ -84,6 +84,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import analyze  # noqa: E402 - исход идеи, вопросы и ретроспектива (план 5, S10)
 import approval  # noqa: E402 - утверждение плана и привязка ревью к версии (S6)
 import config as config_mod  # noqa: E402 - модуль рядом
 import registry  # noqa: E402 - реестр планов
@@ -1122,7 +1123,11 @@ def build_ctx(p: Paths) -> dict:
                    plan_review_format=False, plan_review_ok=True, plan_review_reason="",
                    plan_review_cards=[], plan_review_verdict=None, plan_review_rel="",
                    plan_review_fresh=False, plan_started_journal=False,
-                   plan_review_profile="", plan_fix_cards=[])
+                   plan_review_profile="", plan_fix_cards=[],
+                   # Исход идеи, вопросы и ретроспектива (план 5, S10): те же ключи, что в
+                   # нормальной ветке, — решение обязано не падать `NameError` на сбое сборщика.
+                   plan_decision="", plan_decision_note="", questions_rel="",
+                   questions_open=None, retro_rel="", retro_missing=False)
         return ctx
     step = pkg.get("next")
     ctx["next"] = step
@@ -1171,6 +1176,18 @@ def build_ctx(p: Paths) -> dict:
     except OSError:
         plan_text = ""
     ctx["plan_review_ok"], ctx["plan_review_reason"] = plan_cycle.can_review(plan_text)
+    # Исход идеи и вопросы (план 5, S10): текст плана уже прочитан выше, второй раз файл не
+    # читается. `decide` получает только `ctx` (D4), поэтому строка «Решение:» разбирается
+    # здесь, а не в решении.
+    ctx["plan_decision"], ctx["plan_decision_note"] = analyze.plan_decision(plan_text)
+    questions = scout_research_dir(p.cfg) / f"{p.plan_id}-questions.md"
+    ctx["questions_rel"] = p.cfg.rel(questions)
+    ctx["questions_open"] = analyze.open_questions(questions)
+    # Ретроспектива после закрытия плана (D8): признак «файла ещё нет» — единственное, что
+    # решает, писать ли черновик; идемпотентность держится на существовании файла.
+    retro = Path(p.cfg.reviews_dir) / f"retro-{p.plan_id}.md"
+    ctx["retro_rel"] = p.cfg.rel(retro)
+    ctx["retro_missing"] = not retro.is_file()
     # Свежесть вердикта — привязка к sha плана из утверждения (S6). Имя намеренно новое:
     # `plan_review_ok` — про корректировку по разведке, `plan_review_verdict` — разобранный
     # отчёт, `plan_review_fresh` — признак «вердикт про эту версию плана».
@@ -1213,9 +1230,12 @@ def decide(ctx: dict) -> dict:
                     reason=f"стоп-причина снята (было: {stop.get('reason', '')}); "
                            f"дальше — {base['action']}")
     # Предзаказ постановки N+1 (правило 2): только поверх ожидания и без его блокировок.
+    # `plan_clarify` — тоже блокировка (план 5, S10): у плана, остановленного вопросами
+    # посередине, тик иначе заказал бы постановку следующего шага — работу, которую
+    # решение только что отложило.
     if (base["action"] == "idle" and not base.get("approval_blocked")
             and not base.get("incident") and not base.get("plan_done")
-            and not base.get("close_blocked")):
+            and not base.get("close_blocked") and not base.get("plan_clarify")):
         prefetch = _prefetch_decision(ctx)
         if prefetch:
             return prefetch
@@ -1233,6 +1253,9 @@ def _decide_base(ctx: dict) -> dict:
             return {"action": "idle",
                     "reason": f"у плана {ctx.get('plan_id')} не распознан раздел шагов — "
                               f"конвейер его не ведёт"}
+        retro = _retro_decision(ctx)
+        if retro:
+            return retro
         return {"action": "idle", "reason": "план закрыт — следующих шагов нет", "plan_done": True}
     sid = step["id"]
     approval = ctx.get("approval") or {}
@@ -1255,6 +1278,12 @@ def _decide_base(ctx: dict) -> dict:
     scout = _scout_decision(ctx)
     if scout:
         return scout
+    # Исход — из раздела «Разведка» плана (D5, D7): `plan_decision(ctx)` читает строку
+    # `Решение:` из ctx, совпадение с артефактом стережёт A3. Стоит до ревью плана:
+    # ревью плана, который решено не делать, — работа впустую.
+    plan_decision = _plan_decision(ctx)
+    if plan_decision:
+        return plan_decision
     # Ревью плана — второе предусловие плана, после разведки и до карточек шагов (C9, C10):
     # пока вердикта APPROVE нет, шаг не начинается (D5).
     plan_review = _plan_review_decision(ctx)
@@ -1447,6 +1476,43 @@ def _scout_decision(ctx: dict) -> dict | None:
     return {"action": "stop",
             "reason": (f"разведка плана {plan_id} упала: карточка {card.get('id')} "
                        f"в статусе {status}: {detail}")}
+
+
+def _plan_decision(ctx: dict) -> dict | None:
+    """Исход разведки как предусловие плана: kill закрывает, needs-clarification ждёт.
+
+    Чистое решение планового уровня: строка «Решение:» разобрана в `build_ctx`, совпадение
+    с артефактом стережёт анализатор (A3). Поля `step` нет намеренно — как у решения
+    разведки: иначе `step_key` счёл бы его действием шага (D5).
+    """
+    kind = str(ctx.get("plan_decision") or "")
+    plan_id = ctx.get("plan_id")
+    if kind == "kill":
+        note = str(ctx.get("plan_decision_note") or "").strip() or "причина — в разделе «Разведка»"
+        return {"action": "idle", "plan_done": True, "plan_killed": True,
+                "reason": f"план {plan_id} закрыт исходом kill (разведка): {note}"}
+    if kind == "needs-clarification":
+        opened = ctx.get("questions_open")
+        if opened is None:
+            detail = f"файла вопросов нет: {ctx.get('questions_rel')}"
+        elif opened[0]:
+            detail = f"открыто {opened[0]} из {opened[1]}: {ctx.get('questions_rel')}"
+        else:
+            detail = f"все ответы получены ({opened[1]}) — переведи план в go"
+        return {"action": "idle", "plan_clarify": True,
+                "reason": f"план {plan_id} ждёт ответов на вопросы — {detail}"}
+    return None
+
+
+def _retro_decision(ctx: dict) -> dict | None:
+    """Черновик ретроспективы: шаги плана закрыты, файла ещё нет (D8)."""
+    if str(ctx.get("plan_decision") or "") == "kill":
+        return None
+    if not ctx.get("retro_missing") or not ctx.get("steps_total") or not ctx.get("closed"):
+        return None
+    return {"action": "write_retro",
+            "reason": f"план {ctx.get('plan_id')} закрыт — кладём черновик ретроспективы "
+                      f"{ctx.get('retro_rel')}"}
 
 
 def _plan_review_decision(ctx: dict) -> dict | None:
@@ -1868,6 +1934,10 @@ def status_text(ctx: dict, decision: dict) -> str:
                      f"вердикт {ctx['prev_verdict']['verdict']}")
     if ctx.get("stop"):
         lines.append(f"СТОП-ФЛАГ: {ctx['stop'].get('reason')} (с {ctx['stop'].get('at')})")
+    # Исход идеи виден владельцу всегда (план 5, S10): по нему решается, идёт план или нет.
+    kind = str(ctx.get("plan_decision") or "")
+    lines.append(f"Исход разведки: {kind} — {ctx.get('plan_decision_note') or 'без пояснения'}"
+                 if kind else "Исход разведки: не назван")
     lines.append(f"Решение: {decision['action']} — {decision.get('reason', '')}")
     return "\n".join(lines)
 
@@ -3235,6 +3305,25 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             save_state(p, state)
             say(f"шаг {step['id']} принят ревью, но коммит/пуш не выполнен: {detail}. "
                 f"Повторю сам, как только дерево освободится")
+        return result
+    if action == "write_retro":
+        path = Path(p.cfg.reviews_dir) / f"retro-{p.plan_id}.md"
+        rel = p.cfg.rel(path)
+        if path.exists():                      # идемпотентность: файл уже положен (D8)
+            result.update(applied=False, detail=f"ретроспектива уже есть: {rel}")
+            return result
+        try:
+            text = Path(p.plan_file).read_text(encoding="utf-8", errors="replace")
+            state_io.atomic_write_text(
+                path, analyze.retro_text(text, p.cfg.rel(Path(p.plan_file)), p.plan_id,
+                                         _local_date(_now())))
+        except OSError as exc:
+            print(f"[retro] черновик не записан: {exc}", file=sys.stderr)
+            result.update(applied=False, detail=f"ретроспектива не записана: {rel}")
+            return result
+        result.update(applied=True, detail=f"черновик ретроспективы: {rel}")
+        touch(f"retro:{p.plan_id}")
+        say(f"📝 план {p.plan_id} закрыт — ретроспектива: {rel} (заполняет владелец)")
         return result
     if action == "stop":
         reason = decision.get("reason", "")
