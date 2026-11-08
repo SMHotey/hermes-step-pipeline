@@ -89,10 +89,11 @@ def rewrite_plan(root: Path, plan_text: str) -> Path:
     return path
 
 
-def test_subject_from_heading_routes_card_to_mapped_profile(tmp_path, hermes_stub,
-                                                           monkeypatch):
+def test_subject_routes_to_mapped_profile(tmp_path, hermes_stub, monkeypatch):
     """Предметка `backend` в хвосте заголовка → профиль из `routing`, а не драйвер."""
-    root = make_project(tmp_path / "route", routing={"backend": "reviewer"})
+    root = make_project(tmp_path / "route", routing={"backend": "reviewer",
+                                                    "frontend": "demo", "devops": "demo",
+                                                    "designer": "demo", "security": "demo"})
     monkeypatch.setenv("PIPELINE_REPO", str(root))
     module = load_step_card()
 
@@ -104,7 +105,7 @@ def test_subject_from_heading_routes_card_to_mapped_profile(tmp_path, hermes_stu
     assert rows[0]["assignee"] == "reviewer"
 
 
-def test_subject_without_mapping_keeps_driver(tmp_path, hermes_stub, monkeypatch):
+def test_subject_without_route_goes_to_driver(tmp_path, hermes_stub, monkeypatch):
     """Маршрута нет — предметка ведёт к драйверу, как было до шага (поведение не ломаем)."""
     root = make_project(tmp_path / "plain", routing={})
     monkeypatch.setenv("PIPELINE_REPO", str(root))
@@ -116,9 +117,11 @@ def test_subject_without_mapping_keeps_driver(tmp_path, hermes_stub, monkeypatch
     assert rows[0]["assignee"] == "demo"
 
 
-def test_point_ispolnitel_profile_name_wins_over_routing(tmp_path, hermes_stub, monkeypatch):
+def test_owner_profile_name_is_used_as_is(tmp_path, hermes_stub, monkeypatch):
     """Явное имя профиля сильнее маршрута: владелец назвал роль буквально."""
     root = make_project(tmp_path / "point", routing={"backend": "demo"})
+    # Токен пункта читается из обратных кавычек (`next_step._OWNER_RE`): запись
+    # «Исполнитель: reviewer» без них разбор не видит — S7 это поведение не меняет.
     rewrite_plan(root, PLAN_TEMPLATE.format(
         step1=S1_DEFAULT + "\n- Исполнитель: `reviewer`"))
     monkeypatch.setenv("PIPELINE_REPO", str(root))
@@ -142,7 +145,7 @@ def test_step_without_owner_goes_to_driver(tmp_path, hermes_stub, monkeypatch):
     assert rows[0]["assignee"] == "demo"
 
 
-def test_unknown_owner_stops_instead_of_silent_driver(tmp_path, hermes_stub, monkeypatch):
+def test_unknown_owner_stops_and_no_card(tmp_path, hermes_stub, monkeypatch):
     """Опечатка в профиле (`bckend`) — инцидентный стоп, карточки нет и во втором тике."""
     root = make_project(tmp_path / "typo", routing={"backend": "reviewer"})
     rewrite_plan(root, PLAN_TEMPLATE.format(
@@ -176,7 +179,7 @@ def test_unknown_owner_stops_instead_of_silent_driver(tmp_path, hermes_stub, mon
     assert gate.load_stop(p)["reason"] == stop["reason"]
 
 
-def test_roles_readme_documents_every_role():
+def test_roles_readme_lists_every_role():
     """README ролей: семь ролей, у каждой — что решает, артефакт и чего не делает."""
     readme = ROLES / "README.md"
     assert readme.is_file(), "нет README ролей — не сказано, что роль решает и чего нет"

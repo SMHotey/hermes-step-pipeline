@@ -2899,7 +2899,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 return None, reason
             write_stop(p, reason, "gate", kind="incident")
             result.update(applied=True, detail=reason)
-            touch(f"stop:assignee:{exc.step_id}")
+            touch("stop:assignee")
             say("⛔ " + reason)
             return None, reason
 
