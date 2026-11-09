@@ -1,21 +1,67 @@
 name: CI
 
+# Минуты Actions для приватных репозиториев платные (Windows ×2), поэтому экономия заложена
+# в триггеры: обычный push в main гоняет один быстрый джоб, полная матрица — только PR,
+# теги и ручной запуск.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".pipeline/**"
+      - ".hermes/**"
   pull_request:
+  workflow_dispatch:
 
+# Новый пуш в ту же ветку отменяет предыдущий незавершённый прогон.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Общие переменные и шаги дублируются в двух джобах намеренно: job-level `if` не видит
+# `matrix`, поэтому «быстрый» и «полный» прогоны разделены, а не отфильтрованы по матрице.
+# Меняя шаги ниже — меняй их в обоих джобах (tests и tests-matrix).
 jobs:
+  # Быстрая проверка: push в main и PR от форков, один linux-джоб.
   tests:
+    name: pytest Ubuntu / py3.11
+    runs-on: ubuntu-latest
+    # Полный прогон в tests-matrix; здесь — только push в main, чтобы не считать дважды.
+    if: github.event_name == 'push' && github.ref_type == 'branch'
+    # Замер идёт и в дочерних процессах: sitecustomize.py в корне подхватывает конфиг
+    # по COVERAGE_PROCESS_START, данные детей сводятся в один абсолютный COVERAGE_FILE.
+    env:
+      COVERAGE_PROCESS_START: ${{ github.workspace }}/.coveragerc
+      COVERAGE_FILE: ${{ github.workspace }}/.coverage
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Зависимости
+        run: python -m pip install --upgrade pip pytest coverage==7.17.0
+      - name: Тесты с покрытием (подпроцессы движка тоже меряются)
+        run: python -m coverage run --parallel-mode -m pytest
+      - name: Свести данные покрытия
+        run: python -m coverage combine
+      - name: Отчёт покрытия (порог fail_under — из .coveragerc)
+        run: python -m coverage report -m
+      - name: Гейт покрытия gate.py
+        run: python -m coverage report --include="**/step_pipeline/engine/gate.py" --fail-under=55
+
+  # Полная матрица: PR, теги и ручной запуск.
+  tests-matrix:
     name: pytest ${{ matrix.os }} / py${{ matrix.python }}
     runs-on: ${{ matrix.os }}
+    if: github.event_name != 'push' || github.ref_type == 'tag'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
         python: ["3.11", "3.13"]
-    # Замер идёт и в дочерних процессах: sitecustomize.py в корне подхватывает конфиг
-    # по COVERAGE_PROCESS_START, данные детей сводятся в один абсолютный COVERAGE_FILE.
     env:
       COVERAGE_PROCESS_START: ${{ github.workspace }}/.coveragerc
       COVERAGE_FILE: ${{ github.workspace }}/.coverage
@@ -35,28 +81,17 @@ jobs:
         run: python -m coverage report -m
       - name: Гейт покрытия gate.py
         run: python -m coverage report --include="**/step_pipeline/engine/gate.py" --fail-under=55
-
-  # Валидация манифеста — отдельный job: он не зависит от того, есть ли hermes в раннере
-  # job tests, и падает, если валидация невозможна, вместо молчаливого «шаг пропущен».
-  # Composite action plugin-validate@v2026.9.24 не годится: он ставит hermes через
-  # `pip install git+...`, а setup.py в этом теге запрещает сборку колеса/сдиста
-  # («Building wheels or sdists for hermes-agent is not supported»). Рабочий поддерживаемый
-  # git-путь — editable-установка из копии репозитория; версия та же, что у владельца.
-  manifest:
-    name: Манифест плагина
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
+      # Манифест проверяется один раз, на ubuntu/3.11 — здесь же, чтобы не платить за третий джоб.
       - name: Копия hermes-agent (тег v2026.9.24)
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
         uses: actions/checkout@v7
         with:
           repository: NousResearch/hermes-agent
           ref: v2026.9.24
           path: .hermes-agent
       - name: Установка hermes
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
         run: python -m pip install -e ./.hermes-agent
       - name: hermes plugins validate step_pipeline
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
         run: python -m hermes_cli.main plugins validate step_pipeline
