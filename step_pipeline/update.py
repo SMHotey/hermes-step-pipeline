@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
 import tarfile
@@ -57,10 +58,27 @@ def local_version(explicit: Path | str | None = None) -> str:
     return match.group(1) if match else "0"
 
 
+def github_token() -> str:
+    """Токен только для private-репозиториев: `GITHUB_TOKEN`/`GH_TOKEN` из окружения.
+
+    Публичному репозиторию токен не нужен вовсе; без него приватный отвечает 404 на
+    `releases/latest` и `tags`, и обновление молчит, как будто выпусков нет. Токен
+    берётся из `.env` профиля (или переменной окружения) и никуда не пишется в лог.
+    """
+    for name in ("GITHUB_TOKEN", "GH_TOKEN"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _http_get(url: str, timeout: float) -> bytes:
     """GET с User-Agent: GitHub без него отвечает 403, а Cloudflare режет запросы."""
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
-                                                   "Accept": "application/vnd.github+json"})
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
+    token = github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read()
 

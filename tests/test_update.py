@@ -98,6 +98,18 @@ def test_latest_without_network_is_an_error_not_up_to_date():
     assert "сети нет" in info["error"]
 
 
+def test_github_token_is_taken_from_env_and_never_required(monkeypatch):
+    """Токен — только для private-репо: берём из окружения, пустое значение — «нет»."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    assert update.github_token() == ""
+    monkeypatch.setenv("GITHUB_TOKEN", "  ")
+    monkeypatch.setenv("GH_TOKEN", "gh-token")
+    assert update.github_token() == "gh-token"
+    monkeypatch.setenv("GITHUB_TOKEN", "main-token")
+    assert update.github_token() == "main-token"
+
+
 def test_no_releases_yet_is_quiet_not_an_error(tmp_path: Path):
     """Репозиторий без выпусков и тегов: 404 на обоих адресах — «нечего ставить», не сбой."""
     def nothing(url: str, timeout: float) -> bytes:

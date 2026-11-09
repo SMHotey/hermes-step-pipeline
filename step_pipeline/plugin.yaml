@@ -17,6 +17,7 @@ provides_hooks:
 optional_env:
   - STEP_PIPELINE_TELEGRAM_BOT_TOKEN
   - STEP_PIPELINE_TELEGRAM_CHAT_ID
+  - GITHUB_TOKEN
 config_schema:
   telegram_bot_token:
     type: secret
