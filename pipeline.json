@@ -2,7 +2,7 @@
   "project": "hermes-step-pipeline",
   "board": "step-pipeline",
   "ui_port": 8770,
-  "max_fix_rounds": 3,
+  "max_fix_rounds": 4,
   "profiles": {
     "driver": "pipeline",
     "prompter": "prompter",
