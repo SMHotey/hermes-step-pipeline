@@ -58,6 +58,20 @@ hermes pipeline setup --board myproj --driver myproj \
   --telegram-token 123456:ABC... --telegram-chat 42 --yes
 ```
 
+### Прокси Bot API (если `api.telegram.org` недоступен)
+
+Конвейер берёт адрес Bot API из окружения: `STEP_PIPELINE_TELEGRAM_API_BASE`, а если
+его нет — из общего ключа Hermes `TELEGRAM_API_BASE_URL` (то есть при уже настроенном
+прокси шлюза конвейер ходит через него без всякой настройки). Прокси-воркер Cloudflare
+отдаёт те же пути `/bot<токен>/<метод>`, поэтому подменяется только хост. Готовый
+скрипт воркера и порядок установки — [docs/TELEGRAM-PROXY.md](docs/TELEGRAM-PROXY.md).
+
+```bash
+# в .env профиля Hermes: адрес воркера; токен бота должен быть в секрете BOT_TOKENS
+STEP_PIPELINE_TELEGRAM_API_BASE=https://tg-botapi-proxy.<аккаунт>.workers.dev/bot
+hermes pipeline notify-test   # проверка: сообщение должно дойти
+```
+
 ## UI
 
 ```bash

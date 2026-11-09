@@ -2007,6 +2007,25 @@ def _create_card(p: Paths, title: str, body: str, assignee: str, key: str,
     return m.group(0) if m else None
 
 
+TG_USER_AGENT = "step-pipeline (+https://github.com/SMHotey/hermes-step-pipeline)"
+
+
+def tg_api_base() -> str:
+    """Хост Bot API: прокси из окружения, иначе прямой Telegram.
+
+    Свой ключ конвейера сильнее общего ключа Hermes (`TELEGRAM_API_BASE_URL`): там прокси
+    уже настроен для шлюза, и уведомления обязаны ходить тем же путём. Прокси-воркер
+    (Cloudflare) отдаёт те же пути `/bot<токен>/<метод>` — подменяется только хост.
+    База, оканчивающаяся на `/bot` (так её пишет шлюз Hermes), префикс не дублирует:
+    вызывающий код дописывает `/bot<токен>/<метод>` сам.
+    """
+    base = (os.environ.get("STEP_PIPELINE_TELEGRAM_API_BASE")
+            or os.environ.get("TELEGRAM_API_BASE_URL") or "").strip().rstrip("/")
+    if not base:
+        return "https://api.telegram.org"
+    return base[: -len("/bot")] if base.endswith("/bot") else base
+
+
 def notify(cfg: config_mod.Config, text: str) -> bool:
     """Уведомление владельцу. Выключено — печатаем (cron --deliver покажет в выводе)."""
     prefix = str(cfg.notify.get("prefix") or "")
@@ -2022,10 +2041,11 @@ def notify(cfg: config_mod.Config, text: str) -> bool:
         return False
     data = urllib.parse.urlencode({"chat_id": chat, "text": msg,
                                    "disable_web_page_preview": "true"}).encode()
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    url = f"{tg_api_base()}/bot{token}/sendMessage"
+    request = urllib.request.Request(url, data=data, headers={"User-Agent": TG_USER_AGENT})
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(url, data=data, timeout=20) as resp:
+            with urllib.request.urlopen(request, timeout=20) as resp:
                 if 200 <= resp.status < 300:
                     return True
         except (urllib.error.URLError, OSError) as exc:
@@ -2392,9 +2412,10 @@ TG_HELP = (
 def _tg_call(token: str, method: str, http_timeout: int = 20, **params) -> dict:
     """Один вызов Bot API. Любой сбой — {"ok": False, "description": ...}, без исключений."""
     body = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode()
-    url = f"https://api.telegram.org/bot{token}/{method}"
+    url = f"{tg_api_base()}/bot{token}/{method}"
+    request = urllib.request.Request(url, data=body, headers={"User-Agent": TG_USER_AGENT})
     try:
-        with urllib.request.urlopen(url, data=body, timeout=http_timeout) as resp:
+        with urllib.request.urlopen(request, timeout=http_timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
             return data if isinstance(data, dict) else {"ok": False, "description": "пустой ответ"}
     except urllib.error.HTTPError as exc:

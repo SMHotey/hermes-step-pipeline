@@ -7,13 +7,41 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 API = "https://api.telegram.org/bot{token}/{method}"
+# Прокси Bot API (Cloudflare-воркер) отдаёт тот же путь `/bot<токен>/<метод>`, поэтому
+# подменяется только хост. Свой ключ конвейера сильнее общего ключа Hermes: там прокси уже
+# может быть настроен для шлюза, и конвейер обязан ходить тем же путём (см.
+# `docs/TELEGRAM-PROXY.md`).
+API_ENV = "STEP_PIPELINE_TELEGRAM_API_BASE"
+API_ENV_SHARED = "TELEGRAM_API_BASE_URL"
+# Cloudflare-воркер за Cloudflare-защитой режет `Python-urllib/x.y` (ошибка 1010),
+# поэтому клиент представляется собой, а не стандартной библиотекой.
+USER_AGENT = "step-pipeline (+https://github.com/SMHotey/hermes-step-pipeline)"
 DEFAULT_TIMEOUT = 20
+
+
+def api_template() -> str:
+    """Шаблон адреса Bot API с учётом прокси из окружения.
+
+    Пусто — прямой `api.telegram.org`. Значение — база вида `https://<воркер>` (хвостовой
+    слэш не важен): путь `/bot<токен>/<метод>` дописывается как обычно. База, уже
+    оканчивающаяся на `/bot` (так её пишет шлюз Hermes), не дублирует префикс.
+    """
+    base = (os.environ.get(API_ENV) or os.environ.get(API_ENV_SHARED) or "").strip()
+    if not base:
+        return API
+    base = base.rstrip("/")
+    if base.endswith("/bot"):
+        return base + "{token}/{method}"
+    return base + "/bot{token}/{method}"
+
+
 # D9: три попытки на сетевых отказах и 5xx, паузы между ними — 0.5 и 1.0 с.
 RETRIES = 3
 RETRY_PAUSES = (0.5, 1.0)
@@ -51,7 +79,8 @@ def _call(token: str, method: str, http_timeout: int = DEFAULT_TIMEOUT,
     if not token:
         raise TelegramError("пустой токен бота")
     data = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode()
-    request = urllib.request.Request(API.format(token=token, method=method), data=data)
+    request = urllib.request.Request(api_template().format(token=token, method=method),
+                                     data=data, headers={"User-Agent": USER_AGENT})
     attempts = RETRIES if retries is None else max(1, int(retries))
     last: TelegramError | None = None
     for attempt in range(attempts):

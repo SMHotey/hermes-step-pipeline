@@ -63,6 +63,9 @@ def bot(monkeypatch):
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeBot)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     FakeBot.sent.clear()
+    # Тесты не должны зависеть от того, настроен ли прокси в окружении машины.
+    monkeypatch.delenv(telegram.API_ENV, raising=False)
+    monkeypatch.delenv(telegram.API_ENV_SHARED, raising=False)
     monkeypatch.setattr(telegram, "API",
                         f"http://127.0.0.1:{httpd.server_address[1]}/bot{{token}}/{{method}}")
     try:
@@ -70,6 +73,51 @@ def bot(monkeypatch):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+@pytest.fixture()
+def proxy_bot(monkeypatch):
+    """Прокси задан окружением: адрес берётся из ключа, `telegram.API` не подменяется."""
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeBot)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    FakeBot.sent.clear()
+    monkeypatch.delenv(telegram.API_ENV_SHARED, raising=False)
+    monkeypatch.setenv(telegram.API_ENV, f"http://127.0.0.1:{httpd.server_address[1]}/")
+    try:
+        yield FakeBot
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_api_template_defaults_to_telegram(monkeypatch):
+    monkeypatch.delenv(telegram.API_ENV, raising=False)
+    monkeypatch.delenv(telegram.API_ENV_SHARED, raising=False)
+    assert telegram.api_template() == telegram.API
+
+
+def test_api_template_takes_pipeline_key_first(monkeypatch):
+    monkeypatch.setenv(telegram.API_ENV, "https://proxy.example/x/")
+    monkeypatch.setenv(telegram.API_ENV_SHARED, "https://shared.example")
+    assert telegram.api_template() == "https://proxy.example/x/bot{token}/{method}"
+
+
+def test_api_template_falls_back_to_hermes_key(monkeypatch):
+    monkeypatch.delenv(telegram.API_ENV, raising=False)
+    monkeypatch.setenv(telegram.API_ENV_SHARED, "https://shared.example/")
+    assert telegram.api_template() == "https://shared.example/bot{token}/{method}"
+
+
+def test_api_template_does_not_double_bot(monkeypatch):
+    """База шлюза Hermes оканчивается на `/bot`: префикс не повторяется, токен идёт следом."""
+    monkeypatch.delenv(telegram.API_ENV_SHARED, raising=False)
+    monkeypatch.setenv(telegram.API_ENV, "https://proxy.example/bot/")
+    assert telegram.api_template() == "https://proxy.example/bot{token}/{method}"
+
+
+def test_calls_go_through_proxy_from_env(proxy_bot):
+    assert telegram.get_me("good")["username"] == "demo_bot"
+    assert [c["method"] for c in proxy_bot.sent] == ["getMe"]
 
 
 def test_get_me(bot):
