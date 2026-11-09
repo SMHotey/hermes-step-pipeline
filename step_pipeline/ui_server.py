@@ -172,8 +172,8 @@ def _if_none_match(header: str | None) -> str:
 def _redact(text: str, secret: str) -> str:
     """Убрать секрет из текста: токен не попадает ни в ответ API, ни в лог панели (D6).
 
-    Заменяется полное вхождение; строк с частью токена мастер не печатает вовсе —
-    поэтому маски в его логе нет (в отличие от `setup_flow._mask`).
+    Заменяется полное вхождение; в логе мастера нет ни токена, ни его частей — поэтому
+    маски в нём нет вовсе, только путь к `.env`.
     """
     if not secret:
         return text
@@ -576,23 +576,30 @@ def act_revert_config(state: State, payload: dict) -> dict:
 def act_save_telegram(state: State, payload: dict) -> dict:
     token = str(payload.get("token") or "").strip()
     chat = str(payload.get("chat") or "").strip()
+    owner = str(payload.get("owner") or "").strip()
     driver = (proj.read_config(state.project).get("profiles") or {}).get("driver") or "default"
     if not token or not chat:
         return {"ok": False, "error": "нужны и токен, и chat id"}
+    cfg = proj.read_config(state.project)
+    notify = dict(cfg.get("notify") or {})
+    owner_env = str(notify.get("owner_env") or setup_flow.OWNER_ENV)
+    # Пустое поле не понижает уже записанного владельца до chat id: в группе это разные id.
+    owner = owner or setup_flow.env_values(driver).get(owner_env) or chat
     try:
         me = telegram.get_me(token)
         telegram.validate_chat(token, chat)
     except telegram.TelegramError as exc:
         return {"ok": False, "error": str(exc)}
-    setup_flow.write_env(driver, {setup_flow.TOKEN_ENV: token, setup_flow.CHAT_ENV: chat})
-    cfg = proj.read_config(state.project)
-    notify = dict(cfg.get("notify") or {})
-    notify.update({"enabled": True, "token_env": setup_flow.TOKEN_ENV,
-                   "chat_env": setup_flow.CHAT_ENV})
+    setup_flow.write_env(driver, {setup_flow.TOKEN_ENV: token, setup_flow.CHAT_ENV: chat,
+                                  owner_env: owner})
+    notify.update({"enabled": True, "skipped": False, "token_env": setup_flow.TOKEN_ENV,
+                   "chat_env": setup_flow.CHAT_ENV, "owner_env": owner_env})
     cfg["notify"] = notify
     proj.write_config(state.project, cfg)
     os.environ[setup_flow.TOKEN_ENV] = token
     os.environ[setup_flow.CHAT_ENV] = chat
+    # Иначе `gate.owner_ids` в процессе панели не увидит нового владельца.
+    os.environ[owner_env] = owner
     state.note(f"Telegram подключён: @{me.get('username', '?')} → {chat}")
     return {"ok": True, "bot": me.get("username")}
 
@@ -1921,6 +1928,9 @@ class Handler(BaseHTTPRequestHandler):
         body = {"ok": bool(result.get("ok")), "step": step,
                 "already": bool(result.get("already")), "next": result.get("next"),
                 "log": log}
+        # D7: результат detect (chat и owner) — не секрет, страница подставит его в поля.
+        if result.get("found"):
+            body["found"] = result["found"]
         if error:
             body["error"] = error
         self._json(200 if body["ok"] else 400, body)

@@ -833,16 +833,22 @@ COMMANDS_JOB = "План: бот команды (конвейер)"
 
 
 def ensure_commands_cron(driver: str, project: Path, log: Log, *, skip: bool,
-                         enabled: bool) -> None:
+                         enabled: bool, skipped: bool = False) -> None:
     """Cron-джоба приёма команд бота: no-agent, раз в минуту.
 
     Отдельно от стража: страж идёт раз в 10 минут, а `/status` и `/stop` столько ждать
     нельзя. Модель не нужна — это один `getUpdates`.
+
+    `skipped` — владелец осознанно выбрал «без бота» (D1, D3): это допустимый исход, а не
+    предупреждение. `warn` остаётся только для «бот запрошен, но не сконфигурирован».
     """
     if skip:
         return
     if not enabled:
-        log.warn("приём команд не заводил: уведомления выключены (--no-telegram)")
+        if skipped:
+            log.ok("приём команд бота не заведён: Telegram выключен выбором владельца — допустимо")
+        else:
+            log.warn("приём команд не заводил: уведомления выключены (--no-telegram)")
         return
     if COMMANDS_JOB in (proj.run_hermes("-p", driver, "cron", "list").stdout or ""):
         log.ok("cron-джоба команд бота уже есть")
@@ -1061,36 +1067,50 @@ def run_smoke(project, cfg: dict[str, Any] | None, roles: list[str], log: Log,
     return ok_count, len(cards)
 
 
-def _mask(token: str) -> str:
-    return token[:8] + "…" + token[-4:] if len(token) > 14 else "***"
+def setup_telegram(project: Path, driver: str, args, log: Log) -> tuple[str | None, bool]:
+    """Токен бота, чат и владелец в `.env` профиля. Возвращает `(chat, skipped)`.
 
-
-def setup_telegram(project: Path, driver: str, args, log: Log) -> str | None:
-    """Токен бота, чат и запись в .env профиля. Возвращает chat id, если настроено."""
+    `skipped=True` — владелец осознанно выбрал «без бота» (D1): такой путь не печатает ни
+    одной строки `! `, а исход сохраняется в `pipeline.json` ключом `notify.skipped`.
+    Плохой токен или чат — `(None, False)`: это отказ Telegram, а не выбор владельца.
+    """
     if getattr(args, "no_telegram", False):
-        log.warn("уведомления в Telegram отключены (--no-telegram)")
-        return None
-    if not getattr(args, "telegram_token", "") and not os.environ.get(TOKEN_ENV):
         log.step("── Telegram (необязательно) ──")
-        if not _ask_bool("  Подключить бота для уведомлений и диалога?", True,
+        log.ok("Telegram не подключён: уведомления и команды выключены — допустимый выбор")
+        return None, True
+    token = getattr(args, "telegram_token", "") or ""
+    env_token = os.environ.get(TOKEN_ENV) or ""
+    if not token and not env_token:
+        log.step("── Telegram (необязательно) ──")
+        if not _ask_bool("  Подключить бота для уведомлений и диалога?"
+                         " (без бота не будет ни уведомлений о старте шага и вердиктах,"
+                         " ни команд из чата)", False,
                          yes=getattr(args, "yes", False)):
-            log.warn("работаем без бота: уведомлений и команд не будет")
-            return None
-    token = (getattr(args, "telegram_token", "") or os.environ.get(TOKEN_ENV)
-             or os.environ.get("TELEGRAM_BOT_TOKEN") or "")
+            log.ok("Telegram не подключён: уведомления и команды выключены — допустимый выбор")
+            return None, True
+    if not token and env_token:
+        # D5: повторный запуск не молчит про уже настроенный токен, а предлагает замену.
+        log.step("── Telegram ──")
+        log.ok("токен бота уже настроен")
+        if _ask_bool("  Заменить токен бота?", False, yes=getattr(args, "yes", False)):
+            replacement = _ask("  Новый токен бота от @BotFather (Enter — оставить прежний)",
+                               yes=getattr(args, "yes", False), secret=True)
+            if replacement:
+                token = replacement
+    token = token or env_token or os.environ.get("TELEGRAM_BOT_TOKEN") or ""
     if not token:
         log.step("── Telegram ──")
         log.step("  Бот нужен для уведомлений: старт шага, вердикт ревью, инциденты.")
         token = _ask("  Токен бота от @BotFather (Enter — пропустить)",
                      yes=getattr(args, "yes", False), secret=True)
     if not token:
-        log.warn("уведомления в Telegram не настроены")
-        return None
+        log.ok("Telegram не подключён: уведомления и команды выключены — допустимый выбор")
+        return None, True
     try:
         me = telegram.get_me(token)
     except telegram.TelegramError as exc:
         log.warn(f"токен не принят: {exc}")
-        return None
+        return None, False
     log.ok(f"бот @{me.get('username', '?')} на связи")
     # Вебхук на боте занимает getUpdates: команды из чата получали бы 409. Предупреждаем
     # заранее, в мастере, а не молчаливым отказом стража (D8).
@@ -1104,7 +1124,16 @@ def setup_telegram(project: Path, driver: str, args, log: Log) -> str | None:
                      "затем python .pipeline/gate.py --commands-reset")
     except telegram.TelegramError as exc:
         log.warn(f"вебхук проверить не удалось: {exc}")
+    # D4 и §4.4: правила BotFather называются словами, которые ищет владелец, а в логе нет
+    # ни токена, ни его частей — только путь к `.env`.
+    log.step("  BotFather: вебхук снимается методом Bot API deleteWebhook —"
+             " https://api.telegram.org/botTOKEN/deleteWebhook; пока он стоит,"
+             " getUpdates получает 409 и команды из чата не работают")
+    log.step("  BotFather: privacy mode (/setprivacy) — в группе бот должен видеть сообщения")
+    log.step("  BotFather: кто может писать боту, галочкой не настраивается — это owner id"
+             " (allowlist) в конфиге, API у BotFather для этого нет")
 
+    owner = ""
     chat = (getattr(args, "telegram_chat", "") or os.environ.get(CHAT_ENV) or "")
     if not chat:
         chat = _ask("  Куда слать (chat id, @канал или Enter — найти по последнему сообщению)",
@@ -1114,31 +1143,32 @@ def setup_telegram(project: Path, driver: str, args, log: Log) -> str | None:
                      yes=getattr(args, "yes", False)):
             try:
                 chat, owner = telegram.detect_chat_and_owner(token, wait_seconds=60)
-                log.ok(f"чат найден: {chat}")
+                # D6: owner из /start — достоверный источник; пустой owner заменяется chat id.
+                log.ok(f"чат найден: {chat}"
+                       + (f", владелец {owner}" if owner else ", владелец не виден — chat id"))
             except telegram.TelegramError as exc:
                 log.warn(str(exc))
     if not chat:
         log.warn("chat id не задан — уведомления останутся выключены")
-        return None
+        return None, False
     try:
         telegram.validate_chat(token, chat)
     except telegram.TelegramError as exc:
         log.warn(f"чат не подтверждён: {exc} (проверь chat id и что бот добавлен в чат)")
-        return None
+        return None, False
 
-    owner = locals().get("owner") or ""
     if not owner:
         owner = _ask("  Твой Telegram user id (Enter — только ты из чата)",
                      default=str(chat), yes=getattr(args, "yes", False))
     path = write_env(driver, {TOKEN_ENV: token, CHAT_ENV: chat, OWNER_ENV: owner})
-    log.ok(f"токен и чат записаны в {path} ({_mask(token)})")
+    log.ok(f"токен и чат записаны в {path}")
     if not getattr(args, "no_test", False):
         try:
             telegram.send_message(token, chat, "🔧 Конвейер шагов: уведомления подключены.")
             log.ok("тестовое сообщение отправлено")
         except telegram.TelegramError as exc:
             log.warn(f"тестовое сообщение не ушло: {exc}")
-    return chat
+    return chat, False
 
 
 def run_setup(args) -> int:
@@ -1181,9 +1211,12 @@ def run_setup(args) -> int:
     log.ok(".gitignore: " + ("дополнен" if ensure_gitignore(project) else "уже содержит записи"))
 
     cfg = build_config(project, board, driver, prompter, reviewer, existing)
-    chat = setup_telegram(project, driver, args, log)
+    chat, skipped = setup_telegram(project, driver, args, log)
     notify = dict(cfg.get("notify") or {})
+    # D1: «без бота» — выбор владельца, а не недоделанный шаг. Отказ хранится в конфиге,
+    # иначе мастер в панели вечно показывает «следующий шаг: telegram».
     notify["enabled"] = bool(chat)
+    notify["skipped"] = bool(skipped and not chat)
     cfg["notify"] = notify
     proj.write_config(project, cfg)
     log.ok(f"{proj.MARKER}: записан (уведомления {'вкл' if chat else 'выкл'})")
@@ -1194,7 +1227,7 @@ def run_setup(args) -> int:
     ensure_board(board, log)
     ensure_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)))
     ensure_commands_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)),
-                         enabled=bool(chat))
+                         enabled=bool(chat), skipped=bool(notify.get("skipped")))
 
     # Доверие проекту нужно каждой роли: без него воркер падает `Unknown skill(s)`,
     # и карточка уходит в blocked по failure_limit. Ошибка одной роли не ломает мастер.
@@ -1272,7 +1305,7 @@ SETUP_HINTS = {
     "project": "нужны pipeline.json, .pipeline/gate.py и роли в .hermes/skills",
     "board": "нужна база борды канбана",
     "profiles": "проект должен быть доверенным у всех трёх профилей-ролей",
-    "telegram": "нужны включённые уведомления и токен с chat id в .env драйвера",
+    "telegram": "необязательно: токен и chat id в .env драйвера; без бота шаг закрывается выбором",
     "cron": "нужна cron-джоба стража (метка .pipeline/cron.json)",
     "checks": "отчёт: линтер планов, версии, доверие, борда, cron, Telegram",
 }
@@ -1335,10 +1368,14 @@ def _profiles_fact(project: Path, cfg: dict[str, Any]) -> bool:
 
 
 def _telegram_fact(cfg: dict[str, Any]) -> bool:
-    """Уведомления включены и в `.env` драйвера есть токен с chat id."""
+    """Уведомления настроены или владелец осознанно выбрал «без бота» (D1).
+
+    Выключенные уведомления без отметки `skipped` — недоделанный шаг, а не выполненный:
+    иначе `next` не позвал бы владельца на шаг Telegram.
+    """
     notify = cfg.get("notify") or {}
     if not notify.get("enabled"):
-        return False
+        return bool(notify.get("skipped"))
     env = env_values(roles_from_config(cfg)[0])
     token_env = str(notify.get("token_env") or TOKEN_ENV)
     chat_env = str(notify.get("chat_env") or CHAT_ENV)
@@ -1432,17 +1469,23 @@ def run_setup_step(project: Path, step: str, values: dict[str, Any] | None = Non
     already = _step_done(project, step, cfg)
     log.step(f"{SETUP_TITLES[step]}: "
              + ("уже настроено — проверяю заново" if already else "выполняется"))
+    # D7: out-словарь — единственный канал для `found` из шага Telegram; глобального
+    # состояния нет, форма `(ok, error)` у веток шага остаётся прежней.
+    out: dict[str, Any] = {}
     try:
-        ok, error = _perform_step(project, step, cfg, given, log)
+        ok, error = _perform_step(project, step, cfg, given, log, out)
     except Exception as exc:                                # noqa: BLE001 - наружу не бросаем
         log.warn(f"шаг упал: {type(exc).__name__}: {exc}")
         ok, error = False, f"{type(exc).__name__}: {exc}"
-    return {"ok": ok, "step": step, "already": already, "log": log.lines,
-            "next": setup_status(project)["next"], "error": error}
+    result = {"ok": ok, "step": step, "already": already, "log": log.lines,
+              "next": setup_status(project)["next"], "error": error}
+    if out.get("found"):
+        result["found"] = out["found"]
+    return result
 
 
 def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str, str],
-                  log: Log) -> tuple[bool, str]:
+                  log: Log, out: dict[str, Any]) -> tuple[bool, str]:
     """Тело шага: `(ok, error)`.
 
     Красный шаг — только три случая (`D` постановки §4.1): `ensure_board` вернул False,
@@ -1502,12 +1545,15 @@ def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str
         return True, ""
 
     if step == "telegram":
-        return _setup_step_telegram(project, cfg, driver, given, log)
+        return _setup_step_telegram(project, cfg, driver, given, log, out)
 
     if step == "cron":
+        # Один разбор конфига на оба факта: `enabled` и осознанный выбор «без бота».
+        stored = proj.read_config(project).get("notify") or {}
         ensure_cron(driver, project, log, skip=False)
-        enabled = bool((proj.read_config(project).get("notify") or {}).get("enabled"))
-        ensure_commands_cron(driver, project, log, skip=False, enabled=enabled)
+        ensure_commands_cron(driver, project, log, skip=False,
+                             enabled=bool(stored.get("enabled")),
+                             skipped=bool(stored.get("skipped")))
         return True, ""
 
     # checks: ничего не меняет — только считает и рассказывает (D10).
@@ -1516,26 +1562,58 @@ def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str
 
 
 def _setup_step_telegram(project: Path, cfg: dict[str, Any], driver: str,
-                         given: dict[str, str], log: Log) -> tuple[bool, str]:
-    """Шаг Telegram: токен и chat id в `.env` профиля, обратно в браузер не возвращаются.
+                         given: dict[str, str], log: Log,
+                         out: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """Шаг Telegram: три переменные в `.env`, поиск по `/start`, исход «без бота».
 
-    D6: токен не попадает ни в ответ API, ни в лог — поэтому здесь нет даже маски
-    (`_mask` показывает часть). D9: пустой токен — не отказ, уведомления остаются как
-    были; красный только отказ Telegram на присланном токене или чате.
+    D6: токен не попадает ни в ответ API, ни в лог — в логе нет ни токена, ни его частей,
+    только путь к `.env`. D8: порядок разбора входов — detect, токен формы, снятый
+    чекбокс, приглашение заменить токен из `.env`, отказ. Красный шаг — ровно четыре
+    случая: нет `pipeline.json`, detect без токена, нет токена, отказ Telegram.
     """
-    token = given.get("token") or ""
-    chat = given.get("chat") or ""
+    out = out if out is not None else {}
+    # §4.8 п.4: без `pipeline.json` не известен драйвер проекта (`setup_defaults` подставил бы
+    # `HERMES_PROFILE` панели), и detect читал бы чужой `.env`. Первая проверка шага.
+    if not (project / proj.MARKER).is_file():
+        return False, f"сначала шаг Проект: в проекте нет {proj.MARKER}"
     notify = dict(cfg.get("notify") or {})
     token_env = str(notify.get("token_env") or TOKEN_ENV)
     chat_env = str(notify.get("chat_env") or CHAT_ENV)
-    if not token:
-        env = env_values(driver)
-        if env.get(token_env):
-            log.ok(f"токен уже лежит в .env профиля {driver} — Telegram не перенастраивался")
-        else:
-            log.warn("Telegram пропущен: уведомления выключены")
-        log.ok("уведомления " + ("включены" if notify.get("enabled") else "выключены"))
+    owner_env = str(notify.get("owner_env") or OWNER_ENV)
+    env = env_values(driver)
+
+    # D7: отдельное действие — только ищет chat id и owner id, на диск ничего не пишет.
+    if given.get("detect"):
+        token = given.get("token") or env.get(token_env)
+        if not token:
+            return False, "сначала токен бота"
+        try:
+            chat, owner = telegram.detect_chat_and_owner(token, wait_seconds=15)
+        except telegram.TelegramError as exc:
+            log.warn(f"{exc} — напиши боту /start и повтори")
+            return False, str(exc) or "Telegram не увидел сообщений боту"
+        log.ok(f"нашёл чат {chat}"
+               + (f", владелец {owner}" if owner else ", владелец не виден — подставлю chat id"))
+        out["found"] = {"chat": chat, "owner": owner}
         return True, ""
+
+    token = given.get("token") or ""
+    if not token:
+        # D8 п.2 сильнее прежнего токена в `.env`: снятый чекбокс — осознанный отказ, и
+        # повторное нажатие «Проверить» на настроенном боте не должно гасить уведомления.
+        if given.get("bot") == "0":
+            notify["enabled"] = False
+            notify["skipped"] = True
+            cfg = dict(cfg)
+            cfg["notify"] = notify
+            proj.write_config(project, cfg)
+            log.ok("Telegram не подключён: уведомления и команды выключены — допустимый выбор")
+            return True, ""
+        if env.get(token_env):
+            log.ok(f"токен уже лежит в .env профиля {driver} — чтобы заменить, вставь новый токен")
+            return True, ""
+        return False, "нужен токен бота"
+    chat = given.get("chat") or ""
     if not chat:
         log.warn("токен принят, но не указан chat id — уведомления некуда слать")
         return False, "нужен chat id (chat id или @канал)"
@@ -1546,9 +1624,13 @@ def _setup_step_telegram(project: Path, cfg: dict[str, Any], driver: str,
         log.warn(f"токен или чат не приняты: {exc}")
         return False, str(exc) or "Telegram не принял токен или чат"
     log.ok(f"бот @{me.get('username', '?')} на связи")
-    path = write_env(driver, {token_env: token, chat_env: chat, OWNER_ENV: chat})
+    # D6: owner из поля формы, иначе chat id — тот же фолбэк, что у `gate.owner_ids`;
+    # для группы достоверен только user id, найденный по /start.
+    owner = given.get("owner") or chat
+    path = write_env(driver, {token_env: token, chat_env: chat, owner_env: owner})
     log.ok(f"токен и чат записаны в {path}")
     notify["enabled"] = True
+    notify["skipped"] = False
     notify["token_env"] = token_env
     notify["chat_env"] = chat_env
     notify.setdefault("owner_env", OWNER_ENV)
@@ -1584,10 +1666,20 @@ def _setup_checks(project: Path, cfg: dict[str, Any], log: Log) -> None:
         log.ok("cron: джоба стража заведена")
     else:
         log.warn("cron: метки .pipeline/cron.json нет — страж сам не запустится")
-    if _telegram_fact(cfg):
-        log.ok("telegram: включён")
-    else:
+    # D9: выбор «без бота» нейтрален. `warn` — только когда уведомления включены, а
+    # переменных в `.env` не хватает: это настоящая поломка, а не выбор владельца.
+    notify = cfg.get("notify") or {}
+    env = env_values(roles_from_config(cfg)[0])
+    token_env = str(notify.get("token_env") or TOKEN_ENV)
+    chat_env = str(notify.get("chat_env") or CHAT_ENV)
+    if notify.get("skipped"):
+        log.ok("telegram: не настроен — установка без бота, это допустимо")
+    elif not notify.get("enabled"):
+        log.step("telegram: не настроен — шаг Telegram не пройден")
+    elif not (env.get(token_env) and env.get(chat_env)):
         log.warn("telegram: выключен — токен и chat id не настроены")
+    else:
+        log.ok("telegram: включён")
     lint = plan_lint.lint_project(project)
     if lint.problems:
         log.warn(f"линтер планов: проблем {len(lint.problems)} — "

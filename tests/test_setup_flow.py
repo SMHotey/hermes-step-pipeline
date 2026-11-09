@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sqlite3
+import stat
 import sys
 import time
 from pathlib import Path
@@ -579,3 +580,310 @@ def test_wait_smoke_card_times_out(tmp_path: Path, monkeypatch):
     assert state["timed_out"] is True
     assert state["status"] == "running"
     assert ticks["now"] == 12
+
+
+# ───────────────── S11: бот опционален, токен скрыт, доступ только владельцу ─────────────────
+
+TOKEN = "123456:AAH-demo-secret"
+OLD_TOKEN = "999000:OLD-demo-token"
+
+
+def _isolate_profile(monkeypatch, tmp_path: Path) -> Path:
+    """Изолировать `.env`: тесты шага не читают и не пишут профиль настоящего Hermes.
+
+    `proj.profile_dir` берёт `LOCALAPPDATA`/`~/.hermes` и `HERMES_HOME` не читает, поэтому
+    подмена обязательна везде, где шаг доходит до `write_env`/`env_values`.
+    """
+    monkeypatch.setattr(proj, "profile_dir", lambda profile: tmp_path / "h" / profile)
+    for name in (setup_flow.TOKEN_ENV, setup_flow.CHAT_ENV, setup_flow.OWNER_ENV,
+                 "TELEGRAM_BOT_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    return tmp_path / "h"
+
+
+def _telegram_stubs(monkeypatch, *, detected=("42", "777"), webhook: str = "") -> None:
+    """Telegram без сети: тот же бот, тот же чат, никаких запросов наружу (§3)."""
+    monkeypatch.setattr(setup_flow.telegram, "get_me", lambda token: {"username": "demo_bot"})
+    monkeypatch.setattr(setup_flow.telegram, "get_webhook_info", lambda token: {"url": webhook})
+    monkeypatch.setattr(setup_flow.telegram, "validate_chat", lambda token, chat: {"id": chat})
+    monkeypatch.setattr(setup_flow.telegram, "send_message", lambda token, chat, text: True)
+    monkeypatch.setattr(setup_flow.telegram, "detect_chat_and_owner",
+                        lambda token, wait_seconds=60: detected)
+
+
+def test_setup_without_bot_is_not_an_error(tmp_path: Path, monkeypatch, capsys):
+    """Отказ от бота — допустимый выбор: ни строки `! `, ни слова «ошибка» (D3)."""
+    _isolate_profile(monkeypatch, tmp_path)
+    log = setup_flow.Log()
+    result = setup_flow.setup_telegram(tmp_path / "shop", "shop",
+                                       args(no_telegram=True, yes=False), log)
+    out = capsys.readouterr().out
+    assert result == (None, True)
+    assert not [line for line in out.splitlines() if line.startswith("  ! ")]
+    assert "ошибка" not in out and "не настроены" not in out
+
+
+def test_full_setup_without_bot_has_no_warnings(tmp_path: Path, fake_hermes, monkeypatch,
+                                                capsys):
+    """Полный `run_setup` без бота: код 0, ни одной строки `! `, исход сохранён (D1)."""
+    target = tmp_path / "shop"
+    target.mkdir()
+    _isolate_profile(monkeypatch, tmp_path)
+    monkeypatch.setattr(setup_flow, "run_smoke", lambda *a, **k: (3, 3))
+
+    code = setup_flow.run_setup(args(project=str(target), board="shop", driver="shop",
+                                     no_telegram=True, no_profiles=False, no_cron=False,
+                                     no_trust=False, no_smoke=False))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert not [line for line in out.splitlines() if line.startswith("  ! ")]
+    cfg = json.loads((target / "pipeline.json").read_text(encoding="utf-8"))
+    assert cfg["notify"]["skipped"] is True
+    assert cfg["notify"]["enabled"] is False
+
+
+def test_panel_cron_step_without_bot_has_no_warnings(tmp_path: Path, fake_hermes, monkeypatch):
+    """Шаг `cron` панели после выбора «без бота» тоже молчит предупреждениями (D3)."""
+    root = tmp_path / "shop"
+    root.mkdir()
+    _isolate_profile(monkeypatch, tmp_path)
+    assert setup_flow.run_setup_step(root, "project",
+                                     {"board": "shop", "driver": "shop"})["ok"] is True
+    assert setup_flow.run_setup_step(root, "telegram", {"bot": "0"})["ok"] is True
+
+    cron = setup_flow.run_setup_step(root, "cron")
+    assert cron["ok"] is True
+    assert not [line for line in cron["log"] if line.startswith("  ! ")]
+    assert "выбором владельца" in "\n".join(cron["log"])
+
+
+def test_bot_question_defaults_to_off(tmp_path: Path, monkeypatch):
+    """Умолчание вопроса — «нет»: пустой ответ означает «без бота» (D2)."""
+    home = _isolate_profile(monkeypatch, tmp_path)
+    prompts: list[str] = []
+
+    def answer(prompt: str = "") -> str:
+        prompts.append(prompt)
+        return ""
+
+    monkeypatch.setattr(setup_flow.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", answer)
+    log = setup_flow.Log()
+    result = setup_flow.setup_telegram(tmp_path / "shop", "shop",
+                                       args(no_telegram=False, yes=False), log)
+    assert result == (None, True)
+    assert any("[y/N]" in prompt for prompt in prompts)
+    assert not (home / "shop").exists()
+
+
+def test_repeat_setup_asks_to_replace_token(tmp_path: Path, monkeypatch):
+    """Повторный запуск с токеном в окружении предлагает замену и пишет новый (D5)."""
+    home = _isolate_profile(monkeypatch, tmp_path)
+    monkeypatch.setenv(setup_flow.TOKEN_ENV, OLD_TOKEN)
+    prompts: list[str] = []
+
+    def answer(prompt: str = "") -> str:
+        prompts.append(prompt)
+        return "y" if "Заменить" in prompt else ""
+
+    monkeypatch.setattr(setup_flow.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", answer)
+    monkeypatch.setattr(setup_flow.getpass, "getpass", lambda prompt="": TOKEN)
+    _telegram_stubs(monkeypatch)
+
+    log = setup_flow.Log()
+    chat, skipped = setup_flow.setup_telegram(
+        tmp_path / "shop", "shop",
+        args(no_telegram=False, yes=False, telegram_chat="42"), log)
+    env = (home / "shop" / ".env").read_text(encoding="utf-8")
+    assert (chat, skipped) == ("42", False)
+    assert f"{setup_flow.TOKEN_ENV}={TOKEN}" in env
+    assert any("Заменить" in prompt for prompt in prompts)
+
+
+def test_repeat_setup_keeps_token_when_replace_declined(tmp_path: Path, monkeypatch):
+    """Отказ от замены оставляет прежний токен и не ломает повторную установку (D5)."""
+    home = _isolate_profile(monkeypatch, tmp_path)
+    monkeypatch.setenv(setup_flow.TOKEN_ENV, OLD_TOKEN)
+    monkeypatch.setattr(setup_flow.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    _telegram_stubs(monkeypatch)
+
+    log = setup_flow.Log()
+    result = setup_flow.setup_telegram(
+        tmp_path / "shop", "shop",
+        args(no_telegram=False, yes=False, telegram_chat="42"), log)
+    env = (home / "shop" / ".env").read_text(encoding="utf-8")
+    assert result == ("42", False)
+    assert f"{setup_flow.TOKEN_ENV}={OLD_TOKEN}" in env
+
+
+def test_setup_log_never_shows_token_fragments(tmp_path: Path, monkeypatch, capsys,
+                                               fake_hermes):
+    """Ни токена, ни его первых 8 и последних 4 символов в stdout; `_mask` удалён (D4)."""
+    target = tmp_path / "shop"
+    target.mkdir()
+    _isolate_profile(monkeypatch, tmp_path)
+    _telegram_stubs(monkeypatch)
+
+    code = setup_flow.run_setup(args(project=str(target), board="shop", driver="shop",
+                                     no_telegram=False, telegram_token=TOKEN,
+                                     telegram_chat="42"))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert TOKEN not in out
+    assert TOKEN[:8] not in out
+    assert TOKEN[-4:] not in out
+    assert not hasattr(setup_flow, "_mask")
+
+
+def test_master_mentions_botfather_rules(tmp_path: Path, monkeypatch, capsys, fake_hermes):
+    """Мастер называет deleteWebhook, privacy mode и allowlist — без «команды» BotFather."""
+    target = tmp_path / "shop"
+    target.mkdir()
+    _isolate_profile(monkeypatch, tmp_path)
+    _telegram_stubs(monkeypatch)
+
+    setup_flow.run_setup(args(project=str(target), board="shop", driver="shop",
+                              no_telegram=False, telegram_token=TOKEN, telegram_chat="42"))
+    out = capsys.readouterr().out
+    for word in ("BotFather", "вебхук", "privacy", "owner", "deleteWebhook"):
+        assert word in out, word
+    assert "/deletewebhook" not in out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="на Windows chmod почти ничего не значит")
+def test_env_file_is_owner_only(tmp_path: Path, monkeypatch):
+    """`.env` с токеном доступен только владельцу (0600)."""
+    home = _isolate_profile(monkeypatch, tmp_path)
+    _telegram_stubs(monkeypatch)
+    log = setup_flow.Log()
+    setup_flow.setup_telegram(tmp_path / "shop", "shop",
+                              args(no_telegram=False, telegram_token=TOKEN,
+                                   telegram_chat="42"), log)
+    mode = stat.S_IMODE((home / "shop" / ".env").stat().st_mode)
+    assert mode == 0o600
+
+
+def test_detected_owner_id_is_written_not_chat(tmp_path: Path, monkeypatch):
+    """Owner id из `/start` — достовернее chat id: в `.env` пишется user id (D6)."""
+    home = _isolate_profile(monkeypatch, tmp_path)
+    monkeypatch.setattr(setup_flow.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input",
+                        lambda prompt="": "y" if "/start" in prompt else "")
+    _telegram_stubs(monkeypatch, detected=("42", "777"))
+
+    log = setup_flow.Log()
+    setup_flow.setup_telegram(tmp_path / "shop", "shop",
+                              args(no_telegram=False, yes=False, telegram_token=TOKEN), log)
+    env = (home / "shop" / ".env").read_text(encoding="utf-8")
+    assert f"{setup_flow.CHAT_ENV}=42" in env
+    assert f"{setup_flow.OWNER_ENV}=777" in env
+
+
+def test_build_config_keeps_notify_skipped(tmp_path: Path):
+    """`build_config` сохраняет чужой `notify.skipped` и не выдумывает его сам (D1)."""
+    project = tmp_path / "shop"
+    project.mkdir()
+    cfg = setup_flow.build_config(project, "shop", "shop", "prompter", "reviewer",
+                                  {"notify": {"skipped": True, "enabled": False,
+                                              "prefix": "склад"}})
+    assert cfg["notify"]["skipped"] is True
+    assert cfg["notify"]["enabled"] is False
+    assert cfg["notify"]["prefix"] == "склад"
+    fresh = setup_flow.build_config(project, "shop", "shop", "prompter", "reviewer", {})
+    assert "skipped" not in (fresh.get("notify") or {})
+
+
+def test_telegram_step_requires_project_step(tmp_path: Path, monkeypatch):
+    """Без `pipeline.json` шаг Telegram красный: драйвер проекта ещё не известен (§4.8 п.4)."""
+    _isolate_profile(monkeypatch, tmp_path)
+    root = tmp_path / "bare"
+    root.mkdir()
+    result = setup_flow.run_setup_step(root, "telegram",
+                                       {"token": TOKEN, "chat": "42", "bot": "1"})
+    assert result["ok"] is False
+    assert "сначала шаг Проект" in result["error"]
+    assert not (root / "pipeline.json").exists()
+
+
+def test_telegram_step_with_bot_checked_and_no_token_is_red(tmp_path: Path, monkeypatch):
+    """Включённый чекбокс без токена и без `.env` — красный шаг «нужен токен бота» (D8 п.4)."""
+    home = _isolate_profile(monkeypatch, tmp_path)
+    root = tmp_path / "shop"
+    root.mkdir()
+    assert setup_flow.run_setup_step(root, "project",
+                                     {"board": "shop", "driver": "shop"})["ok"] is True
+    before = (root / "pipeline.json").read_bytes()
+
+    result = setup_flow.run_setup_step(root, "telegram", {"bot": "1"})
+    assert result["ok"] is False
+    assert "нужен токен бота" in result["error"]
+    assert not (home / "shop" / ".env").exists()
+    assert (root / "pipeline.json").read_bytes() == before
+
+
+def test_telegram_detect_error_is_reported_without_disk_writes(tmp_path: Path, monkeypatch):
+    """detect на ошибке Telegram: `ok=False`, подсказка `/start`, на диск ничего не пишется."""
+    home = _isolate_profile(monkeypatch, tmp_path)
+    root = tmp_path / "shop"
+    root.mkdir()
+    assert setup_flow.run_setup_step(root, "project",
+                                     {"board": "shop", "driver": "shop"})["ok"] is True
+
+    def boom(token, wait_seconds=15):
+        raise setup_flow.telegram.TelegramError("нет сообщений")
+
+    monkeypatch.setattr(setup_flow.telegram, "detect_chat_and_owner", boom)
+    before = (root / "pipeline.json").stat().st_mtime_ns
+
+    result = setup_flow.run_setup_step(root, "telegram",
+                                       {"token": TOKEN, "detect": "1"})
+    assert result["ok"] is False
+    assert "нет сообщений" in "\n".join(result["log"])
+    assert "/start" in "\n".join(result["log"])
+    assert (root / "pipeline.json").stat().st_mtime_ns == before
+    assert not (home / "shop" / ".env").exists()
+
+
+def test_telegram_detect_without_token_is_red(tmp_path: Path, monkeypatch):
+    """detect без токена ни в форме, ни в `.env` — красный шаг, сети нет (§4.7 п.1)."""
+    home = _isolate_profile(monkeypatch, tmp_path)
+    root = tmp_path / "shop"
+    root.mkdir()
+    assert setup_flow.run_setup_step(root, "project",
+                                     {"board": "shop", "driver": "shop"})["ok"] is True
+    before = (root / "pipeline.json").read_bytes()
+
+    def forbidden(token, wait_seconds=15):
+        raise AssertionError("detect без токена")
+
+    monkeypatch.setattr(setup_flow.telegram, "detect_chat_and_owner", forbidden)
+    result = setup_flow.run_setup_step(root, "telegram", {"detect": "1"})
+    assert result["ok"] is False
+    assert "сначала токен бота" in result["error"]
+    assert not (home / "shop" / ".env").exists()
+    assert (root / "pipeline.json").read_bytes() == before
+
+
+def test_telegram_detect_uses_token_from_env(tmp_path: Path, monkeypatch):
+    """detect берёт токен из `.env` через `.get` и на диск ничего не пишет (D7)."""
+    home = _isolate_profile(monkeypatch, tmp_path)
+    root = tmp_path / "shop"
+    root.mkdir()
+    assert setup_flow.run_setup_step(root, "project",
+                                     {"board": "shop", "driver": "shop"})["ok"] is True
+    setup_flow.write_env("shop", {setup_flow.TOKEN_ENV: TOKEN})
+    env_path = home / "shop" / ".env"
+    env_before = env_path.stat().st_mtime_ns
+    cfg_before = (root / "pipeline.json").stat().st_mtime_ns
+    _telegram_stubs(monkeypatch, detected=("42", "777"))
+
+    result = setup_flow.run_setup_step(root, "telegram", {"detect": "1"})
+    assert result["ok"] is True
+    assert result["found"] == {"chat": "42", "owner": "777"}
+    assert env_path.stat().st_mtime_ns == env_before
+    assert (root / "pipeline.json").stat().st_mtime_ns == cfg_before
+    cfg = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
+    assert cfg["notify"]["enabled"] is False
+    assert "skipped" not in cfg["notify"]

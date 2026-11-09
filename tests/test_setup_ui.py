@@ -375,3 +375,198 @@ def test_panel_has_setup_tab_hidden_in_preview():
     assert 'type="password" id="setup-token"' in html
     render = html.split("function render(data)")[1].split("function refresh(")[0]
     assert "setupTab.hidden = !!data.preview" in render
+
+
+# ───────────────── S11: бот опционален, владелец из /start, три переменные ─────────────────
+
+
+def _project_step(root: Path) -> None:
+    """Проект с конвейером: без `pipeline.json` шаг Telegram красный по §4.8 п.4."""
+    assert setup_flow.run_setup_step(root, "project",
+                                     {"board": "shop", "driver": "shop"})["ok"] is True
+
+
+def test_telegram_step_without_bot_finishes_without_warnings(stub, tmp_path: Path):
+    """Снятый чекбокс — допустимый выбор: шаг зелёный, ни одной строки `! ` (D3)."""
+    root = tmp_path / "shop"
+    root.mkdir()
+    _project_step(root)
+
+    result = setup_flow.run_setup_step(root, "telegram", {"bot": "0"})
+    assert result["ok"] is True
+    assert not [line for line in result["log"] if line.startswith("  ! ")]
+    cfg = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
+    assert cfg["notify"]["skipped"] is True
+    assert cfg["notify"]["enabled"] is False
+    assert not (stub.home / "shop" / ".env").exists()
+    assert result["next"] != "telegram"
+
+
+def test_telegram_detect_returns_chat_and_owner(stub, monkeypatch, tmp_path: Path):
+    """detect отдаёт chat и owner, ничего не пишет; запись — вторым нажатием (D7)."""
+    monkeypatch.setattr(setup_flow.telegram, "detect_chat_and_owner",
+                        lambda token, wait_seconds=15: ("42", "777"))
+    telegram_ok(monkeypatch)
+    root = tmp_path / "shop"
+    root.mkdir()
+    _project_step(root)
+
+    with running(root) as (url, httpd):
+        code, body = post_setup(url, {"step": "telegram",
+                                      "values": {"token": TOKEN, "detect": "1"}})
+        tail = "\n".join(httpd.RequestHandlerClass.state.tail())
+        assert code == 200, body
+        assert body["found"] == {"chat": "42", "owner": "777"}
+        assert not (stub.home / "shop" / ".env").exists()
+        assert TOKEN not in json.dumps(body, ensure_ascii=False)
+        assert TOKEN not in tail
+
+        code, body = post_setup(url, {"step": "telegram",
+                                      "values": {"token": TOKEN, "chat": "42",
+                                                 "owner": "777"}})
+        assert code == 200, body
+
+    env = (stub.home / "shop" / ".env").read_text(encoding="utf-8")
+    assert f"{setup_flow.TOKEN_ENV}={TOKEN}" in env
+    assert f"{setup_flow.CHAT_ENV}=42" in env
+    assert f"{setup_flow.OWNER_ENV}=777" in env
+
+
+def test_telegram_step_writes_owner_env(stub, monkeypatch, tmp_path: Path):
+    """Шаг пишет три переменные; имя владельца берётся из конфига (D1, D6)."""
+    telegram_ok(monkeypatch)
+    root = tmp_path / "shop"
+    root.mkdir()
+    _project_step(root)
+
+    result = setup_flow.run_setup_step(root, "telegram",
+                                       {"token": TOKEN, "chat": "42", "owner": "777"})
+    assert result["ok"] is True
+    env = (stub.home / "shop" / ".env").read_text(encoding="utf-8")
+    assert f"{setup_flow.OWNER_ENV}=777" in env
+    cfg = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
+    assert cfg["notify"]["owner_env"] == setup_flow.OWNER_ENV
+    assert cfg["notify"]["skipped"] is False
+
+
+def test_telegram_step_invites_token_replacement(stub, tmp_path: Path):
+    """Токен уже в `.env`: приглашение «заменить», `.env` не переписывается (D5)."""
+    root = tmp_path / "shop"
+    root.mkdir()
+    _project_step(root)
+    setup_flow.write_env("shop", {setup_flow.TOKEN_ENV: TOKEN})
+    env_path = stub.home / "shop" / ".env"
+    before = env_path.stat().st_mtime_ns
+
+    result = setup_flow.run_setup_step(root, "telegram", {})
+    assert result["ok"] is True
+    assert "заменить" in "\n".join(result["log"])
+    assert not [line for line in result["log"] if line.startswith("  ! ")]
+    assert env_path.stat().st_mtime_ns == before
+
+
+def test_notify_dialog_writes_owner_env(stub, monkeypatch, tmp_path: Path):
+    """Диалог «Уведомления» пишет те же три переменные и не понижает владельца (D6)."""
+    telegram_ok(monkeypatch)
+    root = tmp_path / "shop"
+    root.mkdir()
+    _project_step(root)
+
+    state = ui_server.State(root)
+    first = ui_server.act_save_telegram(state, {"token": TOKEN, "chat": "42", "owner": "777"})
+    assert first["ok"] is True
+    env = (stub.home / "shop" / ".env").read_text(encoding="utf-8")
+    assert f"{setup_flow.TOKEN_ENV}={TOKEN}" in env
+    assert f"{setup_flow.CHAT_ENV}=42" in env
+    assert f"{setup_flow.OWNER_ENV}=777" in env
+    cfg = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
+    assert cfg["notify"]["enabled"] is True
+    assert cfg["notify"]["owner_env"] == setup_flow.OWNER_ENV
+
+    again = ui_server.act_save_telegram(state, {"token": TOKEN, "chat": "42", "owner": ""})
+    assert again["ok"] is True
+    env = (stub.home / "shop" / ".env").read_text(encoding="utf-8")
+    assert f"{setup_flow.OWNER_ENV}=777" in env      # прежний владелец, не chat id
+
+
+def test_panel_has_bot_toggle_owner_and_detect():
+    """Форма мастера: чекбокс бота без `checked`, поле owner, кнопка detect (D2, D6, D7)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    assert 'id="setup-bot"' in html
+    assert 'id="setup-owner"' in html
+    assert 'id="setup-detect"' in html
+    assert 'type="password" id="setup-token"' in html
+    load = html.split("async function loadSetup()")[1].split("async function runSetupStep")[0]
+    assert '$("setup-bot").checked = !!values.telegram_token_set;' in load
+    assert '$("setup-bot").checked ? "1" : "0"' in html
+    checkbox = [line for line in html.splitlines() if 'id="setup-bot"' in line][0]
+    assert "checked" not in checkbox
+
+
+def test_skipped_bot_after_connection_closes_step(stub, tmp_path: Path):
+    """Снятый чекбокс на настроенном боте гасит уведомления и закрывает шаг (D8 п.2)."""
+    root = tmp_path / "shop"
+    root.mkdir()
+    _project_step(root)
+    path = root / "pipeline.json"
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    cfg["notify"].update({"enabled": True, "skipped": False})
+    path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    setup_flow.write_env("shop", {setup_flow.TOKEN_ENV: TOKEN, setup_flow.CHAT_ENV: "42"})
+
+    result = setup_flow.run_setup_step(root, "telegram", {"bot": "0"})
+    assert result["ok"] is True
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    assert cfg["notify"]["enabled"] is False
+    assert cfg["notify"]["skipped"] is True
+    assert setup_flow._telegram_fact(cfg) is True
+    assert setup_flow.setup_status(root)["next"] != "telegram"
+
+
+def test_checks_step_with_skipped_bot_is_neutral(stub, tmp_path: Path):
+    """Проверки не ругают выбор «без бота»: строка нейтральная, `! ` нет (D9)."""
+    root = tmp_path / "shop"
+    root.mkdir()
+    _project_step(root)
+    path = root / "pipeline.json"
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    cfg["notify"].update({"skipped": True, "enabled": False})
+    path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+
+    result = setup_flow.run_setup_step(root, "checks")
+    log = "\n".join(result["log"])
+    assert result["ok"] is True
+    assert "telegram: не настроен — установка без бота, это допустимо" in log
+    assert not [line for line in result["log"]
+                if line.startswith("  ! ") and "telegram" in line]
+
+
+def test_panel_keeps_token_after_detect():
+    """Поле токена гасится только после записи: detect и ошибка оставляют его (D7)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    run = html.split("async function runSetupStep")[1].split("// D7")[0]
+    assert 'if (data.ok && !data.found) $("setup-token").value = "";' in run
+    assert run.count('$("setup-token").value = ""') == 1
+
+
+def test_repeat_click_on_closed_step_keeps_notify_enabled(stub, tmp_path: Path):
+    """Повторное «Проверить» с включённым чекбоксом не гасит настроенного бота (D8)."""
+    root = tmp_path / "shop"
+    root.mkdir()
+    _project_step(root)
+    path = root / "pipeline.json"
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    cfg["notify"].update({"enabled": True, "skipped": False})
+    path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    setup_flow.write_env("shop", {setup_flow.TOKEN_ENV: TOKEN, setup_flow.CHAT_ENV: "42"})
+    env_path = stub.home / "shop" / ".env"
+    before = env_path.stat().st_mtime_ns
+
+    result = setup_flow.run_setup_step(root, "telegram", {"bot": "1"})
+    assert result["ok"] is True
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    assert cfg["notify"]["enabled"] is True
+    assert cfg["notify"].get("skipped") is False     # отказ не выставлен — бот остался
+    assert env_path.stat().st_mtime_ns == before
+    assert "заменить" in "\n".join(result["log"])
+    assert not [line for line in result["log"] if line.startswith("  ! ")]

@@ -580,10 +580,16 @@
             <div><label for="setup-reviewer">Ревьюер</label>
                  <input type="text" id="setup-reviewer"></div>
           </div>
+          <label><input type="checkbox" id="setup-bot"> Подключить бота (необязательно)</label>
+          <div class="muted">без бота: без уведомлений и команд из чата</div>
           <label for="setup-token">Токен бота — уходит в .env профиля, обратно не возвращается</label>
           <input type="password" id="setup-token" placeholder="оставь пустым, чтобы не менять">
           <label for="setup-chat">Chat id или @канал</label>
           <input type="text" id="setup-chat">
+          <label for="setup-owner">Твой Telegram user id — пусто: chat id</label>
+          <input type="text" id="setup-owner">
+          <button type="button" id="setup-detect">Найти по /start</button>
+          <div class="muted">напиши боту /start и нажми: ищу 15 секунд</div>
           <pre id="setup-log">—</pre>
         </section>
       </div>
@@ -634,6 +640,8 @@
   <label>Токен бота (хранится в .env профиля)</label>
   <input type="password" id="tg-token" placeholder="оставь пустым, чтобы не менять">
   <label>Chat id или @канал</label><input type="text" id="tg-chat">
+  <label>Telegram user id владельца — пусто: оставить как есть</label>
+  <input type="text" id="tg-owner">
   <div style="display:flex;gap:10px;margin-top:12px">
     <button type="button" class="primary" id="save-tg">Подключить</button>
     <button type="button" id="test-tg">Тест</button>
@@ -1422,6 +1430,9 @@ async function loadSetup() {
      ["setup-chat", "telegram_chat"]].forEach(([id, key]) => {
       if (values[key]) $(id).value = values[key];
     });
+    // Токен уже лежит в .env → бот настроен: чекбокс включается, и повторное нажатие
+    // «Проверить» не шлёт bot:"0" (иначе каждое нажатие гасило бы уведомления).
+    $("setup-bot").checked = !!values.telegram_token_set;
     window.__setupLoaded = true;
   }
   renderSetup(data);
@@ -1458,7 +1469,7 @@ function renderSetup(data) {
   });
 }
 
-async function runSetupStep(step) {
+async function runSetupStep(step, extra) {
   const values = {
     board: $("setup-board").value.trim(),
     driver: $("setup-driver").value.trim(),
@@ -1466,6 +1477,10 @@ async function runSetupStep(step) {
     reviewer: $("setup-reviewer").value.trim(),
     token: $("setup-token").value.trim(),
     chat: $("setup-chat").value.trim(),
+    owner: $("setup-owner").value.trim(),
+    // D8: страница всегда шлёт выбор бота строкой — пустое значение дало бы третий исход.
+    bot: $("setup-bot").checked ? "1" : "0",
+    ...(extra || {}),
   };
   $("setup-log").textContent = "выполняется…";
   const data = await api("/api/setup", {
@@ -1474,8 +1489,13 @@ async function runSetupStep(step) {
     // Проект уходит телом: мастер ставит конвейер в выбранный проект реестра.
     body: JSON.stringify({step, values, ...(currentProject ? {project: currentProject} : {})}),
   });
-  // Токен живёт только в поле формы: сервер его не возвращает, поле гасится сразу.
-  $("setup-token").value = "";
+  // Токен живёт только в поле формы: сервер его не возвращает. Поле гасится после записи,
+  // а после detect и ошибки остаётся — владелец правит chat и повторяет с тем же токеном.
+  if (data.ok && !data.found) $("setup-token").value = "";
+  if (data.found) {
+    if (data.found.chat) $("setup-chat").value = data.found.chat;
+    if (data.found.owner) $("setup-owner").value = data.found.owner;
+  }
   setupState.errors[step] = data.ok ? "" : (data.error || "шаг не выполнен");
   // Лог мастера накапливается: строки шагов дописываются, а не затирают друг друга.
   const logEl = $("setup-log");
@@ -1489,6 +1509,9 @@ async function runSetupStep(step) {
   await loadSetup();
   refresh();
 }
+
+// D7: поиск chat id и owner id по /start — только чтение, запись отдельным «Выполнить».
+$("setup-detect").onclick = () => runSetupStep("telegram", {detect: "1"});
 
 // ── проверки (план 3 S5): doctor и линтер планов, только чтение ──
 let checksBusy = false;    // запрос проверок в полёте: кнопку не дёргаем дважды
@@ -2326,8 +2349,9 @@ $("config-revert").onclick = async () => {
 $("save-tg").onclick = () => {
   const token = $("tg-token").value.trim();
   const chat = $("tg-chat").value.trim();
+  const owner = $("tg-owner").value.trim();
   if (!token && !chat) { toast("нужны токен и chat id", true); return; }
-  act("save_telegram", {token, chat}).then(() => { $("tg-token").value = ""; });
+  act("save_telegram", {token, chat, owner}).then(() => { $("tg-token").value = ""; });
 };
 $("test-tg").onclick = () => act("test_telegram");
 // Уведомления (S10): мастер-выключатель пишется сразу, галочки видов — тем же POST.
