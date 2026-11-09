@@ -1327,9 +1327,11 @@ class Handler(BaseHTTPRequestHandler):
             return False
         site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
         if site and site not in ("same-origin", "none"):
+            self._drain_body()
             self._json(403, {"ok": False, "error": "запрос не из панели: Sec-Fetch-Site"})
             return False
         if panel_header and (self.headers.get(PANEL_HEADER) or "").strip() != PANEL_HEADER_VALUE:
+            self._drain_body()
             self._json(403, {"ok": False,
                              "error": "запрос не из панели: нет заголовка X-Pipeline-Panel"})
             return False
@@ -1531,6 +1533,7 @@ class Handler(BaseHTTPRequestHandler):
     def _post_notify(self) -> None:
         """Записать настройки: глобальный выключатель или запись проекта реестра."""
         if getattr(self.state, "preview", False):
+            self._drain_body()
             self._json(403, {"ok": False,
                              "error": "предпросмотр только читает: уведомления не настраиваются"})
             return
@@ -1573,6 +1576,7 @@ class Handler(BaseHTTPRequestHandler):
     def _post_notify_test(self) -> None:
         """Тестовое уведомление: только ответ браузеру — ни файла истории, ни Telegram."""
         if getattr(self.state, "preview", False):
+            self._drain_body()
             self._json(403, {"ok": False,
                              "error": "предпросмотр только читает: тест не отправляется"})
             return
@@ -2077,6 +2081,7 @@ class Handler(BaseHTTPRequestHandler):
     # ── POST ──
     def do_POST(self) -> None:                                  # noqa: N802 - stdlib API
         if not self._local_only():
+            self._drain_body()
             self._json(403, {"ok": False, "error": "только localhost"})
             return
         path = self.path.split("?")[0]
@@ -2099,6 +2104,7 @@ class Handler(BaseHTTPRequestHandler):
             self._post_projects()
             return
         if path != "/api/action":
+            self._drain_body()
             self._json(404, {"ok": False, "error": "нет такого маршрута"})
             return
         if not self._guard_post():
@@ -2151,6 +2157,7 @@ class Handler(BaseHTTPRequestHandler):
         в теле действия) и требует метку панели, как переключатель режима.
         """
         if getattr(self.state, "preview", False):
+            self._drain_body()
             self._json(403, {"ok": False,
                              "error": "предпросмотр только читает: утверждение плана недоступно"})
             return
@@ -2184,6 +2191,7 @@ class Handler(BaseHTTPRequestHandler):
         """Переключить режим планировщика: одно идемпотентное действие, без второго «применить»."""
         # Отказ предпросмотра не зависит от заголовков и тела: сначала «только чтение».
         if getattr(self.state, "preview", False):
+            self._drain_body()
             self._json(403, {"ok": False,
                              "error": "предпросмотр только читает: переключение режима недоступно"})
             return
