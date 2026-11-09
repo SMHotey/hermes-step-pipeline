@@ -45,7 +45,7 @@
 реестр в `hermes_home()/profiles/ИМЯ_ПРОФИЛЯ/projects.json`, где `hermes_home()` —
 копия `setup_flow.hermes_home()` (первым делом `HERMES_HOME`). В процессе, запущенном
 Hermes, `HERMES_HOME` — это уже каталог профиля (на этой машине
-`HERMES_HOME=C:\Users\malik\AppData\Local\hermes\profiles\reviewer`,
+`HERMES_HOME=<hermes_home>\profiles\reviewer`,
 `HERMES_PROFILE=reviewer`). Устройство Hermes 0.21.5:
 `hermes_cli/profiles.py:306-318` — `get_profile_dir("default")` возвращает корень
 Hermes, именованный профиль — `корень/profiles/<имя>`;
@@ -227,9 +227,9 @@ next, risk, hold, closed, stop` (`step_pipeline/engine/gate.py:2462-2471`). Су
 - `grep -c "^def test_" tests/test_ui_server.py` → 60; параметризаций 2 (3 + 4 случая)
   → собирается 65. `grep -rn "def test_" tests | wc -l` → 392, плюс 5
   параметризованных случаев → 397 в целом наборе.
-- `HERMES_HOME` в живом процессе → `C:\Users\malik\AppData\Local\hermes\profiles\reviewer`,
+- `HERMES_HOME` в живом процессе → `<hermes_home>\profiles\reviewer`,
   `HERMES_PROFILE` → `reviewer`; `profiles/default` отсутствует, конфиг default-профиля
-  — `C:\Users\malik\AppData\Local\hermes\config.yaml`.
+  — `<hermes_home>\config.yaml`.
 - Hermes 0.21.5: `hermes_cli/profiles.py:306-318`, `:2356-2373`;
   `hermes_cli/plugins_settings.py:3`; `hermes_cli/plugins_loader.py:393-410`.
 - Точечные сверки адресов: `ui_server.py` (134-155, 388, 416-417, 461-470, 496-505,

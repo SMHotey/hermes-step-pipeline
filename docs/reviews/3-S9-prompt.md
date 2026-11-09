@@ -55,7 +55,7 @@ recon_commit: 79b570b82d2310a4bfedbe516ac00b69faf32d9c
 - [стилистическая] §7:217 (Г2, резервный путь) — `cp tests/test_ui_server.py ../sp-s9-red/tests/`
   стоит после `cd ../sp-s9-red`, то есть выполняется уже из worktree и копирует файл сам в
   себя: правки в прогон не попадут. Ожидается явный путь из основного чекаута, например
-  `cp C:/Users/malik/PycharmProjects/hermes-step-pipeline/tests/test_ui_server.py tests/`.
+  `cp <корень>/tests/test_ui_server.py tests/`.
 - [стилистическая] диапазоны с запасом: §0:27 `tests/stub_hermes.py:21-37` — `SCHEMA`
   занимает 21-36 (37-я пустая); §6.2:155 `snapshot.py:849-911` — последняя строка кода
   `step_detail` 910 (911 пустая); §2:59 `engine/config.py:151-152, 281-282` — `reviewer` это

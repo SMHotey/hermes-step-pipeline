@@ -156,8 +156,11 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
             problems.append(f"cron-джоба «{job_name}» не найдена у профиля {driver} — "
                             f"конвейер не будет двигаться сам")
     else:
-        problems.append("cron для этого проекта не заводился — "
-                        "конвейер работает только по кнопке «Тик»")
+        # Отсутствие cron — не поломка: `setup --no-cron` его и не заводит, конвейер
+        # тогда идёт по кнопке «Тик». В проблемы это писать нельзя, иначе владелец,
+        # осознанно выбравший ручной режим, видит красное «критично» на пустом месте.
+        report.warnings.append("cron для этого проекта не заводился — "
+                               "конвейер работает только по кнопке «Тик»")
     status = snap.snapshot(project, preview=preview)
     decision = status.get("decision") or {}
     notes.append(f"решение стража: {decision.get('action')} — {decision.get('reason')}")

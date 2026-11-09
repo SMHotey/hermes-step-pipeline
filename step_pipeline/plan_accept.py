@@ -74,6 +74,38 @@ def plan_number(name: str) -> str | None:
     return str(int(match.group(1))) if match else None
 
 
+def list_drafts(project) -> list[dict]:
+    """Черновики каталога `drafts/`: номер, имя файла, путь и заголовок плана.
+
+    Список нужен панели: владелец утверждает черновик кнопкой, не набирая команду.
+    Только чтение — движок эти файлы не видит (`plans_dir.glob("*.md")` без рекурсии).
+    """
+    try:
+        files = sorted(drafts_dir(project).glob("*.md"))
+    except OSError:
+        return []
+    rows: list[dict] = []
+    for path in files:
+        number = plan_number(path.name)
+        if number is None:
+            continue
+        rows.append({"id": number, "name": path.name,
+                     "file": _shown(path, project), "title": _title(path)})
+    return sorted(rows, key=lambda row: int(row["id"]))
+
+
+def _title(path: Path) -> str:
+    """Заголовок плана из первой строки `# …`; заголовка нет — имя файла без `.md`."""
+    try:
+        for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+            match = _HEADING_RE.match(line)
+            if match and len(match.group("hashes")) == 1:
+                return match.group("title").strip()
+    except OSError:
+        pass
+    return Path(path).stem
+
+
 def now_iso() -> str:
     """Дата утверждения — отдельной функцией, чтобы тест мог её подменить.
 
@@ -131,18 +163,24 @@ def check_draft(project, draft) -> list[str]:
     return _fallback_errors(project, draft)
 
 
-def accept(project, value) -> int:
-    """Утвердить план по номеру: проверки → перенос → запись с sha256.
+def approve(project, value) -> dict:
+    """Утвердить план и вернуть исход без печати: общий путь CLI и панели.
 
-    Печатает результат сам и возвращает код 0/1 (2 — аргумент не номер). Порядок важен:
-    сначала проверки, потом перенос, потом запись; при любой ошибке файл и запись не
-    трогаются, чтобы не оставить полуутверждённый план.
+    Ключи ответа — контракт панели (`POST /api/plan/accept`): `ok`, `code` (0/1/2, как
+    у CLI), `plan`, `status` (`approved` / `unchanged` / `reapproved` / `errors` /
+    `missing` / `bad-number` / `conflict`), `errors`, `message`, `file`,
+    `approval_file`, `sha256`, `approved_at`. `message` — те же строки, что печатает
+    `accept`: сообщения CLI и панели не расходятся.
+
+    Порядок важен: сначала проверки, потом перенос, потом запись; при любой ошибке файл
+    и запись не трогаются, чтобы не оставить полуутверждённый план.
     """
     project = Path(project)
     text = str(value).strip()
     if not text.isdigit():
-        print(f"--accept принимает номер плана, получено: {value}", file=sys.stderr)
-        return 2
+        return {"ok": False, "code": 2, "plan": "", "status": "bad-number",
+                "errors": [f"--accept принимает номер плана, получено: {value}"],
+                "message": ""}
     number = _normalize(text)
     final = find_plan(project, number)
     missing = ""
@@ -152,72 +190,107 @@ def accept(project, value) -> int:
         draft = None
         missing = str(exc)
     if draft is None and final is None:
-        print(f"ошибка: {missing}", file=sys.stderr)
-        return 1
+        return {"ok": False, "code": 1, "plan": number, "status": "missing",
+                "errors": [], "message": f"ошибка: {missing}"}
 
     errors = check_draft(project, draft or final)
     if errors:
-        for problem in errors:
-            print(f"  ✗ {problem}")
-        print(f"ИТОГ: ошибок {len(errors)} — файл не перенесён, черновик остался на месте")
-        return 1
+        return {"ok": False, "code": 1, "plan": number, "status": "errors",
+                "errors": list(errors),
+                "message": f"ИТОГ: ошибок {len(errors)} — файл не перенесён, "
+                           f"черновик остался на месте"}
 
     if draft is not None and final is not None:
         return _accept_existing(project, number, draft, final)
     if draft is not None:
         return _move_draft(project, number, draft)
-    if final is None:  # недостижимо: выше отсечены «нет ни черновика, ни плана»
-        print(f"ошибка: черновика с номером {number} нет в каталоге черновиков", file=sys.stderr)
-        return 1
     return _accept_final(project, number, final)
+
+
+def accept(project, value) -> int:
+    """Утвердить план по номеру (CLI): печатает исход `approve` и возвращает код 0/1/2."""
+    result = approve(project, value)
+    status = str(result.get("status") or "")
+    if status == "errors":
+        for problem in result.get("errors") or []:
+            print(f"  ✗ {problem}")
+    message = str(result.get("message") or "")
+    if message:
+        stream = sys.stderr if status in ("missing", "bad-number") else sys.stdout
+        print(message, file=stream)
+    code = result.get("code")
+    return int(code if code is not None else 1)
 
 
 # ───────────────────────────── ветки утверждения ─────────────────────────────
 
-def _accept_existing(project: Path, number: str, draft: Path, final: Path) -> int:
+def _approved(number: str, path: Path, project: Path, record: dict | None = None) -> dict:
+    """Ответ успешного утверждения с теми строками, что печатает CLI."""
+    record = record or {}
+    shown = _shown(path, project)
+    return {"ok": True, "code": 0, "plan": number, "status": "approved",
+            "file": shown, "approval_file": str(approval_file(project, number)),
+            "sha256": record.get("sha256") or "",
+            "approved_at": record.get("approved_at") or "", "errors": [],
+            "message": f"План {number} утверждён: {shown}\n"
+                       f"Запись утверждения: {approval_file(project, number)}"}
+
+
+def _unchanged(number: str, record: dict, path: Path, project: Path) -> dict:
+    """Утверждение уже есть и совпадает: ничего не перезаписываем (дата первого важна)."""
+    return {"ok": True, "code": 0, "plan": number, "status": "unchanged",
+            "file": _shown(path, project),
+            "approval_file": str(approval_file(project, number)),
+            "sha256": record.get("sha256") or "",
+            "approved_at": record.get("approved_at") or "", "errors": [],
+            "message": f"План {number}: уже утверждён "
+                       f"({record.get('approved_at', '')}) — ничего не изменено"}
+
+
+def _refused(number: str, message: str) -> dict:
+    """Отказ без переноса и без записи: файл остаётся где был."""
+    return {"ok": False, "code": 1, "plan": number, "status": "conflict",
+            "errors": [], "message": message}
+
+
+def _accept_existing(project: Path, number: str, draft: Path, final: Path) -> dict:
     """Черновик и утверждённый файл уже есть: сравниваем имена и содержимое."""
     if final.name != draft.name:
-        print(f"ошибка: с номером {number} уже есть другой файл: {final.name}", file=sys.stderr)
-        return 1
+        return _refused(number, f"ошибка: с номером {number} уже есть другой файл: {final.name}")
     if _sha256(final) != _sha256(draft):
-        print("ошибка: файл уже есть и отличается содержимым", file=sys.stderr)
-        return 1
+        return _refused(number, "ошибка: файл уже есть и отличается содержимым")
     record = _read_approval(project, number)
     if record is None:
         # Запись потеряли — восстанавливаем её, иначе страж (S7) навсегда заблокирует план.
-        _write_approval(project, number, final)
-        print(f"План {number} утверждён: {_shown(final, project)}")
-        print(f"Запись утверждения: {approval_file(project, number)}")
-        return 0
-    print(f"План {number}: уже утверждён ({record.get('approved_at', '')}) — ничего не изменено")
-    return 0
+        payload = _write_approval(project, number, final)
+        return _approved(number, final, project, payload)
+    return _unchanged(number, record, final, project)
 
 
-def _move_draft(project: Path, number: str, draft: Path) -> int:
+def _move_draft(project: Path, number: str, draft: Path) -> dict:
     """Перенести черновик в каталог планов и записать утверждение."""
     target = plans_dir(project) / draft.name
     target.parent.mkdir(parents=True, exist_ok=True)
     os.replace(draft, target)
-    _write_approval(project, number, target)
-    print(f"План {number} утверждён: {_shown(target, project)}")
-    print(f"Запись утверждения: {approval_file(project, number)}")
-    return 0
+    payload = _write_approval(project, number, target)
+    return _approved(number, target, project, payload)
 
 
-def _accept_final(project: Path, number: str, final: Path) -> int:
+def _accept_final(project: Path, number: str, final: Path) -> dict:
     """Черновика нет, утверждённый файл есть: сверить хэш с записью."""
     record = _read_approval(project, number)
     if record is None:
-        _write_approval(project, number, final)
-        print(f"План {number} утверждён: {_shown(final, project)}")
-        print(f"Запись утверждения: {approval_file(project, number)}")
-        return 0
+        payload = _write_approval(project, number, final)
+        return _approved(number, final, project, payload)
     if record.get("sha256") == _sha256(final):
-        print(f"План {number}: уже утверждён ({record.get('approved_at', '')}) — ничего не изменено")
-        return 0
-    _write_approval(project, number, final)
-    print(f"План {number} переутверждён (содержимое изменилось)")
-    return 0
+        return _unchanged(number, record, final, project)
+    payload = _write_approval(project, number, final)
+    return {"ok": True, "code": 0, "plan": number, "status": "reapproved",
+            "file": _shown(final, project),
+            "approval_file": str(approval_file(project, number)),
+            "sha256": payload.get("sha256") or "",
+            "approved_at": payload.get("approved_at") or "", "errors": [],
+            "message": f"План {number} переутверждён (содержимое изменилось)"}
 
 
 # ───────────────────────────── запись утверждения ─────────────────────────────

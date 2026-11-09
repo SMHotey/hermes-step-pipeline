@@ -144,10 +144,16 @@ def test_post_changes_state_and_is_idempotent(server):
 
 
 def test_page_has_plan_mode_toggle(server):
-    """Отдаваемая страница содержит тумблер, подсказку, маршрут и чтение поля снимка."""
+    """Отдаваемая страница содержит тумблер, маршрут и чтение поля снимка.
+
+    Пояснения «действует со следующей сессии» в шапке больше нет: подпись убрана по
+    требованию владельца, сам тумблер и его состояние на месте.
+    """
     with urllib.request.urlopen(server["url"] + "/", timeout=10) as response:
         html = response.read().decode("utf-8")
         assert response.status == 200
-    for needle in ("Режим планировщика", "со следующей сессии", 'id="plan-mode"',
+    for needle in ("Режим планировщика", 'id="plan-mode"',
                    "/api/plan-mode", "X-Pipeline-Panel", "data.plan_mode"):
         assert needle in html
+    assert 'title="действует со следующей сессии"' not in html
+    assert 'id="plan-mode-hint">предпросмотр' not in html  # текст ставит render(), не разметка

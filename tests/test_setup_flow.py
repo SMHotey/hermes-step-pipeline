@@ -295,6 +295,51 @@ def test_cron_script_written(monkeypatch, tmp_path: Path):
     assert any("cron" in " ".join(c) for c in calls)
 
 
+def test_update_cron_writes_script_and_creates_job(monkeypatch, tmp_path: Path):
+    """Автообновление — своя cron-джоба со скриптом из профиля, а не «когда открыта панель»."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(setup_flow.proj, "profile_dir", lambda p: home / "profiles" / p)
+    calls: list[tuple] = []
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def run(*argv, timeout=180):
+        calls.append(argv)
+        return Result()
+
+    monkeypatch.setattr(setup_flow.proj, "run_hermes", run)
+    log = setup_flow.Log()
+    project = tmp_path / "shop"
+    project.mkdir()
+    setup_flow.ensure_update_cron("shop", project, log, skip=False)
+
+    script = home / "profiles" / "shop" / "scripts" / "pipeline_update.py"
+    assert script.is_file()
+    text = script.read_text(encoding="utf-8")
+    assert "from update import auto" in text and "plugins" in text
+    created = [call for call in calls if "create" in call]
+    assert created and "pipeline_update.py" in created[0]
+    assert setup_flow.UPDATE_CRON in created[0]
+
+
+def test_update_cron_respects_no_cron(monkeypatch, tmp_path: Path):
+    """`--no-cron` — обещание не заводить джобы: автообновление тоже не заводится."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(setup_flow.proj, "profile_dir", lambda p: home / "profiles" / p)
+    calls: list[tuple] = []
+    monkeypatch.setattr(setup_flow.proj, "run_hermes",
+                        lambda *argv, **kw: calls.append(argv))
+    log = setup_flow.Log()
+    project = tmp_path / "shop"
+    project.mkdir()
+    setup_flow.ensure_update_cron("shop", project, log, skip=True)
+    assert calls == []
+    assert not (home / "profiles" / "shop" / "scripts" / "pipeline_update.py").exists()
+
+
 def _trust_calls(calls: list[tuple]) -> list[tuple]:
     return [call for call in calls if "trust" in call]
 

@@ -48,7 +48,7 @@ PLACEHOLDER_ANGLE = re.compile(r"<[^<>\n]{0,40}>")
 VERDICT_HINT = re.compile(r"APPROVE|REQUEST_CHANGES", re.IGNORECASE)
 COMMAND_HINT = re.compile(
     r"(?:python|pytest|grep|rg\b|git\s|npm|pnpm|yarn|cargo|go\s+test|make\b|dotnet|"
-    r"scripts/|\.venv|alembic|docker|bash|powershell)",
+    r"scripts/|alembic|docker|bash|powershell|\.venv)",
     re.IGNORECASE,
 )
 EXPECTED_HINT = re.compile(r"(passed|failed|EXIT|ожида|вернёт|вернет|PASS|FAIL)")

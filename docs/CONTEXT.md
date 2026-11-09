@@ -29,9 +29,9 @@
 
 ## 2. Откуда взялось
 
-Выделено из проекта DoorSystem, где та же схема жила жёстко привязанной к продукту:
-`scripts/plan_gate.py` + роли `saas-prompter` / `saas-reviewer` + скилл
-`doorsystem-plan-next-step` + PG-слоты, `build.bat`, PySide и прайсы.
+Выделено из внутреннего проекта владельца, где та же схема жила жёстко привязанной к
+продукту: `scripts/plan_gate.py` + роли `<проект>-prompter` / `<проект>-reviewer` +
+скилл `<проект>-plan-next-step` + слоты тестовой БД, `build.bat`, PySide и прайсы.
 
 В переносимую версию **не** попало: имена проектов, бизнес-логика, предметные скиллы,
 сборка exe, слоты тестовой БД. Попало: сам механизм, роли, шаблоны, установщик, UI.
@@ -97,17 +97,19 @@ tests/               тесты плагина; tests/engine/ — тесты д�
 5. В репозитории нет имён и предметной логики проектов-потребителей.
 6. Действия в предпросмотре запрещены, панель слушает только localhost.
 
-## 6. Состояние на 2026-11-01
+## 6. Состояние на 2026-11-09
 
-- Репозиторий: `https://github.com/SMHotey/hermes-step-pipeline` (private), ветка `main`.
-- Тег `v0.1.0` → коммит `ff14c10` (с зелёным CI).
+- Репозиторий: `https://github.com/SMHotey/hermes-step-pipeline`, ветка `main`.
+- Версия `0.18.0`: тег `v0.18.0` и GitHub Release; теги ставятся на каждый минор.
 - CI: `.github/workflows/ci.yml` — pytest на ubuntu + windows, python 3.11 и 3.13,
-  затем `hermes plugins validate`, если CLI есть в раннере. Статус: success.
-- Тесты: **96** (48 плагина + 48 движка).
-- Установлен в профиле `doorsystem`: `%LOCALAPPDATA%\hermes\profiles\doorsystem\plugins\step_pipeline`.
-- Демо-проект для проверки: `C:\Users\malik\PycharmProjects\hermes-step-pipeline-demo`.
-- Панель по настоящему DoorSystem (только чтение):
-  `hermes pipeline ui --project …\DoorSystem --preview --board doorsystem --detach --port 8770`.
+  затем `hermes plugins validate`. Зелёный прогон обязателен перед тегом.
+- Тесты: 600+ (плагин + движок отдельными слоями, `tests/` и `tests/engine/`).
+- Установка: `<hermes_home>/plugins/step_pipeline` (мастер `install.sh`/`install.ps1`
+  или `hermes plugins install <repo>/step_pipeline`).
+- Демо-проект для проверки — отдельный каталог без предметной логики, план
+  `docs/plans/1-demo.md`: на нём снимается скриншот панели и гоняются e2e-сценарии.
+- Готово к публикации: `SECURITY.md`, `CONTRIBUTING.md`, шаблоны issue/PR, скриншот
+  панели с демо-проекта, из `docs/` убраны имена проектов-потребителей и локальные пути.
 
 ## 7. Быстрые команды
 
@@ -175,14 +177,17 @@ hermes pipeline doctor  --project <путь>
 
 ## 9. Что осталось
 
-- Публичный репозиторий или private — решение владельца (сейчас private).
+- Публичный репозиторий или private — решение владельца. Репозиторий к публикации
+  подготовлен (теги, release, зелёный CI, безопасность и лицензия); переключение
+  видимости и переписывание истории (имена проектов и локальные пути в старых
+  коммитах) — за владельцем.
 - «Почтальон» между ролями (переписка промптер↔исполнитель↔ревьюер через Telegram
-  или kanban-мост) — в DoorSystem эту роль играл отдельный мост.
-- Реальная установка в DoorSystem вместо предпросмотра — только с согласия владельца
-  (добавит `.pipeline/`, `pipeline.json`, 6 ролей в `.hermes/skills`).
-- Actions в CI — сделано 1-S10: `actions/checkout@v7` и `actions/setup-python@v7`,
-  валидация манифеста вынесена отдельным job `manifest` (composite action
-  `plugin-validate@v2026.9.24`), молчаливого «шаг пропущен» больше нет.
+  или kanban-мост) — в прежнем проекте эту роль играл отдельный мост.
+- Реальная установка в чужой проект вместо предпросмотра — только с согласия владельца
+  (добавит `.pipeline/`, `pipeline.json`, роли в `.hermes/skills`).
+- Actions в CI: `actions/checkout@v7` и `actions/setup-python@v7`; `hermes plugins
+  validate step_pipeline` идёт шагом в `tests-matrix` (ubuntu/3.11), после установки
+  hermes-agent — молчаливого «шаг пропущен» нет.
 - Покрытие — сделано 1-S10, замер честный (с подпроцессами): TOTAL 77 %, `gate.py` 82 %,
   порог `fail_under = 75` по правилу `floor(TOTAL − 2)`. Следующая цель 1-S12: `tick.py`
   (32 %) и `step_card.py` до 80 %; `step_card.py` сейчас в отчёт не попадает вовсе — его

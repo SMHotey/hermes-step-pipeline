@@ -30,11 +30,7 @@
   [data-theme="light"] input[type=password] { background: var(--bg); }
   /* Видимый фокус (S8, D11): клавиатура обязана показывать, где она стоит. */
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  /* Компактный режим (S8, D9): плотнее таблицы и карточки. */
-  body.compact table { font-size: 12px; }
-  body.compact td, body.compact th { padding: 3px 6px; }
-  body.compact .card, body.compact .step-card { padding: 3px 6px; }
-  body.compact pre { max-height: 170px; }
+  /* Плотный вид — стандарт панели (S8, D9): таблицы и карточки без «воздуха». */
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
@@ -93,11 +89,11 @@
   .stage.bad:after { background: var(--bad); }
   .stage b { display: block; font-size: 13px; margin-bottom: 2px; }
   .stage span { color: var(--muted); font-size: 12px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
-       text-transform: uppercase; letter-spacing: .06em; padding: 6px 8px;
+       text-transform: uppercase; letter-spacing: .06em; padding: 3px 6px;
        border-bottom: 1px solid var(--line); }
-  td { padding: 7px 8px; border-bottom: 1px solid #1b2230; vertical-align: top; }
+  td { padding: 3px 6px; border-bottom: 1px solid #1b2230; vertical-align: top; }
   tr.current td { background: #17202c; }
   tr.closed td { color: var(--muted); }
   .pill { padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); }
@@ -109,17 +105,25 @@
   .plan-row { cursor: pointer; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
               background: var(--panel-2); font-size: 12px; }
   .plan-row.active { border-color: var(--accent); }
+  #drafts .plan-row { cursor: default; }
   .plan-row .row1 { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
   .plan-reason, .plan-note, .plan-action { margin-top: 4px; white-space: pre-wrap;
                                            word-break: break-word; }
   .plan-note { color: var(--warn); }
   .plan-action { color: var(--muted); }
   .plan-action code { display: block; margin-top: 2px; color: var(--text); }
+  /* Утверждение плана из панели: кнопка вместо команды в терминале. */
+  .plan-row button { padding: 2px 9px; font-size: 12px; margin-left: auto; }
+  .plans-title { font-size: 12px; color: var(--muted); text-transform: uppercase;
+                 letter-spacing: .06em; margin: 4px 0 6px; }
+  #drafts-error { color: var(--bad); font-size: 12.5px; white-space: pre-wrap;
+                  margin: 0 0 10px; }
+  #drafts-error:empty { display: none; }
   pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px;
-        color: var(--muted); max-height: 260px; overflow: auto; }
+        color: var(--muted); max-height: 170px; overflow: auto; }
   .cards li, .journal li { list-style: none; }
   ul { padding: 0; margin: 0; }
-  .card { padding: 7px 8px; border-bottom: 1px solid #1b2230; font-size: 12.5px; }
+  .card { padding: 3px 6px; border-bottom: 1px solid #1b2230; font-size: 12.5px; }
   .card .row1 { display: flex; gap: 8px; align-items: baseline; }
   .card .title { flex: 1; color: var(--text); }
   .muted { color: var(--muted); }
@@ -209,7 +213,7 @@
   .finding.muted { border-left-color: var(--line); color: var(--muted); }
   .finding b { display: block; font-size: 10.5px; text-transform: uppercase;
                letter-spacing: .05em; color: var(--muted); font-weight: 600; }
-  .step-card { padding: 8px 0; border-bottom: 1px solid #1b2230; }
+  .step-card { padding: 3px 6px; border-bottom: 1px solid #1b2230; }
   .step-card .res pre { max-height: 120px; margin-top: 4px; }
   details.comments { margin-top: 4px; }
   details.comments summary { cursor: pointer; font-size: 11.5px; color: var(--accent); }
@@ -276,21 +280,20 @@
   <select id="project-switch" class="project-switch" hidden
           title="проект реестра: действия и снимок адресуются ему"></select>
   <span class="badge mono" id="board">—</span>
-  <span class="badge mono" id="ui-ver" title="версия движка и отпечаток страницы">—</span>
+  <span class="badge mono" id="ui-ver" title="версия плагина">—</span>
   <span class="badge" id="mode">…</span>
   <span class="badge" id="telegram">telegram</span>
   <!-- Бейдж критичных проблем (план 3 S5, §4.5): виден с любой вкладки, клик ведёт в «Проверки». -->
   <span class="badge stop" id="checks-badge" hidden></span>
-  <label class="plan-mode" title="действует со следующей сессии">
+  <label class="plan-mode">
     <input type="checkbox" id="plan-mode"> Режим планировщика
   </label>
-  <span class="muted" id="plan-mode-hint">действует со следующей сессии</span>
+  <span class="muted" id="plan-mode-hint"></span>
   <span class="spacer"></span>
   <button id="btn-tick" class="primary" aria-label="Тик: один шаг стража (клавиша T)">Тик</button>
   <button id="btn-stop" class="danger" aria-label="Стоп: остановиться после текущего шага (клавиша S)">Стоп</button>
   <button id="btn-resume" aria-label="Продолжить: снять остановку (клавиша R)">Продолжить</button>
   <button id="btn-theme" aria-label="Переключить светлую и тёмную тему" aria-pressed="false">Светлая тема</button>
-  <button id="btn-density" aria-label="Переключить компактный и обычный вид таблиц" aria-pressed="false">Компактный вид</button>
   <button id="btn-settings" aria-label="Настройки конвейера">Настройки</button>
 </header>
 
@@ -342,6 +345,12 @@
         <div class="ov-item"><span>риск шага</span><b class="mono" id="ov-risk">—</b></div>
       </div>
       <div id="ov-bars"><span class="muted">—</span></div>
+      <!-- Черновики планов (S13): владелец утверждает их кнопкой, а не командой в
+           терминале. Утверждение переносит файл и пишет запись с sha256 — по ней страж
+           открывает шаги; в предпросмотре кнопок нет. -->
+      <div class="plans-title">Черновики планов</div>
+      <div class="plans" id="drafts"></div>
+      <div id="drafts-error"></div>
       <!-- Строки планов (S2A): статус, причина и одно действие — данные только из снимка. -->
       <div class="plans" id="plans"></div>
     </section>
@@ -719,7 +728,71 @@ function act(action, payload = {}) {
 
 function actionLabel(action) {
   return {tick: "Тик", stop: "Стоп", resume: "Продолжить",
-          hold: "Допуск", unhold: "Снят допуск"}[action] || action;
+          hold: "Допуск", unhold: "Снят допуск", update: "Обновление",
+          plan_accept: "Утверждение плана"}[action] || action;
+}
+
+// ── утверждение плана (S13): решение владельца, панель только убирает команду ──
+// Проверки и запись делает сервер тем же кодом, что `hermes pipeline plan --accept`.
+function showPlanErrors(errors) {
+  const el = $("drafts-error");
+  const rows = (errors || []).map((item) => String(item)).filter(Boolean);
+  el.textContent = rows.length ? "план не утверждён:\n" + rows.map((r) => "• " + r).join("\n") : "";
+}
+
+function approvePlan(id) {
+  if (window.__preview) { toast("предпросмотр только читает", true); return; }
+  const ok = confirm("Утвердить план " + id + "?\n\n"
+    + "Черновик будет перенесён в каталог планов, а утверждение привязано к sha256 файла. "
+    + "Дальше план ведёт страж.");
+  if (!ok) return;
+  setBusy(true);
+  showPlanErrors([]);
+  api("/api/plan/accept", {
+    method: "POST",
+    headers: PANEL_HEADERS,
+    body: JSON.stringify({plan: String(id),
+                          ...(currentProject ? {project: currentProject} : {})}),
+  }).then((data) => {
+    if (data.ok) toast("План " + id + " утверждён");
+    else {
+      toast("План " + id + " не утверждён: " + (data.message || data.error || "ошибка"), true);
+      showPlanErrors(data.errors && data.errors.length
+        ? data.errors : [data.message || data.error || "ошибка"]);
+    }
+    etag = null;
+    startEvents();
+    return refresh();
+  }).catch((err) => toast(String(err), true))
+    .finally(() => setBusy(false));
+}
+
+function bindApprove(scope) {
+  (scope || document).querySelectorAll("[data-approve]").forEach((btn) => {
+    btn.onclick = (event) => { event.stopPropagation(); approvePlan(btn.dataset.approve); };
+  });
+}
+
+function renderDrafts(data) {
+  const box = $("drafts");
+  const rows = data.drafts || [];
+  if (!rows.length) {
+    box.innerHTML = `<span class="muted">черновиков нет — сюда попадают планы из `
+      + `docs/plans/drafts/</span>`;
+    return;
+  }
+  box.innerHTML = rows.map((d) => `
+    <div class="plan-row" data-draft="${esc(d.id)}">
+      <div class="row1">
+        <span class="pill wait">черновик</span>
+        <span>план ${esc(d.id)}</span>
+        <span class="muted">${esc(d.title)} · шагов: ${esc(d.steps_total || 0)}</span>
+        ${data.preview ? "" : `<button data-approve="${esc(d.id)}"
+            title="перенести в каталог планов и записать утверждение">Утвердить</button>`}
+      </div>
+      <div class="muted mono">${esc(d.file)}</div>
+    </div>`).join("");
+  bindApprove(box);
 }
 
 // ── реестр проектов (план 3 S6): один экран на все репозитории ──
@@ -1621,8 +1694,20 @@ function gotoSighting(plan, step) {
 function render(data) {
   $("project").textContent = data.project || "—";
   $("board").textContent = "борда: " + (data.board || "—");
-  if ($("ui-ver")) $("ui-ver").textContent = "движок " + (data.version || "?")
-    + " · ui " + (data.ui_sha || "?");
+  // Версия плагина в шапке. Когда вышел новый релиз, бейдж становится кнопкой
+  // «vX → vY»: обновление ставит панель, а движок проектов — `setup --upgrade`.
+  const verEl = $("ui-ver");
+  if (verEl) {
+    const upd = data.update || {};
+    const available = Boolean(upd.update_available && upd.latest);
+    verEl.textContent = "v" + (data.version || "?") + (available ? " → v" + upd.latest : "");
+    verEl.classList.toggle("on", available);
+    verEl.dataset.latest = available ? String(upd.latest) : "";
+    verEl.style.cursor = available ? "pointer" : "";
+    verEl.title = available
+      ? "доступно обновление v" + upd.latest + " — нажми, чтобы поставить"
+      : (upd.error ? "проверка обновлений: " + upd.error : "версия плагина");
+  }
   // Первый снимок: план не выбран — берём текущий план сервера, иначе первый, у которого
   // есть следующий шаг. Иначе экран «Шаг» открывается пустым («шаг не выбран»).
   if (!currentPlan) {
@@ -1665,8 +1750,9 @@ function render(data) {
   const pm = $("plan-mode");
   pm.checked = data.plan_mode !== false;
   pm.disabled = !!data.preview;
-  $("plan-mode-hint").textContent = data.preview
-    ? "предпросмотр только читает" : "действует со следующей сессии";
+  // Подписи про «следующую сессию» в шапке нет: тумблер стоит без пояснения, а в
+  // предпросмотре подсказка говорит, что переключать нечего (действия запрещены).
+  $("plan-mode-hint").textContent = data.preview ? "предпросмотр только читает" : "";
 
   // Мастер установки в предпросмотре скрыт: он пишет в проект и в .env профилей.
   const setupTab = $("tab-btn-setup");
@@ -1676,6 +1762,7 @@ function render(data) {
   renderOverview(data);
   renderCycle(data);
   renderEvents(data);
+  renderDrafts(data);
   collectNotify(data.notify);
 
   const plans = data.plans || [];
@@ -1696,13 +1783,19 @@ function render(data) {
       <div class="plan-reason">${esc(p.reason)}</div>
       ${p.note ? `<div class="plan-note">${esc(p.note)}</div>` : ""}
       ${act.text ? `<div class="plan-action">что сделать: ${esc(act.text)}`
-                   + (act.command ? `<code>${esc(act.command)}</code>` : "") + `</div>` : ""}
+                   + (act.kind === "approve"
+                      ? ` <button data-approve="${esc(p.id)}"
+                            title="записать утверждение для текущей версии плана">Утвердить</button>`
+                      : (act.command ? `<code>${esc(act.command)}</code>` : ""))
+                   + `</div>` : ""}
     </div>`;
   }).join("") || `<span class="muted">планов с журналом не найдено</span>`;
-  document.querySelectorAll(".plan-row").forEach((row) => {
+  // Клик по строке плана выбирает его; кнопка утверждения — отдельное действие.
+  $("plans").querySelectorAll(".plan-row").forEach((row) => {
     row.onclick = () => { currentPlan = row.dataset.plan; currentStep = null; etag = null;
                           startEvents(); refresh(); };
   });
+  bindApprove($("plans"));
 
   const plan = data.plan || {};
   const closed = new Set(plan.closed || []);
@@ -2168,13 +2261,8 @@ function applyTheme(theme) {
   $("btn-theme").setAttribute("aria-pressed", value === "light" ? "true" : "false");
 }
 
-function applyDensity(compact) {
-  document.body.classList.toggle("compact", Boolean(compact));
-  try { localStorage.setItem("pipeline.density", compact ? "compact" : "normal"); }
-  catch (e) { /* приватный режим */ }
-  $("btn-density").textContent = compact ? "Обычный вид" : "Компактный вид";
-  $("btn-density").setAttribute("aria-pressed", compact ? "true" : "false");
-}
+// Плотность панели одна — компактная (стандарт), переключателя нет: он ничего не менял,
+// кроме лишнего состояния в localStorage.
 
 // Фильтр строк таблицы шагов: пустой ввод возвращает все строки (S8, D8).
 function filterSteps() {
@@ -2192,16 +2280,32 @@ function currentTheme() {
 }
 
 $("btn-theme").onclick = () => applyTheme(currentTheme() === "light" ? "dark" : "light");
-$("btn-density").onclick = () => applyDensity(!document.body.classList.contains("compact"));
+// Бейдж версии: когда есть новый релиз, клик ставит его (без перезагрузки не обойтись —
+// модули плагина уже загружены в процесс сервера).
+$("ui-ver").onclick = () => {
+  const latest = $("ui-ver").dataset.latest || "";
+  if (!latest) return;
+  if (!confirm("Поставить обновление плагина v" + latest + "?")) return;
+  setBusy(true);
+  api("/api/action", {method: "POST", headers: PANEL_HEADERS,
+                      body: JSON.stringify({action: "update"})})
+    .then((data) => {
+      if (data.ok) {
+        toast(data.message || "плагин обновлён");
+        setTimeout(() => location.reload(), 1500);
+      } else {
+        toast(data.error || "обновление не удалось", true);
+      }
+    })
+    .catch((err) => toast(String(err), true))
+    .finally(() => setBusy(false));
+};
 $("add-project").onclick = () => addProject();
 $("new-project-path").addEventListener("keydown", (event) => {
   if (event.key === "Enter") { event.preventDefault(); addProject(); }
 });
 $("steps-filter").addEventListener("input", () => filterSteps());
 $("close-hotkeys").onclick = () => $("hotkeys-help").close();
-applyDensity(document.body.classList.contains("compact")
-             || (function () { try { return localStorage.getItem("pipeline.density") === "compact"; }
-                              catch (e) { return false; } })());
 applyTheme(currentTheme());   // подпись кнопки — по фактической теме
 
 // Один обработчик на всю страницу (D8): клавиши не срабатывают внутри полей ввода.
@@ -2367,7 +2471,7 @@ $("plan-mode").onchange = (event) => {
                          body: JSON.stringify({on, ...(currentProject ? {project: currentProject} : {})})})
     .then((data) => {
       if (data.ok) {
-        toast("Режим планировщика: " + (on ? "on" : "off") + " — действует со следующей сессии");
+        toast("Режим планировщика: " + (on ? "включён" : "выключен"));
       } else {
         toast(data.error || "не удалось переключить режим", true);
         pm.checked = !on;

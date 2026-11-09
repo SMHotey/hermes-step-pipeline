@@ -17,6 +17,7 @@ try:
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
     from . import stats
+    from . import update
 except ImportError:  # pragma: no cover - отладка файлом
     import doctor  # type: ignore
     import plan_accept  # type: ignore
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - отладка файлом
     import snapshot as snap  # type: ignore
     import telegram  # type: ignore
     import stats  # type: ignore
+    import update  # type: ignore
 
 
 def build_parser(sp: argparse.ArgumentParser) -> None:
@@ -116,6 +118,14 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     planmode.add_argument("--project", default="")
     planmode.add_argument("--json", action="store_true")
     planmode.set_defaults(handler=cmd_plan_mode)
+
+    upd = sub.add_parser("update", help="проверить GitHub-релиз и обновить плагин")
+    upd.add_argument("--check", action="store_true",
+                     help="только проверить, ничего не устанавливать")
+    upd.add_argument("--json", action="store_true", help="ответ одним объектом JSON")
+    upd.add_argument("--timeout", type=float, default=0,
+                     help="секунды на запрос к GitHub (0 — умолчание)")
+    upd.set_defaults(handler=cmd_update)
 
 
 def _project(raw: str) -> Path:
@@ -409,6 +419,52 @@ def _print_plan_list(project: Path) -> None:
             print(f"  {number}  {name}")
 
 
+def cmd_update(args) -> int:
+    """Проверить GitHub-релиз и обновить плагин.
+
+    `--check` — только отчёт (код 0 и когда обновление есть: это не ошибка). Сбой сети
+    или архива — код 1 и текст причины: «обновлений нет» при недоступном GitHub было бы
+    ложью, из-за которой обновление не приезжало бы никогда.
+    """
+    timeout = float(getattr(args, "timeout", 0) or 0) or update.DEFAULT_TIMEOUT
+    as_json = bool(getattr(args, "json", False))
+    info = update.check(timeout=timeout)
+    if info["error"]:
+        if as_json:
+            print(_dump(info))
+        print(f"ошибка проверки обновлений: {info['error']}", file=sys.stderr)
+        return 1
+    current, latest = info["current"], info["latest"]
+    if not info["update_available"]:
+        if as_json:
+            print(_dump(info))
+        else:
+            print(f"обновлений нет: установлена v{current}, на GitHub v{latest}")
+        return 0
+    if getattr(args, "check", False):
+        if as_json:
+            print(_dump(info))
+        else:
+            print(f"доступно обновление: v{current} → v{latest} ({info['source']})")
+            print("поставить: hermes pipeline update")
+        return 0
+    print(f"обновляю плагин: v{current} → v{latest}…")
+    try:
+        result = update.install(tag=info["tag"], timeout=timeout)
+    except update.UpdateError as exc:
+        print(f"ошибка обновления: {exc}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(_dump(result))
+        return 0
+    print(result.get("message") or "готово")
+    if result.get("backup"):
+        print(f"прежняя копия: {result['backup']}")
+    if result.get("restart"):
+        print(result["restart"])
+    return 0
+
+
 def cmd_plan_mode(args) -> int:
     """Прочитать или переключить режим планировщика проекта.
 
@@ -455,7 +511,7 @@ def cmd_plan_mode(args) -> int:
                      "changed_at": payload["changed_at"]}))
     else:
         was = "on" if before else "off"
-        print(f"Режим планировщика: {label} (было {was}) — действует со следующей сессии")
+        print(f"Режим планировщика: {label} (было {was})")
         print(f"Файл состояния: {path}")
     return 0
 
@@ -465,7 +521,8 @@ def run(args) -> int:
     proj.setup_stdio()
     handler = getattr(args, "handler", None)
     if handler is None:
-        print("команды: setup | status | run | ui | doctor | notify-test | config | plan | plan-mode")
+        print("команды: setup | status | run | ui | doctor | notify-test | config | plan | "
+              "plan-mode | update")
         return 0
     try:
         return handler(args)

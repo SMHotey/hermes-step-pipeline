@@ -93,7 +93,9 @@ def test_gitignore_covers_install_artifacts():
 
 def test_readme_uses_single_plugin_name():
     text = read(README)
-    rest = text.replace(REPO_URL, "")
+    # Репозиторий называется hermes-step-pipeline, плагин — step_pipeline: убираем оба
+    # написания имени репозитория, иначе дефис в адресе установки читается как имя плагина.
+    rest = text.replace(REPO_URL, "").replace("hermes-step-pipeline", "")
     assert "step-pipeline" not in rest, "в README осталось дефисное имя плагина"
     for command in ("plugins/step_pipeline", "plugins enable step_pipeline",
                     "plugins remove step_pipeline"):

@@ -1,0 +1,38 @@
+name: Идея
+description: Чего не хватает или что стоит изменить
+title: "[идея] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Что не устраивает
+      description: Сценарий и боль, а не готовое решение.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Как это могло бы выглядеть
+      description: Если есть варианты — перечисли и скажи, чем они различаются.
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Что затрагивает
+      multiple: true
+      options:
+        - движок (step_pipeline/engine)
+        - роли и промпты
+        - панель (ui)
+        - установка (setup_flow)
+        - документация
+        - формат плана
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        Проектное поведение (планы, профили, лимиты) настраивается в `pipeline.json`
+        проекта — в плагин такое не добавляем.

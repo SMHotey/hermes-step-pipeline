@@ -407,7 +407,7 @@ def commit_and_push(p: Paths, files: list[str], message: str) -> tuple[bool, str
     if not p.cfg.git_commit:
         return True, "(коммит выключен в pipeline.json)"
     status = _run(["git", "-c", "core.quotepath=off", "status", "--porcelain", "-z"], p.repo)
-    entries = [e for e in status.stdout.split(chr(0)) if e.strip()]
+    entries = [e for e in status.stdout.split("\0") if e.strip()]
     dirty = [e[3:].strip() for e in entries]
     allowed = {f.replace("\\", "/") for f in files}
     strangers = [d for d in dirty if d.replace("\\", "/") not in allowed]
@@ -1440,7 +1440,7 @@ def _decide_base(ctx: dict) -> dict:
         "  3) доправить вручную по замечаниям и запустить тик: ревью пойдёт заново.",
         "Стоп инцидентный: снимется сам, как только появится вердикт APPROVE.",
     ]
-    return {"action": "stop", "step": sid, "reason": reason, "details": chr(10).join(details)}
+    return {"action": "stop", "step": sid, "reason": reason, "details": "\n".join(details)}
 
 
 def close_block_reason(step_id: str, next_id: str) -> str:
@@ -2840,7 +2840,7 @@ def owner_ids(cfg: config_mod.Config) -> set[str]:
     return ids
 
 
-ANSI_RE = re.compile(chr(27) + r"\[[0-9;?]*[A-Za-z]")
+ANSI_RE = re.compile("\x1b" + r"\[[0-9;?]*[A-Za-z]")
 
 # Служебные строки одноразового ответа (`--cli --oneshot`): шапка профиля, строки сессии,
 # отчёты о вызовах инструментов. D4: такой строки в чате быть не должно.
@@ -2853,11 +2853,11 @@ SERVICE_PREFIXES = (
 
 def clean_agent_output(text: str) -> str:
     """Ответ агента без служебных строк, CR и ANSI-цветов — чтобы чат читался."""
-    raw = (text or "").replace(chr(13) + chr(10), chr(10)).replace(chr(13), chr(10))
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     clean = ANSI_RE.sub("", raw)
     lines = [line for line in clean.splitlines()
              if not line.strip().startswith(SERVICE_PREFIXES)]
-    return chr(10).join(lines).strip()
+    return "\n".join(lines).strip()
 
 
 
@@ -2877,7 +2877,7 @@ def split_message(text: str, limit: int = TG_TEXT_LIMIT) -> list[str]:
                 current = ""
             chunks.append(line[:limit])
             line = line[limit:]
-        candidate = (current + chr(10) + line) if current else line
+        candidate = (current + "\n" + line) if current else line
         if len(candidate) > limit:
             chunks.append(current)
             current = line
@@ -2921,7 +2921,7 @@ def _timeout_answer(exc: subprocess.TimeoutExpired) -> str:
         if isinstance(chunk, bytes):
             chunk = chunk.decode("utf-8", "replace")
         parts.append(str(chunk))
-    partial = clean_agent_output(chr(10).join(parts))[:500]
+    partial = clean_agent_output("\n".join(parts))[:500]
     head = ("не успел ответить за отведённое время (notify.dialog.timeout): диалог разросся."
             " Начать заново — /reset")
     return f"{head} что успел сказать: {partial}" if partial else head
@@ -3204,7 +3204,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             if dod and dod[:60] != summary[:60]:
                 lines.append(f"  готово, когда: {dod[:240]}")
             lines.append(f"  карточка {cid}")
-            say(chr(10).join(lines))
+            say("\n".join(lines))
         else:
             say(f"не смог создать карточку шага {step['id']} — проверь `hermes kanban ls`")
         return result
@@ -3411,7 +3411,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 msg.append("  замечания в отчёте — разбор ниже")
             msg.append(f"  подробно: {report_rel}")
             msg.append(f"  карточка правок {cid}")
-            say(chr(10).join(msg))
+            say("\n".join(msg))
             # Находки — в саму карточку правок: отказ комментария не меняет result и не
             # рвёт тик (в `tick` ложный `applied` обрывает цепочку действий).
             _comment(p, cid, fix_comment_body(p, step, round_no, report_rel,
@@ -3493,8 +3493,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                     "После устранения причины продолжится сам; снять принудительно:"
                     " `python .pipeline/gate.py --resume`")
             say("⛔ конвейер остановлен: " + reason
-                + (chr(10) + chr(10) + extra if extra else "")
-                + chr(10) + tail)
+                + ("\n\n" + extra if extra else "")
+                + "\n" + tail)
         return result
     return result
 

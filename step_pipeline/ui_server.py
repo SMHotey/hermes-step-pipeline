@@ -25,6 +25,8 @@
                            preview_config, save_config, revert_config,
                            save_telegram, test_telegram
     POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
+    POST /api/plan/accept  утвердить план: {"plan": "<номер>"}, заголовок X-Pipeline-Panel;
+                           проверки → перенос черновика → запись утверждения с sha256
     POST /api/notify       настройки уведомлений: {"global": true, "enabled": ...} или
                            {"project": id, "enabled": ..., "events": [...]}; запись в projects.json
                            (ровно одна из двух форм, иначе 400)
@@ -56,18 +58,22 @@ import urllib.request
 
 try:
     from . import doctor
+    from . import plan_accept
     from . import plan_lint
     from . import plan_mode
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
+    from . import update
 except ImportError:  # pragma: no cover
     import doctor  # type: ignore
+    import plan_accept  # type: ignore
     import plan_lint  # type: ignore
     import plan_mode  # type: ignore
     import project as proj  # type: ignore
     import setup_flow  # type: ignore
     import snapshot as snap  # type: ignore
     import telegram  # type: ignore
+    import update  # type: ignore
 
 UI_FILE = Path(__file__).resolve().parent / "ui" / "index.html"
 
@@ -211,6 +217,10 @@ class State:
         # Первый кадр потока ничего не доставляет: иначе каждое открытие панели заново
         # всплывало бы старые события (D7).
         self.notify_primed = False
+        # Обновление плагина: последний ответ GitHub (проверка идёт в фоне, снимок её
+        # не ждёт — сеть не должна тормозить панель).
+        self.update_info: dict[str, Any] = {}
+        self.update_lock = threading.Lock()
 
     def note(self, text: str) -> None:
         with self.lock:
@@ -631,8 +641,7 @@ def set_plan_mode(state: State, on: bool) -> dict:
     if before == on:
         return {"ok": True, "mode": label, "file": str(path), "changed": False}
     payload = plan_mode.write_mode(state.project, on)
-    state.note(f"режим планировщика: {label} (было {'on' if before else 'off'}) — "
-               f"со следующей сессии")
+    state.note(f"режим планировщика: {label} (было {'on' if before else 'off'})")
     return {"ok": True, "mode": label, "file": str(path), "changed": True,
             "changed_at": payload["changed_at"]}
 
@@ -747,6 +756,28 @@ def checks_summary(state: State) -> dict | None:
             "notes": list(payload.get("notes") or [])}
 
 
+def act_update(state: State, payload: dict) -> dict:
+    """Обновить плагин из GitHub (кнопка в панели).
+
+    Плагин один на профиль, поэтому действие не привязано к проекту и не требует
+    `.pipeline/` в нём: отказ «конвейер не установлен» здесь был бы неправдой.
+    """
+    tag = str(payload.get("tag") or "")
+    try:
+        result = update.install(tag=tag)
+    except update.UpdateError as exc:
+        return {"ok": False, "error": f"обновление не удалось: {exc}",
+                "current": update.local_version()}
+    state.note(result.get("message") or "плагин обновлён")
+    try:
+        fresh = update.check()
+        with state.update_lock:
+            state.update_info = fresh
+    except Exception:                                          # noqa: BLE001
+        pass
+    return result
+
+
 ACTIONS = {
     "tick": act_tick,
     "stop": act_stop,
@@ -758,6 +789,7 @@ ACTIONS = {
     "revert_config": act_revert_config,
     "save_telegram": act_save_telegram,
     "test_telegram": act_test_telegram,
+    "update": act_update,
 }
 
 
@@ -1284,11 +1316,13 @@ class Handler(BaseHTTPRequestHandler):
         """
         kind = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if kind != "application/json":
+            self._drain_body()
             self._json(415, {"ok": False, "error": "нужен Content-Type: application/json"})
             return False
         port = self.server.server_address[1]
         origin = (self.headers.get("Origin") or "").strip().rstrip("/").lower()
         if origin and origin not in _allowed_origins(port):
+            self._drain_body()
             self._json(403, {"ok": False, "error": "запрос не из панели: чужой Origin"})
             return False
         site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
@@ -1612,6 +1646,11 @@ class Handler(BaseHTTPRequestHandler):
         data["log"] = state.tail()
         data["plan_mode"] = plan_mode.read_mode(state.project)
         data["installed"] = _installed(state.project)
+        # Обновление плагина: то, что уже посчитал фоновый поток сервера (без сети в
+        # самом снимке). Пусто — проверка ещё не закончилась или панель не запускала её.
+        with state.update_lock:
+            if state.update_info:
+                data["update"] = dict(state.update_info)
         data["project_id"] = state.id
         # События внимания (S10): считаются по уже собранному снимку — движок здесь
         # не запускается второй раз (D6), а отметки доставки в тело не попадают (D5).
@@ -2044,6 +2083,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/plan-mode":
             self._post_plan_mode()
             return
+        if path == "/api/plan/accept":
+            self._post_plan_accept()
+            return
         if path == "/api/setup":
             self._post_setup()
             return
@@ -2079,7 +2121,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"ok": False, "error": f"неизвестное действие: {action}"})
             return
         stamp = {"id": state.id, "name": state.name}
-        if not _installed(state.project):
+        # Обновление плагина не зависит от проекта: плагин один на профиль, и обновлять
+        # его надо даже там, где конвейер в этот проект ещё не поставлен.
+        if action != "update" and not _installed(state.project):
             self._json(400, {"ok": False, "project": stamp,
                              "error": f"конвейер не установлен в проект {state.project}: "
                                       f"нет .pipeline/gate.py"})
@@ -2097,6 +2141,43 @@ class Handler(BaseHTTPRequestHandler):
         # запрос не отдавали состояние «до».
         snap.clear_cache()
         self.state.projects_cache = None      # сводка живёт на состоянии сервера (D8)
+        self._json(200 if result.get("ok") else 400, result)
+
+    def _post_plan_accept(self) -> None:
+        """Утвердить план: проверки → перенос черновика → запись с sha256.
+
+        То же, что `hermes pipeline plan --accept N`, но из панели. Утверждение —
+        решение владельца, поэтому маршрут не входит в `ACTIONS` (у него нет проекта
+        в теле действия) и требует метку панели, как переключатель режима.
+        """
+        if getattr(self.state, "preview", False):
+            self._json(403, {"ok": False,
+                             "error": "предпросмотр только читает: утверждение плана недоступно"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        state = self._choose_project(payload.get("project"))
+        if state is None:
+            return
+        plan_id = str(payload.get("plan") or "").strip()
+        if not plan_id.isdigit():
+            self._json(400, {"ok": False, "project": {"id": state.id, "name": state.name},
+                             "error": "нужно поле plan: номер плана"})
+            return
+        try:
+            result = plan_accept.approve(state.project, plan_id)
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "project": {"id": state.id, "name": state.name},
+                             "error": f"{type(exc).__name__}: {exc}"})
+            return
+        result.setdefault("action", "plan_accept")
+        result["project"] = {"id": state.id, "name": state.name}
+        # Утверждение переносит файл и пишет состояние: старый снимок больше не верен.
+        snap.clear_cache()
+        self.state.projects_cache = None
         self._json(200 if result.get("ok") else 400, result)
 
     def _post_plan_mode(self) -> None:
@@ -2127,6 +2208,36 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, result)
 
 
+def refresh_update(state: State, timeout: float = update.DEFAULT_TIMEOUT) -> dict:
+    """Проверить GitHub и запомнить ответ в состоянии (сеть — вне снимка)."""
+    try:
+        info = update.check(timeout=timeout)
+    except Exception as exc:                                   # noqa: BLE001
+        info = {"update_available": False, "error": f"{type(exc).__name__}: {exc}"}
+    with state.update_lock:
+        state.update_info = info
+    if info.get("update_available"):
+        state.note(f"доступно обновление плагина: v{info.get('current')} → "
+                   f"v{info.get('latest')} (обновить: кнопка версии в шапке)")
+    return info
+
+
+def watch_updates(state: State, interval: float = 6 * 3600) -> threading.Thread:
+    """Фоновый сторож обновлений: проверка при старте панели и дальше раз в 6 часов.
+
+    Обновление ставит не он: панель только показывает кнопку, а ставит его cron-джоба
+    или владелец. Иначе панель меняла бы код под работающим конвейером без спроса.
+    """
+    def worker() -> None:
+        while True:
+            refresh_update(state)
+            time.sleep(interval)
+
+    thread = threading.Thread(target=worker, daemon=True, name="pipeline-update")
+    thread.start()
+    return thread
+
+
 def make_server(project: Path, host: str = "127.0.0.1", port: int = 8770,
                 preview: bool = False, board: str | None = None,
                 extra_projects: list[str | Path] | None = None) -> ThreadingHTTPServer:
@@ -2144,7 +2255,9 @@ def make_server(project: Path, host: str = "127.0.0.1", port: int = 8770,
                    {"state": state, "registry": rows, "states": {state.id: state},
                     "_base_project": rows[0]["root"],
                     "_extra_projects": list(extra_projects or [])})
-    return ThreadingHTTPServer((host, port), handler)
+    server = ThreadingHTTPServer((host, port), handler)
+    setattr(server, "state", state)   # состояние первого проекта — для фоновых сторожей
+    return server
 
 
 def serve(project: Path, host: str = "127.0.0.1", port: int = 8770,
@@ -2162,6 +2275,7 @@ def serve(project: Path, host: str = "127.0.0.1", port: int = 8770,
                          extra_projects=extra_projects)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="pipeline-ui")
     thread.start()
+    watch_updates(getattr(server, "state"))
     actual_port = server.server_address[1]
     url = f"http://{host}:{actual_port}/"
     if open_browser:

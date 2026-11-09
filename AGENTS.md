@@ -31,7 +31,7 @@
 ## Проверки перед коммитом
 
 ```bash
-python -m pytest                        # 345 тестов: 171 плагина + 174 движка
+python -m pytest                        # 600+ тестов: плагин + движок (tests/engine/)
 hermes plugins validate step_pipeline   # манифест, инструменты, security-скан
 ```
 

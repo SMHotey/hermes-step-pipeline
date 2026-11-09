@@ -31,9 +31,11 @@ from pathlib import Path
 from typing import Any
 
 try:  # обычный путь — пакет плагина; __main__ — ручная проверка файлом
+    from . import plan_accept
     from . import project as proj
     from . import stats
 except ImportError:  # pragma: no cover
+    import plan_accept  # type: ignore[no-redef]
     import project as proj  # type: ignore[no-redef]
     import stats  # type: ignore[no-redef]
 
@@ -320,6 +322,11 @@ def fingerprint(root: Path, plan: str | None = None, preview: bool = False,
         plan_files = []
     entries.extend(_stat_entry("plan:" + path.name, path) for path in plan_files)
     try:
+        draft_files = sorted((plans_dir / "drafts").glob("*.md"))
+    except OSError:
+        draft_files = []
+    entries.extend(_stat_entry("draft:" + path.name, path) for path in draft_files)
+    try:
         state_files = sorted(path for path in proj.state_dir(root).glob("*") if path.is_file())
     except OSError:
         state_files = []
@@ -423,6 +430,24 @@ def _steps_total(root: Path, cfg: dict, plan_rel: str) -> int:
         return 0
     return sum(1 for index, _level, title in found
                if span[0] < index < span[1] and _is_step_title(step_re, title))
+
+
+def drafts(root: Path, cfg: dict) -> list[dict]:
+    """Черновики планов для панели: номер, файл, заголовок и число шагов.
+
+    Список — только чтение; утверждение идёт отдельным действием
+    (`POST /api/plan/accept`), потому что оно переносит файл и пишет запись состояния.
+    """
+    try:
+        rows = plan_accept.list_drafts(root)
+    except Exception:                                        # noqa: BLE001 - снимок не падает
+        return []
+    out: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        item["steps_total"] = _steps_total(root, cfg, item.get("file") or "")
+        out.append(item)
+    return out
 
 
 def _duration(seconds) -> str:
@@ -1370,6 +1395,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         "telegram": telegram_state(root),
         "preview": preview,
         "plans": [],
+        "drafts": [],
         "plan": None,
         "package": None,
         "decision": None,
@@ -1386,6 +1412,9 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
                                         extra_env=extra_env) or []
     except Exception as exc:                                    # noqa: BLE001 - показываем в UI
         out["errors"].append(f"планы: {exc}")
+    # Черновики читаются без движка: панель показывает их рядом с планами, чтобы
+    # утверждение было кнопкой, а не командой в терминале.
+    out["drafts"] = drafts(root, cfg)
     chosen = plan
     if chosen is None and out["plans"]:
         # по умолчанию — план, у которого есть открытые шаги (иначе первый по номеру)

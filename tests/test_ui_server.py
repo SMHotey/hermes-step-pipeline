@@ -1920,13 +1920,17 @@ def test_index_hotkeys_markup():
 
 
 def test_index_theme_and_density_markup():
-    """Тема и плотность: переменные светлой палитры, dataset и localStorage (C6)."""
+    """Тема переключается, плотность одна (компактная) и переключателя у неё нет (C6)."""
     html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
     for anchor in ('dataset.theme', '[data-theme="light"]',
                    'localStorage.getItem("pipeline.theme")',
-                   'localStorage.getItem("pipeline.density")',
-                   'id="btn-theme"', 'id="btn-density"', "compact"):
+                   'id="btn-theme"', "table { width: 100%; border-collapse: collapse; font-size: 12px; }"):
         assert anchor in html, anchor
+    # Устаревшие органы управления: подпись «со следующей сессии», переключатель
+    # плотности и отпечаток страницы в бейдже версии — убраны из панели.
+    for gone in ('id="btn-density"', 'id="plan-mode-hint">действует',
+                 'localStorage.getItem("pipeline.density")', '· ui '):
+        assert gone not in html, gone
 
 
 def test_index_focus_and_aria_markup():
@@ -2663,3 +2667,46 @@ def test_index_plan_rows_markup():
     # Контейнер планов — внутри секции «Обзор», до «Потока текущего шага».
     overview = html[html.index('id="overview"'):html.index('id="flow"')]
     assert 'id="plans"' in overview
+
+
+def test_update_action_installs_plugin(server, monkeypatch):
+    """Бейдж версии: действие update ставит релиз и не требует `.pipeline` в проекте.
+
+    Плагин один на профиль, поэтому обновление не привязано к проекту панели — отказ
+    «конвейер не установлен» здесь был бы неправдой.
+    """
+    calls = {}
+
+    def fake_install(tag=""):
+        calls["tag"] = tag
+        return {"ok": True, "updated": True, "from": "0.1.0", "to": "0.2.0",
+                "message": "плагин обновлён: v0.1.0 → v0.2.0", "backup": "backup",
+                "restart": "перезапусти сессию Hermes"}
+
+    monkeypatch.setattr(ui_server.update, "install", fake_install)
+    monkeypatch.setattr(ui_server.update, "check", lambda **_: {
+        "current": "0.2.0", "latest": "0.2.0", "update_available": False, "error": ""})
+
+    status, data = post(server["url"], {"action": "update"},
+                        headers={"X-Pipeline-Panel": "1"})
+    assert status == 200
+    assert data["updated"] is True and data["to"] == "0.2.0"
+    assert data["message"] == "плагин обновлён: v0.1.0 → v0.2.0"
+    assert calls["tag"] == ""
+    assert server["state"].update_info["current"] == "0.2.0"
+
+
+def test_update_action_rejects_foreign_origin(server):
+    """Чужой сайт не обновляет плагин: 403 с причиной, тело дочитано (не RST)."""
+    status, data = post(server["url"], {"action": "update"},
+                        headers={"Origin": "http://evil.example"})
+    assert status == 403 and data["ok"] is False
+    assert "Origin" in data["error"]
+
+
+def test_index_version_badge_offers_update():
+    """Бейдж версии — единственный вход в обновление: без него кнопка «→ vY» мертва."""
+    html = index_html()
+    for anchor in ('id="ui-ver"', "dataset.latest", "data.update",
+                   'action: "update"', "Поставить обновление плагина v"):
+        assert anchor in html, anchor

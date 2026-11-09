@@ -428,6 +428,10 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
     driver = roles_from_config(proj.read_config(project))[0]
     plugin_state = ensure_plugin_enabled(driver, log)
     tick = refresh_tick_script(project, log)
+    # Автообновление заводим только там, где cron уже есть: проект с `--no-cron`
+    # не должен получить джобу «в подарок» при обновлении движка.
+    if (project / ".pipeline" / "cron.json").is_file():
+        ensure_update_cron(driver, project, log, skip=False)
     if trust:
         failed = trust_roles(roles_from_config(proj.read_config(project)), project, log)
         tail = ("доверие ролям оформлено" if not failed
@@ -829,6 +833,102 @@ def cron_command(driver: str, project: Path) -> str:
             f'--no-agent --script pipeline_tick.py --deliver local --workdir "{project}"')
 
 
+#: Ежедневное автообновление: релиз выходит не каждый день, а проверка дешёвая (один
+#: запрос к GitHub) — раз в сутки достаточно и не мешает тику стража.
+UPDATE_CRON = "0 5 * * *"
+UPDATE_JOB = "План: обновление плагина (конвейер)"
+UPDATE_SCRIPT = '''
+def _setup_stdio():
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is None:
+            continue
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def find_plugin():
+    """Каталог установленного плагина: рядом с профилем, иначе в ~/.hermes."""
+    here = Path(__file__).resolve()
+    candidates = [here.parents[1] / "plugins" / "step_pipeline",
+                  Path.home() / ".hermes" / "plugins" / "step_pipeline"]
+    for cand in candidates:
+        if (cand / "update.py").is_file():
+            return cand
+    return None
+
+
+def main():
+    _setup_stdio()
+    plugin = find_plugin()
+    if plugin is None:
+        print("pipeline_update: плагин step_pipeline не найден", file=sys.stderr)
+        return 1
+    sys.path.insert(0, str(plugin))
+    from update import auto  # noqa: E402
+    result = auto()
+    if result.get("error"):
+        print("pipeline_update: " + str(result["error"]), file=sys.stderr)
+        return 1
+    if result.get("updated"):
+        print(result.get("message") or "плагин обновлён")
+        if result.get("restart"):
+            print(result["restart"])
+    return 0
+'''
+
+
+def install_update_script(driver: str) -> Path:
+    """Положить скрипт автообновления в `profiles/<профиль>/scripts/` (cron берёт только оттуда)."""
+    scripts = proj.profile_dir(driver) / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    header = ('# -*- coding: utf-8 -*-\n'
+              '"""Автообновление плагина конвейера из GitHub (`--no-agent`, раз в сутки).\n\n'
+              'Плагин ставится копией, поэтому обновление — скачать архив тега и переписать\n'
+              'пакет. Движок в проектах обновляет владелец: `hermes pipeline setup --upgrade`\n'
+              '(плагин не переписывает `.pipeline/` в проектах молча).\n'
+              '"""\n'
+              'import sys\n'
+              'from pathlib import Path\n')
+    target = scripts / "pipeline_update.py"
+    target.write_text(header + UPDATE_SCRIPT, encoding="utf-8")
+    return target
+
+
+def ensure_update_cron(driver: str, project: Path, log: Log, *, skip: bool) -> None:
+    """Cron-джоба автообновления плагина: no-agent, раз в сутки, доставка local.
+
+    Заводится вместе со стражем: иначе «автоматическое обновление» означало бы «пока
+    открыта панель». Скрипт переписывается при каждом прогоне мастера — джоба,
+    заведённая со старой копией, иначе осталась бы с ней навсегда.
+    """
+    if skip:
+        log.warn("автообновление не заведено (--no-cron)")
+        return
+    install_update_script(driver)
+    listing = proj.run_hermes("-p", driver, "cron", "list")
+    if UPDATE_JOB in (listing.stdout or ""):
+        log.ok("cron-джоба автообновления уже есть (скрипт обновлён)")
+        return
+    res = proj.run_hermes("-p", driver, "cron", "create", UPDATE_CRON,
+                          "--name", UPDATE_JOB, "--no-agent",
+                          "--script", "pipeline_update.py",
+                          "--deliver", "local",
+                          "--workdir", str(project))
+    if res.returncode == 0:
+        log.ok("cron-джоба автообновления создана (ежедневно)")
+    else:
+        log.warn(f"cron автообновления: {(res.stderr or res.stdout or '').strip()[:300]}")
+        log.warn("завести вручную: " + update_cron_command(driver, project))
+
+
+def update_cron_command(driver: str, project: Path) -> str:
+    return (f'hermes -p {driver} cron create "{UPDATE_CRON}" --name "{UPDATE_JOB}" '
+            f'--no-agent --script pipeline_update.py --deliver local --workdir "{project}"')
+
+
 COMMANDS_JOB = "План: бот команды (конвейер)"
 
 
@@ -1228,6 +1328,7 @@ def run_setup(args) -> int:
     ensure_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)))
     ensure_commands_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)),
                          enabled=bool(chat), skipped=bool(notify.get("skipped")))
+    ensure_update_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)))
 
     # Доверие проекту нужно каждой роли: без него воркер падает `Unknown skill(s)`,
     # и карточка уходит в blocked по failure_limit. Ошибка одной роли не ломает мастер.
@@ -1554,6 +1655,7 @@ def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str
         ensure_commands_cron(driver, project, log, skip=False,
                              enabled=bool(stored.get("enabled")),
                              skipped=bool(stored.get("skipped")))
+        ensure_update_cron(driver, project, log, skip=False)
         return True, ""
 
     # checks: ничего не меняет — только считает и рассказывает (D10).

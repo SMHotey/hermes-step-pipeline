@@ -49,14 +49,13 @@ def test_off_then_status_prints_off(project: Path, capsys):
     assert plan_mode.read_mode(project) is False
 
 
-def test_off_reports_exact_change_and_next_session(project: Path, capsys):
-    """off говорит, что было on и что режим действует со следующей сессии; файл получает дату."""
+def test_off_reports_exact_change(project: Path, capsys):
+    """off говорит, что было on; файл получает дату."""
     path = plan_mode.state_file(project)
     assert cli.cmd_plan_mode(Namespace(action="off", project=str(project),
                                        json=False)) == 0
     captured = capsys.readouterr()
-    assert ("Режим планировщика: off (было on) — действует со следующей сессии"
-            in captured.out)
+    assert "Режим планировщика: off (было on)" in captured.out
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["plan_mode"] is False
@@ -73,8 +72,7 @@ def test_on_after_off_restores_and_second_on_is_noop(project: Path, capsys):
     assert cli.cmd_plan_mode(Namespace(action="on", project=str(project),
                                        json=False)) == 0
     captured = capsys.readouterr()
-    assert ("Режим планировщика: on (было off) — действует со следующей сессии"
-            in captured.out)
+    assert "Режим планировщика: on (было off)" in captured.out
     assert plan_mode.read_mode(project) is True
     stamp = json.loads(path.read_text(encoding="utf-8"))["changed_at"]
 

@@ -1,0 +1,48 @@
+name: Баг
+description: Что-то работает не так, как описано
+title: "[баг] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Секреты не прикладывай: токен бота и содержимое `.pipeline/state/` — не для issue.
+        Об уязвимости — не здесь, а через [Security advisory](../security/advisories/new).
+  - type: textarea
+    id: what
+    attributes:
+      label: Что происходит
+      description: Фактическое поведение и что ожидалось.
+      placeholder: |
+        Шаг закрылся, но журнал пустой. Ожидал запись с вердиктом и коммитом.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как повторить
+      placeholder: |
+        1. `hermes pipeline setup --project C:/work/demo`
+        2. `hermes pipeline ui --project C:/work/demo`
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Окружение
+      description: ОС, Python, версия плагина и Hermes.
+      placeholder: |
+        Windows 11, Python 3.11.15, плагин 0.18.0, hermes 2026.11.x
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи и состояние
+      description: |
+        Что полезно: `.pipeline/state/*.json`, вывод `hermes pipeline doctor`,
+        `hermes plugins validate step_pipeline`. Секреты вырежи.
+      render: text
+    validations:
+      required: false
