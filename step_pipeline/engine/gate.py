@@ -76,6 +76,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -2370,6 +2371,8 @@ def send_digest(cfg: config_mod.Config, say=None) -> bool:
 # ───────────────────── команды владельцу (Telegram, вход) ─────────────────────
 
 TG_TEXT_LIMIT = 3900
+# action `typing` в Telegram живёт около 5 секунд — обновляем чаще.
+TYPING_REFRESH = 4.0
 
 TG_HELP = (
     "Команды конвейера:\n"
@@ -2381,6 +2384,7 @@ TG_HELP = (
     "/unhold S3 — снять ручной допуск\n"
     "/reset — начать диалог с агентом заново\n"
     "Свободный текст без «/» уходит агенту: он ответит в этот же чат.\n"
+    "Слишком частые сообщения не обрабатываются (защита от флуда).\n"
     "Работают только из чата, указанного в настройках."
 )
 
@@ -2440,6 +2444,8 @@ def _write_offset(path: Path, offset: int) -> None:
 
 DIALOG_STATE_NAME = "tg_dialog.json"
 COMMANDS_OFF_NAME = "tg_commands_off.json"
+RATE_STATE_NAME = "tg_rate.json"
+RATE_DEFAULTS = {"max": 5, "window": 60}
 
 # Умолчания берутся из `notify.dialog` (config.py), чтобы числа шага жили в одном месте:
 # сюда попадает только запасной вариант для конфига, собранного до S4 (ключа `dialog` там
@@ -2506,6 +2512,75 @@ def _save_dialogs(cfg: config_mod.Config, data: dict) -> None:
         state_io.save_json(_dialog_path(cfg), data)
     except OSError as exc:
         print(f"[commands] состояние диалога не сохранено: {exc}", file=sys.stderr)
+
+
+def rate_settings(cfg: config_mod.Config) -> dict:
+    """Лимит частоты свободного текста: умолчания D4 поверх `notify.commands.rate_limit`.
+
+    Ключ необязательный: его нет в `config.py` и `pipeline.json`, поэтому мусор в конфиге
+    не ломает приём, а даёт умолчания. `max <= 0` — лимита нет вовсе.
+    """
+    commands = cfg.notify.get("commands") if isinstance(cfg.notify, dict) else None
+    raw = commands.get("rate_limit") if isinstance(commands, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    max_msgs = _as_int(raw.get("max"), RATE_DEFAULTS["max"])
+    window = _as_int(raw.get("window"), RATE_DEFAULTS["window"])
+    if window <= 0:
+        window = RATE_DEFAULTS["window"]
+    if max_msgs < 0:
+        max_msgs = 0
+    return {"max": max_msgs, "window": window}
+
+
+def _rate_path(cfg: config_mod.Config) -> Path:
+    return Path(cfg.state_dir) / RATE_STATE_NAME
+
+
+def _read_rate(cfg: config_mod.Config) -> dict:
+    """Счётчики частоты; битый JSON и отсутствие файла — пустое состояние."""
+    try:
+        data = json.loads(_rate_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def rate_allow(cfg: config_mod.Config, chat: str) -> dict:
+    """Пропустить сообщение владельца или отсеять по частоте (D4).
+
+    Квота живёт в `tg_rate.json`: cron запускает новый процесс каждый тик, поэтому счётчик
+    в памяти процесса ничего не ограничивает. Одно предупреждение на окно (`warn`),
+    дальше тишина. Сбой записи — fail-open: потерять сообщение владельца хуже, чем
+    пропустить лишнее.
+    """
+    settings = rate_settings(cfg)
+    if settings["max"] <= 0:
+        return {"allowed": True, "warn": False}
+    state = _read_rate(cfg)
+    key = str(chat)
+    item = state.get(key)
+    item = dict(item) if isinstance(item, dict) else {}
+    now = _now()
+    window_start = _as_float(item.get("window_start"), 0.0)
+    count = _as_int(item.get("count"), 0)
+    warned = item.get("warned") is True
+    if not item or now - window_start >= settings["window"]:
+        count, warned, window_start = 0, False, now
+    warn = False
+    if count >= settings["max"]:
+        warn = not warned
+        warned = True
+        allowed = False
+    else:
+        count += 1
+        allowed = True
+    state[key] = {"count": count, "window_start": window_start, "warned": warned}
+    try:
+        state_io.save_json(_rate_path(cfg), state)
+    except OSError as exc:
+        print(f"[commands] квота не сохранена: {exc}", file=sys.stderr)
+        return {"allowed": True, "warn": False}
+    return {"allowed": allowed, "warn": warn}
 
 
 def _estimate_tokens(text: str, per_char: float) -> int:
@@ -2766,8 +2841,12 @@ def clean_agent_output(text: str) -> str:
 
 
 
-def split_message(text: str, limit: int = 3500) -> list[str]:
-    """Режет длинный ответ по строкам под лимит Telegram (без разрыва слов, если можно)."""
+def split_message(text: str, limit: int = TG_TEXT_LIMIT) -> list[str]:
+    """Режет длинный ответ по строкам под лимит Telegram (без разрыва слов, если можно).
+
+    Порог — `TG_TEXT_LIMIT` (3900): лимит Telegram 4096, запас остаётся на служебные
+    символы Bot API.
+    """
     chunks: list[str] = []
     current = ""
     for line in (text or "").splitlines():
@@ -2786,6 +2865,27 @@ def split_message(text: str, limit: int = 3500) -> list[str]:
     if current:
         chunks.append(current)
     return chunks or [""]
+
+
+def send_answer(token: str, chat: str, text: str) -> None:
+    """Отправить ответ целиком: длинный текст уходит несколькими сообщениями."""
+    for chunk in split_message(text):
+        sent = _tg_call(token, "sendMessage", chat_id=chat, text=chunk,
+                        disable_web_page_preview="true")
+        if not sent.get("ok"):
+            print(f"[commands] ответ не доставлен: {sent.get('description')}", file=sys.stderr)
+            break
+
+
+def send_typing(token: str, chat: str) -> None:
+    """«Печатает» в чате: сбой action не влияет на ответ и не пишется в stderr."""
+    _tg_call(token, "sendChatAction", chat_id=chat, action="typing")
+
+
+def _typing_keepalive(token: str, chat: str, stop_event, interval: float = TYPING_REFRESH) -> None:
+    """Держать «печатает», пока агент думает: гасится через stop_event."""
+    while not stop_event.wait(interval):
+        send_typing(token, chat)
 
 def _timeout_answer(exc: subprocess.TimeoutExpired) -> str:
     """Человеческий ответ на срез по времени (D5): без имени команды и цифр таймаута.
@@ -2839,7 +2939,9 @@ def ask_agent(cfg: config_mod.Config, text: str, chat: str,
     session["tokens"] = _as_int(session.get("tokens"), 0) + _estimate_tokens(
         text + out, settings["tokens_per_char"])
     save_dialog_session(cfg, session)
-    return out[: TG_TEXT_LIMIT - 100]
+    # Длину держит `send_answer`; потолки ответа — 2-S4 (`_timeout_answer`, 240 с),
+    # обрезка здесь делала разбиение фиктивным.
+    return out
 
 
 def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) -> dict:
@@ -2850,7 +2952,8 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
     Ответ 409 (вебхук или второй поллер) выключает приём команд одной записью маркера:
     предупреждение уходит один раз, дальше функция выходит до запроса в сеть.
     """
-    result = {"ok": False, "handled": 0, "ignored": 0, "reason": "", "disabled": False}
+    result = {"ok": False, "handled": 0, "ignored": 0, "limited": 0, "reason": "",
+              "disabled": False}
     if not commands_enabled(cfg):
         result["reason"] = "приём команд выключен (notify.commands.enabled)"
         return result
@@ -2897,17 +3000,35 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
         allowed = owner_ids(cfg)
         if sender_chat != str(chat) or (allowed and sender_id and sender_id not in allowed):
             result["ignored"] += 1
-            print(f"[commands] чужой отправитель {sender_id or '?'} — игнор", file=sys.stderr)
+            # id отправителя и чата; текст чужого сообщения в лог не пишем.
+            print(f"[commands] чужой отправитель {sender_id or '?'} (чат {sender_chat or '?'}) — игнор",
+                  file=sys.stderr)
             continue
+        if not text.startswith("/"):
+            quota = rate_allow(cfg, chat)
+            if not quota["allowed"]:
+                result["limited"] += 1
+                if quota["warn"]:
+                    settings = rate_settings(cfg)
+                    send_answer(token, chat,
+                                f"слишком часто: не больше {settings['max']} сообщений"
+                                f" за {settings['window']} с — это сообщение не обработано.")
+                print(f"[commands] слишком часто: чат {chat} — сообщение не обработано",
+                      file=sys.stderr)
+                continue
         started = time.monotonic()
         if not text.startswith("/"):
-            answer = ask_agent(cfg, text, chat)
-            for chunk in split_message(answer):
-                sent = _tg_call(token, "sendMessage", chat_id=chat, text=chunk,
-                                disable_web_page_preview="true")
-                if not sent.get("ok"):
-                    print(f"[commands] ответ не доставлен: {sent.get('description')}", file=sys.stderr)
-                    break
+            send_typing(token, chat)
+            stop_event = threading.Event()
+            keep = threading.Thread(target=_typing_keepalive, args=(token, chat, stop_event),
+                                    daemon=True)
+            keep.start()
+            try:
+                answer = ask_agent(cfg, text, chat)
+            finally:
+                stop_event.set()
+                keep.join(timeout=1.0)
+            send_answer(token, chat, answer)
             _log_chat(cfg, "tg_dialog", text, started)
             result["handled"] += 1
             continue
@@ -2915,10 +3036,7 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
             answer = handle_command(cfg, text, chat)
         except Exception as exc:  # noqa: BLE001 - команда не должна ронять тик
             answer = f"ошибка выполнения {text.split()[0]}: {exc}"
-        sent = _tg_call(token, "sendMessage", chat_id=chat, text=answer[:TG_TEXT_LIMIT],
-                        disable_web_page_preview="true")
-        if not sent.get("ok"):
-            print(f"[commands] ответ не доставлен: {sent.get('description')}", file=sys.stderr)
+        send_answer(token, chat, answer)
         _log_chat(cfg, "tg_command", text, started)
         result["handled"] += 1
     if newest > offset:
@@ -3971,6 +4089,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 tail = f" ({result['reason']})" if result.get("reason") else ""
                 extra = f", чужих проигнорировано: {result['ignored']}" if result.get("ignored") else ""
+                if result.get("limited"):
+                    extra += f", отсечено по частоте: {result['limited']}"
                 print(f"команд обработано: {result['handled']}{extra}{tail}")
             # Выключенный приём команд — не сбой джобы: иначе cron будет слать ошибки,
             # пока владелец не снимет вебхук или не включит команды обратно.

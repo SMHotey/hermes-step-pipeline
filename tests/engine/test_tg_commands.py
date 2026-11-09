@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -461,3 +462,213 @@ def test_poll_logs_chat_actions_to_history(cfg, monkeypatch):
     assert all(row["plan"] == "1" and row["step"] == "" for row in rows)
     assert rows[0]["detail"].startswith("/status")
     assert rows[1]["detail"].startswith("что случилось?")
+
+
+# ───────────────── S12: длинные ответы, «печатает», защита ─────────────────
+
+def _with_rate(project: Path, max_msgs: int, window: int = 60) -> config_mod.Config:
+    """Конфиг проекта с явным лимитом частоты: ключ необязательный, поэтому пишем его сами."""
+    raw = json.loads((project / "pipeline.json").read_text(encoding="utf-8"))
+    raw["notify"]["commands"] = {"rate_limit": {"max": max_msgs, "window": window}}
+    (project / "pipeline.json").write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    return config_mod.load(project)
+
+
+def test_ask_agent_returns_full_answer(cfg, monkeypatch):
+    """Длинный ответ агента возвращается целиком: обрезка в ask_agent снята."""
+
+    class Done:
+        stdout = "о" * 8000
+        stderr = ""
+
+    monkeypatch.setattr(gate, "_run", lambda cmd, cwd=None, timeout=0, env=None: Done())
+    assert len(gate.ask_agent(cfg, "привет", CHAT)) == 8000
+
+
+def test_long_dialog_answer_goes_in_several_messages(cfg, monkeypatch):
+    """Ответ в 8000 символов уходит тремя сообщениями, ни один кусок не больше лимита."""
+    tg = FakeTG([update("расскажи подробно", uid=51)])
+    monkeypatch.setattr(gate, "_tg_call", tg)
+    monkeypatch.setattr(gate, "ask_agent", lambda _cfg, text, _chat, timeout=240: "x" * 8000)
+
+    result = gate.poll_commands(cfg, wait=0)
+
+    assert len(tg.answers()) == 3
+    assert all(len(chunk) <= gate.TG_TEXT_LIMIT for chunk in tg.answers())
+    assert "".join(tg.answers()) == "x" * 8000
+    assert result["handled"] == 1
+
+
+def test_long_command_answer_goes_in_several_messages(cfg, monkeypatch):
+    """Командная ветка тоже шлёт ответ целиком — терять хвост из-за обрезки она не должна."""
+    tg = FakeTG([update("/plans", uid=52)])
+    monkeypatch.setattr(gate, "_tg_call", tg)
+    monkeypatch.setattr(gate, "plans_table", lambda _cfg: "y" * 8000)
+
+    assert gate.poll_commands(cfg, wait=0)["handled"] == 1
+
+    assert len(tg.answers()) == 3
+    assert all(len(chunk) <= gate.TG_TEXT_LIMIT for chunk in tg.answers())
+
+
+def test_typing_sent_before_agent_answer(cfg, monkeypatch):
+    """«Печатает» уходит до ответа агента, а не после."""
+    tg = FakeTG([update("привет", uid=53)])
+    monkeypatch.setattr(gate, "_tg_call", tg)
+    monkeypatch.setattr(gate, "ask_agent", lambda _cfg, text, _chat, timeout=240: "ответ")
+
+    result = gate.poll_commands(cfg, wait=0)
+
+    typing = [i for i, (method, params) in enumerate(tg.calls)
+              if method == "sendChatAction" and params.get("action") == "typing"
+              and params.get("chat_id") == CHAT]
+    first_answer = [i for i, (method, _params) in enumerate(tg.calls)
+                    if method == "sendMessage"]
+    assert typing and first_answer and typing[0] < first_answer[0]
+    assert result["handled"] == 1
+
+
+def test_typing_keepalive_repeats_until_stopped(monkeypatch):
+    """Поток «печатает» живёт до stop_event и не оставляет работы: три вызова, ни одного ответа."""
+    stop_event = threading.Event()
+    calls: list[tuple[str, dict]] = []
+
+    def fake(_token, method, http_timeout=20, **params):
+        calls.append((method, params))
+        if len(calls) == 3:
+            stop_event.set()
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(gate, "_tg_call", fake)
+    gate._typing_keepalive("123456:TEST", CHAT, stop_event, interval=0)
+
+    assert [method for method, _params in calls] == ["sendChatAction"] * 3
+    assert all(params.get("action") == "typing" for _method, params in calls)
+
+
+def test_typing_failure_does_not_block_answer(cfg, monkeypatch):
+    """Сбой sendChatAction — косметика: ответ владельцу всё равно доставлен."""
+
+    class FailingTyping(FakeTG):
+        def __call__(self, token, method, http_timeout=20, **params):
+            if method == "sendChatAction":
+                self.calls.append((method, params))
+                return {"ok": False, "description": "Bad Request: chat not found"}
+            return super().__call__(token, method, http_timeout=http_timeout, **params)
+
+    tg = FailingTyping([update("привет", uid=54)])
+    monkeypatch.setattr(gate, "_tg_call", tg)
+    monkeypatch.setattr(gate, "ask_agent", lambda _cfg, text, _chat, timeout=240: "ответ")
+
+    result = gate.poll_commands(cfg, wait=0)
+
+    assert tg.answers()
+    assert result["handled"] == 1
+
+
+def test_rate_limit_drops_extra_free_text(cfg, project: Path, monkeypatch):
+    """Лишний свободный текст не запускает агента; о первом отсеве — одно предупреждение."""
+    cfg2 = _with_rate(project, max_msgs=3)
+    tg = FakeTG([update(f"вопрос {n}", uid=60 + n) for n in range(1, 7)])
+    monkeypatch.setattr(gate, "_tg_call", tg)
+    monkeypatch.setattr(gate, "ask_agent", lambda _cfg, text, _chat, timeout=240: "ответ")
+
+    result = gate.poll_commands(cfg2, wait=0)
+
+    assert result["handled"] == 3
+    assert result["limited"] == 3
+    assert len(tg.answers()) == 4
+    assert "3" in tg.answers()[-1] and "60" in tg.answers()[-1]
+
+
+def test_rate_limit_does_not_apply_to_commands(cfg, project: Path, monkeypatch):
+    """Команды с «/» квоту не тратят: аварийный /stop проходит всегда."""
+    cfg2 = _with_rate(project, max_msgs=1)
+    tg = FakeTG([update("/status", uid=71), update("/status", uid=72), update("/status", uid=73)])
+    monkeypatch.setattr(gate, "_tg_call", tg)
+
+    result = gate.poll_commands(cfg2, wait=0)
+
+    assert result["handled"] == 3
+    assert result["limited"] == 0
+
+
+def test_rate_limit_window_resets(cfg, project: Path, monkeypatch):
+    """Окно считается по _now: после window секунд квота начинается заново."""
+    cfg2 = _with_rate(project, max_msgs=3)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(gate, "_now", lambda: clock["now"])
+    monkeypatch.setattr(gate, "ask_agent", lambda _cfg, text, _chat, timeout=240: "ответ")
+    tg = FakeTG([update(f"вопрос {n}", uid=80 + n) for n in range(1, 5)])
+    monkeypatch.setattr(gate, "_tg_call", tg)
+
+    first = gate.poll_commands(cfg2, wait=0)
+    assert first["handled"] == 3 and first["limited"] == 1
+
+    clock["now"] += 61
+    tg.updates = [update("после окна", uid=90)]
+    second = gate.poll_commands(cfg2, wait=0)
+    assert second["handled"] == 1 and second["limited"] == 0
+
+
+def test_rate_limit_quota_survives_new_poll(cfg, project: Path, monkeypatch):
+    """Квота живёт в файле: cron запускает новый процесс, память процесса её не помнит."""
+    cfg2 = _with_rate(project, max_msgs=5)
+    monkeypatch.setattr(gate, "ask_agent", lambda _cfg, text, _chat, timeout=240: "ответ")
+    first = FakeTG([update(f"вопрос {n}", uid=100 + n) for n in range(1, 4)])
+    monkeypatch.setattr(gate, "_tg_call", first)
+    assert gate.poll_commands(cfg2, wait=0)["handled"] == 3
+
+    second = FakeTG([update(f"ещё {n}", uid=110 + n) for n in range(1, 4)])
+    monkeypatch.setattr(gate, "_tg_call", second)
+    result = gate.poll_commands(cfg2, wait=0)
+
+    assert result["handled"] == 2
+    assert result["limited"] == 1
+
+
+def test_rate_limit_zero_means_no_limit(cfg, project: Path, monkeypatch):
+    """`max = 0` — лимит выключен: сообщения идут все, файла квоты нет."""
+    cfg2 = _with_rate(project, max_msgs=0)
+    tg = FakeTG([update(f"вопрос {n}", uid=120 + n) for n in range(1, 7)])
+    monkeypatch.setattr(gate, "_tg_call", tg)
+    monkeypatch.setattr(gate, "ask_agent", lambda _cfg, text, _chat, timeout=240: "ответ")
+
+    result = gate.poll_commands(cfg2, wait=0)
+
+    assert result["handled"] == 6
+    assert result["limited"] == 0
+    assert not (Path(cfg2.state_dir) / "tg_rate.json").exists()
+
+
+def test_foreign_user_attempt_is_logged_with_ids(cfg, monkeypatch, capsys):
+    """Чужой user id ничего не получает, но в stderr есть и его id, и id чата."""
+    tg = FakeTG([update("/status", uid=131, user=999)])
+    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_OWNER_ID", CHAT)
+    monkeypatch.setattr(gate, "_tg_call", tg)
+
+    result = gate.poll_commands(cfg, wait=0)
+
+    err = capsys.readouterr().err
+    assert tg.answers() == []
+    assert result["ignored"] == 1
+    assert "999" in err and CHAT in err
+
+
+def test_foreign_chat_attempt_logged_without_user(cfg, monkeypatch, capsys):
+    """Чужой чат без поля `from` логируется адресом чата, а не «?» вместо него."""
+    tg = FakeTG([update("/status", uid=141, chat="999999")])
+    monkeypatch.setattr(gate, "_tg_call", tg)
+
+    gate.poll_commands(cfg, wait=0)
+
+    err = capsys.readouterr().err
+    assert "999999" in err and "?" in err
+    assert tg.answers() == []
+
+
+def test_help_mentions_all_commands_and_flood_guard():
+    """Справка перечисляет все семь команд и называет защиту от флуда."""
+    for command in ("/status", "/plans", "/stop", "/resume", "/hold", "/unhold", "/reset"):
+        assert command in gate.TG_HELP
+    assert "защита от флуда" in gate.TG_HELP
