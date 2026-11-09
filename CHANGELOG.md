@@ -4,6 +4,19 @@
 Ломающее изменение поведения движка или формата `pipeline.json` — минимум минор.
 
 
+## 0.19.2 — 09.11.2026
+
+### Исправлено
+
+- Telegram и проверка обновлений больше не полагаются на хранилище корней ОС: набор
+  корней берётся из `STEP_PIPELINE_CA_BUNDLE` / `HERMES_CA_BUNDLE` / `SSL_CERT_FILE` /
+  `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE`, иначе из `certifi`. На Windows в системном
+  хранилище лежат просроченные корни (DST Root CA X3 и другие), и OpenSSL строил через
+  них просроченный путь для Let's Encrypt: панель показывала «✗ Telegram: сеть
+  недоступна: certificate has expired» при живом сертификате сервера, а
+  `hermes pipeline update` из окружения без `SSL_CERT_FILE` падал так же на
+  `api.github.com`.
+
 ## 0.19.1 — 09.11.2026
 
 ### Исправлено

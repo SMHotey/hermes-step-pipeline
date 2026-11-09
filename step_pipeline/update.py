@@ -10,11 +10,13 @@
 """
 from __future__ import annotations
 
+import functools
 import io
 import json
 import os
 import re
 import shutil
+import ssl
 import tarfile
 import tempfile
 import urllib.request
@@ -72,6 +74,35 @@ def github_token() -> str:
     return ""
 
 
+# Python без явного набора корней доверяет хранилищу ОС, а в нём бывают просроченные
+# сертификаты (в Windows — DST Root CA X3 и другие старые корни): OpenSSL строит через
+# них просроченный путь для Let's Encrypt, и проверка обновления падает с
+# `CERTIFICATE_VERIFY_FAILED: certificate has expired`. Корни берём из явного набора.
+CA_ENV_VARS = ("STEP_PIPELINE_CA_BUNDLE", "HERMES_CA_BUNDLE", "SSL_CERT_FILE",
+               "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+
+
+def ca_bundle() -> str:
+    """Путь к набору корневых сертификатов; пусто — доверять хранилищу ОС."""
+    for name in CA_ENV_VARS:
+        path = (os.environ.get(name) or "").strip()
+        if path and os.path.isfile(path):
+            return path
+    try:
+        import certifi
+    except ImportError:
+        return ""
+    path = certifi.where()
+    return path if os.path.isfile(path) else ""
+
+
+@functools.lru_cache(maxsize=1)
+def ssl_context() -> ssl.SSLContext:
+    """Контекст TLS с найденным набором корней (строится один раз на процесс)."""
+    bundle = ca_bundle()
+    return ssl.create_default_context(cafile=bundle) if bundle else ssl.create_default_context()
+
+
 def _http_get(url: str, timeout: float) -> bytes:
     """GET с User-Agent: GitHub без него отвечает 403, а Cloudflare режет запросы."""
     headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
@@ -79,7 +110,7 @@ def _http_get(url: str, timeout: float) -> bytes:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=ssl_context()) as response:
         return response.read()
 
 

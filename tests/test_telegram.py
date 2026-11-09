@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import ssl
 import sys
 import threading
 import urllib.error
@@ -180,7 +181,7 @@ def test_call_retries_network_failure(monkeypatch):
     attempts: list[object] = []
     pauses: list[float] = []
 
-    def fake_urlopen(request, timeout=20):
+    def fake_urlopen(request, timeout=20, **kwargs):
         attempts.append(request)
         if len(attempts) < 3:
             raise urllib.error.URLError("TLS handshake timeout")
@@ -198,7 +199,7 @@ def test_call_does_not_retry_bad_token(monkeypatch):
     """401 — окончательный отказ: повтор не нужен и не делается."""
     calls: list[object] = []
 
-    def fake_urlopen(request, timeout=20):
+    def fake_urlopen(request, timeout=20, **kwargs):
         calls.append(request)
         raise urllib.error.HTTPError("https://bot.invalid/botgood/getMe", 401,
                                      "Unauthorized", {},
@@ -211,6 +212,37 @@ def test_call_does_not_retry_bad_token(monkeypatch):
     with pytest.raises(telegram.TelegramError, match="Unauthorized"):
         telegram.get_me("good")
     assert len(calls) == 1
+
+
+def test_ca_bundle_takes_existing_file_from_env(monkeypatch, tmp_path):
+    """Корни берём из явного набора: просроченные корни хранилища ОС ломают Let's Encrypt."""
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="ascii")
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+
+    assert telegram.ca_bundle() == str(bundle)
+
+
+def test_ca_bundle_skips_missing_file(monkeypatch, tmp_path):
+    """Путь из окружения, которого нет на диске, не должен подменять набор корней."""
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "нет-такого.pem"))
+
+    bundle = telegram.ca_bundle()
+    assert bundle == "" or Path(bundle).is_file()
+
+
+def test_call_passes_ssl_context(monkeypatch):
+    """Запрос идёт с найденным контекстом TLS, а не с умолчаниями хранилища ОС."""
+    seen: dict[str, object] = {}
+
+    def fake_urlopen(request, timeout=20, **kwargs):
+        seen.update(kwargs)
+        return _response({"ok": True, "result": {"id": 1}})
+
+    monkeypatch.setattr(telegram.urllib.request, "urlopen", fake_urlopen)
+
+    assert telegram.get_me("good")["id"] == 1
+    assert isinstance(seen.get("context"), ssl.SSLContext)
 
 
 def test_detect_chat_survives_transient_error(monkeypatch):

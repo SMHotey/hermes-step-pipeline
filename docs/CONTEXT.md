@@ -178,6 +178,12 @@ hermes pipeline doctor  --project <путь>
   отдельной строкой отчёта, а `step_pipeline/engine/gate.py` — низкой. `COVERAGE_FILE`
   задавать только абсолютным, иначе данные ребёнка пишутся в его cwd и `combine` их не
   находит.
+- **TLS: корни берём из certifi, а не из хранилища ОС** (0.19.2). В хранилище Windows
+  лежат просроченные корни (DST Root CA X3 и другие), и OpenSSL строил через них
+  просроченный путь для Let's Encrypt: панель показывала «✗ Telegram: сеть недоступна:
+  certificate has expired» при живом сертификате сервера. `telegram.py`, `update.py` и
+  `engine/gate.py` строят контекст из `STEP_PIPELINE_CA_BUNDLE` / `HERMES_CA_BUNDLE` /
+  `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE`, иначе из `certifi`.
 
 ## 9. Что осталось
 

@@ -6,6 +6,7 @@ Telegram не трогаем: `_tg_call` подменяется подделко
 from __future__ import annotations
 
 import json
+import ssl
 import subprocess
 import threading
 import time
@@ -672,3 +673,23 @@ def test_help_mentions_all_commands_and_flood_guard():
     for command in ("/status", "/plans", "/stop", "/resume", "/hold", "/unhold", "/reset"):
         assert command in gate.TG_HELP
     assert "защита от флуда" in gate.TG_HELP
+
+
+def test_ssl_context_prefers_bundle_from_env(monkeypatch, tmp_path):
+    """Корни берём из явного набора: просроченные корни хранилища ОС ломают Let's Encrypt."""
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="ascii")
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+
+    assert gate.ca_bundle() == str(bundle)
+
+
+def test_ssl_context_builds_without_bundle(monkeypatch):
+    """Без переменных окружения контекст всё равно строится (certifi или хранилище ОС)."""
+    for name in gate.CA_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    gate.ssl_context.cache_clear()
+    try:
+        assert isinstance(gate.ssl_context(), ssl.SSLContext)
+    finally:
+        gate.ssl_context.cache_clear()

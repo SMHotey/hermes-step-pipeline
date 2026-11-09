@@ -66,6 +66,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import math
@@ -73,6 +74,7 @@ import os
 import re
 import shutil
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -2026,6 +2028,35 @@ def tg_api_base() -> str:
     return base[: -len("/bot")] if base.endswith("/bot") else base
 
 
+# Python без явного набора корней доверяет хранилищу ОС, а в нём бывают просроченные
+# сертификаты (в Windows — DST Root CA X3 и другие старые корни): OpenSSL строит через
+# них просроченный путь для Let's Encrypt, и уведомление падает с
+# `CERTIFICATE_VERIFY_FAILED: certificate has expired`. Корни берём из явного набора.
+CA_ENV_VARS = ("STEP_PIPELINE_CA_BUNDLE", "HERMES_CA_BUNDLE", "SSL_CERT_FILE",
+               "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+
+
+def ca_bundle() -> str:
+    """Путь к набору корневых сертификатов; пусто — доверять хранилищу ОС."""
+    for name in CA_ENV_VARS:
+        path = (os.environ.get(name) or "").strip()
+        if path and os.path.isfile(path):
+            return path
+    try:
+        import certifi
+    except ImportError:
+        return ""
+    path = certifi.where()
+    return path if os.path.isfile(path) else ""
+
+
+@functools.lru_cache(maxsize=1)
+def ssl_context() -> ssl.SSLContext:
+    """Контекст TLS с найденным набором корней (строится один раз на процесс)."""
+    bundle = ca_bundle()
+    return ssl.create_default_context(cafile=bundle) if bundle else ssl.create_default_context()
+
+
 def notify(cfg: config_mod.Config, text: str) -> bool:
     """Уведомление владельцу. Выключено — печатаем (cron --deliver покажет в выводе)."""
     prefix = str(cfg.notify.get("prefix") or "")
@@ -2045,7 +2076,7 @@ def notify(cfg: config_mod.Config, text: str) -> bool:
     request = urllib.request.Request(url, data=data, headers={"User-Agent": TG_USER_AGENT})
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(request, timeout=20) as resp:
+            with urllib.request.urlopen(request, timeout=20, context=ssl_context()) as resp:
                 if 200 <= resp.status < 300:
                     return True
         except (urllib.error.URLError, OSError) as exc:
@@ -2415,7 +2446,8 @@ def _tg_call(token: str, method: str, http_timeout: int = 20, **params) -> dict:
     url = f"{tg_api_base()}/bot{token}/{method}"
     request = urllib.request.Request(url, data=body, headers={"User-Agent": TG_USER_AGENT})
     try:
-        with urllib.request.urlopen(request, timeout=http_timeout) as resp:
+        with urllib.request.urlopen(request, timeout=http_timeout,
+                                    context=ssl_context()) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
             return data if isinstance(data, dict) else {"ok": False, "description": "пустой ответ"}
     except urllib.error.HTTPError as exc:

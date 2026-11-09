@@ -6,8 +6,10 @@
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -40,6 +42,36 @@ def api_template() -> str:
     if base.endswith("/bot"):
         return base + "{token}/{method}"
     return base + "/bot{token}/{method}"
+
+
+# Python без явного набора корней доверяет хранилищу ОС, а в нём бывают просроченные
+# сертификаты (в Windows — DST Root CA X3 и другие старые корни). OpenSSL тогда строит
+# через просроченный корень путь для Let's Encrypt, и запрос падает с
+# `CERTIFICATE_VERIFY_FAILED: certificate has expired`, хотя сертификат сервера жив.
+# Поэтому корни берём из явного набора: переменная окружения, иначе certifi из Hermes.
+CA_ENV_VARS = ("STEP_PIPELINE_CA_BUNDLE", "HERMES_CA_BUNDLE", "SSL_CERT_FILE",
+               "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+
+
+def ca_bundle() -> str:
+    """Путь к набору корневых сертификатов; пусто — доверять хранилищу ОС."""
+    for name in CA_ENV_VARS:
+        path = (os.environ.get(name) or "").strip()
+        if path and os.path.isfile(path):
+            return path
+    try:
+        import certifi
+    except ImportError:
+        return ""
+    path = certifi.where()
+    return path if os.path.isfile(path) else ""
+
+
+@functools.lru_cache(maxsize=1)
+def ssl_context() -> ssl.SSLContext:
+    """Контекст TLS с найденным набором корней (строится один раз на процесс)."""
+    bundle = ca_bundle()
+    return ssl.create_default_context(cafile=bundle) if bundle else ssl.create_default_context()
 
 
 # D9: три попытки на сетевых отказах и 5xx, паузы между ними — 0.5 и 1.0 с.
@@ -86,7 +118,8 @@ def _call(token: str, method: str, http_timeout: int = DEFAULT_TIMEOUT,
     for attempt in range(attempts):
         retry_left = attempt + 1 < attempts
         try:
-            with urllib.request.urlopen(request, timeout=http_timeout) as response:
+            with urllib.request.urlopen(request, timeout=http_timeout,
+                                        context=ssl_context()) as response:
                 payload = json.loads(response.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as exc:
             if exc.code >= 500 and retry_left:
