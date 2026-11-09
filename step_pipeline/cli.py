@@ -438,8 +438,14 @@ def cmd_update(args) -> int:
     if not info["update_available"]:
         if as_json:
             print(_dump(info))
-        else:
+        elif latest:
             print(f"обновлений нет: установлена v{current}, на GitHub v{latest}")
+        else:
+            # Пустой latest — не «равные версии»: у репозитория нет выпусков, либо он
+            # приватный и проверка без токена получила 404. Второй случай молчанием
+            # выглядел бы как «всё актуально».
+            print(f"обновлений нет: установлена v{current}; выпусков на GitHub не видно "
+                  f"(приватный репозиторий? нужен GITHUB_TOKEN)")
         return 0
     if getattr(args, "check", False):
         if as_json:

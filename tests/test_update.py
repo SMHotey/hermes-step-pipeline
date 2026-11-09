@@ -187,6 +187,16 @@ def test_auto_skips_install_when_up_to_date(tmp_path: Path):
     assert fetch.calls == [update.RELEASES_API]                # архив не качался
 
 
+def test_cli_admits_when_no_release_is_visible(monkeypatch, capsys):
+    """Пустой latest — не «всё актуально»: CLI называет причину и подсказывает токен."""
+    monkeypatch.setattr(update, "check", lambda **_: {
+        "current": "0.19.0", "latest": "", "tag": "", "source": "",
+        "update_available": False, "error": "", "checked_at": "2026-11-09T00:00:00+00:00"})
+    assert cli.cmd_update(Namespace(check=True, json=False, timeout=1)) == 0
+    out = capsys.readouterr().out
+    assert "выпусков на GitHub не видно" in out and "GITHUB_TOKEN" in out
+
+
 def test_cli_check_reports_without_installing(tmp_path: Path, monkeypatch, capsys):
     monkeypatch.setattr(update, "check", lambda **_: {
         "current": "0.1.0", "latest": "0.2.0", "tag": "v0.2.0", "source": "release",
