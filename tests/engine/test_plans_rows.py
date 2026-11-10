@@ -161,3 +161,26 @@ def test_closed_plan_ignores_stop_file(stand):
     assert row["state_label"] == "закрыт"
     assert row["action"] == {"kind": "none", "text": "закрыт, действий не требуется",
                              "command": ""}
+
+
+def test_plan_row_carries_approval_label(stand):
+    """Утверждение видно отдельным бейджем: состояния конвейера про него не говорят (0.22.0)."""
+    root, _cfg = stand
+    mark_cron(root)
+    row = plan_row(root)
+    assert row["approval"]["state"] == "approved", row["approval"]
+    assert row["approval"]["label"] == "утверждён"
+    assert row["approval"]["approved_at"]
+    assert row["state_label"] in ("идёт", "остановлен", "закрыт", "не ведётся")
+
+
+def test_plan_row_marks_changed_plan(stand):
+    """План правился после утверждения: бейдж «изменён после утверждения», а не «утверждён»."""
+    root, _cfg = stand
+    mark_cron(root)
+    plan = Path(root) / "docs" / "plans" / "1-demo.md"
+    plan.write_text(plan.read_text(encoding="utf-8") + "\n- правка после утверждения\n",
+                    encoding="utf-8")
+    row = plan_row(root)
+    assert row["approval"]["state"] == "changed", row["approval"]
+    assert row["approval"]["label"] == "изменён после утверждения"

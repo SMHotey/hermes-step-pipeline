@@ -4084,6 +4084,10 @@ def retry_pending(p: Paths, notify_fn=None) -> dict | None:
 # Подписи состояний печатает панель: страница их не придумывает (план 5 S2A, R1).
 STATE_LABELS = {"running": "идёт", "stopped": "остановлен",
                 "closed": "закрыт", "not-driven": "не ведётся"}
+#: Метка утверждения плана: своей строки состояния у него нет (`state` — про конвейер),
+#: поэтому панель показывает его отдельным бейджем рядом с состоянием.
+APPROVAL_LABELS = {"approved": "утверждён", "changed": "изменён после утверждения",
+                   "missing": "не утверждён"}
 CRON_JOB_NAME = "План: страж шага (конвейер)"
 NOT_DRIVEN_REASON = "план не в driven_plans — конвейер его не ведёт"
 TICK_ACTION_TEXT = "устранить причину и запустить тик"
@@ -4181,8 +4185,18 @@ def plan_view(cfg: config_mod.Config, p: Paths, driven: set[str], cron_ok: bool)
         action = {"kind": "none",
                   "text": "закрыт, действий не требуется" if state == "closed" else "",
                   "command": ""}
+    # Утверждение — отдельный факт, а не состояние конвейера: план бывает утверждён и
+    # при этом «ждёт ревью» или «остановлен». Панель раньше не показывала утверждение
+    # вовсе, и после нажатия «Утвердить» на экране ничего не менялось.
+    approval_state = ctx.get("approval") or {}
+    approval_kind = str(approval_state.get("state") or "missing")
+    approval = {"state": approval_kind,
+                "label": APPROVAL_LABELS.get(approval_kind, APPROVAL_LABELS["missing"]),
+                "approved_at": str((approval_state.get("record") or {}).get("approved_at") or ""),
+                "block": str(approval_state.get("block_kind") or ""),
+                "ok": bool(approval_state.get("ok"))}
     return {"state": state, "state_label": STATE_LABELS[state], "reason": reason,
-            "note": note, "action": action, "next": sid or "—",
+            "note": note, "action": action, "next": sid or "—", "approval": approval,
             # Шага нет — риска нет: пустая строка, а не «normal», иначе данные врут.
             "risk": str(step.get("risk") or "normal") if step else "",
             "hold": hold, "stop": ({**stop, "kind": kind} if stop else None)}
@@ -4211,6 +4225,7 @@ def plans_rows(cfg: config_mod.Config) -> list[dict]:
             "reason": view["reason"],
             "note": view["note"],
             "action": view["action"],
+            "approval": view["approval"],
         })
     return out
 

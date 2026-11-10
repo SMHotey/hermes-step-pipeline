@@ -783,17 +783,32 @@ function renderDrafts(data) {
       + `docs/plans/drafts/</span>`;
     return;
   }
-  box.innerHTML = rows.map((d) => `
+  // Черновик остаётся в `drafts/` и после утверждения: действующим считается файл в
+  // каталоге планов. Поэтому признак приходит из снимка (`d.approved`), а не из наличия
+  // файла — иначе кнопка «Утвердить» висела бы вечно и ничего не меняла.
+  box.innerHTML = rows.map((d) => {
+    const approved = Boolean(d.approved);
+    const pill = approved ? `<span class="pill ok">утверждён</span>`
+                          : (d.changed ? `<span class="pill bad">изменён после утверждения</span>`
+                                       : `<span class="pill wait">черновик</span>`);
+    const hint = approved
+      ? `<div class="muted">утверждён ${esc(d.approved_at || "")}`
+        + (d.draft_differs ? " · текст черновика отличается от утверждённого плана" : "")
+        + `</div>`
+      : "";
+    return `
     <div class="plan-row" data-draft="${esc(d.id)}">
       <div class="row1">
-        <span class="pill wait">черновик</span>
+        ${pill}
         <span>план ${esc(d.id)}</span>
         <span class="muted">${esc(d.title)} · шагов: ${esc(d.steps_total || 0)}</span>
-        ${data.preview ? "" : `<button data-approve="${esc(d.id)}"
+        ${data.preview || approved ? "" : `<button data-approve="${esc(d.id)}"
             title="перенести в каталог планов и записать утверждение">Утвердить</button>`}
       </div>
       <div class="muted mono">${esc(d.file)}</div>
-    </div>`).join("");
+      ${hint}
+    </div>`;
+  }).join("");
   bindApprove(box);
 }
 
@@ -1776,11 +1791,18 @@ function render(data) {
     const badge = planBadge[p.state] || "wait";
     const act = p.action || {};
     const progress = `${esc(p.closed)} закрыто`;
+    // Утверждение — отдельный факт, а не состояние конвейера: план бывает утверждён и
+    // при этом «ждёт ревью». Бейдж приходит из снимка (`p.approval`).
+    const appr = p.approval || {};
+    const apprBadge = appr.state === "approved" ? "ok" : (appr.state === "changed" ? "bad" : "wait");
+    const apprTitle = appr.approved_at ? `утверждён ${esc(appr.approved_at)}` : "";
     return `
     <div class="plan-row ${String(p.id) === String((data.plan || {}).id) ? "active" : ""}"
          data-plan="${esc(p.id)}">
       <div class="row1">
         <span class="pill ${badge} plan-badge">${esc(p.state_label)}</span>
+        ${appr.label ? `<span class="pill ${apprBadge} plan-approval"
+              title="${apprTitle}">${esc(appr.label)}</span>` : ""}
         <span>план ${esc(p.id)}</span>
         <span class="muted">${progress} · → ${esc(p.next)}</span>
       </div>

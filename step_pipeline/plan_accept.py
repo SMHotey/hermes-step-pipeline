@@ -90,9 +90,39 @@ def list_drafts(project) -> list[dict]:
         number = plan_number(path.name)
         if number is None:
             continue
-        rows.append({"id": number, "name": path.name,
-                     "file": _shown(path, project), "title": _title(path)})
+        row = {"id": number, "name": path.name,
+               "file": _shown(path, project), "title": _title(path)}
+        row.update(_draft_state(project, number, path))
+        rows.append(row)
     return sorted(rows, key=lambda row: int(row["id"]))
+
+
+def _draft_state(project, number: str, draft: Path) -> dict:
+    """Утверждён ли уже план этого черновика — то, что панель обязана показать.
+
+    Черновик остаётся в `drafts/` после утверждения (`_accept_existing` его не переносит:
+    действующим считается файл в каталоге планов). Без этих полей панель вечно рисовала
+    «черновик» с кнопкой «Утвердить», а нажатие отвечало «уже утверждён — ничего не
+    изменено»: состояние на экране не менялось, хотя утверждение есть.
+    """
+    out = {"approved": False, "approved_at": "", "changed": False, "draft_differs": False}
+    record = _read_approval(project, number)
+    if record is None:
+        return out
+    out["approved_at"] = str(record.get("approved_at") or "")
+    final = plans_dir(project) / Path(draft).name
+    try:
+        if not final.is_file():
+            return out
+        final_sha = _sha256(final)
+        draft_sha = _sha256(Path(draft))
+    except OSError:
+        return out
+    approved_sha = str(record.get("sha256") or "")
+    out["approved"] = bool(approved_sha) and approved_sha == final_sha
+    out["changed"] = bool(approved_sha) and approved_sha != final_sha
+    out["draft_differs"] = draft_sha != final_sha
+    return out
 
 
 def _title(path: Path) -> str:

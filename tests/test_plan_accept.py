@@ -274,3 +274,39 @@ def test_second_accept_keeps_first_approval_date(project: Path, capsys, monkeypa
 
     record = json.loads(plan_accept.approval_file(project, "5").read_text(encoding="utf-8"))
     assert record["approved_at"] == "2026-01-01T00:00:00"
+
+
+def test_list_drafts_marks_approved_draft(project: Path, monkeypatch):
+    """Черновик утверждённого плана виден панели как «утверждён», а не вечный «черновик».
+
+    `_accept_existing` не переносит черновик (действует файл в каталоге планов), поэтому
+    без признака `approved` кнопка «Утвердить» на панели висела всегда и ничего не меняла.
+    """
+    monkeypatch.setattr(plan_accept, "now_iso", lambda: "2026-01-01T00:00:00")
+    _draft(project, "5-demo.md", helpers.PLAN)
+    assert _cmd(project, accept="5") == 0
+    # Планировщик пишет черновик заново уже после утверждения — так он и остаётся в
+    # `drafts/` рядом с утверждённым планом (случай gapaudit).
+    _draft(project, "5-demo.md", helpers.PLAN)
+
+    rows = plan_accept.list_drafts(project)
+    row = next(item for item in rows if item["id"] == "5")
+    assert row["approved"] is True
+    assert row["approved_at"] == "2026-01-01T00:00:00"
+    assert row["changed"] is False
+    assert row["draft_differs"] is False
+
+
+def test_list_drafts_sees_changed_plan(project: Path, monkeypatch):
+    """План правили после утверждения: черновик остаётся, но помечен «изменён»."""
+    monkeypatch.setattr(plan_accept, "now_iso", lambda: "2026-01-01T00:00:00")
+    _draft(project, "5-demo.md", helpers.PLAN)
+    assert _cmd(project, accept="5") == 0
+    final = project / "docs" / "plans" / "5-demo.md"
+    final.write_text(helpers.PLAN + "\n- правка после утверждения\n", encoding="utf-8")
+    _draft(project, "5-demo.md", helpers.PLAN)
+
+    row = next(item for item in plan_accept.list_drafts(project) if item["id"] == "5")
+    assert row["approved"] is False
+    assert row["changed"] is True
+    assert row["draft_differs"] is True
