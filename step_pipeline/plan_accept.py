@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -303,6 +304,10 @@ def _write_approval(project: Path, number: str, path: Path) -> dict:
         "sha256": _sha256(path),
         "approved_at": now_iso(),
         "profile": os.environ.get("HERMES_PROFILE") or "default",
+        # Момент явного решения владельца: по нему страж считает бюджет кругов ревью
+        # заново. Без этого «правим план ещё раз» упиралось в исчерпанные два круга и
+        # тик снова ставил owner-stop — правка плана не открывала шаги.
+        "review_reset_at": int(time.time()),
     }
     _atomic_write_text(approval_file(project, number),
                        json.dumps(payload, ensure_ascii=False, indent=2))

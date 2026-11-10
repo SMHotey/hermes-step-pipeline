@@ -1788,17 +1788,38 @@ def _plan_review_decision(ctx: dict) -> dict | None:
         return {"action": "stop",
                 "reason": (f"отчёт {rel} не обновлён после карточки {card.get('id')} — "
                            f"вердикт может быть от прошлого круга")}
+    # Вердикт про ПРЕЖНЮЮ версию плана: владелец правил текст и переутвердил его
+    # (`plan --accept N` пишет `review_reset_at`). Правки по такому отчёту заказывать
+    # нельзя — они относились к старому тексту, и карточка правила бы уже исправленное.
+    # Свежий круг ревью даёт новый вердикт. Признак берётся НЕ из «отчёт не свежий»
+    # (так бывает и у отчёта без привязки к sha, и у вердикта прошлого круга — их лечит
+    # стоп выше), а из явного решения владельца: переутверждение позже последней карточки.
+    reset_at = int(((ctx.get("approval") or {}).get("record") or {}).get("review_reset_at") or 0)
+    last_review_at = max((int(c.get("created_at") or 0) for c in cards), default=0)
+    if (reset_at and reset_at > last_review_at and not ctx.get("plan_review_fresh")
+            and (ctx.get("approval") or {}).get("state") == "approved"):
+        return {"action": "create_plan_review", "round": len(cards) + 1,
+                "reason": (f"план {plan_id} переутверждён после вердикта {rel} — нужен свежий "
+                           f"круг ревью (круг {len(cards) + 1})")}
+    # Владелец, переутвердив правленый план (`plan --accept N`), открывает бюджет кругов
+    # ревью заново: `review_reset_at` в записи утверждения — момент его явного решения.
+    # Считаются только карточки этой версии плана, иначе третья правка упиралась бы в
+    # owner-stop на исчерпанных двух кругах и шаги не открылись бы никогда.
+    epoch_cards = ([c for c in cards if int(c.get("created_at") or 0) >= reset_at]
+                   if reset_at else cards)
     fixes = ctx.get("plan_fix_cards") or []
-    if not fixes:
+    epoch_fixes = ([f for f in fixes if int(f.get("created_at") or 0) >= reset_at]
+                   if reset_at else fixes)
+    if not epoch_fixes:
         return {"action": "create_plan_fix", "round": 1,
                 # Маркер круга ревью живёт в ключе карточки правки (T3e): по нему бюджет
                 # отличается «первый отказ после круга, заказанного по устаревшему
                 # APPROVE» от настоящего второго отказа. `max(..., 1)` — отчёт, написанный
                 # руками без карточек, не должен превращать первый отказ во второй.
-                "review_round": max(len(cards), 1),
+                "review_round": max(len(epoch_cards), 1),
                 "reason": (f"ревью плана {plan_id} вернуло REQUEST_CHANGES — "
                            f"правим план один круг: {rel}")}
-    fix = fixes[-1]
+    fix = epoch_fixes[-1]
     fix_status = str(fix.get("status") or "")
     if fix_status not in TERMINAL:
         return {"action": "idle", "plan_review": True,
@@ -1809,11 +1830,10 @@ def _plan_review_decision(ctx: dict) -> dict | None:
         return {"action": "stop",
                 "reason": (f"правка плана {plan_id} упала: карточка {fix.get('id')} "
                            f"в статусе {fix_status}: {detail}")}
-    # Бюджет отказов считается по маркеру круга ревью в ключе карточки правки, а не по
-    # числу карточек ревью: круг, заказанный по устаревшему `APPROVE` (S6), — тоже круг
-    # ревью, и первый отказ после него не должен выглядеть вторым.
-    review_round = int(str(fix.get("key") or "").rsplit(":", 1)[-1] or 0)
-    if len(cards) - review_round >= PLAN_REVIEW_MAX_ROUNDS - 1:
+    # Бюджет отказов — по числу карточек ревью ЭТОЙ версии плана: два круга на версию,
+    # дальше решает владелец (D7). Круг, заказанный по устаревшему `APPROVE` (S6), — тоже
+    # круг ревью и считается наравне: он писался по тому же тексту плана.
+    if len(epoch_cards) >= PLAN_REVIEW_MAX_ROUNDS:
         report = Path(str(verdict["path"]))
         findings = (_blocking_findings(report, FINDINGS_LIMIT)
                     or _review_findings(report, FINDINGS_LIMIT))

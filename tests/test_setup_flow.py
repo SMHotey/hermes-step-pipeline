@@ -206,6 +206,49 @@ def test_upgrade_restores_engine_and_bumps_version(tmp_path: Path, fake_hermes):
     assert json.loads(cfg_path.read_text(encoding="utf-8"))["board"] == "мой-борд"
 
 
+def test_no_cron_records_opt_out(tmp_path: Path, fake_hermes):
+    """`--no-cron` — это выбор владельца, и он записан: иначе обновление не отличит его
+    от «джобы просто нет»."""
+    target = tmp_path / "shop"
+    target.mkdir()
+    setup_flow.run_setup(args(project=str(target), board="shop", no_cron=True))
+
+    marker = json.loads((target / ".pipeline" / "cron.json").read_text(encoding="utf-8"))
+
+    assert marker["skipped"] is True
+
+
+def test_upgrade_creates_cron_jobs_when_project_has_none(tmp_path: Path, fake_hermes):
+    """Проект без джоб получает их при обновлении: страж заказывает карточки, а брать их
+    некому — конвейер стоит, хотя всё «поставлено»."""
+    target = tmp_path / "shop"
+    target.mkdir()
+    setup_flow.run_setup(args(project=str(target), board="shop", no_cron=True))
+    # Проект старой версии: отказа в метке нет, потому что её самой нет.
+    (target / ".pipeline" / "cron.json").unlink()
+    fake_hermes.clear()
+
+    assert setup_flow.run_setup(args(project=str(target), upgrade=True)) == 0
+
+    created = [" ".join(map(str, call)) for call in fake_hermes]
+    assert any("cron" in line and "create" in line for line in created)
+    marker = json.loads((target / ".pipeline" / "cron.json").read_text(encoding="utf-8"))
+    assert marker["skipped"] is False
+
+
+def test_upgrade_keeps_cron_opt_out(tmp_path: Path, fake_hermes):
+    """Явный `--no-cron` обновление не отменяет: джоб не заводим."""
+    target = tmp_path / "shop"
+    target.mkdir()
+    setup_flow.run_setup(args(project=str(target), board="shop", no_cron=True))
+    fake_hermes.clear()
+
+    assert setup_flow.run_setup(args(project=str(target), upgrade=True)) == 0
+
+    created = [" ".join(map(str, call)) for call in fake_hermes]
+    assert not any("cron" in line and "create" in line for line in created)
+
+
 def test_upgrade_without_install_is_error(tmp_path: Path, fake_hermes):
     target = tmp_path / "empty"
     target.mkdir()

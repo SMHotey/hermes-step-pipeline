@@ -408,3 +408,72 @@ def test_review_with_constitution_reference_is_fresh(stand):
     status = registry.approval_status(p.cfg, registry.get(p.cfg, "1"))
     assert status["review"]["state"] == "fresh"
     assert status["ok"] is True
+
+
+# ─────────────────── переутверждение после owner-stop (0.21.0) ───────────────────
+
+REQUEST = ("# Ревью плана 1\n\n- шаг S2 не опирается на S1\n\n"
+           "## ВЕРДИКТ: REQUEST_CHANGES\n")
+
+
+def _to_owner_stop(root: Path, p, db) -> None:
+    """Довести план до owner-stop: два круга ревью, оба REQUEST_CHANGES (D7)."""
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview")
+    write_report(root, REQUEST)
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_fix"
+    complete(db, ":planfix:1")
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview:2")
+    write_report(root, REQUEST)
+    stopped = gate.run_gate(p, notify_fn=quiet)["decision"]
+    assert stopped["action"] == "stop" and stopped["kind"] == "owner", stopped
+
+
+def _reapprove_edited(root: Path, db) -> None:
+    """Владелец правит план и переутверждает его: `plan --accept` пишет `review_reset_at`.
+
+    Карточки первой попытки сдвигаются на две минуты назад: в жизни переутверждение идёт
+    ПОСЛЕ них, а в тесте всё происходит в одну секунду, и без сдвига метка неотличима от
+    них. Новый круг ревью заказывается уже после метки — как и в живом проекте.
+    """
+    con = sqlite3.connect(db)
+    try:
+        con.execute("UPDATE tasks SET created_at = created_at - 120")
+        con.commit()
+    finally:
+        con.close()
+    plan = write_plan(root, PLAN_READY.replace(
+        "### S2. Интеграция demo/spec-kit\n\n- Цель: подключить готовое.",
+        "### S2. Интеграция demo/spec-kit\n\n- Цель: подключить готовое.\n"
+        "- Правка по ревью: шаг опирается на S1 (провенанс из T5-1)."))
+    write_approval(root, plan, review_reset_at=int(time.time()))
+
+
+def test_reapproval_after_owner_stop_opens_new_review_round(stand):
+    """Правка плана владельцем не возвращает тот же стоп: заказывается свежий круг ревью."""
+    root, p, db = stand
+    _to_owner_stop(root, p, db)
+    _reapprove_edited(root, db)
+    gate.clear_stop(p)
+
+    decision = gate.run_gate(p, notify_fn=quiet)["decision"]
+    assert decision["action"] == "create_plan_review", decision
+    assert decision["round"] == 3
+    assert "переутверждён" in decision["reason"]
+
+
+def test_reapproval_resets_review_budget(stand):
+    """После переутверждения бюджет кругов начинается заново: отказ даёт правку, не стоп."""
+    root, p, db = stand
+    _to_owner_stop(root, p, db)
+    _reapprove_edited(root, db)
+    gate.clear_stop(p)
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+
+    complete(db, ":planreview:3")
+    write_report(root, REQUEST)
+    decision = gate.run_gate(p, notify_fn=quiet)["decision"]
+    assert decision["action"] == "create_plan_fix", decision
+    assert [c["key"] for c in cards(db) if c["key"].startswith("planloop:1:planfix")][-1] \
+        == "planloop:1:planfix:1"

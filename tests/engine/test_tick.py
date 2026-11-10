@@ -347,8 +347,8 @@ def test_existing_job_refreshes_installed_script(tmp_path: Path, monkeypatch):
     assert any("тик-скрипт обновлён" in line for line in log.lines), log.lines
 
 
-def test_upgrade_refreshes_tick_script_when_cron_marker_exists(tmp_path: Path, monkeypatch):
-    """`upgrade` обновляет скрипт только у проекта с меткой cron, иначе не создаёт (D4)."""
+def test_upgrade_refreshes_tick_script_and_keeps_jobs(tmp_path: Path, monkeypatch):
+    """`upgrade` обновляет тик-скрипт у проекта с джобами и не заводит второй (0.21.0)."""
     home = _fake_profiles(monkeypatch, tmp_path)
     _stub_hermes(monkeypatch)
     project = tmp_path / "proj"
@@ -362,14 +362,37 @@ def test_upgrade_refreshes_tick_script_when_cron_marker_exists(tmp_path: Path, m
     assert setup_flow.upgrade(project, log, trust=False) == 0
     installed = home / "profiles" / "demo" / "scripts" / "pipeline_tick.py"
     assert installed.read_bytes() == TICK.read_bytes()
+    assert any("стража создана" in line or "стража уже есть" in line for line in log.lines), \
+        log.lines
 
+
+def test_upgrade_creates_jobs_for_project_without_cron(tmp_path: Path, monkeypatch):
+    """Проект без метки cron — не «владелец запретил»: обновление заводит джобы (0.21.0)."""
+    home = _fake_profiles(monkeypatch, tmp_path)
+    calls = _stub_hermes(monkeypatch)
     plain = tmp_path / "plain"
     (plain / ".pipeline").mkdir(parents=True)
     (plain / "pipeline.json").write_text(json.dumps({"profiles": {"driver": "demo"}}),
                                          encoding="utf-8")
-    installed.unlink()
 
-    assert setup_flow.upgrade(plain, log, trust=False) == 0
-    assert not installed.exists(), "скрипт создан там, где cron не заводили"
-    assert any("не обновлялся" in line for line in log.lines), log.lines
+    assert setup_flow.upgrade(plain, setup_flow.Log(), trust=False) == 0
+    installed = home / "profiles" / "demo" / "scripts" / "pipeline_tick.py"
+    assert installed.exists(), "джоба стража не заведена"
+    assert any("cron" in " ".join(c) and "create" in " ".join(c) for c in calls), calls
+
+
+def test_upgrade_keeps_owner_no_cron(tmp_path: Path, monkeypatch):
+    """Явный отказ (`skipped: true`) обновление не отменяет: джоб не заводим и не трогаем."""
+    home = _fake_profiles(monkeypatch, tmp_path)
+    calls = _stub_hermes(monkeypatch)
+    refused = tmp_path / "refused"
+    (refused / ".pipeline").mkdir(parents=True)
+    (refused / "pipeline.json").write_text(json.dumps({"profiles": {"driver": "demo"}}),
+                                           encoding="utf-8")
+    (refused / ".pipeline" / "cron.json").write_text(
+        json.dumps({"driver": "demo", "skipped": True}), encoding="utf-8")
+
+    assert setup_flow.upgrade(refused, setup_flow.Log(), trust=False) == 0
+    assert not (home / "profiles" / "demo" / "scripts" / "pipeline_tick.py").exists()
+    assert not [c for c in calls if "cron" in c and "create" in c], calls
 

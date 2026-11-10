@@ -434,20 +434,6 @@ def ensure_plugin_enabled(profile: str, log: Log) -> str:
     return "плагин включён и команда отвечает"
 
 
-def refresh_tick_script(project: Path, log: Log) -> str:
-    """Обновить установленный тик-скрипт профиля драйвера, если cron заводили.
-
-    Признак заведённой джобы — метка `.pipeline/cron.json` (её пишет мастер). У проекта
-    с `--no-cron` файл в профиле не создаётся: писать владельцу в профиль там, где джобы
-    нет, — сюрприз, а не обновление.
-    """
-    if not (project / ".pipeline" / "cron.json").is_file():
-        log.ok("тик-скрипт профиля не обновлялся: проект без cron")
-        return "тик-скрипт профиля не обновлялся (проект без cron)"
-    driver = roles_from_config(proj.read_config(project))[0]
-    install_tick_script(driver)
-    log.ok(f"тик-скрипт профиля {driver}: обновлён")
-    return f"тик-скрипт профиля {driver} обновлён"
 
 
 def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
@@ -485,11 +471,16 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
     scout = scout_role(cfg)
     if scout != driver:
         ensure_scout_profile(scout, driver, log)
-    tick = refresh_tick_script(project, log)
-    # Автообновление заводим только там, где cron уже есть: проект с `--no-cron`
-    # не должен получить джобу «в подарок» при обновлении движка.
-    if (project / ".pipeline" / "cron.json").is_file():
-        ensure_update_cron(driver, project, log, skip=False)
+    # Джобы проверяем при каждом обновлении: проект, поставленный без них (старый мастер
+    # или `--no-cron` без записи отказа), иначе остаётся без исполнения карточек — страж
+    # заказывает, брать некому. Явный отказ владельца уважаем.
+    if cron_opted_out(project):
+        log.ok("cron не трогаю: проект поставлен с --no-cron")
+        tick = "cron не тронут (--no-cron)"
+    else:
+        ensure_cron_all(driver, project, log, skip=False,
+                        enabled=bool((cfg.get("notify") or {}).get("enabled")))
+        tick = "cron-джобы проверены (страж, команды бота, автообновление)"
     if trust:
         failed = trust_roles(list(dict.fromkeys(roles_from_config(cfg) + [scout])), project, log)
         tail = ("доверие ролям оформлено" if not failed
@@ -498,7 +489,7 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
         log.warn("доверие проекту не оформлялось (--no-trust)")
         tail = "доверие ролям пропущено (--no-trust)"
     log.step(f"── Движок: {was} → {now}, роли: {len(roles.refreshed)} обновлено. "
-             f"Конфиг, telegram и cron-джоба не тронуты; {tick}; {tail} ──")
+             f"Конфиг и telegram не тронуты; {tick}; {tail} ──")
     return 0
 
 
@@ -903,12 +894,48 @@ def ensure_board(board: str, log: Log) -> bool:
     return False
 
 
-def _write_cron_marker(project: Path, driver: str, name: str) -> None:
-    """Метка для `doctor`: какую джобу завёл мастер (cron list не показывает workdir)."""
+def _write_cron_marker(project: Path, driver: str, name: str, *, skipped: bool = False) -> None:
+    """Метка для `doctor`: какую джобу завёл мастер (cron list не показывает workdir).
+
+    `skipped` — владелец поставил `--no-cron`. Отказ надо запомнить: иначе обновление
+    движка не отличит «джобу не заводили намеренно» от «её нет, потому что мастер не
+    дошёл» и либо заведёт джобу против воли владельца, либо не заведёт её никогда.
+    """
     marker = project / ".pipeline" / "cron.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"driver": driver, "name": name, "workdir": str(project)},
+    marker.write_text(json.dumps({"driver": driver, "name": name, "workdir": str(project),
+                                  "skipped": bool(skipped)},
                                  ensure_ascii=False), encoding="utf-8")
+
+
+def cron_opted_out(project: Path) -> bool:
+    """Проект поставлен с `--no-cron`: джобы заводить нельзя, даже при обновлении."""
+    marker = project / ".pipeline" / "cron.json"
+    if not marker.is_file():
+        return False
+    try:
+        info = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool((info or {}).get("skipped"))
+
+
+def ensure_cron_all(driver: str, project: Path, log: Log, *, skip: bool,
+                    enabled: bool = True, commands_skipped: bool = False) -> None:
+    """Все джобы конвейера разом: страж, приём команд бота, автообновление.
+
+    Один вход и для установки, и для обновления движка: проект, поставленный до появления
+    джоб (или с `--no-cron` в старой версии, где отказ не записывался), иначе остаётся
+    без исполнения карточек — страж заказывает карточку, а брать её некому.
+    """
+    if skip:
+        _write_cron_marker(project, driver, "План: страж шага (конвейер)", skipped=True)
+        log.warn("cron не заводил (--no-cron)")
+        return
+    ensure_cron(driver, project, log, skip=False)
+    ensure_commands_cron(driver, project, log, skip=False, enabled=enabled,
+                         skipped=commands_skipped)
+    ensure_update_cron(driver, project, log, skip=False)
 
 
 def ensure_cron(driver: str, project: Path, log: Log, *, skip: bool) -> None:
@@ -1439,10 +1466,8 @@ def run_setup(args) -> int:
         log.step("── Профили ролей ──")
         ensure_profiles(driver, prompter, reviewer, log, scout=scout)
     ensure_board(board, log)
-    ensure_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)))
-    ensure_commands_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)),
-                         enabled=bool(chat), skipped=bool(notify.get("skipped")))
-    ensure_update_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)))
+    ensure_cron_all(driver, project, log, skip=bool(getattr(args, "no_cron", False)),
+                    enabled=bool(chat), commands_skipped=bool(notify.get("skipped")))
 
     # Доверие проекту нужно каждой роли: без него воркер падает `Unknown skill(s)`,
     # и карточка уходит в blocked по failure_limit. Ошибка одной роли не ломает мастер.
