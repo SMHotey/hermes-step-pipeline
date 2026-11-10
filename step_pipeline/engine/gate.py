@@ -2618,9 +2618,24 @@ def inherit_approval(p: Paths, approval: dict) -> dict:
     """Записать унаследованную запись утверждения для уже идущего плана.
 
     Ключи — те же, что у `plan_accept._write_approval`, плюс `inherited`: два формата
-    одной записи недопустимы.
+    одной записи недопустимы. Прежние поля сохраняются: `review_reset_at` — момент
+    явного решения владельца, и без него бюджет кругов ревью снова считался бы за всю
+    жизнь плана (правка плана обнуляла метку и упирала цикл в owner-stop до повторного
+    ревью).
     """
+    path = registry.approval_file_for(p.cfg, p.plan_id)
+    previous: dict = {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            previous = loaded
+    except (OSError, ValueError):
+        previous = {}
+    if not previous:
+        known = (approval.get("record") or {})
+        previous = dict(known) if isinstance(known, dict) else {}
     record = {
+        **previous,
         "plan": str(p.plan_id),
         "file": p.cfg.rel(Path(p.plan_file)),
         "sha256": approval.get("sha256") or registry.sha256_file(p.plan_file),
@@ -2628,7 +2643,6 @@ def inherit_approval(p: Paths, approval: dict) -> dict:
         "profile": os.environ.get("HERMES_PROFILE") or "default",
         "inherited": True,
     }
-    path = registry.approval_file_for(p.cfg, p.plan_id)
     try:
         state_io.save_json(path, record)
     except OSError as exc:
