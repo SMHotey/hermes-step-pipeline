@@ -1801,6 +1801,27 @@ def _scout_fix_decision(ctx: dict) -> dict | None:
                        f"карточка правки плана по разведке (круг {round_no})")}
 
 
+def approval_reset_at(record: dict) -> int:
+    """Момент, с которого считается бюджет кругов ревью (epoch секунд; 0 — считать не с чего).
+
+    `review_reset_at` пишет `plan_accept`; записи, сделанные старой версией плагина или
+    давно запущенной панелью, этого поля не несут. Для них годится сам `approved_at`:
+    владелец утвердил план после вердикта — значит круги прежней версии считать перестали.
+    Без такого запасного пути утверждение «срабатывало», а следующий тик сразу ставил
+    owner-stop «второй REQUEST_CHANGES» — со стороны это выглядело как «кнопка не работает».
+    """
+    explicit = int(record.get("review_reset_at") or 0)
+    if explicit:
+        return explicit
+    stamp = str(record.get("approved_at") or "").strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return int(time.mktime(time.strptime(stamp, fmt)))
+        except ValueError:
+            continue
+    return 0
+
+
 def _plan_review_decision(ctx: dict) -> dict | None:
     """Ревью плана: карточка, ожидание, вердикт, один круг правок, эскалация (C6, D1-D7).
 
@@ -1920,7 +1941,7 @@ def _plan_review_decision(ctx: dict) -> dict | None:
     # Свежий круг ревью даёт новый вердикт. Признак берётся НЕ из «отчёт не свежий»
     # (так бывает и у отчёта без привязки к sha, и у вердикта прошлого круга — их лечит
     # стоп выше), а из явного решения владельца: переутверждение позже последней карточки.
-    reset_at = int(((ctx.get("approval") or {}).get("record") or {}).get("review_reset_at") or 0)
+    reset_at = approval_reset_at((ctx.get("approval") or {}).get("record") or {})
     last_review_at = max((int(c.get("created_at") or 0) for c in cards), default=0)
     if (reset_at and reset_at > last_review_at and not ctx.get("plan_review_fresh")
             and (ctx.get("approval") or {}).get("state") == "approved"):

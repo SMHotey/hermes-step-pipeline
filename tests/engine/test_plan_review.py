@@ -401,6 +401,23 @@ def test_fix_after_reapproval_gets_review_not_owner_stop(stand):
     assert gate.load_stop(p) is None
 
 
+def test_approval_reset_at_falls_back_to_approved_at(stand):
+    """Запись старого формата (без `review_reset_at`) даёт момент утверждения.
+
+    Панель, запущенная до обновления плагина, писала утверждение без метки переутверждения;
+    без запасного пути страж считал бюджет за всю жизнь плана и сразу ставил owner-stop
+    «второй REQUEST_CHANGES» (живой случай — gapaudit, план 2, 21:59:19 → стоп в 22:00:51).
+    """
+    _root, _p, _db = stand
+    stamp = "2026-11-10T21:59:19"
+    expected = int(time.mktime(time.strptime(stamp, "%Y-%m-%dT%H:%M:%S")))
+    assert gate.approval_reset_at({"review_reset_at": 1794327676}) == 1794327676
+    assert gate.approval_reset_at({"approved_at": stamp}) == expected
+    assert gate.approval_reset_at({"approved_at": stamp + ".123456"}) == expected
+    assert gate.approval_reset_at({}) == 0
+    assert gate.approval_reset_at({"approved_at": "не дата"}) == 0
+
+
 def test_config_overrides_profile_skills_runtime(tmp_path, hermes_stub, monkeypatch):
     """Профиль, скиллы и лимит карточки ревью читаются из конфига (C4)."""
     root = make_project(tmp_path / "proj",
