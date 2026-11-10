@@ -254,17 +254,17 @@ def _refused(number: str, message: str) -> dict:
 
 
 def _accept_existing(project: Path, number: str, draft: Path, final: Path) -> dict:
-    """Черновик и утверждённый файл уже есть: сравниваем имена и содержимое."""
+    """Черновик и утверждённый файл уже есть: утверждаем действующий план.
+
+    Действующим считается файл в `docs/plans/`: он и есть план, который ведёт страж,
+    а черновик рядом — остаток прошлого цикла (он не переносится и не перезаписывает
+    план). Раньше расхождение содержимого давало отказ «файл уже есть и отличается
+    содержимым», и переутвердить правленый план командой `--accept N` было нельзя —
+    именно эту команду просит страж после правки плана по разведке (0.20.0).
+    """
     if final.name != draft.name:
         return _refused(number, f"ошибка: с номером {number} уже есть другой файл: {final.name}")
-    if _sha256(final) != _sha256(draft):
-        return _refused(number, "ошибка: файл уже есть и отличается содержимым")
-    record = _read_approval(project, number)
-    if record is None:
-        # Запись потеряли — восстанавливаем её, иначе страж (S7) навсегда заблокирует план.
-        payload = _write_approval(project, number, final)
-        return _approved(number, final, project, payload)
-    return _unchanged(number, record, final, project)
+    return _accept_final(project, number, final)
 
 
 def _move_draft(project: Path, number: str, draft: Path) -> dict:

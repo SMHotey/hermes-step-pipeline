@@ -197,21 +197,25 @@ def test_state_file_of_own_tick_does_not_cancel_review(stand):
 
 
 def test_research_wait_does_not_turn_into_step(stand):
-    """Путь «ожидание корректировки по разведке → ревью»: второй тик не начинает шаг."""
+    """Путь «правка по разведке → ревью»: второй тик не начинает шаг (0.20.0).
+
+    План без отметки правок и с живым артефактом разведки получает карточку правки
+    плана по разведке, а не простой: пока карточка не закрыта, шаг не заказывается.
+    """
     root, p, db = stand
     write_plan(root, PLAN_READY.replace("Правки по разведке: 2\n", ""))
 
     first = gate.run_gate(p, notify_fn=quiet)
-    assert first["decision"]["action"] == "idle", first["decision"]
+    assert first["decision"]["action"] == "create_scout_fix", first["decision"]
     assert "правок по разведке" in first["decision"]["reason"]
     assert (root / ".pipeline" / "state" / "plan_1_state.json").is_file()
 
     second = gate.run_gate(p, notify_fn=quiet)
     decision = second["decision"]
     assert decision["action"] == "idle", decision
-    assert "правок по разведке" in decision["reason"]
+    assert "ждёт правку плана по разведке" in decision["reason"]
     assert plan_review_cards(db) == []          # ни ревью, ни шага не заказано
-    assert not Path(db).exists() or not cards(db)
+    assert "planloop:1:S1:step" not in keys_of(db)
 
 
 def test_failed_card_creation_does_not_mark_plan_started(stand):
@@ -268,7 +272,7 @@ def test_unfinished_research_correction_blocks_review(stand):
 
     first = gate.run_gate(p, notify_fn=quiet)
     decision = first["decision"]
-    assert decision["action"] == "idle", decision
+    assert decision["action"] == "create_scout_fix", decision
     assert "правок по разведке" in decision["reason"]
     assert plan_review_cards(db) == []
 

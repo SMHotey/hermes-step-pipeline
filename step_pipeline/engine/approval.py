@@ -228,9 +228,9 @@ def evaluate(cfg, spec) -> dict:
         result["state"] = "changed"
         result["block_kind"] = "approval"
         result["reason"] = (
-            f"план {spec.id} изменён после утверждения: sha256 {fact[:12]} не совпал "
-            f"с записью {saved[:12] or '—'} (переутвердить: "
-            f"hermes pipeline plan --accept {spec.id}, затем повторное ревью плана)")
+            f"план {spec.id} изменён после утверждения — переутверди: "
+            f"hermes pipeline plan --accept {spec.id} (sha256 {fact[:12]} не совпал "
+            f"с записью {saved[:12] or '—'}, потом повторное ревью плана)")
         return result
     if review["state"] in (REVIEW_FRESH, REVIEW_SKIPPED):
         result["ok"] = True

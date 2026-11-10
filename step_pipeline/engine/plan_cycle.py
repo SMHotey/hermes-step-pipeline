@@ -22,6 +22,9 @@
         «разведка», не заголовок шага и не внутри раздела шагов)
     P2  при вердикте «берём» в разделе разведки в плане есть шаг интеграции
     P3  правка оформлена отметкой `Правки по разведке: N`
+    P4  раздел ссылается на СВОЙ артефакт разведки `docs/research/<план>-prior-art.md`,
+        а не на артефакт чужого плана (0.20.0): ссылка на чужой файл или её отсутствие —
+        находка, потому что разведка тогда проверялась по чужому артефакту.
 """
 from __future__ import annotations
 
@@ -41,6 +44,13 @@ EDIT_MARK_RE = re.compile(r"прав\w*\s+по\s+разведке\s*:\s*(\d+)", 
 #: Идентификатор шага по образцу `plan_lint._STEP_ID_REGEX` (`S1`, `S2A`, `S10`):
 #: `### S1. Старт`, `### S2A. Обзор`, `### S10. Уточнения`.
 STEP_HEADING_RE = re.compile(r"^#{3,}\s+[A-Za-z]{1,4}\d+[A-Za-z]?(?:-\d+)?\b")
+#: Каталог артефактов разведки по умолчанию (`paths.research` в конфиге проекта).
+ARTIFACT_DIR = "docs/research"
+#: Хвост имени артефакта разведки плана: `<номер>-prior-art.md` (§5a, D2).
+ARTIFACT_SUFFIX = "-prior-art.md"
+#: Номер плана из заголовка документа: `# 1. Демо-план` → `1`. Запасной источник, когда
+#: вызывающий код номер не передал: решение обязано быть чистым, но и не терять P4.
+PLAN_ID_RE = re.compile(r"^#\s+([0-9]+[A-Za-z]?)\s*[.)]\s", re.MULTILINE)
 
 #: Уровень заголовка-маркера: `#`…`######` плюс пробел, тело — до конца строки.
 _MAX_HASHES = 6
@@ -158,11 +168,65 @@ def edits_count(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def check_plan(text: str) -> list[tuple[str, str, str]]:
-    """Прогнать проверки. Возвращает список `(уровень, код, сообщение)` в порядке P1-P3.
+def plan_id_of(text: str) -> str | None:
+    """Номер плана из заголовка документа (`# 1. Демо-план` → `1`), иначе `None`.
+
+    Запасной источник для P4: вызывающий код передаёт номер сам (`check_plan(text,
+    plan_id)`), но тесты и внешние читатели зовут функцию одним аргументом.
+    """
+    match = PLAN_ID_RE.search(text)
+    return match.group(1) if match else None
+
+
+def artifact_path(plan_id: str, research_dir: str = ARTIFACT_DIR) -> str:
+    """Путь артефакта разведки плана: `<каталог>/<номер>-prior-art.md` (§5a, D2)."""
+    return f"{str(research_dir).strip('/')}/{plan_id}{ARTIFACT_SUFFIX}"
+
+
+def artifact_links(text: str, research_dir: str = ARTIFACT_DIR) -> tuple[str, ...]:
+    """Ссылки на артефакты разведки в тексте — пути вида `docs/research/2-prior-art.md`.
+
+    Ищутся только упоминания артефакта в каталоге разведки: прозаическое «разведка
+    была» ссылкой не считается, иначе P4 молчал бы на плане без ссылки.
+    """
+    pattern = re.compile(
+        re.escape(str(research_dir).strip("/")) + r"/([^\s`'\"()\[\]<>|]+?)"
+        + re.escape(ARTIFACT_SUFFIX))
+    return tuple(f"{str(research_dir).strip('/')}/{m.group(1)}{ARTIFACT_SUFFIX}"
+                 for m in pattern.finditer(text))
+
+
+def check_artifact(text: str, plan_id: str | None = None,
+                   research_dir: str = ARTIFACT_DIR) -> tuple[str, str, str]:
+    """P4: раздел «Разведка» ссылается на артефакт ЭТОГО плана (0.20.0).
+
+    Раздела нет — P4 молчит (`PASS`): это находка P1, и второй FAIL на ту же причину
+    только запутал бы карточку правки. Номер плана не распознан — сверять не с чем.
+    """
+    if research_section(text) is None:
+        return ("PASS", "P4",
+                "раздела «Разведка» нет — ссылку на артефакт не с чем сверять (P1)")
+    number = str(plan_id or plan_id_of(text) or "")
+    if not number:
+        return ("PASS", "P4", "номер плана не распознан — ссылку на артефакт не сверить")
+    expected = artifact_path(number, research_dir)
+    links = artifact_links(text, research_dir)
+    if expected in links:
+        return ("PASS", "P4", f"раздел ссылается на свой артефакт разведки {expected}")
+    if links:
+        return ("FAIL", "P4",
+                f"раздел ссылается на {links[0]}, а артефакт плана — {expected}")
+    return ("FAIL", "P4",
+            f"раздел не ссылается на артефакт разведки, а артефакт плана — {expected}")
+
+
+def check_plan(text: str, plan_id: str | None = None,
+               research_dir: str = ARTIFACT_DIR) -> list[tuple[str, str, str]]:
+    """Прогнать проверки. Возвращает список `(уровень, код, сообщение)` в порядке P1-P4.
 
     По одной записи на код, уровни `PASS`/`FAIL` — та же структура, что у
     `scout_report.check_text`, ревьюер S5 читает обе одинаково (D6).
+    `plan_id` и `research_dir` нужны только P4: свой артефакт сверяется с номером плана.
     """
     results: list[tuple[str, str, str]] = []
 
@@ -189,16 +253,19 @@ def check_plan(text: str) -> list[tuple[str, str, str]]:
     else:
         results.append(("PASS", "P3", f"отметка правок по разведке: {count}"))
 
+    results.append(check_artifact(text, plan_id, research_dir))
+
     return results
 
 
-def can_review(text: str) -> tuple[bool, str]:
+def can_review(text: str, plan_id: str | None = None,
+               research_dir: str = ARTIFACT_DIR) -> tuple[bool, str]:
     """Дверь перед ревью плана (S5): `(True, "")`, пока нет ни одной FAIL.
 
     При блокирующей находке — `(False, сообщение первой FAIL)`: это сообщение
     увидит ревьюер, поэтому первая FAIL должна называть причину сама (D6).
     """
-    for level, _code, message in check_plan(text):
+    for level, _code, message in check_plan(text, plan_id, research_dir):
         if level == "FAIL":
             return False, message
     return True, ""

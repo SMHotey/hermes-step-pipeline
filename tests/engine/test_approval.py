@@ -16,7 +16,7 @@ import pytest
 import config as config_mod
 import gate
 import registry
-from engine_kit import PLAN, cards, plan_sha256, write_approval
+from engine_kit import PLAN, cards, complete, plan_sha256, write_approval
 
 
 @pytest.fixture()
@@ -219,3 +219,80 @@ def test_blocked_plan_does_not_starve_another_plan(env: Path, hermes_stub: Path)
     keys = [c["key"] for c in cards(hermes_stub)]
     assert "planloop:2:S1:step" in keys
     assert [k for k in keys if str(k).startswith("planloop:1:")] == []
+
+
+# ── План правлен после утверждения: просим переутвердить (0.20.0) ────────────
+#
+# Правку плана по разведке теперь делает карточка конвейера, и после неё sha256 плана
+# меняется. Утверждение остаётся владельческим: страж не подделывает его, а просит
+# переутвердить готовой командой и не заказывает ревью плана до этого.
+
+PLAN_RESEARCH = """# 1. Демо-план
+
+Конституция: docs/CONSTITUTION.md
+
+## Разведка
+
+Артефакт: `docs/research/1-prior-art.md`
+
+| Кандидат | Ссылка | Вердикт |
+|---|---|---|
+| demo/spec-kit | https://example.com/spec-kit | берём |
+
+Решение: go — берём практики demo/spec-kit
+Правки по разведке: 1
+
+## Шаги
+
+### S1. Старт
+
+- Цель: заложить цикл.
+
+### S2. Интеграция demo/spec-kit
+
+- Цель: подключить готовое.
+
+## Журнал выполнения
+
+| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |
+|---|---|---|---|---|
+| — | S1 | — | — | открыт |
+"""
+
+
+def test_edited_plan_asks_to_reaccept_and_orders_no_review(env: Path, hermes_stub: Path):
+    """План правлен карточкой по разведке — простой с командой, ревью не заказано."""
+    plan = plan_path(env)
+    plan.write_text(PLAN_RESEARCH, encoding="utf-8")
+    write_approval(env, plan)
+    research = Path(env) / "docs" / "research"
+    research.mkdir(parents=True, exist_ok=True)
+    (research / "1-prior-art.md").write_text("Итог: берём demo/spec-kit\n", encoding="utf-8")
+    cfg = load_cfg(env, require_prompt=False)
+    p = gate.resolve_paths(cfg, "1")
+
+    # карточка правки по разведке: план без отметки правок → P3 FAIL
+    plan.write_text(PLAN_RESEARCH.replace("Правки по разведке: 1\n", ""), encoding="utf-8")
+    write_approval(env, plan)
+    first = gate.run_gate(p, notify_fn=lambda text: None)
+    assert first["decision"]["action"] == "create_scout_fix", first["decision"]
+    complete(hermes_stub, ":scoutfix:1")
+
+    # карточка дописала план: sha256 больше не совпадает с записью утверждения
+    plan.write_text(PLAN_RESEARCH + "\nПравка по разведке: отметка и ссылка на артефакт.\n",
+                    encoding="utf-8")
+    before = registry.approval_file_for(cfg, "1").read_bytes()
+
+    created: list = []
+    res = gate.run_gate(p, create_card=lambda *a, **k: created.append(a) or None,
+                        notify_fn=lambda text: None)
+
+    decision = res["decision"]
+    assert decision["action"] == "idle", decision
+    assert decision["approval_blocked"] is True
+    assert "изменён после утверждения" in decision["reason"]
+    assert "hermes pipeline plan --accept 1" in decision["reason"]
+    assert created == []
+    assert "planloop:1:planreview" not in [c["key"] for c in cards(hermes_stub)]
+    # запись утверждения не переписана: утверждение остаётся владельческим
+    assert registry.approval_file_for(cfg, "1").read_bytes() == before

@@ -230,6 +230,36 @@ def test_accept_moves_draft_and_writes_sha256_record(project: Path, capsys, monk
     assert record["plan"] == "5"
 
 
+def test_accept_reapproves_live_plan_when_stale_draft_differs(project: Path, capsys,
+                                                              monkeypatch):
+    """`--accept N` переутверждает действующий план, даже если рядом лежит старый черновик.
+
+    Именно эту команду просит страж после правки плана по разведке (0.20.0); отказ
+    «файл уже есть и отличается содержимым» запирал цикл: план правлен карточкой,
+    а переутвердить его владелец не мог.
+    """
+    monkeypatch.setattr(plan_accept, "now_iso", lambda: "2026-01-01T00:00:00")
+    _draft(project, "5-demo.md", helpers.PLAN)
+    assert _cmd(project, accept="5") == 0
+    capsys.readouterr()
+    final = project / "docs" / "plans" / "5-demo.md"
+    final.write_text(helpers.PLAN + "\nПравки по разведке: 1\n", encoding="utf-8")
+    stale = _draft(project, "5-demo.md", helpers.PLAN)
+    before = stale.read_bytes()
+
+    monkeypatch.setattr(plan_accept, "now_iso", lambda: "2026-02-02T00:00:00")
+    assert _cmd(project, accept="5") == 0
+    captured = capsys.readouterr()
+    assert "переутверждён" in captured.out
+
+    record = json.loads(plan_accept.approval_file(project, "5").read_text(encoding="utf-8"))
+    assert record["sha256"] == hashlib.sha256(final.read_bytes()).hexdigest()
+    assert record["approved_at"] == "2026-02-02T00:00:00"
+    # черновик не переносится и план не перезаписывает
+    assert stale.exists() is True and stale.read_bytes() == before
+    assert final.read_text(encoding="utf-8").endswith("Правки по разведке: 1\n")
+
+
 def test_second_accept_keeps_first_approval_date(project: Path, capsys, monkeypatch):
     """Повторный accept того же содержимого дату первого утверждения не переписывает."""
     monkeypatch.setattr(plan_accept, "now_iso", lambda: "2026-01-01T00:00:00")

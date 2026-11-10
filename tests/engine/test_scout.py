@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -223,3 +224,240 @@ def test_scout_profile_skills_and_runtime_from_config(tmp_path, hermes_stub, mon
     assert call["key"] == "planloop:1:scout"
     assert call["parent"] is None                # карточка планового уровня
     assert "scout-x" in result["decision"]["reason"]
+
+
+# ── Правка плана по разведке: страж заказывает её карточкой (0.20.0) ──────────
+#
+# Цикл «план → разведка → правка плана → ревью плана → утверждение» обязан замыкаться
+# сам: артефакт разведки на месте, а план её не учёл — страж заказывает карточку правки,
+# а не отвечает idle и не ждёт, пока владелец поправит план руками.
+
+PLAN_RESEARCH = """# 1. Демо-план разведки
+
+Конституция: docs/CONSTITUTION.md
+
+## Разведка
+
+Артефакт: `docs/research/1-prior-art.md`
+
+| Кандидат | Ссылка | Вердикт |
+|---|---|---|
+| demo/spec-kit | https://example.com/spec-kit | берём |
+
+Решение: go — берём практики demo/spec-kit
+
+## Шаги
+
+### S1. Старт
+
+- Цель: заложить цикл.
+
+## Журнал выполнения
+
+| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |
+|---|---|---|---|---|
+| — | S1 | — | — | открыт |
+"""
+
+
+def write_research_plan(root: Path, *, edits: int | None = None,
+                        integration: bool = False) -> Path:
+    """План с разделом «Разведка» и ссылкой на свой артефакт (0.20.0).
+
+    `edits` — отметка «Правки по разведке: N» (нет — P3 FAIL), `integration` — шаг
+    интеграции по кандидату «берём» (нет — P2 FAIL). Утверждение переписывается:
+    sha файла меняется после записи плана.
+    """
+    text = PLAN_RESEARCH
+    if edits is not None:
+        text = text.replace("Решение: go — берём практики demo/spec-kit\n",
+                            "Решение: go — берём практики demo/spec-kit\n"
+                            f"Правки по разведке: {edits}\n")
+    if integration:
+        text = text.replace(
+            "### S1. Старт\n\n- Цель: заложить цикл.\n",
+            "### S1. Старт\n\n- Цель: заложить цикл.\n\n"
+            "### S2. Интеграция demo/spec-kit\n\n- Цель: подключить готовое.\n")
+    path = Path(root) / "docs" / "plans" / "1-demo.md"
+    path.write_text(text, encoding="utf-8")
+    write_approval(root, path)
+    return path
+
+
+def write_artifact(root: Path, text: str = "Итог: берём demo/spec-kit\n") -> Path:
+    """Артефакт разведки плана: `docs/research/1-prior-art.md` — «разведка проведена»."""
+    research = Path(root) / "docs" / "research"
+    research.mkdir(parents=True, exist_ok=True)
+    path = research / "1-prior-art.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def scout_fix_cards(db: Path) -> list[dict]:
+    """Карточки правки плана по разведке (любого круга); борды ещё нет — пусто."""
+    if not Path(db).is_file():
+        return []
+    try:
+        return [c for c in cards(db) if (c["key"] or "").startswith("planloop:1:scoutfix")]
+    except sqlite3.Error:                  # файл создан, таблиц ещё нет
+        return []
+
+
+def test_scout_fix_card_requested_when_artifact_exists(stand):
+    """P3-FAIL и живой артефакт: страж заказывает карточку правки плана по разведке."""
+    root, p, db = stand
+    write_research_plan(root)
+    write_artifact(root)
+
+    calls: list[dict] = []
+
+    def fake(_p, title, body, assignee, key, skills, parent=None, max_runtime=None):
+        calls.append({"title": title, "assignee": assignee, "key": key,
+                      "skills": tuple(skills), "max_runtime": max_runtime,
+                      "parent": parent, "body": body})
+        return "t_deadbeef"
+
+    result = gate.run_gate(p, create_card=fake, notify_fn=quiet)
+    decision = result["decision"]
+    assert decision["action"] == "create_scout_fix", decision
+    assert result["applied"] is True
+    assert calls, "карточка не создавалась"
+
+    call = calls[0]
+    assert call["assignee"] == "demo"                     # plan_fix_profile → cfg.driver
+    assert call["skills"] == ("pipeline-plan-authoring",)  # умолчание plan_fix_skills
+    assert call["max_runtime"] == "45m"                    # умолчание plan_fix_runtime
+    assert call["key"] == "planloop:1:scoutfix:1"
+    assert call["parent"] is None                          # карточка планового уровня
+    assert call["title"].startswith("[правка по разведке 1]")
+
+    body = call["body"]
+    for anchor in ("docs/research/1-prior-art.md", "Правки по разведке", "P3",
+                   "Интеграц", "docs/plans/1-demo.md", "plan --accept 1", "Коммит"):
+        assert anchor in body, anchor
+
+
+def test_second_tick_waits_and_does_not_duplicate_scout_fix(stand):
+    """Повторный тик при той же карточке — ожидание, второй карточки того же круга нет."""
+    root, p, db = stand
+    write_research_plan(root)
+    write_artifact(root)
+
+    first = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert first["decision"]["action"] == "create_scout_fix", first["decision"]
+    created = scout_fix_cards(db)
+    assert len(created) == 1
+
+    second = gate.run_gate(p, execute=True, notify_fn=quiet)
+    decision = second["decision"]
+    assert decision["action"] == "idle", decision
+    assert second["applied"] is False
+    assert "ждёт правку плана по разведке" in decision["reason"]
+    assert created[0]["id"] in decision["reason"]
+    assert len(scout_fix_cards(db)) == 1
+    assert "planloop:1:S1:step" not in keys_of(db)
+
+
+def test_done_scout_fix_opens_plan_review(stand):
+    """Карточка done, план поправлен и переутверждён — заказывается ревью плана, не шаг."""
+    root, p, db = stand
+    write_research_plan(root)
+    write_artifact(root)
+    assert gate.run_gate(p, execute=True, notify_fn=quiet)["decision"]["action"] == "create_scout_fix"
+
+    complete(db, ":scoutfix:1")
+    write_research_plan(root, edits=1, integration=True)   # P1-P4 зелёные, sha новый
+    gate.clear_stop(p)
+
+    second = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert second["decision"]["action"] == "create_plan_review", second["decision"]
+    assert "planloop:1:S1:step" not in keys_of(db)
+    assert len(scout_fix_cards(db)) == 1
+
+
+def test_failed_scout_fix_stops_with_card_id(stand):
+    """Упавшая карточка — стоп с её id и статусом в причине, как у правки по ревью."""
+    root, p, db = stand
+    write_research_plan(root)
+    write_artifact(root)
+    assert gate.run_gate(p, execute=True, notify_fn=quiet)["decision"]["action"] == "create_scout_fix"
+
+    complete(db, ":scoutfix:1", status="crashed", result="упал: таймаут")
+    second = gate.run_gate(p, execute=True, notify_fn=quiet)
+    decision = second["decision"]
+    assert decision["action"] == "stop", decision
+    assert scout_fix_cards(db)[0]["id"] in decision["reason"]
+    assert "crashed" in decision["reason"]
+    assert gate.load_stop(p)["kind"] == "incident"
+
+
+def test_two_scout_fix_rounds_escalate_to_owner(stand):
+    """Два круга без успеха — стоп владельца с находками P; третьей карточки нет."""
+    root, p, db = stand
+    write_research_plan(root)
+    write_artifact(root)
+
+    assert gate.run_gate(p, execute=True, notify_fn=quiet)["decision"]["action"] == "create_scout_fix"
+    complete(db, ":scoutfix:1")
+
+    second = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert second["decision"]["action"] == "create_scout_fix", second["decision"]
+    assert second["decision"]["round"] == 2
+    assert [c["key"] for c in scout_fix_cards(db)] == ["planloop:1:scoutfix:1",
+                                                      "planloop:1:scoutfix:2"]
+    complete(db, ":scoutfix:2")
+
+    third = gate.run_gate(p, execute=True, notify_fn=quiet)
+    decision = third["decision"]
+    assert decision["action"] == "stop", decision
+    assert decision["kind"] == "owner"
+    assert "не сошлась" in decision["reason"]
+    assert "P3" in decision["details"]
+    assert "правок по разведке" in decision["details"]
+    assert gate.load_stop(p)["kind"] == "owner"
+    assert len(scout_fix_cards(db)) == 2
+
+
+def test_legacy_plan_gets_no_scout_fix(stand):
+    """План старого формата (без «Разведки») новых карточек и требований не получает."""
+    root, p, db = stand
+    write_plan(root, constitution=False)
+    write_prompt(root, "S1")
+    write_artifact(root)                  # артефакт есть, раздела в плане нет
+
+    first = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert first["decision"]["action"] == "create_step", first["decision"]
+    assert scout_fix_cards(db) == []
+
+
+def test_plan_without_research_section_stays_idle(stand):
+    """Есть `Конституция:`, нет раздела «Разведка» — прежний простой, карточки нет (P1)."""
+    root, p, db = stand
+    write_plan(root, constitution=True)
+    write_prompt(root, "S1")
+    write_artifact(root)
+    # Свежий APPROVE — отдельная дверь (отклонение от порядка ветвей §4.3), поэтому
+    # отчёта ревью нет: проверяется именно ветка корректировки по разведке.
+    (root / "docs" / "reviews" / "plan-1.md").unlink()
+
+    first = gate.run_gate(p, execute=True, notify_fn=quiet)
+    decision = first["decision"]
+    assert decision["action"] == "idle", decision
+    assert "Разведка" in decision["reason"]
+    assert scout_fix_cards(db) == []
+    assert not Path(db).is_file() or not cards(db)
+
+
+def test_card_body_keeps_existing_integration_step(stand):
+    """P2 проходит — карточка не велит добавлять второй шаг интеграции (границы карточки)."""
+    root, p, db = stand
+    write_research_plan(root, integration=True)
+    write_artifact(root)
+
+    first = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert first["decision"]["action"] == "create_scout_fix", first["decision"]
+
+    body = gate.scout_fix_card_body(p, gate.build_ctx(p), 1)
+    assert "уже есть" in body
+    assert "добавить шаг" not in body
+    assert "Интеграция demo/spec-kit" in body

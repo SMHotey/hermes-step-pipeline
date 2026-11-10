@@ -97,7 +97,7 @@ def test_integration_step_satisfies_take() -> None:
     assert "Интеграция" in step
 
     assert {code: level for level, code, _ in pc.check_plan(GOOD)} == {
-        "P1": "PASS", "P2": "PASS", "P3": "PASS"}
+        "P1": "PASS", "P2": "PASS", "P3": "PASS", "P4": "PASS"}
 
     # P2 срабатывает только от вердикта: убраны и вердикт, и шаг интеграции
     text = (GOOD.replace("| берём |", "| своё |")
@@ -127,3 +127,41 @@ def test_missing_marker_blocks_review() -> None:
     assert ok is False
     assert "правок по разведке" in reason  # P1 и P2 PASS — первая FAIL это P3
     assert pc.edits_count(broken) is None
+
+
+# ── P4: раздел ссылается на артефакт ЭТОГО плана (0.20.0) ─────────────────────
+
+def test_artifact_link_to_foreign_plan_is_fail() -> None:
+    """Ссылка на артефакт чужого плана — FAIL P4 с обоими путями в тексте."""
+    foreign = GOOD.replace("docs/research/1-prior-art.md", "docs/research/2-prior-art.md")
+    level, code, message = pc.check_artifact(foreign, "1")
+    assert (level, code) == ("FAIL", "P4")
+    assert "docs/research/2-prior-art.md" in message
+    assert "docs/research/1-prior-art.md" in message
+    assert pc.can_review(foreign, "1")[0] is False
+
+
+def test_artifact_link_to_own_plan_is_pass() -> None:
+    """Свой артефакт в ссылке — P4 PASS; номер берётся и из заголовка плана."""
+    assert pc.check_artifact(GOOD, "1")[0] == "PASS"
+    assert pc.check_plan(GOOD, "1")[-1][:2] == ("PASS", "P4")
+    assert pc.can_review(GOOD, "1") == (True, "")
+    # номер плана передан явно: чужая нумерация в заголовке не спасает
+    assert pc.check_artifact(GOOD, "2")[0] == "FAIL"
+
+
+def test_missing_artifact_link_is_fail() -> None:
+    """Ссылки на артефакт нет вовсе — тоже FAIL P4: сверять раздел не с чем."""
+    no_link = GOOD.replace("Артефакт: `docs/research/1-prior-art.md`\n", "")
+    level, code, message = pc.check_artifact(no_link, "1")
+    assert (level, code) == ("FAIL", "P4")
+    assert "а артефакт плана — docs/research/1-prior-art.md" in message
+
+
+def test_no_research_section_keeps_old_behaviour() -> None:
+    """Без раздела «Разведка» поведение прежнее: P1 FAIL, P4 молчит."""
+    broken = GOOD.replace("## Разведка", "## Рассуждения")
+    levels = {code: level for level, code, _ in pc.check_plan(broken, "1")}
+    assert levels["P1"] == "FAIL"
+    assert levels["P4"] == "PASS"
+    assert "нет раздела «Разведка»" in pc.can_review(broken, "1")[1]

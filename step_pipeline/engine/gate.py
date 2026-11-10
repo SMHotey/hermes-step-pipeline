@@ -28,7 +28,9 @@
 Утверждение плана сверяется перед любой карточкой: запись `plan_<НОМЕР>_approval.json`
 в каталоге состояния плюс пересчёт sha256 файла плана. Исключение — план, который уже
 идёт (есть файл состояния или закрытые шаги журнала): ему страж пишет унаследованную
-запись и ведёт дальше, иначе шаг перекрыл бы дорогу сам себе.
+запись и ведёт дальше, иначе шаг перекрыл бы дорогу сам себе. Второе исключение —
+правка плана карточкой по разведке (0.20.0): после неё запись не наследуется, а простой
+несёт готовую команду `hermes pipeline plan --accept N` — утверждает владелец.
 
 Стоп-флаг блокирует ТОЛЬКО начало следующего шага: текущий шаг доводится до ревью и
 журнала (это и значит «остановка ПОСЛЕ выполнения шага»).
@@ -161,6 +163,10 @@ CONSTITUTION_MARK = approval.CONSTITUTION_MARK
 # (`planloop:<план>:planreview:2`), поэтому вид остаётся узнаваемым для `card_of`.
 PLAN_REVIEW_KEY = "planreview"
 PLAN_FIX_KEY = "planfix"
+# Правка плана по разведке (0.20.0): вид карточки в ключе `planloop:<план>:scoutfix:<круг>`.
+# Отдельный вид, а не `planfix`: у разведки свой бюджет кругов, и по ключу видно, из-за
+# чего план правился — по ревью плана или по разведке.
+PLAN_SCOUTFIX_KEY = "scoutfix"
 PLAN_REVIEW_SKILLS_DEFAULT = ("pipeline-plan-reviewer",)
 PLAN_FIX_SKILLS_DEFAULT = ("pipeline-plan-authoring",)
 PLAN_REVIEW_RUNTIME_DEFAULT = "45m"
@@ -840,6 +846,71 @@ def plan_fix_card_body(p: Paths, plan_rel: str, report_rel: str,
     return "\n".join(lines)
 
 
+def scout_fix_card_body(p: Paths, ctx: dict, round_no: int) -> str:
+    """Тело карточки правки плана по разведке (0.20.0): что именно не так и как чинить.
+
+    Карточка правит только план: разведка проведена, но план её не учёл, поэтому
+    `plan_cycle.check_plan` вернул FAIL по P1-P4 и ревью плана не заказывается.
+    """
+    plan_id = p.plan_id
+    plan_rel = ctx.get("plan_rel") or p.cfg.rel(Path(p.plan_file))
+    artifact_rel = ctx.get("scout_artifact_rel") or p.cfg.rel(scout_artifact(p))
+    fails = [row for row in (ctx.get("plan_checks") or []) if row[0] == "FAIL"]
+    takes = ctx.get("plan_take_candidates") or ()
+    lines = [
+        f"# Правка плана {plan_id} по разведке (круг {round_no})",
+        "",
+        "Разведка проведена, а план её не учёл: пока `plan_cycle.check_plan` возвращает",
+        f"FAIL по P1-P4, ревью плана не заказывается. План: `{plan_rel}`.",
+        f"Артефакт разведки: `{artifact_rel}` — читать целиком, это источник правок.",
+        "",
+        "ПРОВАЛЕННЫЕ ПРОВЕРКИ (P1-P4)",
+    ]
+    lines += [f"- {code}: {message}" for _level, code, message in fails] or [
+        "- проверки P1-P4 находок не дали — причину читать в причине решения стража"]
+    lines += [
+        "",
+        "ЧТО СДЕЛАТЬ",
+        "1. Вписать в раздел «## Разведка» строку `Правки по разведке: N`, где N — сколько",
+        "   правок внесено по разведке (`0` — правок нет, но разведка учтена): без отметки",
+        "   правка не оформлена (проверка P3).",
+    ]
+    if takes and any(code == "P2" for _level, code, _msg in fails):
+        lines += [
+            "2. Для каждого кандидата с вердиктом «берём» добавить шаг, в заголовке которого",
+            "   есть «Интеграц…»: `### S<n>. Интеграция <кандидат>`. Кандидаты «берём»: "
+            + ", ".join(f"`{name}`" for name in takes) + ".",
+        ]
+    elif takes:
+        # P2 проходит: шаг интеграции в плане уже есть. Второй не заказываем — иначе
+        # карточка нарушила бы собственные границы («шаги работ не трогаются»).
+        lines += [
+            "2. Шаг интеграции по кандидатам «берём» уже есть: "
+            f"`{ctx.get('plan_integration_step') or 'см. раздел «Шаги»'}` — проверка P2 "
+            "проходит, состав и порядок шагов не менять.",
+        ]
+    else:
+        lines += [
+            "2. Кандидатов с вердиктом «берём» в разделе нет — шаг интеграции не нужен.",
+        ]
+    lines += [
+        "3. Ссылка раздела «## Разведка» обязана указывать на артефакт ЭТОГО плана:",
+        f"   `{artifact_rel}`. Ссылка на артефакт другого плана — находка P4: тогда",
+        "   разведка проверялась по чужому файлу.",
+        "",
+        "ГРАНИЦЫ",
+        f"- Правится только файл плана `{plan_rel}`: замысел, шаги, ссылка, отметка.",
+        "- Код, шаги работ (их состав и порядок) и утверждение не трогаются.",
+        "- Утверждение обновляет владелец: после правки страж попросит",
+        f"  `hermes pipeline plan --accept {plan_id}` — сам он его не пишет и не подделывает.",
+        "- Коммит не делается: правку плана коммитит владелец или шаг после утверждения.",
+        "",
+        "ЗАКРЫТИЕ",
+        "- Результат карточки — первая строка `Итог: …` и перечень правок с адресами.",
+    ]
+    return "\n".join(lines)
+
+
 def prompt_order_body(p: Paths, step: dict) -> str:
     """Тело карточки промптеру: заказ постановки, без которой шаг не начинается."""
     plan_rel = p.cfg.rel(Path(p.plan_file))
@@ -1191,7 +1262,19 @@ def build_ctx(p: Paths) -> dict:
         plan_text = Path(p.plan_file).read_text(encoding="utf-8", errors="replace")
     except OSError:
         plan_text = ""
-    ctx["plan_review_ok"], ctx["plan_review_reason"] = plan_cycle.can_review(plan_text)
+    ctx["plan_review_ok"], ctx["plan_review_reason"] = plan_cycle.can_review(
+        plan_text, p.plan_id, p.cfg.rel(scout_research_dir(p.cfg)))
+    # Находки P1-P4 целиком: из них собирается и причина простоя, и тело карточки правки
+    # плана по разведке (0.20.0). Проверки чистые, поэтому считаются здесь один раз.
+    ctx["plan_checks"] = plan_checks(p, plan_text)
+    ctx["plan_take_candidates"] = plan_cycle.take_candidates(plan_text)
+    # Раздел-якорь «Разведка» (P1): без него ветка правки плана по разведке не включается —
+    # план старого/иного формата остаётся с прежним поведением (0.20.0).
+    ctx["plan_has_research"] = plan_cycle.research_section(plan_text) is not None
+    # Шаг интеграции, который видит P2: если он уже есть, карточка не велит добавлять
+    # второй — состав и порядок шагов правка по разведке не трогает.
+    ctx["plan_integration_step"] = plan_cycle.integration_step(plan_text)
+    ctx["plan_rel"] = p.cfg.rel(Path(p.plan_file))
     # Исход идеи и вопросы (план 5, S10): текст плана уже прочитан выше, второй раз файл не
     # читается. `decide` получает только `ctx` (D4), поэтому строка «Решение:» разбирается
     # здесь, а не в решении.
@@ -1219,6 +1302,12 @@ def build_ctx(p: Paths) -> dict:
     ctx["plan_review_rel"] = plan_review_rel(p)
     ctx["plan_review_profile"] = plan_review_profile(p.cfg)
     ctx["plan_fix_cards"] = read_cards(p, f"planloop:{p.plan_id}:{PLAN_FIX_KEY}")
+    # Правка плана по разведке (0.20.0): артефакт, круги и профиль карточки. Артефакт —
+    # тот же, что ждёт разведка (`scout_artifact`): одна точка правды на имя файла.
+    ctx["scout_fix_cards"] = read_cards(p, f"planloop:{p.plan_id}:{PLAN_SCOUTFIX_KEY}")
+    ctx["scout_artifact_rel"] = p.cfg.rel(scout_artifact(p))
+    ctx["scout_artifact_ready"] = scout_artifact(p).is_file()
+    ctx["plan_fix_profile"] = plan_fix_profile(p.cfg)
     return ctx
 
 
@@ -1284,7 +1373,9 @@ def _decide_base(ctx: dict) -> dict:
             and approval.get("block_kind") != "review"):
         # Неутверждённый план не заказывает карточку. Решение именно `idle`, а не
         # отдельное действие: иначе пропуск съедал бы единственное действие тика (D5)
-        # и вытеснял остальные планы на каждом тике.
+        # и вытеснял остальные планы на каждом тике. Идущий план сюда не попадает: у него
+        # запись утверждения наследуется (`ensure_approval`), а правку плана карточкой по
+        # разведке стережёт отдельная ветка ревью плана (0.20.0).
         return {"action": "idle", "step": sid,
                 "reason": approval.get("reason") or "план не утверждён",
                 "approval": approval.get("state"), "approval_blocked": True}
@@ -1531,6 +1622,59 @@ def _retro_decision(ctx: dict) -> dict | None:
                       f"{ctx.get('retro_rel')}"}
 
 
+def _plan_check_details(ctx: dict) -> str:
+    """Находки P1-P4 плана для `details` стопа: что именно не так, адресом раздела."""
+    rows = [row for row in (ctx.get("plan_checks") or []) if row[0] == "FAIL"]
+    head = (f"Находки корректировки плана {ctx.get('plan_id')} по разведке "
+            f"({ctx.get('plan_rel') or 'файл плана'}, артефакт "
+            f"{ctx.get('scout_artifact_rel') or '—'}):")
+    if not rows:
+        return head + f"\n- проверки P1-P4 находок не дали: {ctx.get('plan_review_reason') or '—'}"
+    return "\n".join([head] + [f"- {code}: {message}" for _level, code, message in rows])
+
+
+def _scout_fix_decision(ctx: dict) -> dict | None:
+    """Правка плана по разведке: карточка, ожидание, стоп или эскалация владельцу (0.20.0).
+
+    Чистое решение планового уровня: `None` — артефакта разведки нет, править нечего
+    (план либо ждёт разведку, либо идёт старым порядком). Поля `step` нет намеренно:
+    иначе инвариант «одно действие на шаг за тик» (`step_key`) счёл бы его действием шага.
+
+    Бюджет — `PLAN_REVIEW_MAX_ROUNDS` карточек на план: круг считается по числу уже
+    созданных карточек, повторный тик второй карточки того же круга не заводит (ключ
+    идемпотентности тот же), а после исчерпания решает владелец. Зацикливания нет ни при
+    каком ответе карточки: ожидание, стоп или эскалация.
+    """
+    if not ctx.get("scout_artifact_ready") or not ctx.get("plan_has_research"):
+        # Артефакта нет — править нечего (план ждёт разведку). Раздела «Разведка» нет —
+        # это находка P1 и прежнее поведение: такой план карточку правки не получает.
+        return None
+    plan_id = ctx.get("plan_id")
+    cards = ctx.get("scout_fix_cards") or []
+    if cards:
+        card = cards[-1]
+        status = str(card.get("status") or "")
+        if status not in TERMINAL:
+            return {"action": "idle", "plan_review": True, "scout_fix": True,
+                    "reason": (f"ждёт правку плана по разведке: карточка "
+                               f"{card.get('id')} ({status})")}
+        if status != "done":
+            detail = " ".join(str(card.get("error") or card.get("result") or "").split())[:300]
+            return {"action": "stop",
+                    "reason": (f"правка плана {plan_id} по разведке упала: карточка "
+                               f"{card.get('id')} в статусе {status}: {detail}")}
+        if len(cards) >= PLAN_REVIEW_MAX_ROUNDS:
+            return {"action": "stop", "kind": "owner",
+                    "reason": (f"правка плана по разведке не сошлась за {len(cards)} "
+                               f"кругов: решает владелец"),
+                    "details": _plan_check_details(ctx)}
+    round_no = len(cards) + 1
+    return {"action": "create_scout_fix", "round": round_no,
+            "reason": (f"план {plan_id} не прошёл корректировку по разведке: "
+                       f"{ctx.get('plan_review_reason') or 'нет раздела «Разведка»'} — "
+                       f"карточка правки плана по разведке (круг {round_no})")}
+
+
 def _plan_review_decision(ctx: dict) -> dict | None:
     """Ревью плана: карточка, ожидание, вердикт, один круг правок, эскалация (C6, D1-D7).
 
@@ -1553,6 +1697,16 @@ def _plan_review_decision(ctx: dict) -> dict | None:
     plan_id = ctx.get("plan_id")
     rel = ctx.get("plan_review_rel") or f"docs/reviews/plan-{plan_id}.md"
     verdict = ctx.get("plan_review_verdict")
+    # План правился карточкой правки по разведке (0.20.0): sha256 изменился, и утверждение
+    # обновляет владелец. Страж его не наследует и не подделывает, а просит переутвердить
+    # готовой командой; до этого ревью не заказывается — оно было бы ревью неутверждённого
+    # плана. После `plan --accept N` запись совпадёт, и ветка снова откроется.
+    approval = ctx.get("approval") or {}
+    if ctx.get("scout_fix_cards") and approval.get("block_kind") == "approval":
+        return {"action": "idle", "plan_review": True, "approval_blocked": True,
+                "reapprove": True,
+                "reason": (f"план {plan_id} изменён после утверждения — переутверди: "
+                           f"hermes pipeline plan --accept {plan_id}")}
     # C9: дверь к шагам — сам вердикт, а не карточка. План, прошедший ревью раньше
     # (например, идущий план или ревью задним числом), шаги не ждёт.
     if verdict is not None and verdict["verdict"] == "APPROVE":
@@ -1564,6 +1718,11 @@ def _plan_review_decision(ctx: dict) -> dict | None:
         if ctx.get("plan_review_fresh"):
             return None
         if not ctx.get("plan_review_ok"):
+            # Правку плана по разведке заказывает страж, а не владелец руками (0.20.0):
+            # карточка правит план, дальше переутверждение и повторное ревью.
+            fix = _scout_fix_decision(ctx)
+            if fix:
+                return fix
             return {"action": "idle", "plan_review": True,
                     "reason": (f"план {plan_id} не прошёл корректировку по разведке: "
                                f"{ctx.get('plan_review_reason') or 'нет раздела «Разведка»'} "
@@ -1591,7 +1750,12 @@ def _plan_review_decision(ctx: dict) -> dict | None:
                            f"(круг {round_no}): "
                            f"{review.get('reason') or 'вердикт про прошлую версию'}")}
     if not ctx.get("plan_review_ok"):
-        # Разведка — предусловие ЗАКАЗА ревью (D5): план без корректировки по разведке ждёт.
+        # Разведка — предусловие ЗАКАЗА ревью (D5): план без корректировки по разведке
+        # ждёт. Артефакт разведки на месте — правим план карточкой (0.20.0): без неё цикл
+        # «план → разведка → правка → ревью» не замыкался и владелец правил руками.
+        fix = _scout_fix_decision(ctx)
+        if fix:
+            return fix
         return {"action": "idle", "plan_review": True,
                 "reason": (f"план {plan_id} не прошёл корректировку по разведке: "
                            f"{ctx.get('plan_review_reason') or 'нет раздела «Разведка»'}")}
@@ -2244,6 +2408,16 @@ def plan_fix_runtime(cfg: config_mod.Config) -> str:
     return _config_text(cfg, "runtimes", "plan_fix") or PLAN_FIX_RUNTIME_DEFAULT
 
 
+def plan_checks(p: Paths, plan_text: str) -> list[tuple[str, str, str]]:
+    """Проверки корректировки плана по разведке P1-P4 для этого проекта (0.20.0).
+
+    Номер плана и каталог разведки передаются явно: P4 сверяет ссылку раздела с
+    артефактом ЭТОГО плана, а `paths.research` в проекте может быть своим.
+    """
+    research = p.cfg.rel(scout_research_dir(p.cfg))
+    return plan_cycle.check_plan(plan_text, p.plan_id, research)
+
+
 def _digest_at(cfg: config_mod.Config) -> tuple[int, int]:
     """Час и минута сводки из notify.digest_at; битое значение — умолчание (D4)."""
     raw = str(cfg.notify.get("digest_at") or DIGEST_DEFAULT).strip()
@@ -2318,9 +2492,15 @@ def ensure_approval(p: Paths, ctx: dict) -> dict | None:
 
     Только исполняющий проход (`--run`): `--status` состояние не меняет. Повторный
     вызов после записи ничего не пишет — в ctx уже `approved`.
+
+    Наследуется запись идущего плана, чтобы шаг не перекрывал дорогу сам себе. Исключение
+    одно: план правился карточкой правки по разведке (0.20.0) — там утверждение обновляет
+    владелец (`hermes pipeline plan --accept N`), и наследование подделало бы его молча.
     """
     approval = ctx.get("approval") or {}
     if approval.get("state") == "approved" or not approval.get("started"):
+        return None
+    if ctx.get("scout_fix_cards"):
         return None
     record = inherit_approval(p, approval)
     approval.update(state="approved", inherited=True, record=record, reason="")
@@ -3307,6 +3487,29 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 f"(карточка {cid}, профиль {profile}); после правки ревью повторится")
         else:
             say(f"план {plan_id}: не смог поставить правку плана — проверь `hermes kanban ls`")
+        return result
+    if action == "create_scout_fix":
+        # Правка плана по разведке (0.20.0): ключ планового уровня с номером круга, как у
+        # ревью плана; `--parent` не ставится. Роль та же, что у правки по ревью (D3):
+        # профиль, скиллы и лимит читаются теми же владельческими ключами конфига.
+        round_no = int(decision.get("round") or 1)
+        key = f"planloop:{plan_id}:{PLAN_SCOUTFIX_KEY}:{round_no}"
+        profile = plan_fix_profile(p.cfg)
+        cid = create_card(
+            p, f"[правка по разведке {plan_id}] Правка плана по разведке (круг {round_no})",
+            scout_fix_card_body(p, ctx, round_no), profile, key, plan_fix_skills(p.cfg),
+            max_runtime=plan_fix_runtime(p.cfg))
+        result.update(applied=bool(cid), detail=f"карточка правки плана по разведке: {cid}")
+        if cid:
+            # Сбой создания состояние не пишет (как у ревью плана): без отметки следующий
+            # тик честно повторит заказ, а план не «станет идущим» из-за промаха борды.
+            touch(f"create_scout_fix:{cid}")
+            say(f"план {plan_id}: разведка не учтена в плане — правку заказываю карточкой "
+                f"{cid} (профиль {profile}, круг {round_no}); после правки план надо "
+                f"переутвердить")
+        else:
+            say(f"план {plan_id}: не смог поставить правку плана по разведке — "
+                f"проверь `hermes kanban ls`")
         return result
     if action == "create_prompt":
         # Постановка N+1: заказ заранее (правило 2) и заказ вместо закрытия (правило 1).
