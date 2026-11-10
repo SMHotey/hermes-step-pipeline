@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Mapping
 
 API = "https://api.telegram.org/bot{token}/{method}"
 # Прокси Bot API (Cloudflare-воркер) отдаёт тот же путь `/bot<токен>/<метод>`, поэтому
@@ -28,14 +29,18 @@ USER_AGENT = "step-pipeline (+https://github.com/SMHotey/hermes-step-pipeline)"
 DEFAULT_TIMEOUT = 20
 
 
-def api_template() -> str:
+def api_template(env: Mapping[str, str] | None = None) -> str:
     """Шаблон адреса Bot API с учётом прокси из окружения.
 
     Пусто — прямой `api.telegram.org`. Значение — база вида `https://<воркер>` (хвостовой
     слэш не важен): путь `/bot<токен>/<метод>` дописывается как обычно. База, уже
     оканчивающаяся на `/bot` (так её пишет шлюз Hermes), не дублирует префикс.
+
+    `env` — окружение проекта (`project.engine_env`): у панели в `os.environ` лежит `.env`
+    её собственного профиля, а проект должен ходить своим каналом, со своим прокси.
     """
-    base = (os.environ.get(API_ENV) or os.environ.get(API_ENV_SHARED) or "").strip()
+    source = os.environ if env is None else env
+    base = (source.get(API_ENV) or source.get(API_ENV_SHARED) or "").strip()
     if not base:
         return API
     base = base.rstrip("/")
@@ -100,7 +105,8 @@ def _http_error_text(exc: urllib.error.HTTPError) -> str:
 
 
 def _call(token: str, method: str, http_timeout: int = DEFAULT_TIMEOUT,
-          retries: int | None = None, **params) -> dict:
+          retries: int | None = None, env: Mapping[str, str] | None = None,
+          **params) -> dict:
     """Вызов Bot API с повтором на сетевых отказах и 5xx (D9).
 
     Всего до `retries` попыток (по умолчанию `RETRIES`), паузы 0.5 и 1.0 секунды.
@@ -111,7 +117,7 @@ def _call(token: str, method: str, http_timeout: int = DEFAULT_TIMEOUT,
     if not token:
         raise TelegramError("пустой токен бота")
     data = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode()
-    request = urllib.request.Request(api_template().format(token=token, method=method),
+    request = urllib.request.Request(api_template(env).format(token=token, method=method),
                                      data=data, headers={"User-Agent": USER_AGENT})
     attempts = RETRIES if retries is None else max(1, int(retries))
     last: TelegramError | None = None
@@ -139,24 +145,26 @@ def _call(token: str, method: str, http_timeout: int = DEFAULT_TIMEOUT,
     raise last or TelegramError("Telegram не ответил")
 
 
-def get_me(token: str) -> dict:
+def get_me(token: str, env: Mapping[str, str] | None = None) -> dict:
     """Проверка токена: возвращает {id, username, ...}."""
-    return _call(token, "getMe")
+    return _call(token, "getMe", env=env)
 
 
-def send_message(token: str, chat_id: str, text: str) -> bool:
+def send_message(token: str, chat_id: str, text: str,
+                env: Mapping[str, str] | None = None) -> bool:
     """Отправить сообщение. Кириллица режется по лимиту 4096 символов."""
     body = (text or "").strip()
     if not body:
         return False
-    _call(token, "sendMessage", chat_id=chat_id, text=body[:4000],
+    _call(token, "sendMessage", env=env, chat_id=chat_id, text=body[:4000],
           disable_web_page_preview="true")
     return True
 
 
-def validate_chat(token: str, chat_id: str) -> dict:
+def validate_chat(token: str, chat_id: str,
+                  env: Mapping[str, str] | None = None) -> dict:
     """Проверить, что бот видит этот чат (getChat)."""
-    return _call(token, "getChat", chat_id=chat_id)
+    return _call(token, "getChat", env=env, chat_id=chat_id)
 
 
 def get_webhook_info(token: str) -> dict:

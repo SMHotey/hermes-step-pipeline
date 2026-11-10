@@ -1529,28 +1529,10 @@ SETUP_HINTS = {
 def env_values(profile: str) -> dict[str, str]:
     """Переменные из `.env` профиля: без комментариев, кавычек и пустых значений.
 
-    Свой разбор, а не `load_profile_env`: тот пишет в `os.environ` процесса панели,
-    а мастеру нужны значения профиля, не подмена окружения сервера.
+    Разбор один на весь пакет — `project.read_env_file`: мастеру нужны значения профиля,
+    а не подмена окружения сервера панели, поэтому `os.environ` здесь не трогаем.
     """
-    path = env_path(profile)
-    try:
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
-        return {}
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        raw = line.strip()
-        if not raw or raw.startswith("#") or "=" not in raw:
-            continue
-        if raw.startswith("export "):
-            raw = raw[len("export "):].lstrip()
-        key, _, value = raw.partition("=")
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        if key.strip() and value:
-            values[key.strip()] = value
-    return values
+    return proj.read_env_file(env_path(profile))
 
 
 def setup_defaults(project: Path) -> dict[str, str]:

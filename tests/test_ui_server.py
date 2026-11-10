@@ -1077,7 +1077,7 @@ def test_checks_never_expose_bot_token(server, monkeypatch, tmp_path):
     env.write_text("STEP_PIPELINE_TELEGRAM_BOT_TOKEN=" + token + "\n"
                    "STEP_PIPELINE_TELEGRAM_CHAT_ID=42\n", encoding="utf-8")
 
-    def boom(_token):
+    def boom(_token, **__):
         raise ui_server.telegram.TelegramError("сеть недоступна: таймаут")
 
     monkeypatch.setattr(ui_server.telegram, "get_me", boom)
@@ -2557,9 +2557,12 @@ def test_notify_telegram_mirrors_feed(tmp_path: Path, hermes_stub: Path,
          "detail": "шаг 1-S1 закрыт", "commit": "abc1234"}])
     calls: list[tuple[str, str, str]] = []
     monkeypatch.setattr(ui_server.telegram, "send_message",
-                        lambda token, chat, text: calls.append((token, chat, text)))
-    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_BOT_TOKEN", "token-тест")
-    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_CHAT_ID", "42")
+                        lambda token, chat, text, **__: calls.append((token, chat, text)))
+    # Канал проекта живёт в `.env` его профиля; чужой токен в окружении панели не в счёт.
+    monkeypatch.setattr(ui_server.proj, "profile_env", lambda root: {
+        "STEP_PIPELINE_TELEGRAM_BOT_TOKEN": "token-тест",
+        "STEP_PIPELINE_TELEGRAM_CHAT_ID": "42"})
+    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_BOT_TOKEN", "чужой-бот")
 
     state = ui_server.State(alpha, project_id="alpha", name="Альфа")
     state.notify_primed = True      # кадр прошёл: доставка не первый (D7)
@@ -2579,8 +2582,9 @@ def test_notify_telegram_mirrors_feed(tmp_path: Path, hermes_stub: Path,
         encoding="utf-8").splitlines()
     assert len(rows) == 1 and "шаг S1 закрыт" in rows[0]
 
-    # Канал без токена: событие есть, вызовов нет.
-    monkeypatch.delenv("STEP_PIPELINE_TELEGRAM_BOT_TOKEN")
+    # Канал без токена в профиле проекта: событие есть, вызовов нет.
+    monkeypatch.setattr(ui_server.proj, "profile_env", lambda root: {
+        "STEP_PIPELINE_TELEGRAM_CHAT_ID": "42"})
     state.notified.clear()
     state.notified_project.clear()
     calls.clear()

@@ -279,16 +279,22 @@ def _event_row(record: dict, root: Path, cfg: dict) -> dict:
 
 
 def telegram_state(project: Path) -> dict:
-    """Настроены ли уведомления (значения секретов наружу не отдаются)."""
+    """Настроены ли уведомления (значения секретов наружу не отдаются).
+
+    Смотрим то же окружение, что получит движок: `.env` профиля драйвера проекта сильнее
+    окружения процесса панели (`proj.profile_env`). Иначе панель показывала «токена нет»
+    при живом токене в файле — тик при этом уже отправлял (0.20.1).
+    """
     import os
     cfg = proj.read_config(project)
     notify = cfg.get("notify") or {}
     token_env = notify.get("token_env") or "STEP_PIPELINE_TELEGRAM_BOT_TOKEN"
     chat_env = notify.get("chat_env") or "STEP_PIPELINE_TELEGRAM_CHAT_ID"
+    env = proj.engine_env(project)
     return {
         "enabled": bool(notify.get("enabled")),
-        "token_set": bool(os.environ.get(token_env)),
-        "chat": os.environ.get(chat_env) or "",
+        "token_set": bool(env.get(token_env)),
+        "chat": env.get(chat_env) or "",
         "token_env": token_env,
         "chat_env": chat_env,
         "prefix": str(notify.get("prefix") or ""),

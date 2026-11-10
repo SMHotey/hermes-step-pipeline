@@ -121,17 +121,15 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
     if not no_key:
         notes.append(f"ключи: сохранённый ключ провайдера есть у всех ролей "
                      f"({', '.join(roles)})")
-    env_file = proj.profile_dir(driver) / ".env"
-    token = chat = ""
-    if env_file.is_file():
-        for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("STEP_PIPELINE_TELEGRAM_BOT_TOKEN="):
-                token = line.split("=", 1)[1]
-            elif line.startswith("STEP_PIPELINE_TELEGRAM_CHAT_ID="):
-                chat = line.split("=", 1)[1]
+    # Канал проекта — из `.env` его профиля и с его прокси: чужой `STEP_PIPELINE_TELEGRAM_*`
+    # из окружения оболочки (например, профиля Hermes) проверку бы испортил (0.20.1).
+    values = proj.read_env_file(proj.profile_dir(driver) / ".env")
+    notify = proj.read_config(project).get("notify") or {}
+    token = values.get(str(notify.get("token_env") or setup_flow.TOKEN_ENV), "")
+    chat = values.get(str(notify.get("chat_env") or setup_flow.CHAT_ENV), "")
     if token and chat:
         try:
-            me = telegram.get_me(token)
+            me = telegram.get_me(token, env=proj.engine_env(project))
             notes.append(f"Telegram: @{me.get('username')} → {chat}")
         except telegram.TelegramError as exc:
             # Текст отказа идёт в панель: токен в него не попадает (telegram.py:22-77).

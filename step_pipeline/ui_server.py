@@ -596,8 +596,10 @@ def act_save_telegram(state: State, payload: dict) -> dict:
     # Пустое поле не понижает уже записанного владельца до chat id: в группе это разные id.
     owner = owner or setup_flow.env_values(driver).get(owner_env) or chat
     try:
-        me = telegram.get_me(token)
-        telegram.validate_chat(token, chat)
+        # Проверка идёт тем же каналом, что запишется: токен из формы, прокси — из профиля.
+        env = _project_env(state.project)
+        me = telegram.get_me(token, env=env)
+        telegram.validate_chat(token, chat, env=env)
     except telegram.TelegramError as exc:
         return {"ok": False, "error": str(exc)}
     setup_flow.write_env(driver, {setup_flow.TOKEN_ENV: token, setup_flow.CHAT_ENV: chat,
@@ -614,15 +616,26 @@ def act_save_telegram(state: State, payload: dict) -> dict:
     return {"ok": True, "bot": me.get("username")}
 
 
+def _project_env(project: Path) -> dict[str, str]:
+    """Окружение канала уведомлений проекта — то же, что получит движок.
+
+    Панель — обычный процесс Hermes, в его окружении лежит `.env` *своего* профиля, а
+    проектов в панели несколько: у каждого свой профиль и свой бот. Поэтому токены и прокси
+    берутся из `.env` профиля драйвера проекта, а не из `os.environ` (0.20.1).
+    """
+    return proj.engine_env(project)
+
+
 def act_test_telegram(state: State, payload: dict) -> dict:
     cfg = proj.read_config(state.project)
     notify = cfg.get("notify") or {}
-    token = os.environ.get(notify.get("token_env") or setup_flow.TOKEN_ENV, "")
-    chat = os.environ.get(notify.get("chat_env") or setup_flow.CHAT_ENV, "")
+    env = _project_env(state.project)
+    token = env.get(notify.get("token_env") or setup_flow.TOKEN_ENV, "")
+    chat = env.get(notify.get("chat_env") or setup_flow.CHAT_ENV, "")
     if not token or not chat:
         return {"ok": False, "error": "Telegram не настроен"}
     try:
-        telegram.send_message(token, chat, "🧪 Тест из UI конвейера.")
+        telegram.send_message(token, chat, "🧪 Тест из UI конвейера.", env=env)
     except telegram.TelegramError as exc:
         return {"ok": False, "error": str(exc)}
     state.note("тестовое сообщение отправлено")
@@ -1230,7 +1243,8 @@ def notify_deliver(state: State, feed: dict | None) -> list[dict]:
     if not isinstance(feed, dict) or not feed.get("global_enabled") or not feed.get("enabled"):
         return []
     channel = snap.telegram_state(state.project)
-    token = os.environ.get(str(channel.get("token_env") or ""), "")
+    env = _project_env(state.project)
+    token = env.get(str(channel.get("token_env") or ""), "")
     chat = str(channel.get("chat") or "")
     if not (channel.get("enabled") and token and chat):
         return []
@@ -1250,7 +1264,7 @@ def notify_deliver(state: State, feed: dict | None) -> list[dict]:
             state.notified[key] = now       # бронь: параллельный поток его не отправит
         text = f"{prefix}{event.get('text') or ''}"
         try:
-            telegram.send_message(token, chat, text)
+            telegram.send_message(token, chat, text, env=env)
         except telegram.TelegramError as exc:
             with state.lock:
                 state.notified.pop(key, None)

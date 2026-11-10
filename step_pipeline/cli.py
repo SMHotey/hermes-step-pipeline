@@ -294,12 +294,16 @@ def cmd_doctor(args) -> int:
 def cmd_notify_test(args) -> int:
     project = _project(args.project)
     state = snap.telegram_state(project)
-    token = os.environ.get(state["token_env"], "")
+    # Канал проекта, а не профиля оболочки: `hermes -p pipeline pipeline notify-test` для
+    # проекта другого профиля иначе возьмёт чужой токен и чужой прокси (0.20.1).
+    env = proj.engine_env(project)
+    token = env.get(state["token_env"], "")
     if not token or not state["chat"]:
         print("Telegram не настроен: нет токена или chat id", file=sys.stderr)
         return 2
     try:
-        telegram.send_message(token, state["chat"], telegram.test_message(str(state.get("prefix") or "")))
+        telegram.send_message(token, state["chat"],
+                              telegram.test_message(str(state.get("prefix") or "")), env=env)
     except telegram.TelegramError as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 1

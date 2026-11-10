@@ -449,13 +449,38 @@ def run(cmd: list[str], *, cwd: str | Path | None = None, timeout: int = 180,
     return subprocess.run(cmd, **kwargs)
 
 
+NOTIFY_ENV_PREFIX = "STEP_PIPELINE_TELEGRAM_"
+NOTIFY_SHARED_ENVS = ("TELEGRAM_API_BASE_URL",)
+
+
+def engine_env(project: Path, extra_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Окружение движка проекта: свой бот вместо чужого из окружения сервера.
+
+    `hermes pipeline ui` — обычный процесс Hermes: он грузит `.env` своего профиля, и в
+    окружении панели оказываются токен, chat id и прокси чужого бота. Панель при этом одна
+    на все проекты. Поэтому переменные канала уведомлений из окружения вычищаются, а
+    значения берутся из `.env` профиля драйвера проекта: нет там токена — уведомления
+    проекта выключены (`token_set: false` в снимке), а не уходят чужому боту.
+    """
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(NOTIFY_ENV_PREFIX) and k not in NOTIFY_SHARED_ENVS}
+    env.update(profile_env(project))
+    env["PIPELINE_REPO"] = str(project)
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
 def run_engine(project: Path, name: str, *args: str, timeout: int = 180,
                engine_dir: Path | None = None,
                extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    """Запустить модуль движка проекта и вернуть результат процесса."""
+    """Запустить модуль движка проекта и вернуть результат процесса.
+
+    Окружение — `engine_env`: окружение процесса без чужих переменных канала уведомлений →
+    `.env` профиля драйвера проекта → `PIPELINE_REPO` → `extra_env` (0.20.1).
+    """
     cmd = [python_exe(project), str(engine(project, name, engine_dir)), *args]
-    env = {**os.environ, "PIPELINE_REPO": str(project), **(extra_env or {})}
-    return run(cmd, cwd=project, timeout=timeout, env=env)
+    return run(cmd, cwd=project, timeout=timeout, env=engine_env(project, extra_env))
 
 
 def engine_json(project: Path, name: str, *args: str, timeout: int = 180,
@@ -501,6 +526,64 @@ def profile_dir(profile: str) -> Path:
     local = os.environ.get("LOCALAPPDATA")
     base = Path(local) / "hermes" if local else Path.home() / ".hermes"
     return base / "profiles" / profile
+
+
+#: Кэш разбора `.env` по mtime: движок запускается на каждый тик и на каждый кадр снимка,
+#: а файл меняют только мастер и панель. Ключ — путь, значение — (mtime, переменные).
+_ENV_CACHE: dict[Path, tuple[float, dict[str, str]]] = {}
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """Переменные из `.env`: без комментариев, кавычек и пустых значений.
+
+    Формат тот же, что пишет `setup_flow.write_env`: `КЛЮЧ=значение` построчно, допустим
+    префикс `export `. Пустое значение — не переменная: `КЛЮЧ=` не должен затирать
+    осмысленное окружение пустотой.
+    """
+    path = Path(path)
+    try:
+        stamp = path.stat().st_mtime
+    except OSError:
+        return {}
+    cached = _ENV_CACHE.get(path)
+    if cached is not None and cached[0] == stamp:
+        return dict(cached[1])
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        if raw.startswith("export "):
+            raw = raw[len("export "):].lstrip()
+        key, _, value = raw.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if key.strip() and value:
+            values[key.strip()] = value
+    _ENV_CACHE[path] = (stamp, values)
+    return dict(values)
+
+
+def profile_env(project: Path) -> dict[str, str]:
+    """Переменные `.env` профиля драйвера проекта — то, где движок ищет токены.
+
+    Движок берёт токен уведомлений из окружения процесса (`notify.token_env`), а не из
+    файла: `hermes -p <профиль> …` грузит `.env` сам, а панель и её тик живут в процессе
+    без профиля проекта. Без этой подстановки тик из панели молчит, хотя токен лежит на
+    месте, а чужой `STEP_PIPELINE_TELEGRAM_*` из окружения сервера уводит уведомления
+    чужому боту. Профиль читается из конфига проекта, поэтому у каждого проекта в одной
+    панели свой бот.
+    """
+    profiles = read_config(project).get("profiles")
+    driver = str(profiles.get("driver") or "").strip() if isinstance(profiles, dict) else ""
+    if not driver:
+        return {}
+    return read_env_file(profile_dir(driver) / ".env")
 
 
 def hermes_bin() -> str:

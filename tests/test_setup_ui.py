@@ -115,9 +115,13 @@ def stub(monkeypatch, hermes_stub, tmp_path: Path) -> FakeHermes:   # noqa: ARG0
 
 def telegram_ok(monkeypatch) -> None:
     """Telegram без сети: тот же бот, тот же чат, без запросов наружу."""
-    monkeypatch.setattr(setup_flow.telegram, "get_me", lambda token: {"username": "demo_bot"})
+    # `**__` — панель передаёт `env` проекта: канал у каждого проекта свой (0.20.1).
+    monkeypatch.setattr(setup_flow.telegram, "get_me",
+                        lambda token, **__: {"username": "demo_bot"})
     monkeypatch.setattr(setup_flow.telegram, "validate_chat",
-                        lambda token, chat: {"id": chat})
+                        lambda token, chat, **__: {"id": chat})
+    monkeypatch.setattr(setup_flow.telegram, "send_message",
+                        lambda token, chat, text, **__: True)
 
 
 @contextmanager
@@ -319,7 +323,7 @@ def test_telegram_step_keeps_token_out_of_responses(stub, monkeypatch,   # noqa:
     # Принудительная утечка: Telegram отклоняет токен и повторяет его в тексте ошибки.
     # Редакция обязана ловить то же (срезанное) значение, что исполнил шаг, иначе токен
     # с хвостовым переводом строки уходит в ответ API и в state.log панели.
-    def reject(token: str) -> dict:
+    def reject(token: str, **__) -> dict:
         raise setup_flow.telegram.TelegramError("Unauthorized: " + token)
 
     monkeypatch.setattr(setup_flow.telegram, "get_me", reject)
