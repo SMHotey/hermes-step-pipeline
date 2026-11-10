@@ -630,6 +630,76 @@ def prompt_fresh(p: Paths, recon: str | None) -> bool:
     return res.returncode == 0
 
 
+# ───────────────── D6: сверка версии ревью постановки по тексту ─────────────────
+
+def _newlines_unified(text: str) -> str:
+    """Переводы строк к LF перед сравнением текстов.
+
+    Файл в рабочем дереве бывает с CRLF (`core.autocrlf`), а blob в git — с LF: это одна
+    редакция, и расхождение переводов строк не должно выглядеть правкой постановки.
+    """
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+def _resolve_commit(base: Path | str | None, sha: str | None) -> str:
+    """Полный sha коммита по короткой или полной записи; пусто/неизвестно — пустая строка.
+
+    Отметку версии в отчёт ревьюер пишет руками, поэтому она бывает короткой (`d7fa024e`)
+    и может быть вовсе не коммитом этого репозитория. Сравнивать записи как строки нельзя —
+    принимаем только то, что git подтвердил.
+    """
+    value = (sha or "").strip().lower()
+    if not value or base is None:
+        return ""
+    try:
+        res = _run(["git", "rev-parse", "--verify", "--quiet", f"{value}^{{commit}}"],
+                   Path(base), timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    full = res.stdout.strip().lower() if res.returncode == 0 else ""
+    return full if re.fullmatch(r"[0-9a-f]{40}", full) else ""
+
+
+def prompt_text_same(p: Paths, prompt: str | None, sha: str | None) -> bool:
+    """Текст постановки на коммите `sha` совпадает с её текущим файлом (D6).
+
+    Единственное, что разрешает принять вердикт при расхождении отметок: ревьюер помечает
+    отчёт sha HEAD вместо sha постановки (инцидент 09.11.2026, план 29 R1-C — 8.5 часа
+    простоя на формальном расхождении). Подмены вердикта здесь нет: переписанная
+    постановка даёт на своём коммите ДРУГОЙ текст и по-прежнему останавливает. Нет файла,
+    нет коммита или sha вне репозитория — подтвердить версию нечем, ответ `False`.
+    """
+    if not prompt:
+        return False
+    full = _resolve_commit(Path(p.repo), sha)
+    if not full:
+        return False
+    rel = str(prompt)
+    try:
+        res = _run(["git", "show", f"{full}:{rel}"], Path(p.repo), timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if res.returncode != 0:
+        return False
+    try:
+        current = (Path(p.repo) / rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return _newlines_unified(res.stdout) == _newlines_unified(current)
+
+
+def prompt_marker_same_commit(p: Paths, prompt_recon: str | None,
+                              report_marker: str | None) -> bool:
+    """Обе отметки — один коммит (D6): короткая запись равна полной.
+
+    Ревьюер пишет короткий sha, промптер — полный; это тот же коммит, а не расхождение.
+    Пустая или неизвестная запись коммитом не считается: подтверждать нечего.
+    """
+    base = Path(p.repo)
+    left = _resolve_commit(base, prompt_recon)
+    right = _resolve_commit(base, report_marker)
+    return bool(left) and left == right
+
+
 def prompt_review_path(p: Paths, step_id: str) -> Path:
     """Отчёт ревью постановки: `docs/reviews/<префикс>-<шаг>-prompt.md`."""
     return Path(p.review_dir) / f"{p.review_prefix}-{step_id}-prompt.md"
@@ -1243,6 +1313,9 @@ def build_ctx(p: Paths) -> dict:
                    # не считаем, иначе решение пропустило бы обязательное ревью.
                    steps=[], prompt=None, prompt_recon=None, prompt_fresh=False,
                    prompt_report=None, prompt_verdict=None, next_step=None,
+                   # D6: расхождение отметок проверять не на чем — обе сверки `False`,
+                   # и решение по ревью постановки остаётся стопом, а не падением.
+                   prompt_marker_text_same=False, prompt_marker_same_commit=False,
                    next_prompt=None, next_cards=[],
                    # Та же форма `ctx`, что и в нормальной ветке (D4): решение разведки
                    # не должно падать `NameError` на сбое сборщика.
@@ -1285,6 +1358,17 @@ def build_ctx(p: Paths) -> dict:
     ctx["prompt_fresh"] = prompt_fresh(p, recon) if prompt else False
     ctx["prompt_report"] = prompt_review_rel(p, step["id"]) if step else None
     ctx["prompt_verdict"] = prompt_verdict(p, step["id"]) if step else None
+    # D6: отметка версии в отчёте и `recon_commit` постановки сверяются не как строки.
+    # Ревьюер пишет sha HEAD (иногда короткий) вместо sha постановки — формальное
+    # расхождение стоило 8.5 часа простоя (план 29 R1-C, 09.11.2026). Сверка по тексту
+    # постановки и по коммиту считается здесь, потому что `decide` получает только `ctx`;
+    # git зовётся лишь при реальном расхождении отметок, а не на каждом тике.
+    marker = str((ctx["prompt_verdict"] or {}).get("recon") or "")
+    mismatch = bool(marker) and marker != (recon or "")
+    ctx["prompt_marker_same_commit"] = (mismatch
+                                       and prompt_marker_same_commit(p, recon, marker))
+    ctx["prompt_marker_text_same"] = bool(mismatch and not ctx["prompt_marker_same_commit"]
+                                         and prompt_text_same(p, ctx["prompt"], marker))
     nxt = next_prompt_step(ctx["steps"], step["id"]) if step else None
     ctx["next_step"] = nxt
     ctx["next_prompt"] = prompt_rel(p, nxt["id"]) if nxt else None
@@ -2044,6 +2128,12 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
                            f"{Path(verdict['path']).name} нет строки recon_commit, "
                            f"в постановке {ctx.get('prompt_recon') or 'отметки нет'}")}
     if verdict["recon"] != (ctx.get("prompt_recon") or ""):
+        # Формальная путаница отметок конвейер не роняет (D6, инцидент 09.11.2026): если
+        # текст постановки на sha из отчёта тот же, что в файле сейчас, или обе отметки —
+        # один коммит (короткий sha против полного), вердикт относится к этой редакции.
+        # Подмены нет: переписанная постановка даёт другой текст и по-прежнему стоп.
+        if ctx.get("prompt_marker_text_same") or ctx.get("prompt_marker_same_commit"):
+            return None
         return {"action": "stop", "step": sid,
                 "reason": (f"ревью постановки {sid} не про эту версию: в отчёте recon_commit "
                            f"{verdict['recon']}, в постановке "

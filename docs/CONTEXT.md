@@ -243,6 +243,14 @@ hermes pipeline doctor  --project <путь>
   `<state_dir>/attention.json`. Тесты: `test_closed_card_on_create_raises_alarm`,
   `test_attention_text_has_loud_header_and_plan`, `test_attention_is_throttled_per_reason`,
   `test_note_action_streak_counts_identical_actions`, `test_next_fix_round_skips_taken_keys`.
+- **Версия ревью постановки сверяется по тексту, а не по записи sha** (0.21.2). Точное
+  совпадение `recon_commit` отчёта и шапки постановки перестало быть единственным
+  критерием: ревьюер помечает отчёт sha HEAD (иногда коротким) — если текст постановки на
+  этом коммите тот же, что в файле (`prompt_text_same`), вердикт относится к той же
+  редакции и шаг стартует; короткий sha того же коммита тоже не считается расхождением
+  (`prompt_marker_same_commit`). Вердикт про переписанную постановку по-прежнему стоп —
+  подмены нет. Живой случай: план 29 шаг R1-C, 8.5 часа простоя на формальной отметке;
+  тесты — `tests/engine/test_prompt_marker.py`.
 - **Джобы конвейера проверяются при обновлении движка** (0.21.0). `--no-cron` пишет отказ
   в `.pipeline/cron.json` (`skipped: true`), `ensure_cron_all` заводит страж, приём команд
   и автообновление одним входом, а `setup --upgrade` проверяет их каждый раз, кроме явного
