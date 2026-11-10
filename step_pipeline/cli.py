@@ -40,6 +40,7 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     setup.add_argument("--driver", default="", help="профиль исполнителя")
     setup.add_argument("--prompter", default="", help="профиль постановщика")
     setup.add_argument("--reviewer", default="", help="профиль ревьюера")
+    setup.add_argument("--scout", default="", help="профиль разведки (готовые решения)")
     setup.add_argument("--telegram-token", default="", help="токен бота (без вопроса)")
     setup.add_argument("--telegram-chat", default="", help="chat id (без вопроса)")
     setup.add_argument("--no-telegram", action="store_true", help="не настраивать уведомления")

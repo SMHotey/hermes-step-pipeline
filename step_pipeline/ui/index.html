@@ -588,6 +588,8 @@
                  <input type="text" id="setup-prompter"></div>
             <div><label for="setup-reviewer">Ревьюер</label>
                  <input type="text" id="setup-reviewer"></div>
+            <div><label for="setup-scout">Разведка</label>
+                 <input type="text" id="setup-scout"></div>
           </div>
           <label><input type="checkbox" id="setup-bot"> Подключить бота (необязательно)</label>
           <div class="muted">без бота: без уведомлений и команд из чата</div>
@@ -1500,6 +1502,7 @@ async function loadSetup() {
     const values = data.values || {};
     [["setup-board", "board"], ["setup-driver", "driver"],
      ["setup-prompter", "prompter"], ["setup-reviewer", "reviewer"],
+     ["setup-scout", "scout"],
      ["setup-chat", "telegram_chat"]].forEach(([id, key]) => {
       if (values[key]) $(id).value = values[key];
     });
@@ -1548,6 +1551,7 @@ async function runSetupStep(step, extra) {
     driver: $("setup-driver").value.trim(),
     prompter: $("setup-prompter").value.trim(),
     reviewer: $("setup-reviewer").value.trim(),
+    scout: $("setup-scout").value.trim(),
     token: $("setup-token").value.trim(),
     chat: $("setup-chat").value.trim(),
     owner: $("setup-owner").value.trim(),

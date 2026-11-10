@@ -25,7 +25,7 @@ import setup_flow                               # noqa: E402
 
 
 def args(**kw) -> argparse.Namespace:
-    base = dict(project="", board="", driver="", prompter="", reviewer="",
+    base = dict(project="", board="", driver="", prompter="", reviewer="", scout="",
                 telegram_token="", telegram_chat="", no_telegram=True, no_test=True,
                 no_profiles=True, no_cron=True, no_trust=True, yes=True, force=False,
                 no_smoke=True, smoke_timeout=0)
@@ -67,7 +67,8 @@ def test_setup_copies_engine_roles_and_config(tmp_path: Path, fake_hermes):
 
     cfg = json.loads((target / "pipeline.json").read_text(encoding="utf-8"))
     assert cfg["board"] == "shopboard"
-    assert cfg["profiles"] == {"driver": "shop", "prompter": "prompter", "reviewer": "reviewer"}
+    assert cfg["profiles"] == {"driver": "shop", "prompter": "prompter",
+                               "reviewer": "reviewer", "scout": "scout"}
     assert cfg["notify"]["enabled"] is False
     assert cfg["notify"]["token_env"] == setup_flow.TOKEN_ENV
     assert cfg["runtimes"]["step"] == "3h"
@@ -345,14 +346,14 @@ def _trust_calls(calls: list[tuple]) -> list[tuple]:
     return [call for call in calls if "trust" in call]
 
 
-def test_setup_trusts_all_three_profiles(tmp_path: Path, fake_hermes):
+def test_setup_trusts_all_role_profiles(tmp_path: Path, fake_hermes):
     target = tmp_path / "shop"
     target.mkdir()
     code = setup_flow.run_setup(args(project=str(target), board="shop", driver="shop",
                                      no_trust=False))
     assert code == 0
     calls = _trust_calls(fake_hermes)
-    assert [call[1] for call in calls] == ["shop", "prompter", "reviewer"]
+    assert [call[1] for call in calls] == ["shop", "prompter", "reviewer", "scout"]
     for call in calls:
         assert call == ("-p", call[1], "skills", "trust", str(target.resolve()))
 
@@ -370,11 +371,48 @@ def test_upgrade_trusts_roles_from_config(tmp_path: Path, fake_hermes):
     assert setup_flow.run_setup(args(project=str(target), upgrade=True,
                                      no_trust=False)) == 0
     calls = _trust_calls(fake_hermes)
-    assert [call[1] for call in calls] == ["shop", "pp", "rr"]
+    # Разведка — четвёртая роль: её профиль заводится, если его нет, и получает доверие.
+    assert [call[1] for call in calls] == ["shop", "pp", "rr", "scout"]
     for call in calls:
         assert call == ("-p", call[1], "skills", "trust", str(target.resolve()))
     again = json.loads(cfg_path.read_text(encoding="utf-8"))
     assert again["profiles"] == {"driver": "shop", "prompter": "pp", "reviewer": "rr"}
+
+
+def test_roles_from_config_adds_scout_only_when_set():
+    """Разведка входит в роли, только когда записана в конфиге."""
+    base = {"profiles": {"driver": "shop", "prompter": "pp", "reviewer": "rr"}}
+    assert setup_flow.roles_from_config(base) == ["shop", "pp", "rr"]
+    with_scout = {"profiles": {**base["profiles"], "scout": "ss"}}
+    assert setup_flow.roles_from_config(with_scout) == ["shop", "pp", "rr", "ss"]
+    # Тот же профиль у двух ролей не дублируется.
+    same = {"profiles": {**base["profiles"], "scout": "rr"}}
+    assert setup_flow.roles_from_config(same) == ["shop", "pp", "rr"]
+
+
+def test_scout_role_defaults_to_engine_profile():
+    """Без `profiles.scout` движок берёт профиль `scout` — мастер знает то же имя."""
+    assert setup_flow.scout_role({}) == "scout"
+    assert setup_flow.scout_role({"profiles": {"scout": "researcher"}}) == "researcher"
+
+
+def test_build_config_writes_scout_and_keeps_owner_value(tmp_path: Path):
+    """Имя разведки пишет мастер; чужое значение переживает установку без него."""
+    project = tmp_path / "shop"
+    project.mkdir()
+    cfg = setup_flow.build_config(project, "shop", "shop", "pp", "rr", {}, scout="ss")
+    assert cfg["profiles"]["scout"] == "ss"
+    kept = setup_flow.build_config(project, "shop", "shop", "pp", "rr", cfg)
+    assert kept["profiles"]["scout"] == "ss"
+
+
+def test_ensure_profiles_creates_scout_role(tmp_path: Path, fake_hermes, monkeypatch):
+    """Мастер заводит профиль разведки наравне с постановщиком и ревьюером."""
+    monkeypatch.setattr(setup_flow.proj, "profile_dir", lambda name: tmp_path / name)
+    setup_flow.ensure_profiles("shop", "prompter", "reviewer", setup_flow.Log(quiet=True),
+                               scout="scout")
+    created = [call[2] for call in fake_hermes if call[:2] == ("profile", "create")]
+    assert created == ["prompter", "reviewer", "scout"]
 
 
 SAVED_CREDENTIAL = {"source": "manual", "access_token": "сохранённый-секрет"}
@@ -428,6 +466,26 @@ def test_doctor_reports_untrusted_roles_with_ready_command(project: Path, monkey
         command = f'hermes -p {role} skills trust "{project.resolve()}"'
         assert any(command in line for line in untrusted)
     assert not any("✗ план" in line for line in out.splitlines())
+
+
+def test_doctor_checks_scout_role_when_configured(project: Path, monkeypatch, capsys,
+                                                  tmp_path: Path):
+    """Разведка в конфиге — доверие и ключ её профиля проверяются наравне с ролями."""
+    cfg_path = project / "pipeline.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["profiles"]["scout"] = "scout"
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    _doctor_env(monkeypatch, project, tmp_path, {
+        name: "skills:\n  trusted_project_dirs:\n"
+              f"    - {project.resolve()}\n"
+        for name in ("demo", "prompter", "reviewer")
+    })
+
+    code = cli.cmd_doctor(argparse.Namespace(project=str(project), plan=""))
+    out = capsys.readouterr().out
+    assert code == 1
+    assert f'hermes -p scout skills trust "{project.resolve()}"' in out
+    assert "ключ (scout)" in out
 
 
 def test_doctor_ok_when_all_roles_trust_project(project: Path, monkeypatch,

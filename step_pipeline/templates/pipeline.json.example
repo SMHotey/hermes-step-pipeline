@@ -5,7 +5,8 @@
   "profiles": {
     "driver": "myproject",
     "prompter": "prompter",
-    "reviewer": "reviewer"
+    "reviewer": "reviewer",
+    "scout": "scout"
   },
   "routing": {
     "frontend": "myproject",

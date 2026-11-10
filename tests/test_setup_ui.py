@@ -205,7 +205,7 @@ def test_project_step_installs_engine_roles_and_config(stub, tmp_path: Path):  #
     cfg = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
     assert cfg["board"] == "shop"
     assert cfg["profiles"] == {"driver": "shop", "prompter": "prompter",
-                               "reviewer": "reviewer"}
+                               "reviewer": "reviewer", "scout": "scout"}
     assert cfg["notify"]["enabled"] is False
 
 
@@ -260,7 +260,7 @@ def test_profiles_and_cron_steps_call_existing_setup(stub, tmp_path: Path):   # 
 
     trust_calls = [call for call in stub.calls
                    if call[0] == "-p" and call[2:4] == ("skills", "trust")]
-    assert {call[1] for call in trust_calls} == {"shop", "prompter", "reviewer"}
+    assert {call[1] for call in trust_calls} == {"shop", "prompter", "reviewer", "scout"}
     assert all(call[4] == str(root) for call in trust_calls)
 
     # Имена ролей — из конфига, а не из формы: иначе зелёный шаг с чужими именами
@@ -539,6 +539,16 @@ def test_checks_step_with_skipped_bot_is_neutral(stub, tmp_path: Path):
     assert "telegram: не настроен — установка без бота, это допустимо" in log
     assert not [line for line in result["log"]
                 if line.startswith("  ! ") and "telegram" in line]
+
+
+def test_panel_setup_form_has_scout_role():
+    """Форма мастера: поле профиля разведки, значение из конфига и отправка шагу."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    assert 'id="setup-scout"' in html
+    load = html.split("async function loadSetup()")[1].split("async function runSetupStep")[0]
+    assert '["setup-scout", "scout"]' in load
+    run = html.split("async function runSetupStep")[1]
+    assert 'scout: $("setup-scout").value.trim()' in run
 
 
 def test_panel_keeps_token_after_detect():

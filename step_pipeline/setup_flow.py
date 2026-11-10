@@ -476,15 +476,22 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
     if not changed and not roles.added and not roles.refreshed:
         log.ok(f"движок и роли уже актуальны ({now})")
     quarantine_stale_plugins(log)
-    driver = roles_from_config(proj.read_config(project))[0]
+    cfg = proj.read_config(project)
+    driver = roles_from_config(cfg)[0]
     plugin_state = ensure_plugin_enabled(driver, log)
+    # Разведка — четвёртая роль: движок берёт `profiles.scout`, а без ключа — профиль
+    # `scout`. Заводим его, если нет (настройки существующего не переписываем), иначе
+    # `create_scout` уходит в несуществующий профиль и разведка молча не идёт.
+    scout = scout_role(cfg)
+    if scout != driver:
+        ensure_scout_profile(scout, driver, log)
     tick = refresh_tick_script(project, log)
     # Автообновление заводим только там, где cron уже есть: проект с `--no-cron`
     # не должен получить джобу «в подарок» при обновлении движка.
     if (project / ".pipeline" / "cron.json").is_file():
         ensure_update_cron(driver, project, log, skip=False)
     if trust:
-        failed = trust_roles(roles_from_config(proj.read_config(project)), project, log)
+        failed = trust_roles(list(dict.fromkeys(roles_from_config(cfg) + [scout])), project, log)
         tail = ("доверие ролям оформлено" if not failed
                 else f"доверие не оформлено у: {', '.join(failed)}")
     else:
@@ -577,7 +584,7 @@ def ensure_gitignore(project: Path) -> bool:
 
 
 def build_config(project: Path, board: str, driver: str, prompter: str, reviewer: str,
-                 existing: dict[str, Any] | None = None) -> dict[str, Any]:
+                 existing: dict[str, Any] | None = None, scout: str = "") -> dict[str, Any]:
     """`pipeline.json`: шаблон плагина + выбранные значения, чужие правки сохраняются."""
     base: dict[str, Any] = {}
     try:
@@ -588,9 +595,13 @@ def build_config(project: Path, board: str, driver: str, prompter: str, reviewer
     cfg["project"] = (existing or {}).get("project") or project.name
     cfg["board"] = board
     profiles = {"driver": driver, "prompter": prompter, "reviewer": reviewer}
-    # `profiles` принадлежит владельцу (`AGENTS.md`): мастер меняет только три роли,
-    # остальные ключи (например, `scout`) обязаны пережить повторный `setup` и шаг
-    # мастера «Проект» (D9).
+    # Разведка — четвёртая роль конвейера: имя пишет мастер (иначе движок берёт профиль
+    # `scout`, которого на чистой машине нет и в который карточка уходит вхолостую).
+    if scout:
+        profiles["scout"] = scout
+    # `profiles` принадлежит владельцу (`AGENTS.md`): мастер меняет роли мастера,
+    # остальные ключи (например, `scout` из прошлой установки) обязаны пережить
+    # повторный `setup` и шаг мастера «Проект» (D9).
     previous = cfg.get("profiles")
     for key, value in (previous.items() if isinstance(previous, dict) else ()):
         profiles.setdefault(key, value)
@@ -602,39 +613,84 @@ def build_config(project: Path, board: str, driver: str, prompter: str, reviewer
     return cfg
 
 
-def ensure_profiles(driver: str, prompter: str, reviewer: str, log: Log) -> None:
-    """Профили ролей: клон драйвера, максимум рассуждений, один воркер за раз."""
+def ensure_scout_profile(scout: str, driver: str, log: Log) -> None:
+    """Завести профиль разведки клоном драйвера, если его ещё нет.
+
+    Настройки существующего профиля не переписываются: `setup --upgrade` не должен
+    менять то, что владелец уже настроил руками.
+    """
     listing = proj.run_hermes("profile", "list")
     have = listing.stdout or ""
-    for role, description, effort in (
+    if f" {scout} " in f" {have} ":
+        log.ok(f"профиль разведки {scout} уже есть")
+        return
+    res = proj.run_hermes("profile", "create", scout, "--clone-from", driver,
+                          "--description", "Разведка: готовые решения и лицензии → prior art")
+    if res.returncode == 0:
+        log.ok(f"профиль разведки {scout} создан (клон {driver})")
+    else:
+        log.warn(f"профиль разведки {scout}: {(res.stderr or res.stdout or '').strip()[:200]}")
+
+
+def ensure_role_profile(role: str, driver: str, description: str, effort: str, log: Log) -> None:
+    """Один профиль роли: клон драйвера, максимум рассуждений, один воркер за раз."""
+    listing = proj.run_hermes("profile", "list")
+    have = listing.stdout or ""
+    if f" {role} " in f" {have} ":
+        log.ok(f"профиль {role} уже есть")
+    else:
+        res = proj.run_hermes("profile", "create", role, "--clone-from", driver,
+                              "--description", description)
+        if res.returncode == 0:
+            log.ok(f"профиль {role} создан")
+        else:
+            log.warn(f"профиль {role}: {(res.stderr or res.stdout or '').strip()[:200]}")
+    for key, value in (("agent.max_turns", "300"),
+                       ("agent.reasoning_effort", effort),
+                       ("kanban.max_in_progress", "1"),
+                       ("kanban.max_in_progress_per_profile", "1"),
+                       ("kanban.failure_limit", "2")):
+        proj.run_hermes("-p", role, "config", "set", key, value)
+
+
+def ensure_profiles(driver: str, prompter: str, reviewer: str, log: Log,
+                    scout: str = "") -> None:
+    """Профили ролей конвейера: постановщик, ревьюер и разведка.
+
+    Разведка — четвёртая роль: её профиль тоже клон драйвера. Без него `create_scout`
+    уходит в профиль, которого нет (или в одноимённый, но без доверия и ключа), и
+    разведка не идёт, хотя установка зелёная.
+    """
+    roles = [
         (prompter, "Постановщик: контекст шага плана → промт-постановка", "max"),
         (reviewer, "Ревьюер: независимая проверка шага по плану и коду", "max"),
-    ):
-        if f" {role} " in f" {have} ":
-            log.ok(f"профиль {role} уже есть")
-        else:
-            res = proj.run_hermes("profile", "create", role, "--clone-from", driver,
-                                  "--description", description)
-            if res.returncode == 0:
-                log.ok(f"профиль {role} создан")
-            else:
-                log.warn(f"профиль {role}: {(res.stderr or res.stdout or '').strip()[:200]}")
-        for key, value in (("agent.max_turns", "300"),
-                           ("agent.reasoning_effort", effort),
-                           ("kanban.max_in_progress", "1"),
-                           ("kanban.max_in_progress_per_profile", "1"),
-                           ("kanban.failure_limit", "2")):
-            proj.run_hermes("-p", role, "config", "set", key, value)
+    ]
+    if scout and scout not in (driver, prompter, reviewer):
+        roles.append((scout, "Разведка: готовые решения и лицензии → prior art", "max"))
+    for role, description, effort in roles:
+        ensure_role_profile(role, driver, description, effort, log)
     for key, value in (("agent.max_turns", "300"),
                        ("kanban.max_in_progress_per_profile", "1"),
                        ("kanban.failure_limit", "2"),
                        ("kanban.default_assignee", driver)):
         proj.run_hermes("-p", driver, "config", "set", key, value)
-    log.ok(f"настройки конвейера применены к {driver}/{prompter}/{reviewer}")
+    applied = f"{driver}/{prompter}/{reviewer}"
+    if any(role == scout for role, _, _ in roles) and scout not in (driver, prompter, reviewer):
+        applied += f"/{scout}"
+    log.ok(f"настройки конвейера применены к {applied}")
 
 
 #: Роли конвейера по умолчанию — те же, что у мастера установки.
 DEFAULT_ROLES = ("default", "prompter", "reviewer")
+#: Профиль разведки по умолчанию — как у движка (`gate.SCOUT_PROFILE_DEFAULT`).
+SCOUT_ROLE_DEFAULT = "scout"
+
+
+def scout_role(cfg: dict[str, Any] | None) -> str:
+    """Профиль разведки из конфига: `profiles.scout`, иначе умолчание движка."""
+    profiles = (cfg or {}).get("profiles")
+    name = profiles.get("scout") if isinstance(profiles, dict) else ""
+    return str(name or SCOUT_ROLE_DEFAULT)
 
 #: Смоук установки: одна эхо-карточка на роль, один дедлайн на все три (S16).
 SMOKE_TIMEOUT = 300
@@ -654,15 +710,20 @@ TERMINAL = {"done", "blocked", "crashed", "timed_out", "gave_up"}
 
 
 def roles_from_config(cfg: dict[str, Any] | None) -> list[str]:
-    """Три роли конвейера из `pipeline.json`: драйвер → промптер → ревьюер.
+    """Роли конвейера из `pipeline.json`: драйвер → промптер → ревьюер → разведка.
 
-    Пустой или битый `profiles` даёт умолчания, дубликаты схлопываются.
+    Разведка попадает в список, только когда задана в конфиге: у проектов, поставленных
+    мастером без неё, ключа нет, и проверять доверие/ключ профиля, которым не
+    пользуются, значило бы красить зелёную установку. Пустой или битый `profiles` даёт
+    умолчания, дубликаты схлопываются.
     """
     profiles = (cfg or {}).get("profiles")
     if not isinstance(profiles, dict):
         profiles = {}
     roles = [profiles.get(key) or fallback
              for key, fallback in zip(("driver", "prompter", "reviewer"), DEFAULT_ROLES)]
+    if profiles.get("scout"):
+        roles.append(profiles["scout"])
     return list(dict.fromkeys(str(role) for role in roles if role))
 
 
@@ -1344,8 +1405,10 @@ def run_setup(args) -> int:
               or os.environ.get("HERMES_PROFILE") or "default")
     prompter = getattr(args, "prompter", "") or profiles.get("prompter") or "prompter"
     reviewer = getattr(args, "reviewer", "") or profiles.get("reviewer") or "reviewer"
+    scout = getattr(args, "scout", "") or profiles.get("scout") or SCOUT_ROLE_DEFAULT
     log.step(f"── Проект ──")
-    log.ok(f"борда {board}, роли: {driver} (исполнитель), {prompter}, {reviewer}")
+    log.ok(f"борда {board}, роли: {driver} (исполнитель), {prompter}, {reviewer}, "
+           f"разведка {scout}")
 
     log.step("── Движок ──")
     for item in copy_engine(project, force):
@@ -1361,7 +1424,7 @@ def run_setup(args) -> int:
         log.ok(f"{item}")
     log.ok(".gitignore: " + ("дополнен" if ensure_gitignore(project) else "уже содержит записи"))
 
-    cfg = build_config(project, board, driver, prompter, reviewer, existing)
+    cfg = build_config(project, board, driver, prompter, reviewer, existing, scout=scout)
     chat, skipped = setup_telegram(project, driver, args, log)
     notify = dict(cfg.get("notify") or {})
     # D1: «без бота» — выбор владельца, а не недоделанный шаг. Отказ хранится в конфиге,
@@ -1374,7 +1437,7 @@ def run_setup(args) -> int:
 
     if not getattr(args, "no_profiles", False):
         log.step("── Профили ролей ──")
-        ensure_profiles(driver, prompter, reviewer, log)
+        ensure_profiles(driver, prompter, reviewer, log, scout=scout)
     ensure_board(board, log)
     ensure_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)))
     ensure_commands_cron(driver, project, log, skip=bool(getattr(args, "no_cron", False)),
@@ -1500,6 +1563,7 @@ def setup_defaults(project: Path) -> dict[str, str]:
         "driver": profiles.get("driver") or os.environ.get("HERMES_PROFILE") or "default",
         "prompter": profiles.get("prompter") or "prompter",
         "reviewer": profiles.get("reviewer") or "reviewer",
+        "scout": profiles.get("scout") or SCOUT_ROLE_DEFAULT,
     }
 
 
@@ -1650,6 +1714,7 @@ def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str
     driver = given.get("driver") or profiles.get("driver") or defaults["driver"]
     prompter = given.get("prompter") or profiles.get("prompter") or defaults["prompter"]
     reviewer = given.get("reviewer") or profiles.get("reviewer") or defaults["reviewer"]
+    scout = given.get("scout") or profiles.get("scout") or defaults["scout"]
     if step != "project":
         # Конфиг важнее формы у всех шагов, кроме «Проекта»: имена ролей и борду пишет
         # в `pipeline.json` он же, а факты шагов считаются по конфигу (`_board_fact`,
@@ -1659,6 +1724,7 @@ def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str
         driver = str(profiles.get("driver") or driver)
         prompter = str(profiles.get("prompter") or prompter)
         reviewer = str(profiles.get("reviewer") or reviewer)
+        scout = str(profiles.get("scout") or scout)
 
     if step == "project":
         # D8: только предмет шага. Уведомления не выключаем, борду не создаём,
@@ -1674,13 +1740,14 @@ def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str
             log.ok(f"{item}")
         log.ok(".gitignore: "
                + ("дополнен" if ensure_gitignore(project) else "уже содержит записи"))
-        fresh = build_config(project, board, driver, prompter, reviewer, cfg)
+        fresh = build_config(project, board, driver, prompter, reviewer, cfg, scout=scout)
         notify = dict(fresh.get("notify") or {})
         notify.setdefault("enabled", bool((cfg.get("notify") or {}).get("enabled")))
         fresh["notify"] = notify
         proj.write_config(project, fresh)
         log.ok(f"{proj.MARKER}: записан (борда {board}, роли: {driver}, {prompter}, "
-               f"{reviewer}; уведомления {'вкл' if notify.get('enabled') else 'выкл'})")
+               f"{reviewer}, разведка {scout}; уведомления "
+               f"{'вкл' if notify.get('enabled') else 'выкл'})")
         return True, ""
 
     if step == "board":
@@ -1690,10 +1757,10 @@ def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str
         return True, ""
 
     if step == "profiles":
-        ensure_profiles(driver, prompter, reviewer, log)
+        ensure_profiles(driver, prompter, reviewer, log, scout=scout)
         # Неудача доверия одной роли не красит шаг: факт `profiles` останется невыполнен,
         # `next` укажет на этот же шаг, и владелец повторит его после починки профиля.
-        trust_roles([driver, prompter, reviewer], project, log)
+        trust_roles(list(dict.fromkeys([driver, prompter, reviewer, scout])), project, log)
         return True, ""
 
     if step == "telegram":
