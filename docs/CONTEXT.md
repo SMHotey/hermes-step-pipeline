@@ -184,6 +184,11 @@ hermes pipeline doctor  --project <путь>
   certificate has expired» при живом сертификате сервера. `telegram.py`, `update.py` и
   `engine/gate.py` строят контекст из `STEP_PIPELINE_CA_BUNDLE` / `HERMES_CA_BUNDLE` /
   `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE`, иначе из `certifi`.
+- **Плагин включается по профилям, а не глобально** (0.19.3). В профиле без своего
+  каталога плагина `plugins enable step_pipeline` отвечает `No plugin named`, и
+  `hermes pipeline` там просто нет. Мастер связывает профиль драйвера с установленным
+  пакетом (junction на Windows, симлинк на POSIX) и повторяет включение; для остальных
+  профилей — вручную `hermes -p <профиль> plugins enable step_pipeline`.
 
 ## 9. Что осталось
 

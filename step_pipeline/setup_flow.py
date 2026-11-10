@@ -360,22 +360,73 @@ def quarantine_stale_plugins(log: Log) -> list[str]:
     return moved
 
 
+def link_plugin_profile(profile: str, log: Log, package: Path | None = None) -> bool:
+    """Связать профиль с установленным пакетом плагина (ссылка, а не вторая копия).
+
+    `plugins enable` не знает плагина, которого нет в `<профиль>/plugins/`: у профиля
+    свой каталог плагинов. Junction на Windows и символьная ссылка на POSIX дают профилю
+    тот же пакет, что и остальным, — обновляется он один, отдельная копия не нужна.
+    """
+    package = (package or Path(__file__).resolve().parent).resolve()
+    target = proj.profile_dir(profile) / "plugins" / package.name
+    if target.exists() or target.is_symlink():
+        return True
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            res = subprocess.run(["cmd", "/c", "mklink", "/J", str(target), str(package)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 timeout=60)
+            if res.returncode != 0:
+                log.warn(f"ссылку на плагин в профиле {profile} создать не удалось "
+                         f"(mklink вернул {res.returncode})")
+                return False
+        else:
+            os.symlink(package, target, target_is_directory=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warn(f"ссылку на плагин в профиле {profile} создать не удалось: {exc}")
+        return False
+    return True
+
+
+def _enable_plugin(profile: str) -> subprocess.CompletedProcess:
+    """`hermes -p <профиль> plugins enable step_pipeline`."""
+    hermes = shutil.which("hermes") or "hermes"
+    return subprocess.run([hermes, "-p", profile, "plugins", "enable", "step_pipeline"],
+                          capture_output=True, text=True, timeout=180)
+
+
+def _plugin_cli_answers(profile: str) -> bool:
+    """Отвечает ли `hermes -p <профиль> pipeline --help` (то есть зарегистрировался CLI)."""
+    try:
+        res = subprocess.run([shutil.which("hermes") or "hermes", "-p", profile,
+                              "pipeline", "--help"],
+                             capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.returncode == 0
+
+
 def ensure_plugin_enabled(profile: str, log: Log) -> str:
     """Включить текущий id плагина в профиле и проверить, что команда `pipeline` есть."""
-    hermes = shutil.which("hermes") or "hermes"
     try:
-        res = subprocess.run([hermes, "-p", profile, "plugins", "enable", "step_pipeline"],
-                             capture_output=True, text=True, timeout=180)
+        res = _enable_plugin(profile)
     except (OSError, subprocess.SubprocessError) as exc:
         log.warn(f"плагин не включён автоматически: {exc}")
         return f"включение плагина не удалось ({exc})"
     out = ((res.stdout or "") + (res.stderr or "")).strip()
+    if res.returncode != 0 and "No plugin named" in out:
+        # В профиле нет своего каталога плагина — команда его не знает. Связываем профиль
+        # с установленным пакетом и повторяем: иначе в этом профиле `hermes pipeline` нет.
+        log.warn(f"в профиле {profile} плагина нет — связываю с установленным пакетом")
+        if link_plugin_profile(profile, log):
+            res = _enable_plugin(profile)
+            out = ((res.stdout or "") + (res.stderr or "")).strip()
     if res.returncode != 0:
         log.warn(f"`plugins enable step_pipeline` вернул {res.returncode}: {out}")
         return "плагин не включён"
-    check = subprocess.run([hermes, "-p", profile, "pipeline", "--help"],
-                           capture_output=True, text=True, timeout=120)
-    if check.returncode != 0:
+    check = _plugin_cli_answers(profile)
+    if not check:
         log.warn("команда `hermes pipeline` не отвечает после включения плагина — "
                  "перезапусти сессию профиля")
         return "плагин включён, команда проверится в новой сессии"

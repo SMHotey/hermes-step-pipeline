@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -932,3 +933,52 @@ def test_telegram_detect_uses_token_from_env(tmp_path: Path, monkeypatch):
     cfg = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
     assert cfg["notify"]["enabled"] is False
     assert "skipped" not in cfg["notify"]
+
+
+def test_link_plugin_profile_connects_profile_to_package(tmp_path: Path, monkeypatch):
+    """Профиль без своего каталога плагина получает ссылку на установленный пакет."""
+    _isolate_profile(monkeypatch, tmp_path)
+    package = tmp_path / "installed" / "step_pipeline"
+    package.mkdir(parents=True)
+    (package / "plugin.yaml").write_text("name: step_pipeline\n", encoding="utf-8")
+
+    assert setup_flow.link_plugin_profile("gapaudit", setup_flow.Log(quiet=True),
+                                          package=package) is True
+
+    linked = tmp_path / "h" / "gapaudit" / "plugins" / "step_pipeline"
+    assert (linked / "plugin.yaml").is_file()
+    # Повторный вызов не перевязывает уже связанный профиль.
+    assert setup_flow.link_plugin_profile("gapaudit", setup_flow.Log(quiet=True),
+                                          package=package) is True
+
+
+def test_ensure_plugin_enabled_links_missing_profile_and_retries(monkeypatch):
+    """`No plugin named` — не отказ: профиль связывается с пакетом и включение повторяется."""
+    calls: list[str] = []
+    linked: list[str] = []
+
+    def fake_enable(profile: str):
+        calls.append(profile)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess([], 1, "", "No plugin named 'step_pipeline'.")
+        return subprocess.CompletedProcess([], 0, "enabled", "")
+
+    monkeypatch.setattr(setup_flow, "_enable_plugin", fake_enable)
+    monkeypatch.setattr(setup_flow, "link_plugin_profile",
+                        lambda profile, log: linked.append(profile) or True)
+    monkeypatch.setattr(setup_flow, "_plugin_cli_answers", lambda profile: True)
+
+    log = setup_flow.Log(quiet=True)
+    assert setup_flow.ensure_plugin_enabled("gapaudit", log) == "плагин включён и команда отвечает"
+    assert linked == ["gapaudit"]
+    assert calls == ["gapaudit", "gapaudit"]
+
+
+def test_ensure_plugin_enabled_reports_link_failure(monkeypatch):
+    """Ссылку создать не удалось — честный отказ, а не тихое «включён»."""
+    monkeypatch.setattr(setup_flow, "_enable_plugin", lambda profile: subprocess.CompletedProcess(
+        [], 1, "", "No plugin named 'step_pipeline'."))
+    monkeypatch.setattr(setup_flow, "link_plugin_profile", lambda profile, log: False)
+
+    log = setup_flow.Log(quiet=True)
+    assert setup_flow.ensure_plugin_enabled("gapaudit", log) == "плагин не включён"
