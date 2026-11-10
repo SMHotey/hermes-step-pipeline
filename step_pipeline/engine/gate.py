@@ -178,6 +178,15 @@ PLAN_FIX_PROFILE_KEY = "plan_fixer"
 # Кругов ревью плана — не больше двух: первый `REQUEST_CHANGES` даёт один круг правок,
 # второй останавливает цикл и уходит владельцу (D7). Третий раз не заказываем никогда.
 PLAN_REVIEW_MAX_ROUNDS = 2
+# Уведомление о зависшем конвейере: единый заголовок, частота и файл отметок.
+# Заголовок обязан быть громким и одинаковым: по нему владелец отличает «конвейер
+# сломался» от обычных сообщений о ходе плана.
+ATTENTION_HEADER = "ВНИМАНИЕ!!! Требуется починить конвейер."
+ATTENTION_GAP = 3600              # одна тревога на план — не чаще раза в час
+ATTENTION_FILE = "attention.json"
+# Сколько одинаковых действий подряд считаем зависанием: тик идёт раз в 10 минут,
+# три повтора — это полчаса без единого сдвига. Ключ `notify.stuck_repeats`.
+STUCK_REPEATS_DEFAULT = 3
 # Состояние вердикта «привязан к текущей версии плана» (S6): само слово живёт в
 # `approval.py`, здесь — имя для решений стража.
 PLAN_REVIEW_FRESH = approval.REVIEW_FRESH
@@ -488,6 +497,39 @@ def read_cards(p: Paths, key_prefix: str) -> list[dict]:
              "result": r["result"], "error": r["last_failure_error"],
              "created_at": int(r.get("created_at") or 0),
              "started_at": int(r.get("started_at") or 0)} for r in rows]
+
+
+def card_status(p: Paths, card_id: str, key: str) -> str:
+    """Статус карточки по её ключу: `hermes kanban create` идемпотентен и на повторный
+    ключ возвращает прежнюю карточку ЛЮБОГО статуса, включая закрытую. Пустая строка —
+    карточку не видно (новую создавали не мы или база недоступна)."""
+    try:
+        cards = read_cards(p, key)
+    except GateError:
+        return ""
+    for card in cards:
+        if str(card.get("id") or "") == str(card_id):
+            return str(card.get("status") or "")
+    return ""
+
+
+def next_fix_round(cards: list[dict], fallback: int = 1) -> int:
+    """Следующий свободный номер круга правок плана по ключам уже созданных карточек.
+
+    Номер в ключе обязан быть уникальным на всю историю плана: ядро карточек дедуплицирует
+    по `idempotency_key` и на занятый ключ возвращает прежнюю карточку любого статуса.
+    """
+    rounds: list[int] = []
+    for card in cards:
+        match = re.search(rf":{PLAN_FIX_KEY}:(\d+)$", str(card.get("key") or ""))
+        if match:
+            rounds.append(int(match.group(1)))
+    if rounds:
+        return max(rounds) + 1
+    try:
+        return max(int(fallback or 1), 1)
+    except (TypeError, ValueError):
+        return 1
 
 
 def card_of(cards: list[dict], kind: str) -> list[dict]:
@@ -1833,7 +1875,10 @@ def _plan_review_decision(ctx: dict) -> dict | None:
     # Бюджет отказов — по числу карточек ревью ЭТОЙ версии плана: два круга на версию,
     # дальше решает владелец (D7). Круг, заказанный по устаревшему `APPROVE` (S6), — тоже
     # круг ревью и считается наравне: он писался по тому же тексту плана.
-    if len(epoch_cards) >= PLAN_REVIEW_MAX_ROUNDS:
+    # Число кругов — из `max_fix_rounds` проекта (тот же ключ, что у правок шага): владелец
+    # может разрешить больше автоматических кругов, не трогая код.
+    max_rounds = int(ctx.get("max_fix_rounds") or PLAN_REVIEW_MAX_ROUNDS)
+    if len(epoch_cards) >= max_rounds:
         report = Path(str(verdict["path"]))
         findings = (_blocking_findings(report, FINDINGS_LIMIT)
                     or _review_findings(report, FINDINGS_LIMIT))
@@ -2268,6 +2313,90 @@ def notify(cfg: config_mod.Config, text: str) -> bool:
                 print(f"[notify] не доставлено: {exc}", file=sys.stderr)
         time.sleep(2)
     return False
+
+
+# ───────────────── тревога о зависшем конвейере ─────────────────
+
+def _attention_path(cfg: config_mod.Config) -> Path:
+    """Файл отметок тревог: `<state_dir>/attention.json` (общий на все планы)."""
+    return Path(cfg.state_dir) / ATTENTION_FILE
+
+
+def attention_text(plan_id: str, what: str, *, evidence=(), todo=(), commands=()) -> str:
+    """Текст тревоги: громкий заголовок, что случилось, что делать, где смотреть.
+
+    Одна форма на все случаи зависания: владелец узнаёт аварию по первой строке, а не
+    по вчитанному тексту. Подробности — списком, команды — отдельным блоком.
+    """
+    lines = [ATTENTION_HEADER, ""]
+    lines.append(f"План {plan_id}: {what}" if plan_id else what)
+    if evidence:
+        lines += ["", "Что случилось:"]
+        lines += [f"- {item}" for item in evidence]
+    if todo:
+        lines += ["", "Что нужно сделать:"]
+        lines += [f"{number}. {item}" for number, item in enumerate(todo, 1)]
+    if commands:
+        lines += ["", "Команды:"]
+        lines += [f"  {cmd}" for cmd in commands]
+    lines += ["", f"Время: {_local_stamp(_now())}"]
+    return "\n".join(lines)
+
+
+def _attention_seen(cfg: config_mod.Config) -> dict:
+    """Прочитанные отметки тревог; битый или чужой файл — пустая карта, не сбой тика."""
+    path = _attention_path(cfg)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def attention_ready(cfg: config_mod.Config, reason: str,
+                    gap: float = ATTENTION_GAP) -> bool:
+    """Пора ли тревожить владельца по этой причине: одна тревога на причину в `gap`.
+
+    Отметка пишется сразу: повторный тик с той же причиной молчит, даже если Телеграм
+    не ответил — иначе cron засыпал бы чат одним и тем же сообщением.
+    """
+    if not cfg.notify.get("enabled"):
+        return True                    # выключенные уведомления печатаются в stderr
+    now = _now()
+    data = {key: value for key, value in _attention_seen(cfg).items()
+            if isinstance(value, (int, float)) and now - float(value) < 86400}
+    last = data.get(reason)
+    fresh = not isinstance(last, (int, float)) or now - float(last) >= gap
+    if fresh:
+        data[reason] = now
+        try:
+            state_io.save_json(_attention_path(cfg), data)
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"[attention] отметка не записана: {exc}", file=sys.stderr)
+    return fresh
+
+
+def attention(cfg: config_mod.Config, text: str, reason: str, say=None,
+              gap: float = ATTENTION_GAP) -> bool:
+    """Отправить тревогу владельцу (с оглядкой на частоту). True — сообщение ушло."""
+    if not attention_ready(cfg, reason, gap=gap):
+        return False
+    (say or (lambda value: notify(cfg, value)))(text)
+    return True
+
+
+def stuck_repeats_of(cfg: config_mod.Config) -> int:
+    """Сколько одинаковых действий подряд считать зависанием (`notify.stuck_repeats`)."""
+    raw = cfg.notify.get("stuck_repeats")
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return STUCK_REPEATS_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return STUCK_REPEATS_DEFAULT
+    return value if value >= 2 else STUCK_REPEATS_DEFAULT
 
 
 # ───────────────── сторож простоя и дневная сводка ─────────────────
@@ -3365,6 +3494,39 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             say("⛔ " + reason)
             return None, reason
 
+    def reused_card(cid: str | None, key: str, what: str) -> bool:
+        """Заказ вернул уже закрытую карточку — это зависание, а не выполненное действие.
+
+        `hermes kanban create` идемпотентен по ключу: занятый ключ возвращает прежнюю
+        карточку любого статуса. Для `done`-карточки новой работы не появляется, и без
+        этой проверки тик писал «выполнено», пока план стоял (карточка правки плана,
+        переутверждение после owner-stop, круг правок начинается заново).
+        """
+        if not cid:
+            return False
+        status = card_status(p, cid, key)
+        if status not in TERMINAL:
+            return False
+        reason = (f"заказ «{what}» вернул уже закрытую карточку {cid} "
+                  f"(статус {status}, ключ {key}): новой карточки нет, план не двигается")
+        write_stop(p, reason, "gate", kind="incident")
+        result.update(applied=True, detail=reason)
+        touch(f"reused:{key}")
+        attention(p.cfg, attention_text(
+            plan_id, reason,
+            evidence=[f"ключ идемпотентности {key} занят карточкой {cid} в статусе {status}",
+                      "повторный заказ не создаёт карточку: движок собирает ключ, который уже был",
+                      "журнал тиков повторяет один и тот же номер карточки"],
+            todo=["посмотреть ключи карточек плана и журнал тиков (команды ниже)",
+                  "обновить движок проекта до версии с уникальными ключами правок",
+                  "снять стоп и дождаться следующего тика"],
+            commands=[f"python .pipeline/gate.py --status --plan {plan_id}",
+                      f"hermes kanban --board <борда> show {cid}",
+                      "hermes pipeline setup --upgrade --project <путь>",
+                      "python .pipeline/gate.py --resume"]),
+            f"stall:{plan_id}", say)
+        return True
+
     action = decision["action"]
     if action == "idle":
         # Простой виден только здесь (и в tick), поэтому и записывается здесь.
@@ -3422,6 +3584,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         cid = create_card(p, f"[план {plan_id} {step['id']}] {step['title']}",
                           step_card_body(p, step, prompt), assignee, key,
                           p.cfg.step_skills, max_runtime=p.cfg.step_runtime)
+        if reused_card(cid, key, f"шаг {step['id']}"):
+            return result
         result.update(applied=bool(cid), detail=f"карточка шага: {cid}")
         touch(f"create_step:{cid}")
         if cid:
@@ -3448,6 +3612,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         cid = create_card(p, f"[разведка {plan_id}] Разведка плана: готовые решения",
                           scout_card_body(p, ctx.get("steps") or []), profile, key,
                           scout_skills(p.cfg), max_runtime=scout_runtime(p.cfg))
+        if reused_card(cid, key, "разведка плана"):
+            return result
         result.update(applied=bool(cid),
                       detail=(f"карточка разведки: {cid} (профиль {profile})" if cid
                               else "карточку разведки создать не удалось"))
@@ -3472,6 +3638,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                                                 profile),
                           profile, key, plan_review_skills(p.cfg),
                           max_runtime=plan_review_runtime(p.cfg))
+        if reused_card(cid, key, "ревью плана"):
+            return result
         result.update(applied=bool(cid), detail=f"карточка ревью плана: {cid}")
         if cid:
             # Сбой создания карточки состояние НЕ пишет: `touch` перевёл бы план в
@@ -3489,16 +3657,23 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         # ревью. Маркер — номер круга ревью, по которому пришёл отказ (T3e), он же делит
         # бюджет отказов; тело карточки по-прежнему говорит «круг 1» правок.
         review_round = int(decision.get("review_round") or 1)
-        key = f"planloop:{plan_id}:{PLAN_FIX_KEY}:{review_round}"
+        # Номер в ключе — по числу уже созданных правок, а не по кругу ревью: после
+        # переутверждения план получает свежий круг ревью (`review_round` снова 1), а
+        # ключ `planfix:1` занят выполненной карточкой прошлой версии. `hermes kanban
+        # create` идемпотентен по ключу и вернул бы её — новых правок не появилось бы.
+        key_round = next_fix_round(ctx.get("plan_fix_cards") or [], review_round)
+        key = f"planloop:{plan_id}:{PLAN_FIX_KEY}:{key_round}"
         profile = plan_fix_profile(p.cfg)
         report_rel = plan_review_rel(p)
         findings = (_blocking_findings(plan_review_path(p), FINDINGS_LIMIT)
                     or _review_findings(plan_review_path(p), FINDINGS_LIMIT))
-        cid = create_card(p, f"[правки плана {plan_id}] Правки плана по ревью (круг 1)",
+        cid = create_card(p, f"[правки плана {plan_id}] Правки плана по ревью (круг {key_round})",
                           plan_fix_card_body(p, p.cfg.rel(Path(p.plan_file)), report_rel,
                                              findings),
                           profile, key, plan_fix_skills(p.cfg),
                           max_runtime=plan_fix_runtime(p.cfg))
+        if reused_card(cid, key, "правка плана по ревью"):
+            return result
         result.update(applied=bool(cid), detail=f"карточка правок плана: {cid}")
         if cid:
             touch(f"create_plan_fix:{cid}")
@@ -3519,6 +3694,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             p, f"[правка по разведке {plan_id}] Правка плана по разведке (круг {round_no})",
             scout_fix_card_body(p, ctx, round_no), profile, key, plan_fix_skills(p.cfg),
             max_runtime=plan_fix_runtime(p.cfg))
+        if reused_card(cid, key, "правка плана по разведке"):
+            return result
         result.update(applied=bool(cid), detail=f"карточка правки плана по разведке: {cid}")
         if cid:
             # Сбой создания состояние не пишет (как у ревью плана): без отметки следующий
@@ -3743,13 +3920,18 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             extra = decision.get("details") or ""
             # Owner-стоп тик не снимает сам (`decide`), поэтому не обещаем самовосстановление.
             owner_stop = (decision.get("kind") or "") == "owner"
-            tail = ("Снимает только владелец: `python .pipeline/gate.py --resume`"
-                    if owner_stop else
-                    "После устранения причины продолжится сам; снять принудительно:"
-                    " `python .pipeline/gate.py --resume`")
-            say("⛔ конвейер остановлен: " + reason
-                + ("\n\n" + extra if extra else "")
-                + "\n" + tail)
+            todo = [line.lstrip("-—•* ").strip() for line in extra.splitlines() if line.strip()]
+            todo = [item for item in todo if item]
+            todo.append("снять стоп, когда причина устранена: python .pipeline/gate.py --resume")
+            attention(p.cfg, attention_text(
+                p.plan_id, reason,
+                evidence=[f"тип остановки: {'решение владельца' if owner_stop else 'инцидент'}",
+                          f"стоп-флаг: {Path(p.stop_file).name}",
+                          "до снятия стопа шаги плана не двигаются"],
+                todo=todo,
+                commands=[f"python .pipeline/gate.py --status --plan {p.plan_id}",
+                          "python .pipeline/gate.py --resume"]),
+                f"stall:{p.plan_id}", say)
         return result
     return result
 
@@ -4135,6 +4317,26 @@ def remember_action(p: Paths, plan_id: str, decision: dict, detail: str,
 
 
 
+def note_action_streak(p: Paths, entry: dict) -> int:
+    """Сколько одинаковых действий подряд дало один и тот же результат.
+
+    Счёт живёт в состоянии плана (`action_streak`) и сбрасывается любым другим действием.
+    Нужен как общий сторож: заказ может «примениться» и не создать работы (идемпотентный
+    ключ занят закрытой карточкой), и без счёта тик вечно пишет «выполнено».
+    """
+    state = load_state(p)
+    signature = f"{entry.get('action')}|{entry.get('detail')}"
+    streak = state.get("action_streak")
+    streak = streak if isinstance(streak, dict) else {}
+    count = int(streak.get("count") or 0) + 1 if streak.get("sig") == signature else 1
+    state["action_streak"] = {"sig": signature, "count": count,
+                              "action": str(entry.get("action") or ""),
+                              "detail": str(entry.get("detail") or ""),
+                              "at": _local_stamp(_now())}
+    save_state(p, state)
+    return count
+
+
 def tick(cfg: config_mod.Config, execute: bool = True,
          max_actions: int | None = None) -> dict:
     """Один тик по ВСЕМ ведомым планам: до `max_actions` действий, по одному на шаг.
@@ -4221,6 +4423,30 @@ def tick(cfg: config_mod.Config, execute: bool = True,
             if entry["applied"]:
                 remember_action(p, spec.id, decision, entry["detail"], duration=duration,
                                 commit=str(result.get("commit") or ""))
+            # Зависание: план не двигается, а тик исправно пишет «выполнено» (пример —
+            # заказ схлопнулся в уже закрытую карточку). Счёт повторов живёт в состоянии.
+            streak = note_action_streak(p, entry)
+            if streak >= stuck_repeats_of(cfg):
+                stuck_reason = (f"{streak} тика подряд действие «{entry['action']}» "
+                                f"не сдвинуло план {spec.id}: {entry['detail']}")
+                write_stop(p, stuck_reason, "gate", kind="incident")
+                attention(cfg, attention_text(
+                    spec.id, stuck_reason,
+                    evidence=[f"повторяется: {entry['action']} — {entry['detail']}",
+                              f"одинаковых тиков подряд: {streak}",
+                              "журнал считает действия выполненными, но план стоит"],
+                    todo=["посмотреть состояние плана и хвост журнала тиков (команды ниже)",
+                          "найти повторяющуюся карточку или ключ и устранить причину",
+                          "обновить движок проекта, если причина в его версии",
+                          "снять стоп и дождаться следующего тика"],
+                    commands=[f"python .pipeline/gate.py --status --plan {spec.id}",
+                              "tail -5 .pipeline/state/history.jsonl",
+                              "hermes pipeline setup --upgrade --project <путь>",
+                              "python .pipeline/gate.py --resume"]),
+                    f"stall:{spec.id}")
+                reason = stuck_reason
+                finish = True
+                break
             if not entry["applied"]:
                 reason = (f"действие {entry['action']} не применилось: "
                           f"{entry['detail'] or 'подробностей нет'} — второй попытки в этом тике нет")
@@ -4290,7 +4516,14 @@ def incident(cfg: config_mod.Config, args: argparse.Namespace, exc: BaseExceptio
                 print(f"ошибка: {stop_exc}", file=sys.stderr)
         if fresh:
             try:
-                notify(cfg, "⛔ сбой тика: " + reason)
+                notify(cfg, attention_text(
+                    plan_id or "", "сбой тика конвейера",
+                    evidence=[reason],
+                    todo=["посмотреть вывод тика и состояние плана (команды ниже)",
+                          "устранить причину сбоя",
+                          "проверить тик вручную и дождаться следующего запуска"],
+                    commands=[f"python .pipeline/gate.py --status --plan {plan_id}",
+                              f"python .pipeline/gate.py --run --plan {plan_id}"]))
             except Exception as notify_exc:  # noqa: BLE001 - обработчик не даёт второй трейсбек
                 print(f"ошибка: уведомление не отправлено: {notify_exc}", file=sys.stderr)
     print(f"ошибка: {reason}", file=sys.stderr)
@@ -4342,6 +4575,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"тик остановлен: {why}", file=sys.stderr)
             print("обновите движок проекта: hermes pipeline setup --upgrade --project <путь>",
                   file=sys.stderr)
+            # Без уведомления такой тик конвейер просто не ведёт, а владелец не узнаёт.
+            try:
+                attention(cfg, attention_text(
+                    "", "тик не запускается: движок проекта не совпадает с маркером целостности",
+                    evidence=[why,
+                              "пока это не устранено, ни один план не двигается",
+                              "причина обычно — правка файлов .pipeline/ руками или старой копией"],
+                    todo=["обновить движок проекта штатной командой (ниже)",
+                          "проверить, что после обновления тик выполняется вручную без ошибки",
+                          "сообщение об этом придёт ещё раз, если тик снова не запустится"],
+                    commands=["hermes pipeline setup --upgrade --project <путь>",
+                              "python .pipeline/gate.py --run",
+                              "python .pipeline/gate.py --status --plan <план>"]),
+                    "engine-integrity")
+            except Exception as exc:  # noqa: BLE001 - уведомление не отменяет код выхода
+                print(f"уведомление не отправлено: {exc}", file=sys.stderr)
             return 3
 
     try:

@@ -71,7 +71,9 @@ def test_broken_board_leaves_incident_stop_and_notifies(project: Path, hermes_st
     assert "борда недоступна" in payload["reason"]
     notices = [line for line in res.stderr.splitlines() if "[notify]" in line]
     assert len(notices) == 1, res.stderr
-    assert "борда недоступна" in notices[0]
+    # Тревога многострочная (заголовок, «что случилось», «что делать»): причина — в теле.
+    assert notices[0].startswith("[notify] ВНИМАНИЕ!!!"), notices[0]
+    assert "борда недоступна" in res.stderr
 
     again = run_gate(project, "--run")
     assert again.returncode == 1
@@ -92,7 +94,7 @@ def test_broken_board_leaves_incident_stop_and_notifies(project: Path, hermes_st
     assert owner["reason"] == "остановка владельца"
     notices = [line for line in res.stderr.splitlines() if "[notify]" in line]
     assert len(notices) == 1, res.stderr
-    assert "борда недоступна" in notices[0]
+    assert "борда недоступна" in res.stderr
     assert "ошибка: борда недоступна" in res.stderr
 
     # Сбой чтения/записи стоп-флага не отменяет уведомление.
@@ -103,7 +105,7 @@ def test_broken_board_leaves_incident_stop_and_notifies(project: Path, hermes_st
     assert "Traceback (most recent call last)" not in broken.stderr
     broken_notices = [line for line in broken.stderr.splitlines() if "[notify]" in line]
     assert len(broken_notices) == 1, broken.stderr
-    assert "файл стоп-флага не читается" in broken_notices[0]
+    assert "файл стоп-флага не читается" in broken.stderr
     assert "ошибка: файл стоп-флага не читается" in broken.stderr
     assert "стоп-флаг не записывается" in broken.stderr
 

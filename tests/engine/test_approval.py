@@ -51,6 +51,27 @@ def read_state(root: Path, plan_id: str = "1") -> dict:
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
 
 
+def test_inherit_approval_keeps_review_reset_at(env: Path):
+    """Наследование записи сохраняет `review_reset_at` и обновляет sha256.
+
+    Без этого поля бюджет кругов ревью считается за всю жизнь плана: первая же
+    автоматическая правка плана превращается в owner-stop «второй REQUEST_CHANGES».
+    """
+    cfg = config_mod.load(env)
+    plan = plan_path(env)
+    write_approval(env, plan, review_reset_at=1_700_000_000)
+    plan.write_text(plan.read_text(encoding="utf-8") + "\nПравка.\n", encoding="utf-8")
+    p = gate.resolve_paths(cfg, "1")
+
+    record = gate.inherit_approval(p, {"sha256": registry.sha256_file(plan)})
+
+    assert record["review_reset_at"] == 1_700_000_000
+    assert record["inherited"] is True
+    on_disk = json.loads(registry.approval_file_for(cfg, "1").read_text(encoding="utf-8"))
+    assert on_disk["review_reset_at"] == 1_700_000_000
+    assert on_disk["sha256"] == registry.sha256_file(plan)
+
+
 def test_registry_status_missing_approved_and_changed(env: Path):
     cfg = config_mod.load(env)
     spec = registry.get(cfg, "1")

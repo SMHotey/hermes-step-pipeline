@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -348,6 +349,58 @@ def test_second_request_changes_escalates_to_owner(stand):
     assert gate.load_stop(p)["kind"] == "owner"
 
 
+def test_fix_after_reapproval_gets_review_not_owner_stop(stand):
+    """Правка плана после переутверждения не съедает остаток бюджета кругов.
+
+    Регресс: наследование записи утверждения переписывало её целиком и теряло
+    `review_reset_at`; бюджет снова считался за всю жизнь плана, и круг правок упирался
+    в owner-stop до повторного ревью. Живой случай — `gapaudit`, план 1, 21:21:05:
+    «второй REQUEST_CHANGES», хотя поправленный план ещё ни разу не ревьюили.
+    """
+    root, p, db = stand
+    plan = Path(root) / "docs" / "plans" / "1-demo.md"
+    request = ("# Ревью плана 1\n\n- шаг S2 не опирается на S1\n\n"
+               "## ВЕРДИКТ: REQUEST_CHANGES\n")
+
+    # Круг до переутверждения: карточка ревью и правка. Их отметки времени сдвигаем в
+    # прошлое — иначе секундная точность карточек делает сцену недетерминированной.
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview")
+    write_report(root, request)
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_fix"
+    complete(db, ":planfix:1")
+
+    reset = int(time.time()) - 2
+    con = sqlite3.connect(db)
+    try:
+        con.execute("UPDATE tasks SET created_at = ? WHERE idempotency_key LIKE 'planloop:1:%'",
+                    (reset - 10,))
+        con.commit()
+    finally:
+        con.close()
+
+    # Владелец переутверждает план: бюджет кругов начинается заново.
+    write_approval(root, plan, review_reset_at=reset)
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview:2")
+    later = time.time() + 5
+    os.utime(write_report(root, request), (later, later))
+    again = gate.run_gate(p, notify_fn=quiet)
+    assert again["decision"]["action"] == "create_plan_fix", again["decision"]
+
+    # Правка правит текст плана: утверждение переписывается наследованием (inherited),
+    # но метка переутверждения обязана пережить эту запись.
+    complete(db, ":planfix:2")
+    plan.write_text(plan.read_text(encoding="utf-8") + "\nПравка по ревью.\n",
+                    encoding="utf-8")
+    os.utime(write_report(root, request), (later, later))
+
+    decision = gate.run_gate(p, notify_fn=quiet)["decision"]
+    assert decision["action"] == "create_plan_review", decision
+    assert "поправлен по ревью" in decision["reason"]
+    assert gate.load_stop(p) is None
+
+
 def test_config_overrides_profile_skills_runtime(tmp_path, hermes_stub, monkeypatch):
     """Профиль, скиллы и лимит карточки ревью читаются из конфига (C4)."""
     root = make_project(tmp_path / "proj",
@@ -475,5 +528,79 @@ def test_reapproval_resets_review_budget(stand):
     write_report(root, REQUEST)
     decision = gate.run_gate(p, notify_fn=quiet)["decision"]
     assert decision["action"] == "create_plan_fix", decision
-    assert [c["key"] for c in cards(db) if c["key"].startswith("planloop:1:planfix")][-1] \
-        == "planloop:1:planfix:1"
+    fixes = [c for c in cards(db) if c["key"].startswith("planloop:1:planfix")]
+    # Ключ правки обязан быть новым: закрытая карточка прошлой версии не переиспользуется
+    # (ядро дедуплицирует по ключу и вернуло бы её — правок бы не появилось вовсе).
+    assert [c["key"] for c in fixes] == ["planloop:1:planfix:1", "planloop:1:planfix:2"], fixes
+    assert fixes[-1]["status"] == "ready"
+
+
+# ─────────────────── зависание: тревога владельцу (0.21.1) ───────────────────
+
+def test_next_fix_round_skips_taken_keys():
+    """Номер круга правок — по занятым ключам, а не по кругу ревью (иначе переиспользование)."""
+    assert gate.next_fix_round([], 1) == 1
+    assert gate.next_fix_round([{"key": "planloop:1:planfix:1"}], 1) == 2
+    assert gate.next_fix_round([{"key": "planloop:1:planfix:1"},
+                                {"key": "planloop:1:planfix:2"}], 1) == 3
+
+
+def test_attention_text_has_loud_header_and_plan():
+    """Тревога начинается с громкой строки и говорит, что случилось и что делать."""
+    text = gate.attention_text("1", "план стоит", evidence=["карточка done"],
+                               todo=["обновить движок"], commands=["python .pipeline/gate.py --status"])
+    assert text.splitlines()[0] == "ВНИМАНИЕ!!! Требуется починить конвейер."
+    assert "План 1: план стоит" in text
+    assert "Что случилось:" in text and "Что нужно сделать:" in text and "Команды:" in text
+
+
+def test_attention_is_throttled_per_reason(stand):
+    """Одна тревога на причину: cron не должен засыпать чат одинаковыми сообщениями."""
+    _root, p, _db = stand
+    p.cfg.notify["enabled"] = True
+    said: list[str] = []
+    assert gate.attention(p.cfg, "раз", "stall:1", said.append) is True
+    assert gate.attention(p.cfg, "два", "stall:1", said.append) is False
+    assert gate.attention(p.cfg, "три", "stall:2", said.append) is True
+    assert said == ["раз", "три"]
+
+
+def test_note_action_streak_counts_identical_actions(stand):
+    """Счёт повторов растёт на одинаковых действиях и сбрасывается на другом результате."""
+    _root, p, _db = stand
+    entry = {"action": "create_plan_fix", "detail": "карточка правок плана: t_1"}
+    assert gate.note_action_streak(p, entry) == 1
+    assert gate.note_action_streak(p, entry) == 2
+    assert gate.note_action_streak(p, {"action": "create_plan_fix",
+                                       "detail": "карточка правок плана: t_2"}) == 1
+
+
+def test_closed_card_on_create_raises_alarm(stand):
+    """Заказ вернул закрытую карточку — стоп-инцидент и тревога, а не «выполнено»."""
+    root, p, db = stand
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview")
+    write_report(root, REQUEST)
+    said: list[str] = []
+
+    def closed_create(_p, title, body, assignee, key, skills, parent=None, max_runtime=None):
+        """Имитация настоящего `hermes kanban create`: на занятый ключ отдаёт done-карточку."""
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "INSERT INTO tasks (id, title, status, assignee, idempotency_key, completed_at,"
+                " result, last_failure_error, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                ("t_closed01", title, "done", assignee, key, int(time.time()), "", "",
+                 int(time.time())))
+            con.commit()
+        finally:
+            con.close()
+        return "t_closed01"
+
+    result = gate.run_gate(p, create_card=closed_create, notify_fn=said.append)
+    assert result["applied"] is True
+    assert "закрытую карточку" in result["detail"], result
+    stop = json.loads((Path(root) / ".pipeline" / "state" / "plan_1_stop.json")
+                      .read_text(encoding="utf-8"))
+    assert stop["kind"] == "incident"
+    assert any(gate.ATTENTION_HEADER in text for text in said), said

@@ -138,6 +138,17 @@ def main() -> int:
     con = sqlite3.connect(db)
     try:
         con.executescript(SCHEMA)
+        # Идемпотентность как у настоящего Hermes: на занятый ключ возвращается прежняя
+        # карточка ЛЮБОГО статуса (включая done), новая не создаётся. Без этого движок
+        # нельзя проверить на повторный заказ — именно так терялись круги правок плана.
+        key = (fields.get("idempotency_key") or "").strip()
+        if key:
+            row = con.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? AND status <> 'archived'"
+                " ORDER BY created_at DESC LIMIT 1", (key,)).fetchone()
+            if row:
+                print(row[0])
+                return 0
         task_id = "t_" + uuid.uuid4().hex[:8]
         con.execute(
             "INSERT INTO tasks (id, title, status, assignee, idempotency_key, completed_at,"
