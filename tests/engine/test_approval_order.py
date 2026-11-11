@@ -138,10 +138,13 @@ def test_plan_edited_after_approve_requires_new_review(stand):
     assert status["ok"] is False
     assert status["block_kind"] == "review"
     assert status["review"]["state"] == "stale"
-    label, fact = status["review"]["label_sha"], status["review"]["file_sha"]
-    assert label and fact and label != fact
+    label = status["review"]["label_sha"]
+    # 0.22.1: причина называет sha версии плана (файл без содержимого журнала), а не
+    # сырые байты: строку журнала страж версией плана больше не считает.
+    version = status["review"]["version_sha256"]
+    assert label and version and label != version
     assert label[:12] in status["reason"]
-    assert fact[:12] in status["reason"]
+    assert version[:12] in status["reason"]
     assert "повторное ревью" in status["reason"]
 
 

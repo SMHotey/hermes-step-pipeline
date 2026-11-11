@@ -25,8 +25,9 @@ R5. Правки по разведке — отметка `Правки по р�
     артефактом. Источник: `plan_cycle.EDIT_MARK_RE`, `plan_cycle.edits_count`.
 R6. Ревью плана — отчёт `plan-N.md` в каталоге отчётов, вердикт собирается по
     ВСЕМ строкам `ВЕРДИКТ:` (две разные дают `invalid`), привязка к версии плана —
-    метка `plan_sha256:` и sha256 сырых байтов файла плана. Источник:
-    `approval.verdict_at`, `approval.plan_sha_of`, `approval.sha256_file`,
+    метка `plan_sha256:` и sha256 версии плана (файл без содержимого журнала, 0.22.1;
+    метка по сырым байтам принимается, пока файл не менялся). Источник:
+    `approval.verdict_at`, `approval.plan_sha_of`, `approval.plan_version_sha`,
     `approval.has_constitution`, `approval.review_status`. Ссылка на пункт конституции
     (`approval.CONSTITUTION_REF_RE`, состояние `unreferenced`) — часть того же правила:
     вердикт без номера пункта не считается проверкой принципов.
@@ -305,7 +306,28 @@ def _review_state(plan_text: str, plan_file: Path, report: Path) -> str:
     if not CONSTITUTION_REF_RE.search(text):
         return "unreferenced"
     file_sha = _sha256(plan_file)
-    return "fresh" if file_sha and match.group(1).lower() == file_sha else "stale"
+    label = match.group(1).lower()
+    # 0.22.1: метка пишется по версии плана (файл без содержимого журнала), поэтому
+    # закрытие шага отчёт не старит; метка по сырому хэшу принимается, пока файл не менялся.
+    version_sha = _version_sha(plan_file)
+    return "fresh" if label in (version_sha, file_sha) else "stale"
+
+
+def _version_sha(plan_file: Path) -> str | None:
+    """sha256 версии плана — нормализация движка (`engine/approval.py`), не копия.
+
+    Вторая реализация нормализации разошлась бы со стражем при первой же правке.
+    Пакетного окружения нет (файл запущен отдельно) — `None`: состояние ревью тогда
+    считается по сырому хэшу, как до 0.22.1.
+    """
+    try:
+        from .engine import approval as engine_approval
+    except ImportError:  # pragma: no cover - запуск файлом без пакета
+        return None
+    try:
+        return engine_approval.plan_version_sha(plan_file, DEFAULT_JOURNAL_MARKER)
+    except OSError:  # pragma: no cover - файл плана не читается
+        return None
 
 
 def _rounds(state_dir: Path, errors: list[str]) -> dict[str, int]:

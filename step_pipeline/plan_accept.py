@@ -37,6 +37,13 @@ try:
 except ImportError:  # шаг 1-S8 ещё не сделан — работают запасные проверки
     plan_lint = None  # type: ignore
 
+try:
+    # Модуль движка: версия плана (файл без журнала) считается там же, где её сверяет
+    # страж. Второй реализации нормализации не заводится.
+    from .engine import approval as engine_approval
+except ImportError:  # pragma: no cover - отладка файлом, движка рядом нет
+    engine_approval = None  # type: ignore
+
 _PLANS_DEFAULT = "docs/plans"
 _APPROVAL_NAME = "plan_{}_approval.json"
 # Номер плана в имени файла — как engine/registry.py:30.
@@ -332,6 +339,10 @@ def _write_approval(project: Path, number: str, path: Path) -> dict:
         "plan": str(number),
         "file": _shown(path, project),
         "sha256": _sha256(path),
+        # Версия плана без содержимого журнала (0.22.1): по ней страж сверяет утверждение,
+        # иначе строка журнала при закрытии шага выглядела правкой плана. `sha256` остаётся
+        # сырым хэшем файла — по нему работают старые записи и внешние проверки.
+        "version_sha256": _version_sha256(project, path),
         "approved_at": now_iso(),
         "profile": os.environ.get("HERMES_PROFILE") or "default",
         # Момент явного решения владельца: по нему страж считает бюджет кругов ревью
@@ -554,6 +565,20 @@ def _normalize(plan_id) -> str:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _version_sha256(project: Path, path: Path) -> str:
+    """sha256 версии плана (файл без содержимого журнала), как её считает страж.
+
+    Считает модуль движка (`engine/approval.py`): вторая реализация нормализации
+    разошлась бы с ним при первой же правке. Модуль не импортируется (отладка файлом,
+    движка рядом нет) — остаётся пустая строка, и запись работает по сырому `sha256`.
+    """
+    if engine_approval is None:  # pragma: no cover - отладочный запуск файлом
+        return ""
+    marker = ((proj.read_config(Path(project)).get("markers") or {}).get("journal")
+              or "журнал")
+    return engine_approval.plan_version_sha(path, str(marker))
 
 
 def _shown(path: Path, project: Path) -> str:

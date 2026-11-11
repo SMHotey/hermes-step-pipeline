@@ -904,7 +904,9 @@ def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str
         "`## ВЕРДИКТ: APPROVE` либо `## ВЕРДИКТ: REQUEST_CHANGES`.",
         "",
         "Первая строка отчёта — метка версии: `plan_sha256:` и 64 hex-символа sha256",
-        "файла плана (`sha256sum` по файлу плана). Без метки вердикт считается",
+        f"ВЕРСИИ плана: `python .pipeline/gate.py --plan-version-sha {plan_rel}` — журнал",
+        "выполнения в версию не входит (строка журнала вердикт не сбрасывает, правка шага",
+        "сбрасывает). Без метки вердикт считается",
         "непривязанным к версии плана, и страж закажет повторное ревью.",
         "",
         "Вторая обязательная строка отчёта — ссылка на пункты конституции проекта:",
@@ -2725,7 +2727,7 @@ def watch_idle(cfg: config_mod.Config, p: Paths, ctx: dict, decision: dict,
 APPROVAL_NOTICE_KEY = registry.APPROVAL_NOTICE_KEY
 
 
-def inherit_approval(p: Paths, approval: dict) -> dict:
+def inherit_approval(p: Paths, decision: dict) -> dict:
     """Записать унаследованную запись утверждения для уже идущего плана.
 
     Ключи — те же, что у `plan_accept._write_approval`, плюс `inherited`: два формата
@@ -2733,6 +2735,9 @@ def inherit_approval(p: Paths, approval: dict) -> dict:
     явного решения владельца, и без него бюджет кругов ревью снова считался бы за всю
     жизнь плана (правка плана обнуляла метку и упирала цикл в owner-stop до повторного
     ревью).
+
+    Параметр называется `decision`, а не `approval`: модуль `approval` нужен здесь же
+    (`plan_version_sha`), и одноимённая переменная его затеняет.
     """
     path = registry.approval_file_for(p.cfg, p.plan_id)
     previous: dict = {}
@@ -2743,13 +2748,18 @@ def inherit_approval(p: Paths, approval: dict) -> dict:
     except (OSError, ValueError):
         previous = {}
     if not previous:
-        known = (approval.get("record") or {})
+        known = (decision.get("record") or {})
         previous = dict(known) if isinstance(known, dict) else {}
     record = {
         **previous,
         "plan": str(p.plan_id),
         "file": p.cfg.rel(Path(p.plan_file)),
-        "sha256": approval.get("sha256") or registry.sha256_file(p.plan_file),
+        "sha256": decision.get("sha256") or registry.sha256_file(p.plan_file),
+        # Версия плана без журнала (0.22.1): по ней сверяется утверждение, иначе закрытие
+        # шага («открыт» → «ЗАКРЫТ») выглядело правкой плана и требовало переутверждения.
+        "version_sha256": (decision.get("version_sha256")
+                           or approval.plan_version_sha(p.plan_file,
+                                                        approval.journal_marker_of(p.cfg))),
         "approved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "profile": os.environ.get("HERMES_PROFILE") or "default",
         "inherited": True,
@@ -4687,6 +4697,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="сколько действий за тик (по умолчанию — из pipeline.json)")
     ap.add_argument("--status", action="store_true", help="только показать состояние и решение")
     ap.add_argument("--json", action="store_true", help="машинный вывод")
+    ap.add_argument("--plan-version-sha", metavar="ФАЙЛ",
+                    help="напечатать sha256 версии плана (файл без содержимого журнала)")
     ap.add_argument("--stop", metavar="ПРИЧИНА", help="остановиться после текущего шага")
     ap.add_argument("--resume", action="store_true", help="снять стоп-флаг")
     ap.add_argument("--hold", metavar="ШАГ", help="шаг требует ручного допуска владельца")
@@ -4707,6 +4719,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # D2: флаг важнее файла; флаг задаёт предел на один запуск и в конфиг не пишется.
     limit = args.max_actions if args.max_actions is not None else max_actions_of(cfg)
+
+    if args.plan_version_sha:
+        # Метка `plan_sha256:` в отчёте ревью плана пишется этой командой: ревьюеру нужен
+        # детерминированный способ посчитать версию плана, а не «sha256sum по файлу» (та
+        # метка сбрасывалась бы от строки журнала при каждом закрытии шага).
+        target = Path(args.plan_version_sha)
+        if not target.is_absolute():
+            target = Path(repo_root()) / target
+        if not target.is_file():
+            print(f"ошибка: нет файла плана: {args.plan_version_sha}", file=sys.stderr)
+            return 2
+        print(approval.plan_version_sha(target, approval.journal_marker_of(cfg)))
+        return 0
 
     if args.run:
         # Тик меняет план и коммитит: на разъехавшейся копии движка он не запускается.

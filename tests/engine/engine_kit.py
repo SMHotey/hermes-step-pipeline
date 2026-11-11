@@ -60,12 +60,22 @@ def plan_sha256(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def plan_version_sha(path) -> str:
+    """sha256 версии плана (файл без содержимого журнала) — метка отчёта ревью."""
+    import approval  # noqa: PLC0415 - движок на sys.path ставит модуль выше
+    return approval.plan_version_sha(path)
+
+
 def write_approval(root: Path, plan, plan_id=None, *, sha: str | None = None,
-                   **extra) -> Path:
+                   version_sha: str | None = None, **extra) -> Path:
     """Записать `plan_<НОМЕР>_approval.json` как это делает `plan_accept._write_approval`.
 
     `sha` и `**extra` — чтобы тесты могли положить испорченную запись (чужой хэш,
     лишние ключи). Номер берётся из `plan_id` или из имени файла плана.
+
+    `version_sha256` (версия плана без журнала) пишется по умолчанию, как это делает
+    владелец после 0.22.1. Явный `sha=` означает «запись нарочно испорчена»: тогда поле
+    версии не пишется, и запись сверяется по сырому хэшу (поведение до 0.22.1).
     """
     root = Path(root)
     plan = Path(plan)
@@ -76,6 +86,8 @@ def write_approval(root: Path, plan, plan_id=None, *, sha: str | None = None,
         "plan": number,
         "file": plan.resolve().relative_to(root.resolve()).as_posix(),
         "sha256": sha or plan_sha256(plan),
+        "version_sha256": (version_sha if version_sha is not None
+                           else ("" if sha else plan_version_sha(plan))),
         "approved_at": "2026-01-01T00:00:00",
         "profile": "test",
     }

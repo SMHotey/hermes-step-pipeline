@@ -98,6 +98,12 @@ def _draft(project: Path, name: str, text: str) -> Path:
     return path
 
 
+def _engine_approval():
+    """Модуль движка: версия плана (файл без журнала) считается там же, где у стража."""
+    from step_pipeline.engine import approval as engine_approval
+    return engine_approval
+
+
 def _names(project: Path) -> list[str]:
     """Имена файлов каталога планов (черновики сюда не попадают)."""
     return sorted(path.name for path in plan_accept.plans_dir(project).glob("*.md"))
@@ -224,6 +230,11 @@ def test_accept_moves_draft_and_writes_sha256_record(project: Path, capsys, monk
 
     record = json.loads(plan_accept.approval_file(project, "5").read_text(encoding="utf-8"))
     assert record["sha256"] == hashlib.sha256(final.read_bytes()).hexdigest()
+    # 0.22.1: вместе с сырым хэшем пишется sha256 версии плана (файл без содержимого
+    # журнала) — по нему страж сверяет утверждение, чтобы закрытие шага его не сбрасывало.
+    engine_approval = _engine_approval()
+    assert record["version_sha256"] == engine_approval.plan_version_sha(final)
+    assert record["version_sha256"] != record["sha256"]
     assert record["approved_at"] == "2026-01-01T00:00:00"
     assert record["profile"] == "prompter"
     assert record["file"] == "docs/plans/5-demo.md"

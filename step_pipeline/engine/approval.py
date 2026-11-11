@@ -4,8 +4,10 @@
 Вопрос «можно ли начинать шаги» решается здесь и только здесь. Две части ответа:
 
     1. запись утверждения `plan_<НОМЕР>_approval.json` (её пишет владелец командой
-       `hermes pipeline plan --accept N`) сверяется с sha256 файла плана;
-    2. вердикт ревью плана из `docs/reviews/plan-<N>.md` привязан к тому же sha256
+       `hermes pipeline plan --accept N`) сверяется с sha256 версии плана — файла без
+       содержимого журнала (`plan_version_text`), чтобы закрытие шага не выглядело
+       правкой плана;
+    2. вердикт ревью плана из `docs/reviews/plan-<N>.md` привязан к той же версии
        меткой `plan_sha256:` в отчёте. Правка плана после APPROVE не отменяет
        утверждение владельца, но сбрасывает ревью: состояние `stale` означает
        «нужно повторное ревью», а отчёт без метки (`unbound`) вердиктом не считается.
@@ -78,6 +80,84 @@ def approval_file_for(cfg, plan_id) -> Path:
 def sha256_file(path) -> str:
     """sha256 сырых байтов файла плана (без перекодирования: CRLF не мешает)."""
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+#: Строка журнала — ровно пять колонок (`registry.JOURNAL_COLUMNS`); модуль самодостаточен
+#: и движок не импортирует, поэтому константа продублирована.
+JOURNAL_COLUMNS = 5
+#: Каноническая замена любой строки журнала: содержимое журнала — факт истории шагов,
+#: а не версия плана.
+JOURNAL_PLACEHOLDER = "| ⟨журнал⟩ |"
+HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>\S.*?)\s*$")
+SEPARATOR_CELL_RE = re.compile(r"^:?-{2,}:?$")
+
+
+def plan_version_text(path, journal_marker: str = "журнал") -> str:
+    """Текст плана с нормализованным журналом — «версия плана» для сверки меток.
+
+    Строки таблицы журнала меняются при каждом закрытии шага (дата, коммит, вердикт,
+    «открыт» → «ЗАКРЫТ»), и на сырых байтах это меняет sha256 файла: вердикт ревью
+    плана и запись утверждения становились устаревшими от закрытия шага, а не от правки
+    плана (11.11.2026: одиннадцать кругов ревью плана 1, часть — из-за строки журнала).
+    Нормализация заменяет каждую строку журнала заглушкой; шапка таблицы (первая строка
+    с `|`), остальные таблицы, заголовки и весь прочий текст остаются как есть.
+
+    Переводы строк приводит к LF сам `read_text` (универсальные переводы), поэтому клон
+    с `core.autocrlf=true` даёт ту же версию. Файла нет — пустая строка.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = text.split("\n")
+    start = 0
+    level = 0
+    for i, line in enumerate(lines):
+        found = HEADING_RE.match(line)
+        if not found or journal_marker not in found.group("title").lower():
+            continue
+        if len(found.group("hashes")) < 2:
+            continue
+        start, level = i, len(found.group("hashes"))
+        break
+    if not start:
+        return text
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        found = HEADING_RE.match(lines[j])
+        if found and len(found.group("hashes")) <= level:
+            end = j
+            break
+    header_seen = False
+    for k in range(start + 1, end):
+        line = lines[k]
+        if not line.strip().startswith("|"):
+            continue
+        if not header_seen:
+            header_seen = True  # шапка таблицы журнала — часть плана, не меняется
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < JOURNAL_COLUMNS:
+            continue
+        if all(not c or SEPARATOR_CELL_RE.match(c) for c in cells):
+            continue  # разделитель шапки `|---|` — тоже часть плана
+        lines[k] = JOURNAL_PLACEHOLDER
+    return "\n".join(lines)
+
+
+def plan_version_sha(path, journal_marker: str = "журнал") -> str:
+    """sha256 версии плана: файл без содержимого журнала (`plan_version_text`).
+
+    Именно эта метка привязывает вердикт ревью к версии плана: закрытие шага (строка
+    журнала) её не меняет, правка шага — меняет.
+    """
+    return hashlib.sha256(plan_version_text(path, journal_marker).encode("utf-8")).hexdigest()
+
+
+def journal_marker_of(cfg) -> str:
+    """Маркер журнала из конфига проекта (`markers.journal`), по умолчанию «журнал»."""
+    marker = getattr(cfg, "journal_marker", "") or ""
+    return str(marker) or "журнал"
 
 
 def read_approval(cfg, plan_id) -> dict | None:
@@ -155,8 +235,10 @@ def review_status(cfg, spec) -> dict:
     """
     path = review_path(cfg, spec.id)
     file_sha = sha256_file(spec.file)
+    version_sha = plan_version_sha(spec.file, journal_marker_of(cfg))
     result = {"state": REVIEW_FRESH, "reason": "", "path": str(path), "verdict": None,
-              "report_sha": None, "label_sha": None, "file_sha": file_sha}
+              "report_sha": None, "label_sha": None, "file_sha": file_sha,
+              "version_sha256": version_sha}
     if not has_constitution(spec.file):
         result["state"] = REVIEW_SKIPPED
         return result
@@ -193,11 +275,16 @@ def review_status(cfg, spec) -> dict:
             f"«Конституция: п.N — …»; ревью плана {spec.id} обязано назвать пункты "
             f"конституции проекта")
         return result
-    if label != file_sha:
+    # Метка вердикта: с 0.22.1 ревьюер пишет sha версии плана (`--plan-version-sha`),
+    # раньше — sha сырых байтов файла. Принимаются обе: старый отчёт остаётся вердиктом,
+    # пока план не правился по существу (сырые байты совпали). Строка журнала версией
+    # плана не считается (см. `plan_version_text`), поэтому закрытие шага вердикт не
+    # сбрасывает — сбрасывает только содержательная правка плана.
+    if label != version_sha and label != file_sha:
         result["state"] = REVIEW_STALE
-        result["reason"] = (f"план {spec.id} правился после APPROVE: sha256 {label[:12]} "
-                            f"не совпал с файлом {file_sha[:12]} — нужно повторное ревью "
-                            f"({rel})")
+        result["reason"] = (f"план {spec.id} правился после APPROVE: sha256 версии "
+                            f"{label[:12]} не совпал с файлом {version_sha[:12]} — нужно "
+                            f"повторное ревью ({rel})")
         return result
     return result
 
@@ -211,10 +298,12 @@ def evaluate(cfg, spec) -> dict:
     плана); пустая строка — не хватает ничего. `review` — вложенный `review_status`.
     """
     fact = sha256_file(spec.file)
+    version = plan_version_sha(spec.file, journal_marker_of(cfg))
     record = read_approval(cfg, spec.id)
     review = review_status(cfg, spec)
     result = {"state": "approved", "reason": "", "ok": False, "block_kind": "",
-              "record": record, "sha256": fact, "review": review, "report": review["path"]}
+              "record": record, "sha256": fact, "version_sha256": version,
+              "review": review, "report": review["path"]}
     if record is None:
         result["state"] = "missing"
         result["block_kind"] = "approval"
@@ -223,14 +312,19 @@ def evaluate(cfg, spec) -> dict:
             f"{APPROVAL_TEMPLATE.format(spec.id)} (утверждает владелец: "
             f"hermes pipeline plan --accept {spec.id})")
         return result
+    # Запись с `version_sha256` (0.22.1) сверяется по версии плана: закрытие шага пишет
+    # строку журнала, и на сырых байтах это выглядело «план изменён после утверждения».
+    # Легаси-запись без поля сверяется по сырым байтам — как раньше.
     saved = str(record.get("sha256") or "")
-    if saved != fact:
+    saved_version = str(record.get("version_sha256") or "")
+    same = (saved_version == version) if saved_version else (saved == fact)
+    if not same:
         result["state"] = "changed"
         result["block_kind"] = "approval"
         result["reason"] = (
             f"план {spec.id} изменён после утверждения — переутверди: "
-            f"hermes pipeline plan --accept {spec.id} (sha256 {fact[:12]} не совпал "
-            f"с записью {saved[:12] or '—'}, потом повторное ревью плана)")
+            f"hermes pipeline plan --accept {spec.id} (sha256 версии {version[:12]} не совпал "
+            f"с записью {(saved_version or saved)[:12] or '—'}, потом повторное ревью плана)")
         return result
     if review["state"] in (REVIEW_FRESH, REVIEW_SKIPPED):
         result["ok"] = True
