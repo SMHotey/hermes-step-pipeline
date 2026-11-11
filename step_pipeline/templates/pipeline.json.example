@@ -47,6 +47,13 @@
     "scout": "30m",
     "plan_review": "45m"
   },
+  "ui": {
+    "progress": {
+      "learn": true,
+      "min_samples": 3,
+      "weights": {"prompt": 10, "step": 55, "review": 25, "journal": 10}
+    }
+  },
   "kanban": {
     "tenant": "plan"
   },

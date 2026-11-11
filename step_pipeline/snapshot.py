@@ -32,10 +32,12 @@ from typing import Any
 
 try:  # обычный путь — пакет плагина; __main__ — ручная проверка файлом
     from . import plan_accept
+    from . import progress
     from . import project as proj
     from . import stats
 except ImportError:  # pragma: no cover
     import plan_accept  # type: ignore[no-redef]
+    import progress  # type: ignore[no-redef]
     import project as proj  # type: ignore[no-redef]
     import stats  # type: ignore[no-redef]
 
@@ -313,7 +315,7 @@ def fingerprint(root: Path, plan: str | None = None, preview: bool = False,
                 board: str | None = None) -> tuple:
     """Отпечаток источников снимка: только `stat`, без чтения содержимого.
 
-    Входят `pipeline.json`, все `*.md` каталога планов, файлы каталога состояния, файл
+    Входят `pipeline.json`, `*.md` планов, отчёты ревью, файлы каталога состояния и файл
     борды и сам ключ кэша (проект, план, предпросмотр, борда) — чтобы отпечатки разных
     планов одного проекта не совпали. Результат отсортирован: порядок обхода не влияет.
     """
@@ -336,6 +338,14 @@ def fingerprint(root: Path, plan: str | None = None, preview: bool = False,
     except OSError:
         state_files = []
     entries.extend(_stat_entry("state:" + path.name, path) for path in state_files)
+    # Отчёты ревью: по ним считаются вердикт и счётчик находок в прогрессе, поэтому их
+    # появление обязано поднимать отпечаток — иначе панель показала бы прошлый круг.
+    reviews_dir = root / ((cfg.get("paths") or {}).get("reviews") or "docs/reviews")
+    try:
+        review_files = sorted(reviews_dir.glob("*.md"))
+    except OSError:
+        review_files = []
+    entries.extend(_stat_entry("review:" + path.name, path) for path in review_files)
     entries.append(_stat_entry("board", proj.board_db(root, board)))
     entries.extend([
         ("key:root", str(root), 0),
@@ -769,6 +779,60 @@ def _plan_file_of(root: Path, cfg: dict, plan_id: str) -> Path | None:
     matches = sorted(path for path in folder.glob("*.md")
                      if re.match(rf"^{re.escape(prefix)}\d*", path.name))
     return matches[0] if matches else None
+
+
+# ───────────── прогресс шага и плана (проценты этапов, находки, остаток) ─────────────
+PLAN_CARDS_LIMIT = 1000     # карточек плана в прогресс: окно борды для одного плана
+
+
+def _closed_steps(root: Path, cfg: dict, plan_id: str) -> set[str]:
+    """Номера шагов, закрытых журналом, — по файлу плана, без запуска движка.
+
+    Экран «Шаг» открывается сам по себе (пара план + шаг), поэтому брать список закрытых
+    из `next_step.py` значило бы запускать движок на каждый показ шага.
+    """
+    path = _plan_file_of(root, cfg, plan_id)
+    if path is None:
+        return set()
+    closed: set[str] = set()
+    for row in journal_tail(root, _relative(root, path), limit=200):
+        if len(row) >= 2 and "закрыт" in str(row[-1]).lower():
+            # В журнале номер шага идёт с заголовком: «T1 (Закрытый контур…)» — берём токен.
+            key = str(row[1]).strip()
+            match = re.match(r"[^\s(]+", key)
+            closed.add((match.group(0) if match else key).upper())
+    return closed
+
+
+def _progress_settings(cfg: dict) -> dict | None:
+    """Секция `ui.progress` из `pipeline.json`: веса, порог замеров, обучение (P2)."""
+    ui = cfg.get("ui")
+    section = ui.get("progress") if isinstance(ui, dict) else None
+    return section if isinstance(section, dict) else None
+
+
+def _plan_progress(root: Path, cfg: dict, plan_row: dict, board: str | None,
+                   now: float | None = None) -> dict:
+    """Прогресс шагов плана: проценты, плитки этапов, находки ревью и остаток времени.
+
+    Карточки читаются одним запросом по префиксу ключа плана, отчёты ревью — по шагам:
+    это файлы проекта, движок для прогресса не нужен (тот же критерий, что у обзора).
+    """
+    plan_id = str(plan_row.get("id") or "").strip()
+    steps = plan_row.get("steps") or []
+    if not plan_id or not steps:
+        return {}
+    db = proj.board_db(root, board)
+    plan_cards = cards(db, limit=PLAN_CARDS_LIMIT, key_prefix=f"planloop:{plan_id}:")
+    runs = _card_runs(db, [str(card.get("id") or "") for card in plan_cards])
+    reviews: dict[str, dict] = {}
+    for row in steps:
+        step_id = str(row.get("id") or "").strip().upper()
+        if step_id:
+            # Текст отчёта здесь не нужен: считаются вердикт и раздел находок.
+            reviews[step_id] = _review(root, cfg, plan_id, step_id, limit=1)
+    return progress.plan(steps, plan_cards, runs, plan_row.get("closed") or [], now=now,
+                         ui=_progress_settings(cfg), reviews=reviews)
 
 
 def _bullets(lines: list[str]) -> list[str]:
@@ -1367,10 +1431,17 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
     # отвечают на разные вопросы, поэтому это два ключа, а не один (D8).
     plan_cards = cards(db, limit=1000, key_prefix=f"planloop:{plan}:")
     plan_runs = _card_runs(db, [str(card.get("id") or "") for card in plan_cards])
+    # Прогресс шага: процент по каноническому пути, находки ревью и остаток времени.
+    # Веса учатся по замерам всего плана, а не этого шага: у одного шага замеров мало (P2).
+    weight_rows = progress.weights(progress.samples(plan_cards, plan_runs),
+                                   _progress_settings(cfg))
+    step_progress = progress.step(raw_cards, runs, weight_rows,
+                                  closed=step in _closed_steps(root, cfg, plan),
+                                  review=review, now=now)
     return {"ok": True, "plan": plan, "step": step, "title": contract.get("title") or "",
             "contract": contract, "prompt": prompt, "review": review,
             "commit": _git_show(root, review.get("commit") or "", cap),
-            "cards": step_cards,
+            "cards": step_cards, "progress": step_progress,
             "times": times, "stages": stages,
             "roles": _plan_roles(plan_cards, cfg, plan_runs, now),
             "step_roles": _step_roles(stages),
@@ -1408,6 +1479,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         "metrics": {},
         "cycle": {},
         "events": {"rows": [], "total": 0, "bad": 0, "limit": EVENTS_LIMIT, "note": ""},
+        "progress": {},
         "cards": cards(proj.board_db(root, board)),
         "journal": [],
         "errors": [],
@@ -1452,6 +1524,33 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         out["git"] = pkg.get("git") or {}
     except Exception as exc:                                    # noqa: BLE001
         out["errors"].append(f"шаги: {exc}")
+    # Прогресс шагов (проценты этапов, находки ревью, остаток времени) — по карточкам
+    # плана и файлам отчётов. Ошибка прогресса снимок не валит: он вспомогательный.
+    out["progress"] = {}
+    if out.get("plan"):
+        try:
+            data = _plan_progress(root, cfg, out["plan"], board)
+        except Exception as exc:                                # noqa: BLE001
+            out["errors"].append(f"прогресс: {exc}")
+            data = {}
+        if data:
+            out["progress"] = data
+            out["plan"]["steps"] = [
+                {**row, "progress": data["steps"].get(str(row.get("id") or "").upper(), {})}
+                for row in out["plan"].get("steps") or []]
+            out["plan"]["progress"] = {"percent": data["percent"],
+                                       "closed": data["closed"], "total": data["total"],
+                                       "eta": data["eta"],
+                                       "weights": str((data["weights"] or {}).get("basis") or "")}
+            flow_step = str((out["plan"].get("next") or {}).get("id") or "").upper()
+            flow = data["steps"].get(flow_step) or {}
+            out["plan"]["flow"] = {"step": flow_step,
+                                   "title": str((out["plan"].get("next") or {}).get("title") or ""),
+                                   "tiles": flow.get("tiles") or [],
+                                   "percent": flow.get("percent"),
+                                   "eta": flow.get("eta") or {},
+                                   "findings": flow.get("findings") or {},
+                                   "rounds": flow.get("rounds") or []}
     decision = out.get("decision") or {}
     out["stage"] = ACTION_LABELS.get(decision.get("action") or "", decision.get("action") or "")
     out["stop"] = any(_plan_stopped(p) for p in out["plans"])

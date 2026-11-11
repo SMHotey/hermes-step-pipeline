@@ -85,10 +85,33 @@
                  background: var(--line); }
   .stage.done:after { background: var(--ok); }
   .stage.run:after { background: var(--run); }
-  .stage.wait:after { background: var(--warn); }
+  .stage.wait:after { background: var(--line); }
   .stage.bad:after { background: var(--bad); }
   .stage b { display: block; font-size: 13px; margin-bottom: 2px; }
   .stage span { color: var(--muted); font-size: 12px; }
+  /* Прогресс шага (0.24.0): процент этапа, полоса и бейдж находок в плитке. */
+  .stage .pct { float: right; font-size: 11px; color: var(--muted); }
+  .stage .bar { margin-top: 6px; }
+  .stage .pill { margin-top: 6px; font-size: 10.5px; }
+  .bar { display: block; width: 100%; height: 5px; border-radius: 999px;
+         background: var(--panel-2); overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--ok); }
+  .cell-bar { display: flex; gap: 6px; align-items: center; min-width: 96px; }
+  .cell-bar .bar { flex: 1; }
+  /* Дорожка этапов в строке шага: четыре микро-сегмента — весь путь виден без раскрытия. */
+  .segs { display: inline-flex; gap: 2px; margin-bottom: 3px; }
+  .seg { width: 10px; height: 5px; border-radius: 2px; background: var(--line); }
+  .seg.done { background: var(--ok); }
+  .seg.run { background: var(--run); }
+  .seg.bad { background: var(--bad); }
+  .stage.run .bar > i { background: var(--run); }
+  .stage.bad .bar > i { background: var(--bad); }
+  .flow-summary { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
+                  font-size: 12.5px; margin-bottom: 8px; color: var(--muted); }
+  .flow-summary b { color: var(--text); }
+  .step-progress { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+                   font-size: 12.5px; margin: 8px 0 10px; }
+  .step-progress .bar { width: 120px; min-width: 120px; margin-top: 0; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
        text-transform: uppercase; letter-spacing: .06em; padding: 3px 6px;
@@ -361,13 +384,16 @@
     </section>
     <section style="margin-top:16px">
       <h2>Поток текущего шага</h2>
+      <!-- Сводка прогресса (0.24.0): процент плана, шаг и остаток времени — из снимка. -->
+      <div class="flow-summary" id="flow-summary"><span class="muted">—</span></div>
       <div class="flow" id="flow"></div>
       <!-- Поиск по шагам (S8, D8): «/» ставит фокус сюда. -->
       <label for="steps-filter">Поиск по шагам</label>
       <input type="text" id="steps-filter" autocomplete="off" placeholder="/ — фильтр по тексту строки">
       <table>
-        <thead><tr><th>Шаг</th><th>Название</th><th>Дни</th><th>Исполнитель</th><th>Статус</th></tr></thead>
-        <tbody id="steps"><tr><td colspan="5" class="muted">загрузка…</td></tr></tbody>
+        <thead><tr><th>Шаг</th><th>Название</th><th>Дни</th><th>Исполнитель</th>
+                   <th>Прогресс</th><th>Статус</th></tr></thead>
+        <tbody id="steps"><tr><td colspan="6" class="muted">загрузка…</td></tr></tbody>
       </table>
     </section>
     <section class="console">
@@ -397,6 +423,7 @@
         <section>
           <h2>Шаг <span class="mono" id="step-id">—</span></h2>
           <div class="step-head" id="step-title">—</div>
+          <div class="step-progress" id="step-progress"><span class="muted">—</span></div>
           <div class="muted mono" id="step-plan-path"></div>
           <div class="step-actions">
             <label class="muted" for="step-picker">шаг</label>
@@ -447,6 +474,8 @@
              тикает страница. Источники таблиц разные: `step_roles` — этот шаг, `roles` — план. -->
         <section>
           <h2>Время и этапы</h2>
+          <!-- Плитки этапов с процентами: тот же прогресс, что в «Потоке», но для этого шага. -->
+          <div class="flow" id="step-flow"></div>
           <div class="step-times" id="step-times"><span class="muted">—</span></div>
           <table>
             <thead><tr><th>Этап</th><th>Роль</th><th>Начало</th><th>Конец</th>
@@ -1031,29 +1060,68 @@ function setBusy(busy) {
   $("btn-tick").disabled = busy || !tickAllowed;
 }
 
-function stageOf(cards, planId, stepId) {
-  const prefix = `planloop:${planId}:${stepId}:`;
-  const mine = cards.filter((c) => String(c.idempotency_key || "").startsWith(prefix));
-  const by = (kind) => mine.filter((c) => String(c.idempotency_key || "").includes(":" + kind));
-  const prompt = by("prompt");
-  const step = by("step");
-  const review = by("review");
-  const fix = by("fix");
-  const pick = (list) => list[0] || null;
-  const stateOf = (card) => {
-    if (!card) return "wait";
-    if (card.status === "done") return "done";
-    if (["crashed", "timed_out", "blocked", "gave_up"].includes(card.status)) return "bad";
-    return "run";
-  };
-  return [
-    {title: "Постановка", hint: prompt.length ? (pick(prompt).status) : (step.length ? "выполнена" : "нужна"),
-     cls: step.length || prompt.some((c) => c.status === "done") ? "done" : stateOf(pick(prompt))},
-    {title: "Исполнение", hint: step.length ? pick(step).status : "ждёт", cls: stateOf(pick(step))},
-    {title: "Ревью", hint: review.length ? pick(review).status : "ждёт", cls: stateOf(pick(review))},
-    {title: "Журнал", hint: fix.length ? "правки" : "—", cls: review.some((c) => c.status === "done") ? "run" : "wait"},
-  ];
+// ── прогресс шага (0.24.0): плитки этапов, находки ревью и остаток времени ──
+// Всё считает снимок (`progress.py`), страница только рисует: правила процентов и оценок
+// не должны жить в двух местах.
+function barHtml(percent) {
+  const width = Math.max(0, Math.min(100, Number(percent) || 0));
+  return `<span class="bar"><i style="width:${width}%"></i></span>`;
 }
+
+function findingsPill(findings) {
+  // Числа нет — «?»: ноль в этом месте читался бы как «находок нет» (P6).
+  const f = findings || {};
+  if (f.exists === undefined && !f.unparsed && f.total === undefined) return "";
+  if (f.unparsed) return `<span class="pill wait" title="${esc(f.note || "")}">? находки</span>`;
+  if (f.total === null || f.total === undefined) {
+    return f.exists === false ? "" : `<span class="pill wait">?</span>`;
+  }
+  const cls = f.blocking ? "bad" : (f.total ? "wait" : "ok");
+  const word = f.total === 1 ? "находка" : "находки";
+  const text = f.total ? `${f.total} ${word}` : "0 находок";
+  const title = [f.label, f.note].filter(Boolean).join(" — ");
+  return `<span class="pill ${cls}" title="${esc(title)}">${esc(text)}</span>`;
+}
+
+function tileHtml(tile) {
+  const t = tile || {};
+  const cls = ["done", "run", "wait", "bad"].includes(t.state) ? t.state : "wait";
+  const percent = Math.max(0, Math.min(100, Number(t.percent) || 0));
+  return `<div class="stage ${cls}">
+    <span class="pct mono">${percent}%</span>
+    <b>${esc(t.title || t.stage || "—")}</b>
+    <span>${esc(t.hint || t.label || "")}</span>
+    ${t.findings ? findingsPill(t.findings) : ""}
+    ${barHtml(percent)}
+  </div>`;
+}
+
+function etaText(eta) {
+  // Вилка и основа — в title: одна цифра без них выглядела бы обещанием (P7).
+  const e = eta || {};
+  if (!e.seconds) return "";
+  const range = [e.low_text, e.high_text].filter(Boolean).join(" — ");
+  const title = [e.basis, range ? `вилка ${range}` : "", e.note].filter(Boolean).join(" · ");
+  return `<span class="mono" title="${esc(title)}">осталось ${esc(e.text || "")}</span>`;
+}
+
+function segsHtml(tiles) {
+  const rows = tiles || [];
+  if (!rows.length) return "";
+  return `<span class="segs">` + rows.map((tile) =>
+    `<i class="seg ${esc(tile.state)}" title="${esc(tile.title + " · " + (tile.percent || 0) + "% · " + (tile.hint || ""))}"></i>`
+  ).join("") + `</span>`;
+}
+
+function progressCell(progress) {
+  const pr = progress || {};
+  const percent = Math.max(0, Math.min(100, Number(pr.percent) || 0));
+  const eta = (pr.eta || {}).text || "";
+  return segsHtml(pr.tiles) + `<div class="cell-bar">${barHtml(percent)}<span class="mono">${percent}%</span></div>` +
+    (eta ? `<div class="muted mono">${esc(eta)}</div>` : "") +
+    findingsPill(pr.findings);
+}
+
 
 // ── лента действий (S9, D1/D5): строки снимка фильтруются на клиенте ──
 let eventsRows = [];     // строки последнего снимка: фильтры перерисовывают их без запроса
@@ -1391,6 +1459,29 @@ function renderTimes(data) {
   $("plan-roles-title").textContent = `Этапы по ролям за план ${data.plan || "—"}`;
 }
 
+function renderStepProgress(data) {
+  // Прогресс шага на экране «Шаг»: процент, остаток времени, находки ревью и круги правок.
+  // Все числа приходят из снимка (`progress.step`), страница их не считает.
+  const pr = data.progress || {};
+  const el = $("step-progress");
+  if (pr.percent === undefined || pr.percent === null) {
+    el.innerHTML = `<span class="muted">прогресс не посчитан</span>`;
+  } else {
+    const eta = pr.eta || {};
+    const rounds = (pr.rounds || []).map((r) =>
+      `<span class="pill wait" title="${esc(r.label || "")}">${esc(r.label || ("круг " + r.round))} · ${Number(r.percent) || 0}%</span>`).join("");
+    el.innerHTML = [
+      barHtml(pr.percent),
+      `<b class="mono">${Number(pr.percent) || 0}%</b>`,
+      eta.text ? etaText(eta) : `<span class="muted">${esc(eta.note || "оценки нет")}</span>`,
+      pr.findings && pr.findings.exists !== false ? findingsPill(pr.findings) : "",
+      rounds,
+      pr.weights_basis ? `<span title="${esc(pr.weights_basis)}">веса</span>` : "",
+    ].filter(Boolean).join("");
+  }
+  $("step-flow").innerHTML = (pr.tiles || []).map(tileHtml).join("");
+}
+
 function renderStep(data) {
   const contract = data.contract || {};
   $("step-id").textContent = data.step || "—";
@@ -1445,6 +1536,7 @@ function renderStep(data) {
   $("btn-unhold").disabled = !!window.__preview || !hold.held;
 
   renderTimes(data);
+  renderStepProgress(data);
 
   $("step-cards").innerHTML = (data.cards || []).map((card) => {
     const cls = card.status === "done" ? "ok"
@@ -1832,14 +1924,26 @@ function render(data) {
       <td>${esc(s.title)}</td>
       <td>${esc(s.days || "")}</td>
       <td>${esc(s.owner || "")}</td>
+      <td>${progressCell(s.progress)}</td>
       <td>${closed.has(s.id) ? '<span class="pill ok">закрыт</span>'
             : (s.id === nextId ? '<span class="pill run">сейчас</span>' : '<span class="pill">открыт</span>')}</td>
-    </tr>`).join("") || `<tr><td colspan="5" class="muted">${esc(plan.note || "шаги не распознаны")}</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="6" class="muted">${esc(plan.note || "шаги не распознаны")}</td></tr>`;
   filterSteps();     // перерисовка таблицы не должна снимать введённый фильтр (S8, D8)
 
+  // Поток шага и его прогресс приходят из снимка (`plan.flow`, `plan.progress`): плитки,
+  // проценты и остаток времени считает `progress.py`, страница только рисует.
   const stepId = nextId || (plan.steps || [])[0]?.id;
-  $("flow").innerHTML = (stepId ? stageOf(data.cards || [], plan.id, stepId) : []).map((s) => `
-    <div class="stage ${s.cls}"><b>${esc(s.title)}</b><span>${esc(s.hint)}</span></div>`).join("")
+  const flow = plan.flow || {};
+  const planProgress = plan.progress || {};
+  const planEta = planProgress.eta || {};
+  $("flow-summary").innerHTML = plan.id
+    ? `<b>шаг ${esc(flow.step || stepId || "—")}</b> <span>${esc(flow.title || "")}</span>` +
+      `<span>план ${esc(plan.id)} · ${esc(planProgress.closed ?? 0)}/${esc(planProgress.total ?? 0)} шагов` +
+      ` · ${Number(planProgress.percent) || 0}%</span>` +
+      (planEta.text ? etaText(planEta) : "") +
+      (planProgress.weights ? `<span title="${esc(planProgress.weights)}">веса</span>` : "")
+    : `<span class="muted">план не выбран</span>`;
+  $("flow").innerHTML = (flow.tiles || []).map(tileHtml).join("")
     || `<div class="stage"><b>Нет шага</b><span>все закрыты или план не выбран</span></div>`;
 
   // Контекст вкладки «Шаг»: ею управляет снимок, а не догадки страницы.

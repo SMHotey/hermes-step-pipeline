@@ -2714,3 +2714,113 @@ def test_index_version_badge_offers_update():
     for anchor in ('id="ui-ver"', "dataset.latest", "data.update",
                    'action: "update"', "Поставить обновление плагина v"):
         assert anchor in html, anchor
+
+
+# ─────────── прогресс шага (0.24.0): проценты этапов, находки, остаток ───────────
+# Отчёт с явными классами находок: блокирующая считается отдельно от прочих (P6).
+PROGRESS_REVIEW = """# Ревью: план 1, шаг S1
+
+## ВЕРДИКТ: REQUEST_CHANGES
+
+## Находки
+
+- [блокирующая] `app/a.py:12` — нет проверки входа
+- [значимая] `app/b.py:13` — нет теста на пустой список
+- [стилистическая] `app/c.py:14` — имя переменной без смысла
+"""
+
+
+def progress_fixture(server) -> None:
+    """Карточки шага S1: постановка закрыта, исполнение идёт, отчёт ревью с находками."""
+    db, now = server["db"], int(time.time())
+    add_step_card(db, "planloop:1:S1:prompt", "prompter", created=now - 400)
+    add_step_card(db, "planloop:1:S1:step", "driver", created=now - 300, status="running")
+    set_card_times(db, "S1:prompt", started=now - 400, completed=now - 100)
+    set_card_times(db, "S1:step", started=now - 300)
+    (server["root"] / "docs" / "reviews" / "1-S1.md").write_text(PROGRESS_REVIEW,
+                                                                encoding="utf-8")
+    snapshot.clear_cache()
+
+
+def test_snapshot_shows_step_progress_and_findings(server):
+    """Снимок отдаёт процент шага, плитки этапов, счётчик находок и остаток времени."""
+    progress_fixture(server)
+    data = snapshot.snapshot(server["root"], plan="1")
+    steps = {row["id"]: row for row in data["plan"]["steps"]}
+    row = steps["S1"]["progress"]
+    # 10% постановки целиком + половина веса исполнения (медианы нет) = 37.5 → 38%.
+    assert row["percent"] == 38
+    assert [tile["state"] for tile in row["tiles"]] == ["done", "run", "wait", "wait"]
+    assert [tile["percent"] for tile in row["tiles"]] == [100, 50, 0, 0]
+    assert row["findings"]["total"] == 3 and row["findings"]["blocking"] == 1
+    assert row["tiles"][2]["findings"]["label"].startswith("REQUEST_CHANGES")
+    assert row["eta"]["seconds"] is not None and row["eta"]["text"].startswith("~")
+    # Поток и сводка плана тоже приходят из снимка: страница их не считает.
+    assert data["plan"]["flow"]["step"] == "S1"
+    assert [tile["title"] for tile in data["plan"]["flow"]["tiles"]] == [
+        "Постановка", "Исполнение", "Ревью", "Журнал"]
+    assert data["plan"]["progress"]["total"] == 2
+    assert data["plan"]["progress"]["percent"] == int(round(row["percent"] / 2))
+    assert data["plan"]["progress"]["weights"]
+
+
+def test_step_screen_shows_progress_and_eta(server):
+    """Экран «Шаг» показывает тот же прогресс: процент, находки и остаток с основой."""
+    progress_fixture(server)
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200
+    row = data["progress"]
+    assert row["percent"] == 38
+    assert [tile["title"] for tile in row["tiles"]] == [
+        "Постановка", "Исполнение", "Ревью", "Журнал"]
+    assert row["findings"]["total"] == 3 and row["findings"]["blocking"] == 1
+    assert "веса" in row["weights_basis"]
+    assert row["eta"]["seconds"] is not None and row["eta"]["basis"]
+
+
+def test_step_progress_is_hundred_when_journal_closed(server):
+    """Строка журнала со статусом ЗАКРЫТ делает шаг 100% без запуска движка (P4)."""
+    plan_file = server["root"] / "docs" / "plans" / "1-demo.md"
+    text = plan_file.read_text(encoding="utf-8")
+    plan_file.write_text(text.replace("| — | S1 | — | — | открыт |",
+                                      "| 05.11.2026 | S1 | `abc1234` | тесты | ЗАКРЫТ |"),
+                         encoding="utf-8")
+    snapshot.clear_cache()
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200 and data["progress"]["percent"] == 100
+
+
+def test_snapshot_cache_rebuilds_after_review_appears(server):
+    """Новый отчёт ревью поднимает отпечаток: иначе панель показывала бы прошлый круг."""
+    snapshot.clear_cache()
+    before = snapshot.snapshot(server["root"], plan="1")
+    assert before["plan"]["steps"][0]["progress"]["findings"]["total"] is None
+    (server["root"] / "docs" / "reviews" / "1-S1.md").write_text(PROGRESS_REVIEW,
+                                                                encoding="utf-8")
+    after = snapshot.snapshot(server["root"], plan="1")
+    row = after["plan"]["steps"][0]["progress"]["findings"]
+    assert row["total"] == 3 and row["blocking"] == 1
+
+
+def test_closed_step_with_title_in_journal_is_hundred_percent(server):
+    """В журнале номер шага идёт с заголовком — закрытие всё равно узнаётся (реальный формат)."""
+    plan_file = server["root"] / "docs" / "plans" / "1-demo.md"
+    plan_file.write_text(plan_file.read_text(encoding="utf-8").replace(
+        "| — | S1 | — | — | открыт |",
+        "| 05.11.2026 | S1 (Демо-шаг с заголовком) | `abc1234` | тесты | ЗАКРЫТ |"),
+        encoding="utf-8")
+    snapshot.clear_cache()
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200 and data["progress"]["percent"] == 100
+
+
+def test_index_has_progress_markup():
+    """Разметка прогресса на месте: сводка потока, колонка «Прогресс», плитки шага."""
+    html = index_html()
+    for anchor in ('id="flow-summary"', 'id="step-progress"', 'id="step-flow"',
+                   "<th>Прогресс</th>", "function tileHtml", "function progressCell",
+                   "function findingsPill", "function etaText", "function segsHtml",
+                   ".segs {", ".seg.done"):
+        assert anchor in html, anchor
+    # Плитки этапов больше не считаются на странице: их собирает снимок.
+    assert "function stageOf" not in html
