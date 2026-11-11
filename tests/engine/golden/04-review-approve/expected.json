@@ -1,0 +1,72 @@
+{
+  "cards": [
+    {
+      "assignee": "reviewer",
+      "key": "planloop:1:S1:review:1",
+      "max_runtime": "",
+      "status": "done",
+      "title": "Ревью S1"
+    },
+    {
+      "assignee": "demo",
+      "key": "planloop:1:S1:step",
+      "max_runtime": "",
+      "status": "done",
+      "title": "S1. Таблица счетов"
+    },
+    {
+      "assignee": "prompter",
+      "key": "planloop:1:S2:prompt",
+      "max_runtime": "45m",
+      "status": "ready",
+      "title": "[постановка 1 S2] Эндпоинт списка"
+    }
+  ],
+  "journal": [
+    "| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |",
+    "| <date> | S1 (Таблица счетов) | <sha> | ревью `reviewer` — APPROVE (`docs/reviews/1-S1.md`, коммит `<sha>`); гейты шага прогнаны ревьюером самостоятельно | ЗАКРЫТ |",
+    "| — | S2 | — | — | открыт |"
+  ],
+  "stop": {
+    "kind": "incident",
+    "reason": "нет постановки шага S2: заказана роли prompter (карточка <card>); ожидается docs/prompts/<дата>_1-S2_prompt.md — шаг не начинаю"
+  },
+  "ticks": [
+    {
+      "action": "close_step",
+      "actions": [
+        {
+          "action": "close_step",
+          "applied": true,
+          "detail": "журнал: добавлена строка; коммит/пуш: ok <sha>",
+          "plan": "1",
+          "step": "S1"
+        }
+      ],
+      "applied": true,
+      "decision_reason": "",
+      "detail": "close_step: журнал: добавлена строка; коммит/пуш: ok <sha>",
+      "incident_cleared": false,
+      "plan_id": "1",
+      "reason": "предел действий за тик исчерпан (max_actions=1)"
+    },
+    {
+      "action": "create_step",
+      "actions": [
+        {
+          "action": "create_step",
+          "applied": true,
+          "detail": "нет постановки шага S2: заказана роли prompter (карточка <card>); ожидается docs/prompts/<дата>_1-S2_prompt.md — шаг не начинаю",
+          "plan": "1",
+          "step": "S2"
+        }
+      ],
+      "applied": true,
+      "decision_reason": "",
+      "detail": "create_step: нет постановки шага S2: заказана роли prompter (карточка <card>); ожидается docs/prompts/<дата>_1-S2_prompt.md — шаг не начинаю",
+      "incident_cleared": false,
+      "plan_id": "1",
+      "reason": "предел действий за тик исчерпан (max_actions=1)"
+    }
+  ]
+}

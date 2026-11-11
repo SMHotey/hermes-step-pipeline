@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from helpers import PLAN, PLUGIN, install_project  # noqa: E402
+from helpers import PLUGIN, install_project  # noqa: E402
 import cli  # noqa: E402
 import snapshot  # noqa: E402
 import ui_server  # noqa: E402

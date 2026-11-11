@@ -10,7 +10,6 @@ import hashlib
 import json
 from pathlib import Path
 
-import pytest
 
 import helpers  # noqa: F401  (загружает плагин и алиасы модулей)
 import project as proj
@@ -107,7 +106,7 @@ def report_text(verdict: str, sha: str | None = None, extra: str = "",
     `unreferenced` и свежим не считается. `constitution=False` — только тестам про это
     состояние.
     """
-    text = f"# 1. Ревью плана\n\n## Вердикт шага\n"
+    text = "# 1. Ревью плана\n\n## Вердикт шага\n"
     if constitution:
         text += "\nКонституция: п.1, п.7 — нарушений нет\n"
     text += f"\n## ВЕРДИКТ: {verdict}\n"

@@ -24,6 +24,20 @@ DEFAULTS_FILE = TEMPLATES_SRC / "pipeline.json.example"
 
 MARKER = "pipeline.json"
 
+DEBUG_ENV = "STEP_PIPELINE_DEBUG"
+
+
+def debug_note(where: str, exc: object) -> None:
+    """Сказать в stderr, что исключение поймано и подавлено (только в отладке).
+
+    Тот же флаг, что у движка (`config.debug_note`): плагин не импортирует движок,
+    поэтому предикат продублирован — он в три строки и стережётся тестом.
+    """
+    value = (os.environ.get(DEBUG_ENV) or "").strip().lower()
+    if value in ("", "0", "false", "нет", "no"):
+        return
+    print(f"[{where}] подавлено: {exc}", file=sys.stderr)
+
 
 class ProjectNotFound(RuntimeError):
     """Проект без установленного конвейера."""

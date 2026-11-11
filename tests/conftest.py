@@ -13,7 +13,6 @@ for path in (str(TESTS), str(TESTS.parent)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-import helpers  # noqa: E402  (загружает плагин как пакет и алиасы модулей)
 from helpers import install_project  # noqa: E402
 
 

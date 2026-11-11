@@ -786,8 +786,8 @@ def act_update(state: State, payload: dict) -> dict:
         fresh = update.check()
         with state.update_lock:
             state.update_info = fresh
-    except Exception:                                          # noqa: BLE001
-        pass
+    except Exception as exc:                                   # noqa: BLE001
+        proj.debug_note("update", exc)
     return result
 
 

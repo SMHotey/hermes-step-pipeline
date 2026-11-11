@@ -32,12 +32,20 @@
 
 ```bash
 python -m pytest                        # 600+ тестов: плагин + движок (tests/engine/)
+ruff check .                            # линтер разработки (requirements-dev.txt)
 hermes plugins validate step_pipeline   # манифест, инструменты, security-скан
 ```
 
 Без `-q`: в `pytest.ini` он уже стоит, второй `-q` скрывает итог прогона.
 Ломающее изменение движка или формата `pipeline.json` — минимум минор версии
 в `plugin.yaml` и запись в `CHANGELOG.md`.
+
+**Golden-вердикты** (`tests/engine/golden/`) сравнивают решение стража с эталоном.
+Осознанно изменил поведение — перезапиши эталон и проверь diff глазами:
+
+```bash
+GOLDEN_UPDATE=1 python -m pytest tests/engine/test_golden_verdicts.py
+```
 
 ## Конвенции
 

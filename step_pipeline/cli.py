@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-import webbrowser
 from pathlib import Path
 from typing import Any
 

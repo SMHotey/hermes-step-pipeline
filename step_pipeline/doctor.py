@@ -88,6 +88,20 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
         notes.append(f"версия движка: {engine_ver}")
     elif (project / ".pipeline").is_dir():
         notes.append("у движка нет маркера версии — поставь через setup")
+    # Дрейф копии движка (S3 0.23.0): версия могла совпасть, а содержимое — нет.
+    # Проверяем после версии, чтобы не писать два раза про одно и то же.
+    if (project / ".pipeline" / "gate.py").is_file():
+        broken = setup_flow.engine_marker_problem(project)
+        if broken:
+            problems.append(f"движок: {broken} — hermes pipeline setup --upgrade")
+        elif engine_ver and engine_ver == plugin_ver:
+            drift = setup_flow.engine_drift(project)
+            if drift:
+                shown = ", ".join(drift[:5]) + (f" и ещё {len(drift) - 5}" if len(drift) > 5 else "")
+                problems.append(f"движок: копия расходится с плагином при равной версии "
+                                f"({shown}) — hermes pipeline setup --upgrade")
+            else:
+                notes.append("движок: копия совпадает с плагином")
     if not plans:
         notes.append("! ни одного плана — конвейеру нечего вести")
     db = proj.board_db(project, board or None)

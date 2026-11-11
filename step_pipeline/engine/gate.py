@@ -93,7 +93,6 @@ import analyze  # noqa: E402 - исход идеи, вопросы и ретро
 import approval  # noqa: E402 - утверждение плана и привязка ревью к версии (S6)
 import config as config_mod  # noqa: E402 - модуль рядом
 import registry  # noqa: E402 - реестр планов
-import next_step  # noqa: E402 - сборщик контракта шага
 import plan_cycle  # noqa: E402 - гейт корректировки плана по разведке (план 5, S4)
 import state_io  # noqa: E402 - атомарная запись состояния и блокировка тика
 
@@ -2227,7 +2226,6 @@ def _blocking_findings(path: Path, limit: int = 5) -> list[str]:
 
 def _review_recommendations(path: Path, limit: int = 3) -> list[str]:
     """Раздел «Рекомендации» из отчёта ревью: что владельцу делать, а не что не так."""
-    items = _review_findings(path, 50)
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -3235,7 +3233,8 @@ def tg_status(cfg: config_mod.Config) -> str:
     for spec in plans_of(cfg):
         try:
             p = resolve_paths(cfg, spec.id)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - сводка обязана ответить целиком
+            config_mod.debug_note("commands", exc)
             continue
         stop = load_stop(p)
         if stop:
@@ -3563,7 +3562,6 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
 
 
 def _evidence(p: Paths, verdict: dict) -> str:
-    name = Path(verdict["path"]).name
     commit = f"коммит `{verdict['commit']}`" if verdict.get("commit") else "коммит не указан"
     report = p.cfg.rel(Path(verdict["path"]))
     return (f"ревью `{p.cfg.reviewer}` — APPROVE (`{report}`, {commit}); "

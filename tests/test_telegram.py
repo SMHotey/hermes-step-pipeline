@@ -263,8 +263,6 @@ def test_detect_chat_survives_transient_error(monkeypatch):
 
 
 def test_detect_chat_timeout(monkeypatch, bot):
-    bot_updates = bot
-
     def empty(token):
         return []
 

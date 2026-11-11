@@ -9,7 +9,6 @@ from pathlib import Path
 PLUGIN = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import helpers  # noqa: E402  (загружает плагин как пакет и регистрирует алиасы)
 import setup_flow                                      # noqa: E402
 
 ROLES = PLUGIN / "step_pipeline" / "roles"

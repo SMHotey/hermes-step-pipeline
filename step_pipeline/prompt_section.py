@@ -105,8 +105,8 @@ def _session_cwd() -> Path | None:
         resolved = resolve_context_cwd()
         if resolved:
             return Path(resolved)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - без Hermes живём на TERMINAL_CWD
+        proj.debug_note("prompt_section", exc)
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     return Path(raw) if raw else None
 

@@ -1,0 +1,22 @@
+{
+  "note": "Ревью REQUEST_CHANGES: круг правок, карточка исполнителю с замечаниями",
+  "approved": true,
+  "ticks": 1,
+  "seed_cards": [
+    {
+      "key": "planloop:1:S1:step",
+      "status": "done",
+      "assignee": "demo",
+      "title": "S1. Таблица счетов"
+    },
+    {
+      "key": "planloop:1:S1:review:1",
+      "status": "done",
+      "assignee": "reviewer",
+      "title": "Ревью S1"
+    }
+  ],
+  "untracked": [
+    "docs/reviews/1-S1.md"
+  ]
+}

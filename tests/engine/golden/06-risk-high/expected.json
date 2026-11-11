@@ -1,0 +1,29 @@
+{
+  "cards": [],
+  "journal": [
+    "| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |",
+    "| — | S1 | — | — | открыт |",
+    "| — | S2 | — | — | открыт |"
+  ],
+  "stop": null,
+  "ticks": [
+    {
+      "action": "hold_risk",
+      "actions": [
+        {
+          "action": "hold_risk",
+          "applied": true,
+          "detail": "шаг S1 помечен «Риск: high» — нужен допуск владельца; раздел плана: `docs/plans/1-demo.md` §S1; снять: `python .pipeline/gate.py --unhold S1`",
+          "plan": "1",
+          "step": "S1"
+        }
+      ],
+      "applied": true,
+      "decision_reason": "шаг S1 помечен «Риск: high» — нужен допуск владельца; раздел плана: `docs/plans/1-demo.md` §S1; снять: `python .pipeline/gate.py --unhold S1`",
+      "detail": "hold_risk: шаг S1 помечен «Риск: high» — нужен допуск владельца; раздел плана: `docs/plans/1-demo.md` §S1; снять: `python .pipeline/gate.py --unhold S1`",
+      "incident_cleared": false,
+      "plan_id": "1",
+      "reason": "предел действий за тик исчерпан (max_actions=1)"
+    }
+  ]
+}

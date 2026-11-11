@@ -252,7 +252,8 @@ def git_state(cfg: config_mod.Config) -> dict[str, object]:
     repo = str(cfg.repo)
     branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cfg.repo)
     sha = _run(["git", "log", "-1", "--oneline"], cfg.repo)
-    dirty = [l for l in _run(["git", "status", "--porcelain"], cfg.repo).splitlines() if l.strip()]
+    dirty = [line for line in _run(["git", "status", "--porcelain"], cfg.repo).splitlines()
+             if line.strip()]
     return {"branch": branch or "?", "head": sha or "?", "dirty_count": len(dirty),
             "dirty": dirty[:10], "repo": repo}
 

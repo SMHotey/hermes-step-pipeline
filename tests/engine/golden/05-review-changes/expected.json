@@ -1,0 +1,51 @@
+{
+  "cards": [
+    {
+      "assignee": "demo",
+      "key": "planloop:1:S1:fix:1",
+      "max_runtime": "3h",
+      "status": "ready",
+      "title": "[правки 1 S1 #1] Таблица счетов"
+    },
+    {
+      "assignee": "reviewer",
+      "key": "planloop:1:S1:review:1",
+      "max_runtime": "",
+      "status": "done",
+      "title": "Ревью S1"
+    },
+    {
+      "assignee": "demo",
+      "key": "planloop:1:S1:step",
+      "max_runtime": "",
+      "status": "done",
+      "title": "S1. Таблица счетов"
+    }
+  ],
+  "journal": [
+    "| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |",
+    "| — | S1 | — | — | открыт |",
+    "| — | S2 | — | — | открыт |"
+  ],
+  "stop": null,
+  "ticks": [
+    {
+      "action": "create_fix",
+      "actions": [
+        {
+          "action": "create_fix",
+          "applied": true,
+          "detail": "карточка правок: <card>",
+          "plan": "1",
+          "step": "S1"
+        }
+      ],
+      "applied": true,
+      "decision_reason": "",
+      "detail": "create_fix: карточка правок: <card>",
+      "incident_cleared": false,
+      "plan_id": "1",
+      "reason": "предел действий за тик исчерпан (max_actions=1)"
+    }
+  ]
+}

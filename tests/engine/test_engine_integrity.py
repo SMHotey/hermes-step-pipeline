@@ -92,3 +92,31 @@ class TestSetupFlowAgreesWithGate:
         assert (project / ".pipeline" / gate.ENGINE_MARKER).is_file()
         assert gate.engine_digest(project / ".pipeline") == digest
         assert gate.verify_engine_integrity(project / ".pipeline")[0] is True
+
+    def test_two_digest_implementations_agree_on_repo_engine(self):
+        """Дубль digest'а (`gate` и `setup_flow`) — не расходится ни на байт.
+
+        Реализации оставлены раздельными намеренно: плагин не импортирует движок
+        (решение docs/CONTEXT.md:49). Согласие стережёт этот тест, а не общий модуль.
+        """
+        from step_pipeline.setup_flow import engine_digest as setup_digest
+
+        assert setup_digest(ENGINE) == gate.engine_digest(ENGINE)
+
+    def test_two_digest_implementations_agree_on_empty_dir(self, tmp_path):
+        from step_pipeline.setup_flow import engine_digest as setup_digest
+
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert setup_digest(empty) == gate.engine_digest(empty)
+
+    def test_vendored_file_list_matches_engine_dir(self):
+        """Список копируемых файлов не должен отставать от каталога движка.
+
+        Иначе новый модуль движка не доедет до проекта: `gate.py` на него сошлётся,
+        а в `.pipeline/` его не будет — ImportError в cron.
+        """
+        from step_pipeline.setup_flow import ENGINE_FILES as setup_files
+
+        present = {path.name for path in Path(ENGINE).glob("*.py") if path.name != "__init__.py"}
+        assert set(setup_files) - {"__init__.py"} == present

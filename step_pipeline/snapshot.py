@@ -285,7 +285,6 @@ def telegram_state(project: Path) -> dict:
     окружения процесса панели (`proj.profile_env`). Иначе панель показывала «токена нет»
     при живом токене в файле — тик при этом уже отправлял (0.20.1).
     """
-    import os
     cfg = proj.read_config(project)
     notify = cfg.get("notify") or {}
     token_env = notify.get("token_env") or "STEP_PIPELINE_TELEGRAM_BOT_TOKEN"

@@ -12,7 +12,8 @@
     PIPELINE_BOARD       — борда канбана;
     PIPELINE_STATE_DIR   — каталог состояния/стоп-флагов;
     PIPELINE_PLANS       — список ведомых планов через запятую (`*` — все);
-    PIPELINE_KANBAN_DB   — путь к базе борды (для проверок без гейтвея).
+    PIPELINE_KANBAN_DB   — путь к базе борды (для проверок без гейтвея);
+    STEP_PIPELINE_DEBUG  — `1` включает вывод подавленных исключений в stderr.
 """
 from __future__ import annotations
 
@@ -263,6 +264,27 @@ def setup_stdio() -> None:
             reconf(encoding="utf-8", errors="replace")
         except (ValueError, OSError):
             pass
+
+
+DEBUG_ENV = "STEP_PIPELINE_DEBUG"
+
+
+def debug_enabled() -> bool:
+    """Отладочный вывод включён: `STEP_PIPELINE_DEBUG=1`.
+
+    Зачем отдельная ручка: часть `except` в движке глотает исключение намеренно
+    (необязательный шаг не должен ронять тик), но молчать о нём совсем нельзя —
+    иначе «почему не сработало» не выяснить. По умолчанию вывод молчит: stdout
+    движка читают cron-лог и панель, лишняя строка там — шум.
+    """
+    value = (os.environ.get(DEBUG_ENV) or "").strip().lower()
+    return value not in ("", "0", "false", "нет", "no")
+
+
+def debug_note(where: str, exc: object) -> None:
+    """Сказать в stderr, что исключение поймано и подавлено (только в отладке)."""
+    if debug_enabled():
+        print(f"[{where}] подавлено: {exc}", file=sys.stderr)
 
 
 def _kanban_db(board: str) -> Path:

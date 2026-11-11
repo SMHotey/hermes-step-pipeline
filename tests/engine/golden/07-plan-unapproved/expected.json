@@ -1,0 +1,21 @@
+{
+  "cards": [],
+  "journal": [
+    "| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |",
+    "| — | S1 | — | — | открыт |",
+    "| — | S2 | — | — | открыт |"
+  ],
+  "stop": null,
+  "ticks": [
+    {
+      "action": "idle",
+      "actions": [],
+      "applied": false,
+      "decision_reason": "во всех планах нет работы",
+      "detail": "",
+      "incident_cleared": false,
+      "plan_id": null,
+      "reason": "во всех планах нет работы"
+    }
+  ]
+}

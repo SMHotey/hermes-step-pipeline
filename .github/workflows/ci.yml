@@ -50,7 +50,7 @@ jobs:
       - name: Отчёт покрытия (порог fail_under — из .coveragerc)
         run: python -m coverage report -m
       - name: Гейт покрытия gate.py
-        run: python -m coverage report --include="**/step_pipeline/engine/gate.py" --fail-under=55
+        run: python -m coverage report --include="**/step_pipeline/engine/gate.py" --fail-under=78
 
   # Полная матрица: PR, теги и ручной запуск.
   tests-matrix:
@@ -80,7 +80,7 @@ jobs:
       - name: Отчёт покрытия (порог fail_under — из .coveragerc)
         run: python -m coverage report -m
       - name: Гейт покрытия gate.py
-        run: python -m coverage report --include="**/step_pipeline/engine/gate.py" --fail-under=55
+        run: python -m coverage report --include="**/step_pipeline/engine/gate.py" --fail-under=78
       # Манифест проверяется один раз, на ubuntu/3.11 — здесь же, чтобы не платить за третий джоб.
       - name: Копия hermes-agent (тег v2026.9.24)
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'

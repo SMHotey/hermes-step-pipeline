@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import getpass
 import json
-import hashlib
 import os
 import re
 import shutil
@@ -303,6 +302,51 @@ def engine_version(project: Path) -> str:
         return ""
 
 
+def engine_marker_problem(project: Path) -> str:
+    """Почему копия движка в проекте не сходится со своим маркером ('' — сходится).
+
+    Семантика та же, что у `gate.verify_engine_integrity`: маркера нет — легаси-установка,
+    это не поломка (тик на ней работает); маркер есть и не сходится — поломка, при которой
+    тик отказывается работать (код 3), поэтому в отчёте это проблема, а не заметка.
+    """
+    base = Path(project) / ".pipeline"
+    marker = base / ENGINE_MARKER
+    if not marker.is_file():
+        return ""
+    try:
+        text = marker.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return f"маркер целостности не читается: {exc}"
+    expected = text.split()[0].removeprefix("sha256:") if text else ""
+    if not expected:
+        return "маркер целостности пуст"
+    actual = engine_digest(base)
+    if actual != expected:
+        return f"движок изменён после установки: {actual[:12]} != {expected[:12]}"
+    return ""
+
+
+def engine_drift(project: Path) -> list[str]:
+    """Файлы, которыми копия движка в проекте расходится с движком плагина.
+
+    Нужен doctor'у: прецедент 02.11.2026 — копия и плагин с одинаковым VERSION несли
+    разную логику. Сверка по байтам ловит это без запуска тика, ещё до стопа стража.
+    """
+    base = Path(project) / ".pipeline"
+    if not base.is_dir():
+        return []
+    names = {path.name for path in base.glob("*.py")} | set(ENGINE_FILES)
+    drift = []
+    for name in sorted(names):
+        mine = proj.ENGINE_SRC / name
+        theirs = base / name
+        if not mine.is_file() or not theirs.is_file():
+            drift.append(name)          # файл есть только с одной стороны
+        elif mine.read_bytes() != theirs.read_bytes():
+            drift.append(name)
+    return drift
+
+
 def hermes_home() -> Path:
     """Корень Hermes: HERMES_HOME, иначе LOCALAPPDATA/hermes, иначе ~/.hermes."""
     env = os.environ.get("HERMES_HOME")
@@ -464,7 +508,7 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
     quarantine_stale_plugins(log)
     cfg = proj.read_config(project)
     driver = roles_from_config(cfg)[0]
-    plugin_state = ensure_plugin_enabled(driver, log)
+    plugin_state = ensure_plugin_enabled(driver, log)  # noqa: F841 - важен сам вызов, а не итог
     # Разведка — четвёртая роль: движок берёт `profiles.scout`, а без ключа — профиль
     # `scout`. Заводим его, если нет (настройки существующего не переписываем), иначе
     # `create_scout` уходит в несуществующий профиль и разведка молча не идёт.
@@ -1246,8 +1290,8 @@ def wait_smoke_card(project, key: str, timeout: float = SMOKE_TIMEOUT,
 
 def smoke_cause(state: dict) -> str:
     """Первая непустая причина провала из полей карточки (без `worker_output`)."""
-    for field in ("error", "result", "event"):
-        value = str(state.get(field) or "").strip()
+    for key in ("error", "result", "event"):
+        value = str(state.get(key) or "").strip()
         if value:
             return value[:300]
     return ""
@@ -1433,7 +1477,7 @@ def run_setup(args) -> int:
     prompter = getattr(args, "prompter", "") or profiles.get("prompter") or "prompter"
     reviewer = getattr(args, "reviewer", "") or profiles.get("reviewer") or "reviewer"
     scout = getattr(args, "scout", "") or profiles.get("scout") or SCOUT_ROLE_DEFAULT
-    log.step(f"── Проект ──")
+    log.step("── Проект ──")
     log.ok(f"борда {board}, роли: {driver} (исполнитель), {prompter}, {reviewer}, "
            f"разведка {scout}")
 
@@ -1514,8 +1558,8 @@ def run_setup(args) -> int:
                  f"конвейер не заработает, пока не починено")
     log.step(f"  статус:  hermes pipeline status --project \"{project}\"")
     log.step(f"  UI:      hermes pipeline ui --project \"{project}\"")
-    log.step(f"  план:    скопировать templates/plan-template.md → docs/plans/1-<слаг>.md")
-    log.step(f"  тик:     python .pipeline/gate.py --status   (в каталоге проекта)")
+    log.step("  план:    скопировать templates/plan-template.md → docs/plans/1-<слаг>.md")
+    log.step("  тик:     python .pipeline/gate.py --status   (в каталоге проекта)")
     if smoke is not None and smoke[0] < smoke[1]:
         return 3
     return 0

@@ -1,0 +1,44 @@
+{
+  "cards": [
+    {
+      "assignee": "reviewer",
+      "key": "planloop:1:S1:review:1",
+      "max_runtime": "150m",
+      "status": "ready",
+      "title": "[ревью 1 S1 #1] Таблица счетов"
+    },
+    {
+      "assignee": "demo",
+      "key": "planloop:1:S1:step",
+      "max_runtime": "",
+      "status": "done",
+      "title": "S1. Таблица счетов"
+    }
+  ],
+  "journal": [
+    "| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |",
+    "| — | S1 | — | — | открыт |",
+    "| — | S2 | — | — | открыт |"
+  ],
+  "stop": null,
+  "ticks": [
+    {
+      "action": "create_review",
+      "actions": [
+        {
+          "action": "create_review",
+          "applied": true,
+          "detail": "карточка ревью: <card>",
+          "plan": "1",
+          "step": "S1"
+        }
+      ],
+      "applied": true,
+      "decision_reason": "",
+      "detail": "create_review: карточка ревью: <card>",
+      "incident_cleared": false,
+      "plan_id": "1",
+      "reason": "предел действий за тик исчерпан (max_actions=1)"
+    }
+  ]
+}

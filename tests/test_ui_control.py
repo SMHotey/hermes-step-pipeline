@@ -10,7 +10,6 @@ from pathlib import Path
 
 import helpers  # noqa: F401  (загружает плагин и алиасы)
 import project as proj
-import pytest
 import ui_control
 
 
