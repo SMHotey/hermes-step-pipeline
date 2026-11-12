@@ -287,6 +287,36 @@ def test_second_accept_keeps_first_approval_date(project: Path, capsys, monkeypa
     assert record["approved_at"] == "2026-01-01T00:00:00"
 
 
+def test_accept_rewrites_record_inherited_by_gate(project: Path, capsys, monkeypatch):
+    """--accept перебивает запись, унаследованную стражем, и начинает бюджет заново.
+
+    `gate.inherit_approval` подтверждает новое содержимое плана молча, без решения
+    владельца, и сохраняет прежнюю метку `review_reset_at`. Явный `--accept` по такой
+    записи отвечал «уже утверждён», метка не обновлялась, и при исчерпанном лимите кругов
+    ревью владелец не мог разблокировать план вообще.
+    """
+    monkeypatch.setattr(plan_accept, "now_iso", lambda: "2026-01-01T00:00:00")
+    _draft(project, "5-demo.md", helpers.PLAN)
+    assert _cmd(project, accept="5") == 0
+    capsys.readouterr()
+
+    path = plan_accept.approval_file(project, "5")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record.update({"inherited": True, "review_reset_at": 1, "profile": "default"})
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    monkeypatch.setattr(plan_accept, "now_iso", lambda: "2026-02-02T00:00:00")
+    monkeypatch.setattr(plan_accept.time, "time", lambda: 1794489999)
+    assert _cmd(project, accept="5") == 0
+    captured = capsys.readouterr()
+    assert "переутверждён владельцем" in captured.out
+
+    again = json.loads(path.read_text(encoding="utf-8"))
+    assert again["approved_at"] == "2026-02-02T00:00:00"
+    assert again["review_reset_at"] == 1794489999
+    assert "inherited" not in again
+
+
 def test_list_drafts_marks_approved_draft(project: Path, monkeypatch):
     """Черновик утверждённого плана виден панели как «утверждён», а не вечный «черновик».
 

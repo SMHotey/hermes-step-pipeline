@@ -275,7 +275,24 @@ def _approved(number: str, path: Path, project: Path, record: dict | None = None
 
 
 def _unchanged(number: str, record: dict, path: Path, project: Path) -> dict:
-    """Утверждение уже есть и совпадает: ничего не перезаписываем (дата первого важна)."""
+    """Утверждение уже есть и совпадает: ничего не перезаписываем (дата первого важна).
+
+    Исключение — запись, которую написал страж наследованием (`gate.inherit_approval`,
+    поле `inherited`): она подтверждает содержимое файла молча, без решения владельца, и
+    сохраняет прежнюю метку `review_reset_at`. Явный `--accept` по такой записи раньше
+    отвечал «уже утверждён», бюджет кругов ревью не начинался заново, и при исчерпанном
+    лимите владелец не мог разблокировать план ничем: переутверждение было пустышкой.
+    Поэтому явное решение владельца перебивает наследование и пишет запись заново.
+    """
+    if record.get("inherited"):
+        payload = _write_approval(project, number, path)
+        return {"ok": True, "code": 0, "plan": number, "status": "reapproved",
+                "file": _shown(path, project),
+                "approval_file": str(approval_file(project, number)),
+                "sha256": payload.get("sha256") or "",
+                "approved_at": payload.get("approved_at") or "", "errors": [],
+                "message": f"План {number} переутверждён владельцем: бюджет кругов "
+                           f"ревью начат заново"}
     return {"ok": True, "code": 0, "plan": number, "status": "unchanged",
             "file": _shown(path, project),
             "approval_file": str(approval_file(project, number)),
