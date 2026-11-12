@@ -503,6 +503,8 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
         log.ok(f"добавлена роль {item}")
     for item in roles.refreshed:
         log.ok(f"обновлена роль {item} (прежняя версия: {roles.backups[item]})")
+    for item, files in roles.kept.items():
+        log.ok(f"роль {item}: сохранены файлы проекта — {', '.join(files)}")
     if not changed and not roles.added and not roles.refreshed:
         log.ok(f"движок и роли уже актуальны ({now})")
     quarantine_stale_plugins(log)
@@ -544,6 +546,7 @@ class RolesSync:
     added: list[str] = field(default_factory=list)
     refreshed: list[str] = field(default_factory=list)
     backups: dict[str, str] = field(default_factory=dict)
+    kept: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _role_files(root: Path) -> dict[str, bytes]:
@@ -565,6 +568,12 @@ def copy_roles(project: Path, *, refresh: bool = False) -> RolesSync:
     правка проекта не пропадает молча. Причина: улучшения ролей живут в
     `step_pipeline/roles/`, `.hermes/` в проекте — вендоренная копия; до 0.6.0 она
     не обновлялась никогда, и правки роли не доезжали до уже поставленных проектов.
+
+    Вендоринг касается только файлов, которые плагин поставляет: свои файлы внутри
+    роли (шаблоны промтов, фрагменты `AGENTS.md`) проект дописывает сам, ссылки на них
+    стоят в `SKILL.md` роли — такие файлы обновление оставляет на месте (0.25.1).
+    До этого `rmtree` сносил их, и шаблон приходилось восстанавливать из бэкапа руками
+    (так было на 0.13.0 и повторилось на 0.25.0).
     """
     result = RolesSync()
     for name, category in SKILL_CATEGORIES.items():
@@ -578,15 +587,27 @@ def copy_roles(project: Path, *, refresh: bool = False) -> RolesSync:
             shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__"))
             result.added.append(rel)
             continue
-        if not refresh or _role_files(dest) == _role_files(src):
+        if not refresh:
             continue
+        wanted, have = _role_files(src), _role_files(dest)
+        # Сравниваем только поставленные плагином файлы: дописанное проектом не повод
+        # переписывать роль и плодить бэкап на каждом `--upgrade`.
+        if all(have.get(path) == data for path, data in wanted.items()):
+            continue
+        local_only = sorted(set(have) - set(wanted))
         backup = project / ROLES_BACKUP / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}"
         backup.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(dest, backup, ignore=shutil.ignore_patterns("__pycache__"))
         shutil.rmtree(dest)
         shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__"))
+        for extra in local_only:
+            target = dest / extra
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup / extra, target)
         result.refreshed.append(rel)
         result.backups[rel] = backup.relative_to(project).as_posix()
+        if local_only:
+            result.kept[rel] = local_only
     return result
 
 
@@ -1491,6 +1512,8 @@ def run_setup(args) -> int:
         log.ok(f"добавлена роль {item}")
     for item in roles_sync.refreshed:
         log.ok(f"обновлена роль {item} (прежняя версия: {roles_sync.backups[item]})")
+    for item, files in roles_sync.kept.items():
+        log.ok(f"роль {item}: сохранены файлы проекта — {', '.join(files)}")
     for item in ensure_dirs(project):
         log.ok(f"{item}")
     log.ok(".gitignore: " + ("дополнен" if ensure_gitignore(project) else "уже содержит записи"))

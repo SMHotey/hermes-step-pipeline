@@ -266,7 +266,7 @@ def test_engine_copy_updates_changed_file(tmp_path: Path, fake_hermes):
 
 
 def test_upgrade_refreshes_changed_role_and_keeps_backup(tmp_path: Path, fake_hermes,
-                                                         monkeypatch):
+                                                         monkeypatch, capsys):
     """Правка `step_pipeline/roles/` доезжает до поставленного проекта, старая не пропадает."""
     monkeypatch.setattr(setup_flow, "ensure_plugin_enabled", lambda profile, log: "пропущено")
     target = tmp_path / "shop"
@@ -276,15 +276,65 @@ def test_upgrade_refreshes_changed_role_and_keeps_backup(tmp_path: Path, fake_he
     role = role_dir / "SKILL.md"
     role.write_text("старая версия роли\n", encoding="utf-8")
     (role_dir / "лишний.md").write_text("файл, которого нет в плагине\n", encoding="utf-8")
+    capsys.readouterr()
 
     assert setup_flow.run_setup(args(project=str(target), upgrade=True)) == 0
+    out = capsys.readouterr().out
 
     plugin_role = proj.ROLES_SRC / "pipeline-reviewer" / "SKILL.md"
     assert role.read_text(encoding="utf-8") == plugin_role.read_text(encoding="utf-8")
-    assert not (role_dir / "лишний.md").exists(), "роль — вендоренная копия: лишнее уходит"
+    # Файл, который проект дописал в роль сам, обновление не сносит: на него ссылается
+    # SKILL.md роли (шаблоны промтов), и плагин его не поставляет.
+    assert (role_dir / "лишний.md").read_text(encoding="utf-8") == "файл, которого нет в плагине\n"
+    assert "сохранены файлы проекта — лишний.md" in out
     backups = list((target / ".pipeline" / "roles-backup").glob("pipeline-reviewer-*"))
     assert len(backups) == 1
     assert (backups[0] / "SKILL.md").read_text(encoding="utf-8") == "старая версия роли\n"
+
+
+def test_upgrade_does_not_touch_role_when_only_project_files_differ(tmp_path: Path,
+                                                                    fake_hermes,
+                                                                    monkeypatch, capsys):
+    """Свои файлы в роли не повод переписывать поставленное и плодить бэкап."""
+    monkeypatch.setattr(setup_flow, "ensure_plugin_enabled", lambda profile, log: "пропущено")
+    target = tmp_path / "shop"
+    target.mkdir()
+    setup_flow.run_setup(args(project=str(target), board="shop"))
+    role_dir = target / ".hermes" / "skills" / "software-development" / "pipeline-reviewer"
+    template = role_dir / "templates" / "task-prompt.md"
+    template.parent.mkdir(parents=True)
+    template.write_text("шаблон проекта\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert setup_flow.run_setup(args(project=str(target), upgrade=True)) == 0
+    out = capsys.readouterr().out
+
+    assert template.read_text(encoding="utf-8") == "шаблон проекта\n"
+    assert "обновлена роль" not in out
+    assert "движок и роли уже актуальны" in out
+    assert not (target / ".pipeline" / "roles-backup").exists()
+
+
+def test_role_refresh_keeps_nested_project_files(tmp_path: Path, fake_hermes, monkeypatch):
+    """Вложенные подкаталоги проекта внутри роли тоже переживают обновление."""
+    monkeypatch.setattr(setup_flow, "ensure_plugin_enabled", lambda profile, log: "пропущено")
+    target = tmp_path / "shop"
+    target.mkdir()
+    setup_flow.run_setup(args(project=str(target), board="shop"))
+    role_dir = target / ".hermes" / "skills" / "software-development" / "pipeline-reviewer"
+    (role_dir / "SKILL.md").write_text("устаревшая версия\n", encoding="utf-8")
+    nested = role_dir / "templates" / "nested" / "AGENTS-pipeline-fragment.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("фрагмент проекта\n", encoding="utf-8")
+
+    sync = setup_flow.copy_roles(target, refresh=True)
+
+    rel = ".hermes/skills/software-development/pipeline-reviewer"
+    assert rel in sync.refreshed
+    assert sync.kept[rel] == ["templates/nested/AGENTS-pipeline-fragment.md"]
+    assert nested.read_text(encoding="utf-8") == "фрагмент проекта\n"
+    assert (role_dir / "SKILL.md").read_text(encoding="utf-8") == (
+        proj.ROLES_SRC / "pipeline-reviewer" / "SKILL.md").read_text(encoding="utf-8")
 
 
 def test_upgrade_leaves_fresh_roles_alone(tmp_path: Path, fake_hermes, monkeypatch, capsys):
