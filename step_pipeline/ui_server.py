@@ -22,6 +22,7 @@
                            заголовок X-Pipeline-Panel; токен уходит в .env профиля
                            и обратно в браузер не возвращается
     POST /api/action       действия: tick, stop, resume, hold, unhold,
+                           pause_all, resume_all, autostart,
                            preview_config, save_config, revert_config,
                            save_telegram, test_telegram
     POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
@@ -57,7 +58,9 @@ from urllib.parse import unquote
 import urllib.request
 
 try:
+    from . import autostart
     from . import doctor
+    from . import panel_pause
     from . import plan_accept
     from . import plan_lint
     from . import plan_mode
@@ -65,7 +68,9 @@ try:
     from . import setup_flow, snapshot as snap, telegram
     from . import update
 except ImportError:  # pragma: no cover
+    import autostart  # type: ignore
     import doctor  # type: ignore
+    import panel_pause  # type: ignore
     import plan_accept  # type: ignore
     import plan_lint  # type: ignore
     import plan_mode  # type: ignore
@@ -136,6 +141,8 @@ EVENTS_MAX_SECONDS = 25
 # то, что всплывает в браузере и зеркалится в уже настроенный канал.
 NOTIFY_GAP = 30            # секунд: не чаще одного уведомления на проект
 NOTIFY_LIMIT = 50          # потолок событий в ответе и строк истории доставок
+PAUSE_WATCH = 10           # секунд: сверка глобальной паузы (стоп-флаги и карточки)
+PAUSE_NOTICE = "⏸ Все проекты на паузе"
 DELIVERY_FILE = "notify_deliveries.jsonl"   # файл истории доставок в state_dir проекта
 NOTIFY_DEFAULT_HOURS = 3   # порог простоя, как WATCHDOG_DEFAULT_HOURS движка
 NOTIFY_LABELS = {"step_started": "шаг в работе", "step_closed": "шаг закрыт (APPROVE)",
@@ -221,6 +228,17 @@ class State:
         # не ждёт — сеть не должна тормозить панель).
         self.update_info: dict[str, Any] = {}
         self.update_lock = threading.Lock()
+        # Глобальная пауза панели: состояние кнопки считает фоновый сторож, снимок его
+        # только читает — иначе каждый кадр запускал бы `gate.py --plans` по всем проектам.
+        self.pause: dict[str, Any] = {}
+        self.pause_lock = threading.Lock()
+        # Жест паузы идёт в фоне: движок может ждать блокировку тика, пока идёт шаг.
+        self.pause_task: threading.Thread | None = None
+        self.pause_pending = False
+        # Автозагрузка: статус спрашивается у системы один раз и после переключения.
+        self.autostart: dict[str, Any] = {}
+        # Порт, который слушает панель: автозагрузке нужно записать именно его.
+        self.port: int = 0
 
     def note(self, text: str) -> None:
         with self.lock:
@@ -274,6 +292,106 @@ def act_unhold(state: State, payload: dict) -> dict:
     plan = str(payload.get("plan") or "").strip()
     extra = ["--plan", plan] if plan else []
     return _run_engine(state, "--unhold", step, *extra)
+
+
+# ── глобальная пауза и автозагрузка: жесты на всю панель, а не на проект ──
+# Эти действия не адресуются одному проекту: пауза обходит реестр, автозагрузка — про
+# саму панель. Поэтому `do_POST` кладёт им реестр в тело и не требует `.pipeline`
+# в проекте сервера.
+
+PANEL_WIDE_ACTIONS = ("pause_all", "resume_all", "autostart")
+
+
+def _panel_rows(state: State, payload: dict) -> list[dict]:
+    """Строки реестра для жеста на всю панель.
+
+    Реестр кладёт `do_POST`; без него (прямой вызов обработчика) жест применяется к
+    одному проекту состояния — это единственный проект, о котором обработчик знает.
+    """
+    rows = payload.get("_registry")
+    if isinstance(rows, list) and rows:
+        return [row for row in rows if isinstance(row, dict)]
+    return [{"id": state.id, "name": state.name, "root": str(state.project)}]
+
+
+def _pause_note(state: State, result: dict) -> None:
+    """Журнал панели: что остановлено и что не получилось — построчно."""
+    if result.get("text"):
+        state.note(str(result["text"]))
+    for item in result.get("failed") or []:
+        if isinstance(item, dict):
+            state.note(f"пауза: {item.get('name') or item.get('project')} "
+                       f"план {item.get('plan') or '—'}: {item.get('error')}")
+
+
+def _start_gesture(state: State, payload: dict, action: str) -> dict:
+    """Запустить жест паузы в фоне: движок может ждать блокировку тика до получаса.
+
+    `gate.py --stop` берёт блокировку тика, а её держит идущий шаг, поэтому синхронный
+    HTTP-ответ висел бы ровно тогда, когда стоп нужен сильнее всего. Кнопка получает
+    ответ сразу, состояние и журнал обновляет воркер, подпись берёт из снимка
+    (`pause.working`). Второй жест во время работы отклоняется: два потока дрались бы
+    за ту же блокировку движка.
+    """
+    with state.pause_lock:
+        if state.pause_pending:
+            return {"ok": False, "busy": True,
+                    "text": "жест паузы уже выполняется — дождись его конца"}
+        state.pause_pending = True
+    rows = _panel_rows(state, payload)
+    worker_fn = panel_pause.pause_all if action == "pause_all" else panel_pause.resume_all
+
+    def worker() -> None:
+        try:
+            result = worker_fn(rows, state.board)
+            _pause_note(state, result)
+            fresh = result.get("state")
+            if fresh:
+                with state.pause_lock:
+                    state.pause = fresh
+        except Exception as exc:                        # noqa: BLE001
+            proj.debug_note("pause", exc)
+            state.note(f"пауза: {type(exc).__name__}: {exc}")
+        finally:
+            with state.pause_lock:
+                state.pause_pending = False
+
+    thread = threading.Thread(target=worker, daemon=True, name=f"pipeline-{action}")
+    with state.pause_lock:
+        state.pause_task = thread
+    thread.start()
+    text = ("остановка после шага запрошена: ждём движок" if action == "pause_all"
+            else "снятие паузы запрошено: ждём движок")
+    return {"ok": True, "started": True, "text": text}
+
+
+def act_pause_all(state: State, payload: dict) -> dict:
+    """«Остановить после шага»: owner-стоп-флаг всем открытым планам реестра."""
+    return _start_gesture(state, payload, "pause_all")
+
+
+def act_resume_all(state: State, payload: dict) -> dict:
+    """«Запустить всё»: снять стоп-флаги, которые поставила пауза."""
+    return _start_gesture(state, payload, "resume_all")
+
+
+def act_autostart(state: State, payload: dict) -> dict:
+    """Автозагрузка панели: включить или выключить по чекбоксу в настройках."""
+    raw = payload.get("on")
+    if not isinstance(raw, bool):
+        return {"ok": False, "error": "нужно поле on: true|false"}
+    project = state.project
+    if raw:
+        result = autostart.enable(project, state.port)
+    else:
+        result = autostart.disable()
+    fresh = result.get("status") or autostart.status(project)
+    state.autostart = fresh
+    state.note(("автозагрузка включена: " if raw else "автозагрузка выключена: ")
+               + str(fresh.get("mechanism") or fresh.get("path") or ""))
+    result["autostart"] = fresh
+    # Плагин ставится один на профиль: панели других проектов тоже надо перечитать статус.
+    return result
 
 
 def _backup_path(root: Path) -> Path:
@@ -797,6 +915,9 @@ ACTIONS = {
     "resume": act_resume,
     "hold": act_hold,
     "unhold": act_unhold,
+    "pause_all": act_pause_all,
+    "resume_all": act_resume_all,
+    "autostart": act_autostart,
     "preview_config": act_preview_config,
     "save_config": act_save_config,
     "revert_config": act_revert_config,
@@ -1280,6 +1401,136 @@ def notify_deliver(state: State, feed: dict | None) -> list[dict]:
     return delivered
 
 
+# ── пуш «Все проекты на паузе»: один жест — одно сообщение (0.25.0) ──
+
+def pause_text(info: dict) -> str:
+    """Текст пуша: что именно стоит на паузе."""
+    names = [str(item.get("name") or item.get("id") or "")
+             for item in info.get("projects") or []
+             if item.get("installed") and item.get("open")]
+    names = [name for name in names if name]
+    return f"{PAUSE_NOTICE}: {', '.join(names)}" if names else PAUSE_NOTICE
+
+
+def pause_channels(rows: list[dict]) -> list[dict]:
+    """Куда уходит пуш: по одному адресу на (токен, чат), а не на проект.
+
+    Пауза — жест на всю панель, и один и тот же бот с одним чатом получил бы столько
+    сообщений, сколько проектов в реестре. Адрес берётся у первого проекта, где
+    уведомления включены и канал готов; настройки у каждого проекта свои.
+    """
+    settings = proj.read_notify()
+    if not settings.get("global"):
+        return []
+    enabled = settings.get("projects") or {}
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        wanted = enabled.get(str(row.get("id"))) or {}
+        if not wanted.get("enabled"):
+            continue
+        root = Path(row["root"])
+        channel = snap.telegram_state(root)
+        env = _project_env(root)
+        token = env.get(str(channel.get("token_env") or ""), "")
+        chat = str(channel.get("chat") or "")
+        if not (channel.get("enabled") and token and chat):
+            continue
+        pair = (token, chat)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append({"project": str(row.get("id")), "root": root, "token": token,
+                    "chat": chat, "prefix": str(channel.get("prefix") or ""), "env": env})
+    return out
+
+
+def deliver_pause(state: State, info: dict, rows: list[dict]) -> list[dict]:
+    """Пуш «Все проекты на паузе» — один раз на жест паузы.
+
+    Отметка доставки лежит в маркере (`notified_at`), а не в памяти процесса: перезапуск
+    панели не повторяет то же сообщение. Нет ни одного готового канала — жест всё равно
+    помечается доставленным (иначе сторож пытался бы вечно), а причина уходит в журнал.
+    """
+    marker = proj.read_pause()
+    if not marker.get("active") or marker.get("notified_at") or not info.get("all_paused"):
+        return []
+    now = time.time()
+    text = pause_text(info)
+    channels = pause_channels(rows)
+    if not channels:
+        state.note("«все проекты на паузе»: пуш не отправлен — канал Telegram не настроен")
+    delivered: list[dict] = []
+    for channel in channels:
+        message = f"{channel['prefix']}{text}"
+        try:
+            telegram.send_message(channel["token"], channel["chat"], message,
+                                  env=channel["env"])
+        except telegram.TelegramError as exc:
+            state.note(f"«все проекты на паузе» не отправлено ({channel['project']}): {exc}")
+            continue
+        row = {"ts": now, "at": snap._fmt_ts(now, with_seconds=True),
+               "project": channel["project"], "plan": "", "step": "",
+               "kind": "all_paused", "text": message, "channel": "telegram"}
+        _append_deliveries(channel["root"], [row])
+        delivered.append(row)
+    fields: dict[str, Any] = {"notified_at": now}
+    if not float(marker.get("completed_at") or 0):
+        fields["completed_at"] = now
+    panel_pause.mark(**fields)
+    return delivered
+
+
+def pause_rows(server) -> list[dict]:
+    """Реестр сервера в короткой форме: жест и его сторож обходят проекты, а не файлы."""
+    return [{"id": row["id"], "name": row["name"], "root": str(row["root"])}
+            for row in getattr(server.RequestHandlerClass, "registry", []) or []]
+
+
+def prime_pause_state(server, state=None) -> None:
+    """Посчитать паузу один раз до старта сервера: первый кадр не ждёт сторожа.
+
+    Вызывается из `serve`, а не из `make_server`: в тестах снимок остаётся без
+    запусков движка (бюджет `gate.py`), а рабочая панель показывает верную подпись
+    кнопки сразу после перезапуска. Ошибку не поднимаем — сторож повторит.
+    """
+    state = state or getattr(server, "state")
+    try:
+        info = panel_pause.state(pause_rows(server), getattr(state, "board", None))
+    except Exception as exc:                                # noqa: BLE001
+        proj.debug_note("pause", exc)
+        return
+    with state.pause_lock:
+        state.pause = info
+
+
+def watch_pause(server, interval: float = PAUSE_WATCH) -> threading.Thread:
+    """Фоновый сторож глобальной паузы: подпись кнопки и пуш о полной остановке.
+
+    Отдельный поток: снимок не ждёт запуска движка по соседним проектам, а уведомление
+    уходит в тот момент, когда закрылась последняя карточка в работе. Отметки времени
+    ставит он, а не экран: экран может быть закрыт.
+    """
+    state = getattr(server, "state")
+
+    def worker() -> None:
+        while True:
+            try:
+                rows = pause_rows(server)
+                info = panel_pause.state(rows, getattr(state, "board", None))
+                with state.pause_lock:
+                    state.pause = info
+                if info.get("all_paused"):
+                    deliver_pause(state, info, rows)
+            except Exception as exc:                        # noqa: BLE001
+                proj.debug_note("pause", exc)
+            time.sleep(interval)
+
+    thread = threading.Thread(target=worker, daemon=True, name="pipeline-pause")
+    thread.start()
+    return thread
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "StepPipelineUI/1.0"
     state: State  # задаётся в serve()
@@ -1387,6 +1638,7 @@ class Handler(BaseHTTPRequestHandler):
         if state is None:
             state = State(row["root"], preview=self.state.preview, board=self.state.board,
                           project_id=row["id"], name=row["name"])
+            state.port = getattr(self.state, "port", 0)
             self.states[row["id"]] = state
             row["state"] = state
         return state
@@ -1624,6 +1876,51 @@ class Handler(BaseHTTPRequestHandler):
         self.registry[:] = rows
         self.state.projects_cache = None
 
+    # ── глобальная пауза и автозагрузка (0.25.0) ──
+    def _pause_view(self, state: State) -> dict:
+        """Состояние кнопки паузы: память сторожа, до первого расчёта — только маркер.
+
+        Снимок за движком не ходит: `gate.py --plans` — это процесс на проект, а панель
+        держит бюджет запусков (тесты `snapshot_cache_*` считают их штуками). В рабочей
+        панели состояние считает `serve` до старта сервера и дальше сторож каждые
+        `PAUSE_WATCH` секунд; здесь остаётся дешёвая выжимка из маркера, чтобы кнопка
+        не врала о самом жесте («пауза запрошена»), пока расчёта ещё нет.
+        """
+        with state.pause_lock:
+            info = dict(state.pause) if state.pause else {}
+            working = bool(state.pause_pending)
+        if info:
+            info["working"] = working
+            return info
+        marker = proj.read_pause()
+        return {"active": bool(marker.get("active")), "all_stopped": False,
+                "all_paused": False, "projects": [], "running": [], "unstopped": [],
+                "requested_at": float(marker.get("requested_at") or 0.0),
+                "requested_at_text": str(marker.get("requested_at_text") or ""),
+                "completed_at": float(marker.get("completed_at") or 0.0),
+                "notified": bool(marker.get("notified_at")),
+                "reason": str(marker.get("reason") or ""),
+                "working": working, "pending": True,
+                "error": str(marker.get("error") or "")}
+
+    def _autostart_view(self) -> dict:
+        """Автозагрузка панели: статус спрашивается у системы один раз на сессию.
+
+        `schtasks` — это процесс, а снимок собирается на каждое движение, поэтому
+        каждый кадр его спрашивать нельзя. Переключение чекбокса статус обновляет
+        (`act_autostart`).
+        """
+        info = self.state.autostart
+        if info:
+            return dict(info)
+        try:
+            info = autostart.status(self._base_project)
+        except Exception as exc:                            # noqa: BLE001
+            info = {"platform": "", "supported": False, "enabled": False, "mechanism": "",
+                    "path": "", "detail": "", "error": f"{type(exc).__name__}: {exc}"}
+        self.state.autostart = info
+        return dict(info)
+
     @staticmethod
     def _line_limit(query: dict[str, str], default: int = snap.STEP_LINES) -> int:
         """Сколько строк блока отдавать: параметр `lines`, иначе умолчание, с потолком."""
@@ -1664,6 +1961,10 @@ class Handler(BaseHTTPRequestHandler):
         data["log"] = state.tail()
         data["plan_mode"] = plan_mode.read_mode(state.project)
         data["installed"] = _installed(state.project)
+        # Глобальная пауза и автозагрузка (0.25.0): оба состояния считаются не в снимке,
+        # а сторожем паузы и переключателем настроек — снимок их только отдаёт.
+        data["pause"] = self._pause_view(state)
+        data["autostart"] = self._autostart_view()
         # Обновление плагина: то, что уже посчитал фоновый поток сервера (без сети в
         # самом снимке). Пусто — проверка ещё не закончилась или панель не запускала её.
         with state.update_lock:
@@ -2141,9 +2442,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"ok": False, "error": f"неизвестное действие: {action}"})
             return
         stamp = {"id": state.id, "name": state.name}
+        # Жест на всю панель (пауза, автозагрузка): обработчику нужен весь реестр, а не
+        # один проект, и `.pipeline` в проекте сервера для него не обязателен — иначе
+        # панель отказывала бы в автозагрузке там, где конвейер ещё не поставлен.
+        if action in PANEL_WIDE_ACTIONS:
+            payload["_registry"] = [{"id": row["id"], "name": row["name"],
+                                     "root": str(row["root"])} for row in self.registry]
         # Обновление плагина не зависит от проекта: плагин один на профиль, и обновлять
         # его надо даже там, где конвейер в этот проект ещё не поставлен.
-        if action != "update" and not _installed(state.project):
+        if action not in PANEL_WIDE_ACTIONS and action != "update" and not _installed(state.project):
             self._json(400, {"ok": False, "project": stamp,
                              "error": f"конвейер не установлен в проект {state.project}: "
                                       f"нет .pipeline/gate.py"})
@@ -2161,7 +2468,9 @@ class Handler(BaseHTTPRequestHandler):
         # запрос не отдавали состояние «до».
         snap.clear_cache()
         self.state.projects_cache = None      # сводка живёт на состоянии сервера (D8)
-        self._json(200 if result.get("ok") else 400, result)
+        # 409 — жест паузы уже идёт: это не кривой ввод, а занятость фоновой работы.
+        code = 200 if result.get("ok") else (409 if result.get("busy") else 400)
+        self._json(code, result)
 
     def _post_plan_accept(self) -> None:
         """Утвердить план: проверки → перенос черновика → запись с sha256.
@@ -2272,6 +2581,7 @@ def make_server(project: Path, host: str = "127.0.0.1", port: int = 8770,
     rows = _registry_rows(project, extra_projects)
     state = State(rows[0]["root"], preview=preview, board=board,
                   project_id=rows[0]["id"], name=rows[0]["name"])
+    state.port = int(port or 0)
     rows[0]["state"] = state
     handler = type("BoundHandler", (Handler,),
                    {"state": state, "registry": rows, "states": {state.id: state},
@@ -2295,9 +2605,16 @@ def serve(project: Path, host: str = "127.0.0.1", port: int = 8770,
                            f"останови его: hermes pipeline ui --stop, или задай --port")
     server = make_server(project, host, port, preview=preview, board=board,
                          extra_projects=extra_projects)
+    server_state = getattr(server, "state")
+    # Порт известен только после bind: автозагрузка запишет именно его, а не 0.
+    server_state.port = int(server.server_address[1])
+    # Первый кадр уже знает про паузу: один расчёт до старта сервера, дальше — сторож.
+    # Иначе кнопка на секунду показывала бы «Остановить после шага» при живой паузе.
+    prime_pause_state(server, server_state)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="pipeline-ui")
     thread.start()
-    watch_updates(getattr(server, "state"))
+    watch_updates(server_state)
+    watch_pause(server)
     actual_port = server.server_address[1]
     url = f"http://{host}:{actual_port}/"
     if open_browser:

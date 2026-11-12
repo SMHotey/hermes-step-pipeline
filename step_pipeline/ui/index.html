@@ -58,6 +58,11 @@
   #projects-table tbody tr.current td { background: rgba(64, 196, 255, .07); }
   #projects-table tbody tr.current b::after { content: " •"; color: var(--accent); }
   #projects-table .pill.bad { color: var(--bad); border-color: var(--bad); }
+  /* Глобальная пауза (0.25.0): строка над таблицей проектов; без паузы её нет. */
+  .pause-banner { margin: 8px 0 10px; padding: 8px 12px; border: 1px solid var(--warn);
+                  border-radius: 8px; background: var(--panel-2); font-size: 12.5px; }
+  .pause-banner[hidden] { display: none; }
+  .pause-banner.wait { border-color: var(--line); color: var(--muted); }
   .spacer { flex: 1; }
   button { background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
            border-radius: 8px; padding: 7px 12px; cursor: pointer; font-size: 13px; }
@@ -316,6 +321,8 @@
   <button id="btn-tick" class="primary" aria-label="Тик: один шаг стража (клавиша T)">Тик</button>
   <button id="btn-stop" class="danger" aria-label="Стоп: остановиться после текущего шага (клавиша S)">Стоп</button>
   <button id="btn-resume" aria-label="Продолжить: снять остановку (клавиша R)">Продолжить</button>
+  <button id="btn-pause-all" class="danger"
+          aria-label="Остановить после шага все проекты реестра">Остановить после шага</button>
   <button id="btn-theme" aria-label="Переключить светлую и тёмную тему" aria-pressed="false">Светлая тема</button>
   <button id="btn-settings" aria-label="Настройки конвейера">Настройки</button>
 </header>
@@ -342,6 +349,8 @@
     <!-- Сводка реестра (план 3 S6): один экран на все проекты, где стоит конвейер. -->
     <section id="projects-summary">
       <h2>Проекты</h2>
+      <!-- Глобальная пауза (0.25.0): подпись кнопки и ожидание закрытия шагов. -->
+      <div id="pause-banner" class="pause-banner" hidden></div>
       <div id="projects-table"><span class="muted">реестр не загружен</span></div>
       <!-- Подключение проекта из панели (S8, D2): путь проверяет сервер, каталог не трогаем. -->
       <div class="project-add">
@@ -686,6 +695,11 @@
     <button type="button" class="primary" id="save-tg">Подключить</button>
     <button type="button" id="test-tg">Тест</button>
   </div>
+  <hr style="border-color:var(--line);margin:18px 0">
+  <!-- Автозагрузка (0.25.0): состояние читается с системы, а не из настроек панели. -->
+  <h2>Автозагрузка</h2>
+  <label><input type="checkbox" id="autostart"> запускать панель при входе в систему</label>
+  <div class="muted" id="autostart-hint"></div>
 </dialog>
 
 <!-- Подсказка по клавишам (S8, D8): открывается «?», закрывается Esc. -->
@@ -760,6 +774,8 @@ function act(action, payload = {}) {
 function actionLabel(action) {
   return {tick: "Тик", stop: "Стоп", resume: "Продолжить",
           hold: "Допуск", unhold: "Снят допуск", update: "Обновление",
+          pause_all: "Остановка после шага", resume_all: "Запуск всех",
+          autostart: "Автозагрузка",
           plan_accept: "Утверждение плана"}[action] || action;
 }
 
@@ -1052,9 +1068,145 @@ async function loadProjects() {
 }
 
 
+// ── глобальная пауза панели (0.25.0) ──
+// Кнопка одна на весь реестр: «Остановить после шага» ставит owner-стоп-флаги всем
+// открытым планам всех проектов (текущие шаги доигрываются). Когда флаги стоят у всех,
+// кнопка становится «Запустить всё». Состояние приходит в снимке с сервера, поэтому
+// переживает перезагрузку страницы — страница ничего не запоминает сама.
+let pauseWasAll = null;      // «все на паузе» на прошлом кадре: всплытие только на переходе
+
+function pauseNames(info) {
+  return (info.projects || []).filter((p) => p.installed && p.open).map((p) => p.name);
+}
+
+function renderPause(info) {
+  const pause = info || window.__pause || {};
+  window.__pause = pause;
+  const btn = $("btn-pause-all");
+  if (!btn) return;
+  const allStopped = Boolean(pause.all_stopped);
+  const working = Boolean(pause.working);
+  // Пока жест идёт в фоне, подпись не откатывается на «Остановить после шага»: стоп-флагов
+  // ещё нет, но намерение уже в работе.
+  btn.textContent = working ? "Пауза выполняется…"
+    : (allStopped ? "Запустить всё" : "Остановить после шага");
+  btn.className = allStopped ? "primary" : "danger";
+  btn.disabled = working || panelBusy || Boolean(window.__preview);
+  btn.title = allStopped
+    ? "снять стоп-флаги у всех открытых планов реестра и продолжить"
+    : "все проекты остановятся после текущего шага: текущие шаги доигрываются";
+  const banner = $("pause-banner");
+  if (!banner) return;
+  const running = (pause.projects || []).filter((p) => (p.running || []).length);
+  if (working) {
+    banner.hidden = false;
+    banner.className = "pause-banner wait";
+    banner.textContent = "Жест паузы выполняется: движок занят текущим шагом — "
+      + "стоп-флаги ставятся, как только он освободится";
+  } else if (pause.all_paused) {
+    const since = pause.completed_at
+      ? new Date(pause.completed_at * 1000).toLocaleTimeString()
+      : (pause.requested_at_text || "");
+    banner.hidden = false;
+    banner.className = "pause-banner";
+    banner.innerHTML = "<b>Все проекты на паузе</b>" + (since ? " с " + esc(since) : "")
+      + (pauseNames(pause).length ? ": " + esc(pauseNames(pause).join(", ")) : "")
+      + " · «Запустить всё», чтобы продолжить";
+  } else if (allStopped) {
+    const waiting = running.map((p) => p.name + " (" + p.running.length + " в работе)").join(", ");
+    banner.hidden = false;
+    banner.className = "pause-banner wait";
+    banner.textContent = "Пауза: ждём закрытия текущего шага" + (waiting ? " — " + waiting : "");
+  } else if (pause.active) {
+    banner.hidden = false;
+    banner.className = "pause-banner wait";
+    banner.textContent = "Пауза запрошена, но остановлены не все планы: "
+      + ((pause.unstopped || []).join(", ") || "нет данных");
+  } else {
+    banner.hidden = true;
+    banner.textContent = "";
+  }
+  if (pause.error) {
+    banner.hidden = false;
+    banner.className = "pause-banner";
+    banner.textContent = "пауза: " + pause.error;
+  }
+  // Всплытие — только на переходе «не все» → «все на паузе»: первый кадр молчит,
+  // иначе каждое открытие панели заново сообщало бы о старой паузе.
+  if (pauseWasAll === false && pause.all_paused) {
+    showNotification({title: "Все проекты на паузе",
+                      text: "Конвейеры стоят, новых шагов не будет", key: "pause:all"});
+  }
+  pauseWasAll = Boolean(pause.all_paused);
+}
+
+async function togglePauseAll() {
+  if (window.__preview) { toast("предпросмотр только читает", true); return; }
+  const resume = Boolean((window.__pause || {}).all_stopped);
+  setBusy(true);
+  try {
+    const data = await api("/api/action", {
+      method: "POST", headers: PANEL_HEADERS,
+      body: JSON.stringify({action: resume ? "resume_all" : "pause_all"}),
+    });
+    if (data.ok) {
+      toast(data.text || (resume ? "пауза снимается" : "остановка после шага"));
+    } else {
+      // Жест идёт в фоне: «уже выполняется» — не ошибка, а состояние.
+      toast(data.text || data.error || "не получилось", !data.busy);
+    }
+    etag = null;
+    startEvents();
+    await refresh();
+  } catch (err) {
+    toast(String(err), true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+// ── автозагрузка панели (0.25.0): чекбокс в настройках, состояние — с системы ──
+function renderAutostart(info) {
+  const box = $("autostart");
+  const hint = $("autostart-hint");
+  if (!box || !hint) return;
+  const auto = info || window.__autostart || {};
+  window.__autostart = auto;
+  box.checked = Boolean(auto.enabled);
+  box.disabled = Boolean(window.__preview) || panelBusy || auto.supported === false;
+  const parts = [];
+  if (auto.detail) parts.push(auto.detail);
+  if (auto.path) parts.push(auto.path);
+  if (auto.error) parts.push(auto.error);
+  hint.textContent = parts.join(" · ");
+}
+
+async function toggleAutostart(on) {
+  setBusy(true);
+  try {
+    const data = await api("/api/action", {
+      method: "POST", headers: PANEL_HEADERS,
+      body: JSON.stringify({action: "autostart", on: Boolean(on)}),
+    });
+    if (data.ok) toast(data.detail || (on ? "автозагрузка включена" : "автозагрузка выключена"));
+    else toast(data.error || "автозагрузка не переключилась", true);
+    if (data.autostart) renderAutostart(data.autostart);
+    etag = null;
+    startEvents();
+    await refresh();
+  } catch (err) {
+    toast(String(err), true);
+  } finally {
+    setBusy(false);
+  }
+}
+
 function setBusy(busy) {
   panelBusy = busy;
-  ["btn-stop", "btn-resume"].forEach((id) => { $(id).disabled = busy; });
+  ["btn-stop", "btn-resume", "btn-pause-all"].forEach((id) => {
+    if ($(id)) $(id).disabled = busy;
+  });
+  if ($("autostart")) $("autostart").disabled = busy;
   // «Тик» включается только когда действие доступно: иначе `.finally` после «Стопа»
   // вернул бы кнопку в строй при стоп-флаге и до следующего кадра/опроса.
   $("btn-tick").disabled = busy || !tickAllowed;
@@ -1983,6 +2135,11 @@ function render(data) {
 
   $("log").textContent = (data.log || []).join("\n—\n") || "—";
 
+  // Пауза и автозагрузка рисуются последними: обеим нужен `window.__preview`,
+  // который выставляется выше по функции.
+  renderPause(data.pause);
+  renderAutostart(data.autostart);
+
   // Один автозапуск проверок на загрузку страницы (§4.6, решение Q2): после первого
   // снимка, дальше только кнопка «Перепроверить». Бейдж обновится этим же запуском —
   // loadChecks после перепроверки заново тянет снимок.
@@ -2491,6 +2648,10 @@ $("btn-stop").onclick = () => {
   if (reason !== null) act("stop", {reason});
 };
 $("btn-resume").onclick = () => act("resume");
+// Глобальная пауза: жест на весь реестр, поэтому кнопка не в `act()` — тот подписывает
+// действие текущим проектом.
+$("btn-pause-all").onclick = togglePauseAll;
+$("autostart").onchange = (event) => toggleAutostart(event.target.checked);
 $("btn-settings").onclick = () => { $("settings").showModal(); loadConfigForm(); };
 $("close-settings").onclick = () => $("settings").close();
 // Любая правка поля обнуляет проверку: сохранён будет ровно тот дифф, что видели.

@@ -24,7 +24,7 @@ if str(REPO) not in sys.path:
 
 PACKAGE_NAME = "step_pipeline"
 ALIASES = ("project", "telegram", "snapshot", "setup_flow", "cli", "tools", "ui_server",
-           "ui_control")
+           "ui_control", "panel_pause", "autostart")
 
 
 def load_plugin():

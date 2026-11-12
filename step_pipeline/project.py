@@ -296,6 +296,68 @@ def write_notify(project_id: str = "", global_enabled: bool | None = None,
     return result
 
 
+# ─── глобальная пауза панели: намерение в реестре, стоп-флаги — в проектах ───
+# Ключ `pause` в контейнере реестра помнит, какие проекты и планы остановил жест
+# «Остановить после шага»: по нему «Запустить всё» снимает ровно свои флаги, а не чужие.
+PAUSE_KEY = "pause"
+
+
+def read_pause() -> dict[str, Any]:
+    """Маркер глобальной паузы из реестра панели.
+
+    Ключа нет — `active: False`. Битый файл не роняет панель: `error` объясняет
+    причину, а стоп-флаги в самих проектах остаются единственным источником правды
+    о том, стоит конвейер или идёт.
+    """
+    out: dict[str, Any] = {"active": False, "requested_at": 0.0, "requested_at_text": "",
+                           "reason": "", "projects": {}, "completed_at": 0.0,
+                           "notified_at": 0.0, "error": ""}
+    try:
+        container, _entries = _read_registry_raw()
+    except ValueError as exc:
+        out["error"] = f"файл реестра не разбирается: {exc}"
+        return out
+    raw = container.get(PAUSE_KEY) if isinstance(container, dict) else None
+    if not isinstance(raw, dict) or not raw:
+        return out
+    out["active"] = True
+    out["reason"] = str(raw.get("reason") or "")
+    for key in ("requested_at", "completed_at", "notified_at"):
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[key] = float(value)
+    out["requested_at_text"] = str(raw.get("requested_at_text") or "")
+    raw_projects = raw.get("projects")
+    if isinstance(raw_projects, dict):
+        for project_id, item in raw_projects.items():
+            data = item if isinstance(item, dict) else {}
+            plans = data.get("plans")
+            out["projects"][str(project_id)] = {
+                "name": str(data.get("name") or project_id),
+                "plans": ([str(plan) for plan in plans]
+                          if isinstance(plans, (list, tuple)) else [])}
+    return out
+
+
+def write_pause(marker: dict[str, Any] | None) -> dict[str, Any]:
+    """Записать маркер паузы; `None` — снять ключ.
+
+    Правится только ключ `pause`: чужие ключи контейнера и записи проектов остаются
+    как были. Реестр в форме списка — `ValueError`: места под маркер в нём нет, а
+    переписывать формат файла из-за одного жеста нельзя.
+    """
+    container, entries = _read_registry_raw()
+    if container is None:
+        raise ValueError("реестр в форме списка: маркер паузы некуда писать, "
+                         "добавь в файл контейнер projects")
+    if marker is None:
+        container = {key: value for key, value in container.items() if key != PAUSE_KEY}
+    else:
+        container = {**container, PAUSE_KEY: dict(marker)}
+    _write_registry(container, entries)
+    return read_pause()
+
+
 def add_project(root: Path | str, name: str = "") -> dict[str, Any]:
     """Добавить проект в реестр панели: запись `{"id", "name", "root"}` (D1).
 
