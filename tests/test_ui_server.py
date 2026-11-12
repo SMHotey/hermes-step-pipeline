@@ -1919,6 +1919,21 @@ def test_index_hotkeys_markup():
         assert anchor in html, anchor
 
 
+def test_index_act_returns_promise():
+    """`act()` отдаёт цепочку: иначе `.then` у вызывающего падает с TypeError.
+
+    Ошибка из консоли панели «Cannot read properties of undefined (reading 'then')» —
+    это отсутствие `return` в `act`: «Допуск», «Снят допуск» и «Сохранить Telegram»
+    ждут результата действия, чтобы перечитать карточку шага или очистить поле.
+    """
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    body = html[html.index("function act(action"):]
+    body = body[:body.index("\n}\n")]
+    assert 'return api("/api/action"' in body
+    # Карточку шага перечитываем и после отказа движка: комментарий выше обещает это.
+    assert 'act(action, plan ? {step: currentStep, plan} : {step: currentStep})\n    .finally' in html
+
+
 def test_index_theme_and_density_markup():
     """Тема переключается, плотность одна (компактная) и переключателя у неё нет (C6)."""
     html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")

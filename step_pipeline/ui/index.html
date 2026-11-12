@@ -752,9 +752,12 @@ async function api(path, options) {
   return data;
 }
 
+// Возвращает цепочку промисов: вызывающий ждёт её окончания (`act(...).then(...)`,
+// `stepAction`). Без `return` он получал undefined и падал на `.then` ещё до ответа
+// сервера — карточка шага оставалась неперечитанной.
 function act(action, payload = {}) {
   setBusy(true);
-  api("/api/action", {
+  return api("/api/action", {
     method: "POST",
     headers: PANEL_HEADERS,
     // Проект уходит телом, а не адресом: POST адресован действию, а не ресурсу (§4.4).
@@ -2649,8 +2652,10 @@ document.querySelectorAll(".tab").forEach((tab) => {
 function stepAction(action) {
   if (!currentStep) { toast("шаг не выбран", true); return; }
   const plan = planIdOf();
+  // Карточку перечитываем в любом исходе: отказ движка («план 2 не найден») — тоже
+  // новость для панели, а не повод оставить её с прежним состоянием.
   act(action, plan ? {step: currentStep, plan} : {step: currentStep})
-    .then(() => loadStep());
+    .finally(() => loadStep());
 }
 $("btn-hold").onclick = () => stepAction("hold");
 $("btn-unhold").onclick = () => stepAction("unhold");
