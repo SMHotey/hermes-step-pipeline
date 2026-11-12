@@ -157,6 +157,15 @@ NOTIFY_TICK_ACTIONS = ("create_step", "create_prompt", "create_prompt_review", "
                        "create_review", "retry_pending", "hold_risk", "tg_dialog")
 # Ключ карточки: `planloop:{план}:{шаг}:...`; шаг приводится к верхнему регистру.
 CARD_KEY_RE = re.compile(r"planloop:([^:]+):([^:]+):")
+# Строка плана в ответе `/api/projects` (план 6 S2): ровно эти поля и в этом порядке.
+# Набор фиксируют тесты: по нему собирают вкладку «Планы» (S5) и «Обзор» (S6), поэтому
+# поле нельзя ни добавить, ни убрать, не назвав это изменением контракта.
+PLAN_ROW_FIELDS = ("id", "name", "state", "state_label", "action", "approval", "closed",
+                   "total", "next", "stop", "hold", "driven", "idle")
+# Название плана — `# `-заголовок файла без префикса номера («6. Панель…» → «Панель…»):
+# то же правило, что у движка (`engine/analyze.py::_plan_title`), но импорт движка из
+# плагина запрещён (D5), поэтому префикс снимается здесь.
+PLAN_NAME_PREFIX_RE = re.compile(r"^\d+\.\s*")
 
 
 def _allowed_origins(port: int) -> set[str]:
@@ -1660,17 +1669,56 @@ class Handler(BaseHTTPRequestHandler):
                          "projects": [str(row["id"]) for row in self.registry]})
         return None
 
-    def _summary_plans(self, state: State) -> list[dict]:
-        """`gate.py --plans` проекта; в предпросмотре — движком плагина, как снимок."""
+    def _summary_plans(self, state: State, root: Path, cfg: dict) -> list[dict]:
+        """Строки планов проекта для панели: одна точка формы строки (план 6 S2).
+
+        Источник — движок (`gate.py --plans`): в обычном режиме через кэш
+        `panel_pause.plans` (`PLANS_TTL` 5 с), поэтому за один запрос страницы движок
+        поднимается не больше раза на проект. Предпросмотр берёт движок плагина
+        (`proj.ENGINE_SRC`) и кэш не трогает: чужой проект не должен задерживаться в
+        памяти панели. Строки кэша не мутируются — каждая строка панели новая копия,
+        иначе дописанные поля копились бы в общем кэше паузы.
+        """
         if state.preview:
             extra = {"PIPELINE_ASSUME_DEFAULTS": "1"}
             if state.board:
                 extra["PIPELINE_BOARD"] = state.board
             data = proj.engine_json(state.project, "gate.py", "--plans", timeout=90,
                                     engine_dir=proj.ENGINE_SRC, extra_env=extra)
+            source = [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
         else:
-            data = proj.engine_json(state.project, "gate.py", "--plans", timeout=90)
-        return data if isinstance(data, list) else []
+            source = panel_pause.plans(root)
+        return [self._plan_row(root, cfg, row) for row in source]
+
+    def _plan_row(self, root: Path, cfg: dict, row: dict) -> dict:
+        """Одна строка плана: тринадцать полей `PLAN_ROW_FIELDS` (план 6 S2).
+
+        Чего в строке движка нет: `name` — `# `-заголовок файла плана без префикса номера
+        (разбор `plan_accept._title`), `total` — `snap._steps_total` от `file` той же строки,
+        `idle` — простой словарём, как у строки проекта. Движок на строку не запускается.
+        """
+        rel = str(row.get("file") or "")
+        name = plan_accept._title(root / rel) if rel else ""
+        since = snap._plan_state(root, str(row.get("id") or "")).get("waiting_since")
+        idle = None
+        if isinstance(since, (int, float)) and not isinstance(since, bool):
+            idle = {"text": snap._duration(max(0, int(time.time() - float(since))))}
+        item = {
+            "id": str(row.get("id") or ""),
+            "name": PLAN_NAME_PREFIX_RE.sub("", name).strip(),
+            "state": str(row.get("state") or ""),
+            "state_label": str(row.get("state_label") or ""),
+            "action": row.get("action"),
+            "approval": row.get("approval"),
+            "closed": int(row.get("closed") or 0),
+            "total": snap._steps_total(root, cfg, rel),
+            "next": str(row.get("next") or ""),
+            "stop": row.get("stop"),
+            "hold": list(row.get("hold") or []),
+            "driven": bool(row.get("driven")),
+            "idle": idle,
+        }
+        return {key: item[key] for key in PLAN_ROW_FIELDS}
 
     def _project_summary(self, row: dict) -> dict:
         """Строка сводки: план, следующий шаг, закрыто, стоп, простой (D8).
@@ -1685,7 +1733,8 @@ class Handler(BaseHTTPRequestHandler):
                    "source": row["source"], "installed": _installed(root),
                    "plan": "", "next": "—", "closed": 0, "total": 0,
                    "state": "", "state_label": "",
-                   "stop": None, "idle": None, "error": "", "capacity": None}
+                   "stop": None, "idle": None, "error": "", "capacity": None,
+                   "plans": []}
         if not summary["installed"] and not state.preview:
             return summary
         # Занятость слотов от плана не зависит: считается до ранних выходов ниже (D5).
@@ -1697,10 +1746,11 @@ class Handler(BaseHTTPRequestHandler):
                 summary["error"] = f"{type(exc).__name__}: {exc}"
         try:
             cfg = proj.read_config(root)
-            plans = self._summary_plans(state)
+            plans = self._summary_plans(state, root, cfg)
         except Exception as exc:                                # noqa: BLE001
             summary["error"] = f"{type(exc).__name__}: {exc}"
             return summary
+        summary["plans"] = plans
         if not plans:
             return summary
         # План, у которого есть открытые шаги, иначе первый — как в снимке.
@@ -1710,7 +1760,7 @@ class Handler(BaseHTTPRequestHandler):
         summary["plan"] = plan_id
         summary["next"] = str(chosen.get("next") or "—")
         summary["closed"] = int(chosen.get("closed") or 0)
-        summary["total"] = snap._steps_total(root, cfg, str(chosen.get("file") or ""))
+        summary["total"] = int(chosen.get("total") or 0)
         # Состояние — из строки плана: «остановлен» считает движок, а не наличие файла (S2A).
         summary["state"] = str(chosen.get("state") or "")
         summary["state_label"] = str(chosen.get("state_label") or "")
@@ -2283,6 +2333,7 @@ class Handler(BaseHTTPRequestHandler):
         if result.get("ok"):
             snap.clear_cache()      # шаг пишет на диск: прежний снимок больше не верен
             self.state.projects_cache = None   # и сводка реестра — тоже
+            panel_pause.clear_cache()          # строки планов тоже устарели (план 6 S2)
         body = {"ok": bool(result.get("ok")), "step": step,
                 "already": bool(result.get("already")), "next": result.get("next"),
                 "log": log}
@@ -2468,6 +2519,7 @@ class Handler(BaseHTTPRequestHandler):
         # запрос не отдавали состояние «до».
         snap.clear_cache()
         self.state.projects_cache = None      # сводка живёт на состоянии сервера (D8)
+        panel_pause.clear_cache()             # строки планов тоже устарели (план 6 S2)
         # 409 — жест паузы уже идёт: это не кривой ввод, а занятость фоновой работы.
         code = 200 if result.get("ok") else (409 if result.get("busy") else 400)
         self._json(code, result)
@@ -2508,6 +2560,7 @@ class Handler(BaseHTTPRequestHandler):
         # Утверждение переносит файл и пишет состояние: старый снимок больше не верен.
         snap.clear_cache()
         self.state.projects_cache = None
+        panel_pause.clear_cache()             # строки планов тоже устарели (план 6 S2)
         self._json(200 if result.get("ok") else 400, result)
 
     def _post_plan_mode(self) -> None:

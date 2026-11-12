@@ -22,6 +22,7 @@ PLUGIN = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from helpers import KANBAN_SCHEMA, install_project, run_gate, stub_cards, complete_card  # noqa: E402
+import panel_pause  # noqa: E402
 import project  # noqa: E402
 import snapshot  # noqa: E402
 import ui_server  # noqa: E402
@@ -29,10 +30,12 @@ import ui_server  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def clean_cache():
-    """Кэш снимка — состояние процесса: между тестами его обнуляем."""
+    """Кэши снимка и планов — состояние процесса: между тестами их обнуляем."""
     snapshot.clear_cache()
+    panel_pause.clear_cache()
     yield
     snapshot.clear_cache()
+    panel_pause.clear_cache()
 
 
 @pytest.fixture()
@@ -1224,6 +1227,43 @@ def test_index_makes_only_step_findings_clickable():
 
 # ───────────────────────── реестр проектов (план 3 S6) ─────────────────────────
 
+# Тринадцать полей строки плана в `/api/projects` (план 6 S2). Литерал, а не импорт из
+# `ui_server`: тест, читающий набор из кода, ничего не фиксирует.
+EXPECTED_PLAN_FIELDS = ("action", "approval", "closed", "driven", "hold", "id",
+                        "idle", "name", "next", "state", "state_label", "stop", "total")
+
+PLAN2_TEMPLATE = """# 2. {title}
+
+Цель: второй план проекта для реестра панели.
+
+## Шаги
+{steps}
+## Журнал выполнения
+
+| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |
+|---|---|---|---|---|
+| — | S1 | — | — | открыт |
+"""
+
+
+def second_plan(title: str, steps: int) -> str:
+    """Второй план проекта: свой заголовок и своё число шагов (форма — `helpers.PLAN`)."""
+    body = "".join(
+        f"\n### S{i}. Шаг {i} плана (1 дн)\n\n"
+        f"- Файл: `app/mod{i}.py`\n"
+        f"- Тесты/гейты: `python -m pytest tests/test_mod{i}.py -q` → {i} passed\n"
+        f"- Готово = строка {i} на месте\n"
+        for i in range(1, steps + 1))
+    return PLAN2_TEMPLATE.format(title=title, steps=body)
+
+
+def add_plan(root: Path, title: str, steps: int, number: int = 2) -> Path:
+    """Положить в проект второй файл плана: номер в имени, заголовок и число шагов свои."""
+    path = root / "docs" / "plans" / f"{number}-extra.md"
+    path.write_text(second_plan(title, steps), encoding="utf-8")
+    return path
+
+
 def write_registry(home: Path, entries: list[dict]) -> Path:
     """Реестр в home профиля: панель читает его, но никогда не пишет (D4)."""
     path = home / "projects.json"
@@ -1271,6 +1311,150 @@ def test_projects_route_lists_two_projects(tmp_path: Path, hermes_stub: Path,
                             "total", "stop", "idle", "source"}
     assert rows["alpha"]["next"] == "S1" and rows["alpha"]["total"] == 2
     assert rows["beta"]["plan"] == "1" and rows["beta"]["stop"] is None
+
+
+def test_projects_plan_rows_have_thirteen_fields(tmp_path: Path, hermes_stub: Path,
+                                                isolated_hermes_home: Path):
+    """Строки всех планов реестра: по строке на план, ровно тринадцать полей (план 6 S2)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    beta = install_project(tmp_path / "beta", board="uiboard")
+    add_plan(alpha, "Второй план панели", 3)
+    add_plan(beta, "Второй план беты", 2)
+    write_registry(isolated_hermes_home,
+                   [{"id": "beta", "name": "Бета", "root": str(beta)}])
+    with running(alpha) as (url, _httpd):
+        status, data = get(url + "/api/projects")
+    assert status == 200 and data["ok"] is True
+    rows = {row["id"]: row for row in data["projects"]}
+    pairs = sorted((row_id, plan["id"]) for row_id, row in rows.items()
+                   for plan in row["plans"])
+    # Четыре строки планов: по два плана в каждом из двух проектов.
+    assert pairs == [("alpha", "1"), ("alpha", "2"), ("beta", "1"), ("beta", "2")]
+    for row in rows.values():
+        for plan in row["plans"]:
+            assert tuple(sorted(plan)) == EXPECTED_PLAN_FIELDS
+            assert plan["next"] == "S1" and plan["closed"] == 0
+            assert plan["driven"] is True and plan["hold"] == []
+            assert plan["stop"] is None and plan["idle"] is None
+            assert plan["state"] == "running" and plan["state_label"] == "идёт"
+            assert plan["action"], "поле действия обязано быть у каждого плана"
+    plans = {row_id: {plan["id"]: plan for plan in row["plans"]}
+             for row_id, row in rows.items()}
+    assert plans["alpha"]["1"]["name"] == "Демо-план конвейера"
+    assert plans["beta"]["1"]["name"] == "Демо-план конвейера"
+    assert plans["alpha"]["2"]["name"] == "Второй план панели"
+    assert plans["beta"]["2"]["name"] == "Второй план беты"
+    assert (plans["alpha"]["1"]["total"], plans["alpha"]["2"]["total"]) == (2, 3)
+    assert (plans["beta"]["1"]["total"], plans["beta"]["2"]["total"]) == (2, 2)
+    # Утверждение проходит из движка как есть: план 2 никто не утверждал.
+    assert plans["alpha"]["1"]["approval"]["state"] == "approved"
+    assert plans["alpha"]["2"]["approval"]["state"] == "missing"
+    assert plans["alpha"]["2"]["approval"]["label"] == "не утверждён"
+    assert plans["alpha"]["2"]["approval"]["ok"] is False
+
+
+def test_plan_row_idle_is_a_dictionary_like_project_idle(tmp_path: Path, hermes_stub: Path):
+    """Простой плана — тот же словарь, что у строки проекта; нет простоя — `None` (S2)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    add_plan(alpha, "Второй план панели", 3)
+    state_path = alpha / ".pipeline" / "state" / "plan_1_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"waiting_since": time.time() - 3900}), encoding="utf-8")
+    with running(alpha) as (url, _httpd):
+        status, data = get(url + "/api/projects")
+    assert status == 200
+    row = data["projects"][0]
+    assert row["idle"] == {"text": "1 ч 5 мин"}
+    assert row["plans"][0]["idle"] == {"text": "1 ч 5 мин"}
+    assert "idle" in row["plans"][1] and row["plans"][1]["idle"] is None
+
+
+def test_plan_row_stop_flag_appears_after_action(tmp_path: Path, hermes_stub: Path,
+                                                 isolated_hermes_home: Path):
+    """Стоп-флаг плана виден на втором запросе: кэш планов сбрасывается действием (S2)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    add_plan(alpha, "Второй план панели", 3)
+    with running(alpha) as (url, _httpd):
+        status, before = get(url + "/api/projects")
+        action_status, action = post(url, {"action": "stop", "reason": "стоп по альфе",
+                                           "project": "alpha"})
+        second_status, after = get(url + "/api/projects")
+    assert status == 200
+    first = {plan["id"]: plan for plan in before["projects"][0]["plans"]}
+    assert first["1"]["stop"] is None and first["1"]["state"] == "running"
+    assert action_status == 200 and action["ok"] is True, action
+    assert second_status == 200
+    later = {plan["id"]: plan for plan in after["projects"][0]["plans"]}
+    assert later["1"]["stop"]["kind"] == "owner"
+    assert later["1"]["stop"]["reason"] == "стоп по альфе"
+    assert later["1"]["state"] == "stopped" and later["1"]["state_label"] == "остановлен"
+    assert later["2"]["stop"] is None
+
+
+def test_project_without_pipeline_has_empty_plans(tmp_path: Path, hermes_stub: Path,
+                                                  isolated_hermes_home: Path):
+    """Каталог без конвейера: `installed: false` и пустые планы, а не выдуманное состояние."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    write_registry(isolated_hermes_home,
+                   [{"id": "bare", "name": "Голый", "root": str(bare)}])
+    with running(alpha) as (url, _httpd):
+        status, data = get(url + "/api/projects")
+    assert status == 200 and data["ok"] is True
+    row = {item["id"]: item for item in data["projects"]}["bare"]
+    assert row["installed"] is False
+    assert row["plans"] == [] and "plans" in row
+    assert row["next"] == "—" and row["total"] == 0
+    assert row["state"] == "" and row["error"] == ""
+
+
+def test_engine_failure_keeps_other_projects_rows(tmp_path: Path, hermes_stub: Path,
+                                                 isolated_hermes_home: Path):
+    """Упавший движок пишет причину в `error` и не роняет строки соседей (S2)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    beta = install_project(tmp_path / "beta", board="uiboard")
+    (beta / ".pipeline" / "gate.py").write_text("raise SystemExit(3)\n", encoding="utf-8")
+    write_registry(isolated_hermes_home,
+                   [{"id": "beta", "name": "Бета", "root": str(beta)}])
+    with running(alpha) as (url, _httpd):
+        status, data = get(url + "/api/projects")
+    assert status == 200 and data["ok"] is True
+    rows = {row["id"]: row for row in data["projects"]}
+    assert rows["beta"]["installed"] is True
+    assert rows["beta"]["plans"] == []
+    assert "gate.py вышел с 3" in rows["beta"]["error"]
+    assert len(rows["alpha"]["plans"]) == 1
+    assert tuple(sorted(rows["alpha"]["plans"][0])) == EXPECTED_PLAN_FIELDS
+    assert rows["beta"]["plan"] == "" and rows["beta"]["next"] == "—"
+
+
+def test_plans_cache_prevents_second_engine_launch(tmp_path: Path, hermes_stub: Path,
+                                                   isolated_hermes_home: Path, monkeypatch):
+    """Второй запрос страницы берёт строки из кэша планов: движок не поднимается (S2)."""
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    beta = install_project(tmp_path / "beta", board="uiboard")
+    write_registry(isolated_hermes_home,
+                   [{"id": "beta", "name": "Бета", "root": str(beta)}])
+    calls = engine_counter(monkeypatch)
+    with running(alpha) as (url, httpd):
+        handler_state = httpd.RequestHandlerClass.state
+        handler_state.projects_cache = None
+        panel_pause.clear_cache()
+        status, _data = get(url + "/api/projects")
+        assert status == 200
+        assert len(calls) == 2, "по одному `--plans` на проект за запрос страницы"
+        # Кэш ответа сброшен, кэш планов жив: движок не поднимается вовсе.
+        handler_state.projects_cache = None
+        status, _data = get(url + "/api/projects")
+        assert status == 200
+        assert len(calls) == 2, "живой кэш планов обязан отдать строки без запуска движка"
+        # Оба кэша сброшены: движок поднимается заново — тест меряет именно кэш.
+        handler_state.projects_cache = None
+        panel_pause.clear_cache()
+        status, _data = get(url + "/api/projects")
+        assert status == 200
+        assert len(calls) == 4
 
 
 def test_registry_entry_without_pipeline_is_installed_false(tmp_path: Path, hermes_stub: Path,
