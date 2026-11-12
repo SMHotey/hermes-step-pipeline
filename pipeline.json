@@ -44,10 +44,7 @@
   "step_id_regex": "(?P<id>[A-Za-z]{1,4}\\d+[A-Za-z]?(?:-\\d+)?)",
   "default_plan": null,
   "driven_plans": [
-    "2",
-    "3",
-    "4",
-    "5"
+    "6"
   ],
   "require_prompt": true,
   "runtimes": {
