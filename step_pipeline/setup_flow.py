@@ -265,8 +265,10 @@ def copy_engine(project: Path, force: bool) -> list[str]:
         if not src.is_file():
             raise FileNotFoundError(f"в плагине нет движка: {src}")
         dest = dest_dir / name
-        if dest.is_file() and not force and dest.read_text(encoding="utf-8", errors="replace") == \
-                src.read_text(encoding="utf-8", errors="replace"):
+        # Сверка по байтам, а не по тексту: `read_text` съедает CRLF, и копия с виндовыми
+        # переводами строк считалась идентичной — файл не перезаписывался, а `doctor`
+        # (сверка по байтам) потом вечно показывал «копия расходится при равной версии».
+        if dest.is_file() and not force and dest.read_bytes() == src.read_bytes():
             continue
         shutil.copy2(src, dest)
         copied.append(f".pipeline/{name}")

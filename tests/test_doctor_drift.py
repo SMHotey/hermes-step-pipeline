@@ -123,6 +123,24 @@ class TestEngineDriftFunctions:
     def test_drift_of_missing_pipeline_dir_is_empty(self, tmp_path: Path):
         assert setup_flow.engine_drift(tmp_path) == []
 
+    def test_crlf_copy_is_refreshed_by_upgrade(self, engine_project: Path):
+        """Копия с виндовыми переводами строк — дрейф; upgrade её перезаписывает.
+
+        Регресс 0.25.3: `copy_engine` сверял текст (`read_text` съедает CRLF) и считал такую
+        копию идентичной, поэтому файл не перезаписывался, а `doctor` сравнивал байты и
+        вечно требовал `setup --upgrade` (живой случай — registry.py, scout_report.py).
+        """
+        src = proj.ENGINE_SRC / "registry.py"
+        target = engine_project / ".pipeline" / "registry.py"
+        target.write_bytes(src.read_text(encoding="utf-8").replace("\n", "\r\n").encode("utf-8"))
+        assert "registry.py" in setup_flow.engine_drift(engine_project)
+
+        copied = setup_flow.copy_engine(engine_project, force=False)
+
+        assert ".pipeline/registry.py" in copied
+        assert setup_flow.engine_drift(engine_project) == []
+        assert target.read_bytes() == src.read_bytes()
+
     def test_marker_problem_of_clean_copy_is_empty(self, engine_project: Path):
         assert setup_flow.engine_marker_problem(engine_project) == ""
 
