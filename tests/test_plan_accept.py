@@ -148,6 +148,24 @@ def test_list_without_drafts_dir_reports_none(project: Path, capsys):
     assert plan_accept.drafts_dir(project).exists() is False
 
 
+def test_check_prints_stale_address_as_warning(project: Path, capsys):
+    """`plan --check` показывает уехавший адрес предупреждением и не мешает утверждению.
+
+    0.25.6: адресную проверку сняли с ревьюера и отдали линтеру, но стоп она не держит —
+    иначе номер строки снова стал бы способом остановить план.
+    """
+    (project / "app" / "api").mkdir(parents=True, exist_ok=True)
+    (project / "app" / "api" / "invoices.py").write_text("x = 1\n", encoding="utf-8")
+    draft = _draft(project, "5-demo.md",
+                   helpers.PLAN.replace("`app/api/invoices.py`", "`app/api/invoices.py:1-999`"))
+
+    assert plan_accept.check_draft(project, draft) == []
+    assert _cmd(project, check=str(draft)) == 0
+    captured = capsys.readouterr()
+    assert "уехал" in captured.out
+    assert "ИТОГ: ошибок нет, предупреждений" in captured.out
+
+
 def test_check_without_lint_accepts_valid_draft(project: Path, capsys, monkeypatch):
     """Без линтера валидный черновик проходит: разбор движком и контракт шагов чисты."""
     monkeypatch.setattr(plan_accept, "plan_lint", None)

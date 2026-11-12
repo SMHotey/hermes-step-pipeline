@@ -373,10 +373,15 @@ def cmd_plan(args) -> int:
         errors = plan_accept.check_draft(project, draft)
         for problem in errors:
             print(f"  ✗ {problem}")
+        warnings = plan_accept.check_warnings(project, draft)
+        for warning in warnings:
+            print(f"  ! {warning}")
         if errors:
-            print(f"ИТОГ: ошибок {len(errors)}")
+            print(f"ИТОГ: ошибок {len(errors)}"
+                  + (f", предупреждений {len(warnings)}" if warnings else ""))
             return 1
-        print("ИТОГ: ошибок нет")
+        print("ИТОГ: ошибок нет"
+              + (f", предупреждений {len(warnings)}" if warnings else ""))
         return 0
 
     return plan_accept.accept(project, getattr(args, "accept", ""))

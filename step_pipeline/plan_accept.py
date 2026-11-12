@@ -201,6 +201,18 @@ def check_draft(project, draft) -> list[str]:
     return _fallback_errors(project, draft)
 
 
+def check_warnings(project, draft) -> list[str]:
+    """Предупреждения черновика: о них сообщают, но утверждение они не держат.
+
+    Адрес `файл.py:строки`, уехавший после правки кода (Л21), — повод сказать человеку,
+    а не блокировать план: владельцу нужен один способ снять стоп.
+    """
+    if plan_lint is None:
+        return []
+    lint = plan_lint.lint_project(Path(project), str(Path(draft)))
+    return [str(warning) for warning in lint.warnings]
+
+
 def approve(project, value) -> dict:
     """Утвердить план и вернуть исход без печати: общий путь CLI и панели.
 
