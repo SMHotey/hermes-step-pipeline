@@ -4535,6 +4535,12 @@ def tick(cfg: config_mod.Config, execute: bool = True,
                             "status": retried.get("detail", ""), "actions": [],
                             "actions_count": 0, "reason": "выполнен отложенный коммит"}
             ctx = build_ctx(p)
+            if execute:
+                # Наследование утверждения ДО решения — и для простаивающего плана: до
+                # run_gate такой план не доходит (`idle` → `continue`), запись оставалась
+                # со старым sha, и панель вечно показывала «изменён после утверждения»
+                # без кнопки (у стартовавшего плана блокировки утверждения нет).
+                ensure_approval(p, ctx)
             decision = decide(ctx)
             status_by_plan[spec.id] = status_text(ctx, decision)
             if decision["action"] == "idle":
