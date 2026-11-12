@@ -21,6 +21,7 @@ from pathlib import Path
 
 import helpers  # noqa: F401  (загружает плагин и алиасы)
 import cli
+import pytest
 from step_pipeline import plan_accept
 
 # Шаг S1 без пункта «Файл» и с пустыми гейтами: запасной путь обязан это увидеть.
@@ -394,3 +395,15 @@ def test_list_drafts_keeps_approved_after_journal_line(project: Path, monkeypatc
     row = next(item for item in plan_accept.list_drafts(project) if item["id"] == "5")
     assert row["approved"] is True
     assert row["changed"] is False
+
+
+def test_plan_number_with_superscript_is_rejected():
+    """«²» проходит `str.isdigit()`, но не `int()`: `ValueError` с текстом, а не из недр.
+
+    Тот же класс, что у `gate.load_extra_fix_rounds` и `registry.normalize`: номер плана
+    сюда приходит из CLI (`plan --check ²`), поэтому мусор обязан давать понятную ошибку.
+    """
+    for bad in ("\u00b2", "1" * 4400):
+        with pytest.raises(ValueError, match="должен быть числом"):
+            plan_accept._normalize(bad)
+    assert plan_accept._normalize(" 01 ") == "1"

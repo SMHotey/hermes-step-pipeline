@@ -593,11 +593,19 @@ def _journal_rows(lines: list[str], found: list[tuple[int, int, str]],
 # ───────────────────────────── мелочи ─────────────────────────────
 
 def _normalize(plan_id) -> str:
-    """Номер в каноническом виде: `01` → `1` (как registry.normalize)."""
+    """Номер в каноническом виде: `01` → `1` (как registry.normalize).
+
+    «²» проходит `str.isdigit()`, но не `int()` — как и цифровая строка длиннее лимита
+    CPython: это не номер плана, поэтому `ValueError` с тем же текстом, а не исключение
+    из недр разбора.
+    """
     text = str(plan_id).strip()
     if not text.isdigit():
         raise ValueError(f"номер плана должен быть числом, получено: {plan_id!r}")
-    return str(int(text))
+    try:
+        return str(int(text))
+    except ValueError:
+        raise ValueError(f"номер плана должен быть числом, получено: {plan_id!r}") from None
 
 
 def _sha256(path: Path) -> str:

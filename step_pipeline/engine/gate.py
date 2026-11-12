@@ -358,8 +358,13 @@ def load_extra_fix_rounds(p: Paths) -> int:
 
     Правила чтения: файла нет, он не читается, это не словарь, ключа `extra_fix_rounds`
     нет, значение `bool`, отрицательное или не число → 0. Целое ≥ 0 берётся как есть,
-    строка из цифр — тоже (маркер правят руками). Битый маркер — не повод для `GateError`
-    и не повод для стопа: тик идёт дальше с нулём дополнительных кругов.
+    строка из цифр — тоже (маркер правят руками), дробное без остатка (`1.0`) — как целое:
+    так пишут некоторые сериализаторы, и жест владельца иначе теряется молча. Дробное
+    с остатком (`1.5`) — «не число кругов», тоже 0.
+    Битый маркер — не повод для `GateError` и не повод для стопа: тик идёт дальше с нулём
+    дополнительных кругов. Разбор не бросает: `isdigit()` истинно и для «²», которые
+    `int()` не принимает, а на цифровой строке длиннее лимита CPython (4300) `int()`
+    отказывает — оба случая отдаёт толерантный `_as_int`.
     """
     path = rounds_path(p)
     if not path.exists():
@@ -371,14 +376,12 @@ def load_extra_fix_rounds(p: Paths) -> int:
     if not isinstance(data, dict):
         return 0
     value = data.get("extra_fix_rounds")
-    if isinstance(value, bool):           # `true` — не число кругов
+    if isinstance(value, bool):           # `true` — не число кругов, хотя int(True) == 1
         return 0
-    if isinstance(value, int):
-        return value if value > 0 else 0
-    if isinstance(value, str):
-        text = value.strip()
-        return int(text) if text.isdigit() else 0
-    return 0
+    if isinstance(value, float):          # 1.0 — целое, 1.5 — не число кругов
+        value = int(value) if value.is_integer() else 0
+    number = _as_int(value, 0)            # единый толерантный разбор файла (gate.py:3069)
+    return number if number > 0 else 0
 
 
 # ───────────────────────────── вердикт ─────────────────────────────

@@ -88,3 +88,17 @@ def test_unknown_plan_raises(project: Path):
     cfg = config_mod.load(project)
     with pytest.raises(registry.PlanNotFound):
         registry.get(cfg, "9")
+
+
+def test_superscript_plan_id_is_not_a_number():
+    """«²» проходит `str.isdigit()`, но не `int()`: это `PlanNotFound`, а не `ValueError`.
+
+    Тот же класс, что у маркера кругов правок (`gate.load_extra_fix_rounds`): `isdigit()`
+    истинно и для символов, которые `int()` не принимает, а на цифровой строке длиннее
+    лимита CPython (4300) `int()` отказывает. Номер плана приходит из CLI, панели и
+    конфига — значит мусор обязан превращаться в понятную ошибку реестра.
+    """
+    for bad in ("\u00b2", "1" * 4400):
+        with pytest.raises(registry.PlanNotFound):
+            registry.normalize(bad)
+    assert registry.normalize(" 01 ") == "1"

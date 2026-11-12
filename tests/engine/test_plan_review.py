@@ -770,22 +770,32 @@ def test_broken_marker_gives_zero_extra_rounds(stand):
     Маркер правят руки и панель, поэтому неверное значение — не повод для `GateError`:
     файла нет, он не разбирается, это не словарь, ключа нет, `true`, минус, не число — всё
     ноль. Строка из цифр считается числом: такой маркер мог прийти из JSON, собранного
-    руками.
+    руками. Отдельно — значения, которые проходят `str.isdigit()`, но не `int()` («²» и
+    цифровая строка длиннее лимита CPython): разбор обязан отдать 0, а не бросить
+    `ValueError`, иначе тик падает до `try/except` вокруг коллектора.
     """
     root, p, db = stand
     marker = gate.rounds_path(p)
     assert marker == Path(p.cfg.state_dir) / "plan_1_rounds.json"
     broken = [json.dumps("abc"), json.dumps(-1), json.dumps(True), json.dumps([]),
-              json.dumps({"at": "2026-11-12T18:00:00"}), '{"extra_fix_rounds": 1']
+              json.dumps({"at": "2026-11-12T18:00:00"}), '{"extra_fix_rounds": 1',
+              json.dumps({"extra_fix_rounds": "\u00b2"}),
+              json.dumps({"extra_fix_rounds": "1" * 4400}),
+              json.dumps({"extra_fix_rounds": 1.5})]
     for payload in broken:
         marker.write_text(payload, encoding="utf-8")
         assert gate.load_extra_fix_rounds(p) == 0, payload
     marker.write_text(json.dumps({"extra_fix_rounds": "1"}), encoding="utf-8")
     assert gate.load_extra_fix_rounds(p) == 1, "строка из цифр — число кругов"
+    marker.write_text(json.dumps({"extra_fix_rounds": 1.0}), encoding="utf-8")
+    assert gate.load_extra_fix_rounds(p) == 1, "1.0 — целое число кругов, а не ноль"
     marker.write_text(json.dumps({"extra_fix_rounds": 1}), encoding="utf-8")
     assert gate.load_extra_fix_rounds(p) == 1     # защита от «функция всегда возвращает 0»
 
-    marker.write_text("{oops", encoding="utf-8")  # тик идёт с нулём доп. кругов
+    # Тик идёт с нулём доп. кругов и на значении из класса «проходит isdigit(), но не int()»:
+    # `build_ctx` читает маркер ДО `try/except` вокруг коллектора, поэтому разбор обязан быть
+    # небросающим — иначе вместо owner-стопа будет трейсбек.
+    marker.write_text(json.dumps({"extra_fix_rounds": "\u00b2"}), encoding="utf-8")
     stopped = _to_owner_stop(root, p, db)
     assert "исчерпаны (2 из 2)" in stopped["reason"], stopped
     assert gate.load_stop(p)["kind"] == "owner"
