@@ -28,6 +28,13 @@
     POST /api/plan-mode    режим планировщика: {"on": true|false}, заголовок X-Pipeline-Panel
     POST /api/plan/accept  утвердить план: {"plan": "<номер>"}, заголовок X-Pipeline-Panel;
                            проверки → перенос черновика → запись утверждения с sha256
+    POST /api/plan/start   запустить план в работу: {"plan": "2", "project": "<id>"} —
+                           адресный `gate.py --plan N --resume` и номер в driven_plans;
+                           заголовок X-Pipeline-Panel обязателен
+    POST /api/plan/stop    остановить план после текущего шага: {"plan": "2",
+                           "reason": "...", "project": "<id>"} — адресный
+                           `gate.py --plan N --stop "причина"`; заголовок X-Pipeline-Panel
+                           обязателен
     POST /api/notify       настройки уведомлений: {"global": true, "enabled": ...} или
                            {"project": id, "enabled": ..., "events": [...]}; запись в projects.json
                            (ровно одна из двух форм, иначе 400)
@@ -64,6 +71,7 @@ try:
     from . import plan_accept
     from . import plan_lint
     from . import plan_mode
+    from . import plans_api
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
     from . import update
@@ -74,6 +82,7 @@ except ImportError:  # pragma: no cover
     import plan_accept  # type: ignore
     import plan_lint  # type: ignore
     import plan_mode  # type: ignore
+    import plans_api  # type: ignore
     import project as proj  # type: ignore
     import setup_flow  # type: ignore
     import snapshot as snap  # type: ignore
@@ -2457,6 +2466,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/plan/accept":
             self._post_plan_accept()
             return
+        if path == "/api/plan/start":
+            self._post_plan_command("start")
+            return
+        if path == "/api/plan/stop":
+            self._post_plan_command("stop")
+            return
         if path == "/api/setup":
             self._post_setup()
             return
@@ -2558,6 +2573,50 @@ class Handler(BaseHTTPRequestHandler):
         result.setdefault("action", "plan_accept")
         result["project"] = {"id": state.id, "name": state.name}
         # Утверждение переносит файл и пишет состояние: старый снимок больше не верен.
+        snap.clear_cache()
+        self.state.projects_cache = None
+        panel_pause.clear_cache()             # строки планов тоже устарели (план 6 S2)
+        self._json(200 if result.get("ok") else 400, result)
+
+    def _post_plan_command(self, action: str) -> None:
+        """Запуск (`start`) или остановка (`stop`) плана — жесты владельца.
+
+        Каркас тот же, что у `_post_plan_accept`: маршрут не входит в `ACTIONS` (проект
+        выбирается полем тела), требует метку панели и в предпросмотре отвечает 403.
+        Адрес плана берётся из тела, а не из плана по умолчанию: иначе жест по плану 2
+        бил бы по наименьшему номеру проекта.
+        """
+        title = "запуск" if action == "start" else "остановка"
+        if getattr(self.state, "preview", False):
+            self._drain_body()
+            self._json(403, {"ok": False,
+                             "error": f"предпросмотр только читает: {title} плана недоступен"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        state = self._choose_project(payload.get("project"))
+        if state is None:
+            return
+        plan_id = str(payload.get("plan") or "").strip()
+        if not plan_id.isdigit():
+            self._json(400, {"ok": False, "project": {"id": state.id, "name": state.name},
+                             "error": "нужно поле plan: номер плана"})
+            return
+        try:
+            if action == "start":
+                result = plans_api.start(state.project, plan_id)
+            else:
+                result = plans_api.stop(state.project, plan_id, payload.get("reason"))
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "project": {"id": state.id, "name": state.name},
+                             "error": f"{type(exc).__name__}: {exc}"})
+            return
+        result.setdefault("action", f"plan_{action}")
+        result["project"] = {"id": state.id, "name": state.name}
+        # Жест пишет `pipeline.json` и стоп-флаг: все три кэша устарели, как в accept.
         snap.clear_cache()
         self.state.projects_cache = None
         panel_pause.clear_cache()             # строки планов тоже устарели (план 6 S2)
