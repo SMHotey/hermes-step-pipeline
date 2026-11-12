@@ -63,19 +63,11 @@ class PlanSpec:
 
 
 def normalize(plan_id: object) -> str:
-    """Номер плана в каноническом виде: `01`→`1`, ` 31 `→`31`.
-
-    `str.isdigit()` истинно и для символов, которые `int()` не принимает («²», «³»), а
-    на цифровой строке длиннее лимита CPython (4300) `int()` отказывает. Оба случая —
-    не номер плана, значит `PlanNotFound`, а не `ValueError` из недр разбора.
-    """
+    """Номер плана в каноническом виде: `01`→`1`, ` 31 `→`31`."""
     text = str(plan_id).strip()
     if not text.isdigit():
         raise PlanNotFound(f"номер плана должен быть числом, получено: {plan_id!r}")
-    try:
-        return str(int(text))
-    except ValueError:
-        raise PlanNotFound(f"номер плана должен быть числом, получено: {plan_id!r}") from None
+    return str(int(text))
 
 
 def default_plan_id(cfg: config_mod.Config) -> str:

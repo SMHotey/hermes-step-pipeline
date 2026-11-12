@@ -380,7 +380,7 @@ def load_extra_fix_rounds(p: Paths) -> int:
         return 0
     if isinstance(value, float):          # 1.0 — целое, 1.5 — не число кругов
         value = int(value) if value.is_integer() else 0
-    number = _as_int(value, 0)            # единый толерантный разбор файла (gate.py:3069)
+    number = _as_int(value, 0)            # единый толерантный разбор: функция `_as_int` ниже в файле
     return number if number > 0 else 0
 
 

@@ -622,8 +622,7 @@ def _resolve_plan(project: Path, plans_dir: Path, plan: str) -> Path | None:
     local = project / as_path
     if local.is_file():
         return local
-    # `isdecimal()`, а не `isdigit()`: последний истинен и для «²», которые `int()` не примет.
-    if plan.isdecimal() and plans_dir.is_dir():
+    if plan.isdigit() and plans_dir.is_dir():
         want = str(int(plan))
         for candidate in sorted(plans_dir.glob("*.md")):
             m = _PLAN_NUM_RE.match(candidate.name)
