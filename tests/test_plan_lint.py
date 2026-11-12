@@ -622,3 +622,17 @@ def test_doctor_shows_constitution_warning(project: Path):
     # Итог и код возврата считают только problems: предупреждение установку не краснит.
     assert doctor.format_report(doctor.Report(warnings=list(report.warnings))).splitlines()[-1] \
         == "ИТОГ: OK"
+
+
+def test_superscript_plan_number_is_reported_not_raised(project: Path):
+    """«²» проходит `str.isdigit()`, но не `int()`: линтер отвечает «план не найден».
+
+    Тот же класс, что у маркера кругов правок (`gate.load_extra_fix_rounds`): номер плана
+    приходит из CLI (`plan --check ²`), и мусор обязан стать проблемой линтера, а не
+    `ValueError` из недр разбора.
+    """
+    plans_dir = plan_lint._plans_dir(project)
+    assert plan_lint._resolve_plan(project, plans_dir, "\u00b2") is None
+    assert plan_lint._resolve_plan(project, plans_dir, "01") is not None   # номер плана живой
+    problems = [str(item) for item in plan_lint.lint_project(project, "\u00b2").problems]
+    assert problems and "не найден" in problems[0], problems

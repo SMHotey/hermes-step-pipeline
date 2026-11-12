@@ -399,7 +399,8 @@ def _plan_rows(folder: Path) -> list[tuple[str, str]]:
     """(номер, имя файла) по файлам каталога: номер из имени, файлы без номера — в конце."""
     rows = [(plan_accept.plan_number(path.name) or "—", path.name)
             for path in folder.glob("*.md")]
-    rows.sort(key=lambda row: (row[0] == "—", int(row[0]) if row[0].isdigit() else 0, row[1]))
+    # `isdecimal()`, а не `isdigit()`: последний истинен и для «²», которые `int()` не примет.
+    rows.sort(key=lambda row: (row[0] == "—", int(row[0]) if row[0].isdecimal() else 0, row[1]))
     return rows
 
 

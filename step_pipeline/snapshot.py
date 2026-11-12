@@ -1380,7 +1380,8 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
     root = Path(project).resolve() if project else proj.find_project()
     cfg = proj.read_config(root)
     plan = str(plan_id).strip()
-    if plan.isdigit():
+    # `isdecimal()`, а не `isdigit()`: последний истинен и для «²», которые `int()` не примет.
+    if plan.isdecimal():
         plan = str(int(plan))
     step = str(step_id or "").strip().upper()
     if not plan or not step:
