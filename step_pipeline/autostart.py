@@ -150,17 +150,31 @@ def _write(path: Path, text: str, *, crlf: bool = False) -> None:
 
 
 def _cmd_text(project: Path, port: int, home: Path) -> str:
-    """Сценарий Windows: цикл перезапуска, лог рядом, окна нет (его гасит vbs)."""
+    """Сценарий Windows: цикл перезапуска, лог рядом, окна нет (его гасит vbs).
+
+    Живую панель цикл узнаёт запросом `/api/health`, а не повторным запуском: CLI на
+    занятом порту выходит с кодом 1, и владелец получал в браузере
+    `ERR_CONNECTION_REFUSED` вместо пульта (12.11.2026). Нет `curl.exe` (старая
+    Windows) — проверка не срабатывает и цикл ведёт себя как раньше, поэтому
+    отсутствие утилиты не ломает автозагрузку.
+    """
     log = _panel_dir(home) / LOG_NAME
     cmd = " ".join(f'"{part}"' for part in _command_line(project, port))
+    health = f"http://127.0.0.1:{port}/api/health"
     return (
         "@echo off\n"
         "rem Панель конвейера шагов: автозагрузка. Файл создан панелью (настройки).\n"
         "rem Задача планировщика запускает его при входе в систему через wscript — без окна.\n"
+        "rem Панель на хосте одна: если порт отвечает, второй сервер не поднимаем.\n"
         "chcp 65001 >nul\n"
         f'set "HERMES_HOME={home}"\n'
         f'cd /d "{Path(project)}"\n'
         ":loop\n"
+        f'curl.exe -s -o nul --max-time 2 "{health}" 2>nul\n'
+        "if not errorlevel 1 (\n"
+        f"  timeout /t {RETRY_SECONDS} /nobreak >nul\n"
+        "  goto loop\n"
+        ")\n"
         f"{cmd} >> \"{log}\" 2>&1\n"
         f'echo [%DATE% %TIME%] панель завершилась, перезапуск через {RETRY_SECONDS} с >> "{log}"\n'
         f"timeout /t {RETRY_SECONDS} /nobreak >nul\n"

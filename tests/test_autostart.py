@@ -128,6 +128,14 @@ def test_windows_enable_creates_task_and_hidden_scripts(tmp_path: Path, panel_ho
     cmd = (folder / autostart.CMD_NAME).read_text(encoding="utf-8")
     assert '"--port" "8770"' in cmd and str(project) in cmd
     assert "goto loop" in cmd
+    # Живая панель узнаётся запросом, а не повторным запуском: иначе цикл молотит
+    # «порт занят» и владелец видит ERR_CONNECTION_REFUSED вместо пульта.
+    assert 'curl.exe -s -o nul --max-time 2 "http://127.0.0.1:8770/api/health"' in cmd
+    assert "if not errorlevel 1" in cmd
+    # cmd.exe разбирает .cmd построчно и на одиночных \n срывается: «'g' is not recognized»,
+    # «'10' is not recognized», цикл уходит в холостой ход и панель не поднимается вовсе.
+    raw = (folder / autostart.CMD_NAME).read_bytes()
+    assert raw.count(b"\r\n") > 5 and raw.count(b"\n") == raw.count(b"\r\n"), "нужны CRLF"
     assert "\n\n" not in cmd, "перевод строки не должен удваиваться"
     create = [command for command in runner.commands() if "/Create" in command]
     assert create and f"/TN {autostart.TASK_NAME}" in create[0]

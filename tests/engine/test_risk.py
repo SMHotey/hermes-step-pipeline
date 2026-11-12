@@ -169,6 +169,41 @@ def test_hold_visible_in_status_and_snapshot_source(project: Path, hermes_stub: 
     assert "hold: S1" in gate.plans_table(cfg)
 
 
+def test_hold_refuses_step_absent_from_plan(project: Path, stand):
+    """Опечатка в номере шага не оседает в состоянии плана.
+
+    `--hold` шлёт и панель (номер из выбранной вкладки), и бот: устаревшая страница
+    присылает шаг, которого в плане уже нет. До 0.25.9 такой номер записывался в
+    `hold_released` навсегда — снять его командой было нечем, а страж держал шаг.
+    """
+    cfg, p = stand
+    assert "S1" in gate.declared_steps(cfg, p), "фикстура должна разбирать шаги плана"
+    answer = gate.handle_command(cfg, "/hold NOPE-99")
+    assert "нет шага NOPE-99" in answer
+    assert "S1" in answer                       # отказ называет допустимые шаги
+    assert not Path(p.state_file).exists(), "отказ не должен создавать состояние"
+
+
+def test_cli_hold_refuses_unknown_step(project: Path, stand, capsys):
+    """Тот же отказ в CLI: код 2 и причина в stderr — её показывает панель."""
+    for flag in ("--hold", "--unhold"):
+        assert gate.main(["--plan", "1", flag, "NOPE-99"]) == 2
+        assert "нет шага NOPE-99" in capsys.readouterr().err
+
+
+def test_unhold_of_released_step_stays_allowed(project: Path, stand):
+    """Снятие допуска идемпотентно: повторный `--unhold` не отказ.
+
+    Шаг после снятия живёт в `hold_released`, а не в шагах плана — проверка номера
+    обязана это учитывать, иначе владелец получал бы отказ на собственном повторе.
+    """
+    cfg, p = stand
+    assert "S1" in gate.handle_command(cfg, "/hold S1")
+    assert "—" in gate.handle_command(cfg, "/unhold S1")
+    assert "—" in gate.handle_command(cfg, "/unhold S1")
+    assert gate.load_state(p)["hold_released"] == ["S1"]
+
+
 def test_risk_hold_is_idempotent(project: Path, hermes_stub: Path, stand):
     cfg, p = stand
     write_risk_plan(project)

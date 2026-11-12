@@ -94,6 +94,7 @@ import approval  # noqa: E402 - утверждение плана и привя�
 import config as config_mod  # noqa: E402 - модуль рядом
 import registry  # noqa: E402 - реестр планов
 import plan_cycle  # noqa: E402 - гейт корректировки плана по разведке (план 5, S4)
+import next_step  # noqa: E402 - шаги плана: проверка номера в ручном допуске
 import state_io  # noqa: E402 - атомарная запись состояния и блокировка тика
 
 # ──────────────────── целостность движка ────────────────────
@@ -3362,25 +3363,59 @@ def _plan_paths(cfg: config_mod.Config, plan: str | None = None) -> Paths:
     return resolve_paths(cfg, target)
 
 
-def _hold_change(cfg: config_mod.Config, step: str, add: bool) -> str:
-    p = _plan_paths(cfg)
+def declared_steps(cfg: config_mod.Config, p: Paths) -> set[str]:
+    """Идентификаторы шагов из файла плана; пусто — план не разобран.
+
+    Ошибку разбора не превращаем в отказ команды: у legacy-плана без раздела шагов
+    проверять нечего, и `--hold` там работает как раньше. Отказ на таком плане был бы
+    новым способом остановить владельца, а не защитой от опечатки.
+    """
+    try:
+        return {step.id.upper() for step in next_step.plan_steps(cfg, Path(p.plan_file))}
+    except Exception:                                           # noqa: BLE001
+        return set()
+
+
+def hold_state_change(cfg: config_mod.Config, p: Paths, step: str, add: bool) -> dict:
+    """Ручной допуск шага: единственный путь и для CLI, и для команд из чата.
+
+    Возвращает `{ok, message}` либо `{ok: False, error}`. Номер шага сверяется с планом:
+    раньше `--hold NOPE-99` отвечал «шаги с ручным допуском: NOPE-99» и навсегда
+    дописывал мусор в `hold_released`, откуда его уже не убрать командой (панель шлёт
+    в `--hold` то, что выбрано на вкладке шага, поэтому опечатка доходит и оттуда).
+    """
+    key = str(step or "").strip().upper()
+    if not key:
+        return {"ok": False, "error": "укажи шаг: /hold S3"}
     state = load_state(p)
     hold = {str(item).upper() for item in (state.get("hold_steps") or [])}
     released = {str(item).upper() for item in (state.get("hold_released") or [])}
-    key = step.strip().upper()
-    if not key:
-        return "укажи шаг: /hold S3"
+    declared = declared_steps(cfg, p)
+    # Уже упомянутый шаг остаётся допустимым: без этого повторный `--unhold` того же
+    # шага отвечал бы отказом, а снятие допуска обязано быть идемпотентным.
+    if declared and key not in (declared | hold | released):
+        return {"ok": False,
+                "error": f"нет шага {key} в плане {p.plan_id}: шаги плана — "
+                         + (", ".join(sorted(declared)) or "—")}
     if add:
         hold.add(key)
     else:
         hold.discard(key)
-        # Снятие допуска из чата — то же действие владельца, что `--unhold`: без отметки
-        # риск-hold вернулся бы на следующем тике (D4).
+        # Отметка владельца: автоматический риск-hold по этому шагу больше не ставится,
+        # иначе снять допуск было бы невозможно (D4).
         released.add(key)
     state["hold_steps"] = sorted(hold)
     state["hold_released"] = sorted(released)
     save_state(p, state)
-    return "шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—")
+    return {"ok": True,
+            "message": "шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—"),
+            "hold": sorted(hold)}
+
+
+def _hold_change(cfg: config_mod.Config, step: str, add: bool) -> str:
+    p = _plan_paths(cfg)
+    result = hold_state_change(cfg, p, step, add)
+    return result["message"] if result["ok"] else result["error"]
 
 
 def handle_command(cfg: config_mod.Config, text: str, chat: str | None = None) -> str:
@@ -4918,20 +4953,12 @@ def main(argv: list[str] | None = None) -> int:
                     notify(cfg, "▶️ стоп снят, конвейер продолжит со следующего шага")
                     print("стоп-флаг снят" if existed else "стоп-флага не было")
                     return 0
-                state = load_state(p)
-                hold = {str(item).upper() for item in (state.get("hold_steps") or [])}
-                released = {str(item).upper() for item in (state.get("hold_released") or [])}
-                if args.hold:
-                    hold.add(args.hold.upper())
-                else:
-                    hold.discard(args.unhold.upper())
-                    # Отметка владельца: автоматический риск-hold по этому шагу больше
-                    # не ставится, иначе снять допуск было бы невозможно (D4).
-                    released.add(args.unhold.upper())
-                state["hold_steps"] = sorted(hold)
-                state["hold_released"] = sorted(released)
-                save_state(p, state)
-                print("шаги с ручным допуском: " + (", ".join(sorted(hold)) or "—"))
+                result = hold_state_change(cfg, p, args.hold if args.hold is not None
+                                           else args.unhold, add=bool(args.hold))
+                if not result["ok"]:
+                    print(f"ошибка: {result['error']}", file=sys.stderr)
+                    return 2
+                print(result["message"])
                 return 0
             finally:
                 state_io.release(lock)
