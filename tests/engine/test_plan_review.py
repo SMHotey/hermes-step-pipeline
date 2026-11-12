@@ -420,6 +420,11 @@ def test_fix_after_reapproval_gets_review_not_owner_stop(stand):
     os.utime(write_report(root, request), (later, later))
     again = gate.run_gate(p, notify_fn=quiet)
     assert again["decision"]["action"] == "create_plan_fix", again["decision"]
+    # Ключ нумеруется по всем правкам за жизнь плана (planfix:2), а круг в заголовке — по
+    # эпохе переутверждения: иначе карточка читается как «круг 2 из 2» при свежей эпохе.
+    fresh = [c for c in cards(db) if c["key"].startswith("planloop:1:planfix")][-1]
+    assert fresh["key"] == "planloop:1:planfix:2", fresh["key"]
+    assert "(круг 1)" in fresh["title"], fresh["title"]
 
     # Правка правит текст плана: утверждение переписывается наследованием (inherited),
     # но метка переутверждения обязана пережить эту запись.

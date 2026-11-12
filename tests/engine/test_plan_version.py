@@ -175,6 +175,25 @@ def test_cli_prints_the_same_version_sha(stand, project: Path):
     assert len(printed) == 64
 
 
+def test_plan_review_card_forbids_address_nitpicks(stand):
+    """Карточка ревью плана запрещает придирки об адресах и арифметике тестов.
+
+    Круг правок плана стоит часов работы и заказа, поэтому в контракт внесены «не находки»:
+    номера строк в коде, сумма тестов, имена внутренних функций, формулировки. Блокирует
+    только то, из-за чего шаг нельзя выполнить; закрытые находки повторно не поднимаются.
+    """
+    root, plan, cfg = stand
+    p = gate.resolve_paths(cfg, "1")
+
+    body = gate.plan_review_card_body(p, p.cfg.rel(plan), "docs/reviews/plan-1.md", "reviewer")
+
+    assert "НЕ НАХОДКИ" in body
+    assert "номера строк" in body
+    assert "арифметика числа тестов" in body
+    assert "Блокирует только то" in body
+    assert "повторно не поднимаются" in body
+
+
 def test_plan_review_card_points_to_version_command(stand):
     """Карточка ревью плана называет команду метки, а не `sha256sum` по файлу."""
     root, plan, cfg = stand
