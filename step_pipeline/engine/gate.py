@@ -174,8 +174,9 @@ PLAN_FIX_RUNTIME_DEFAULT = "45m"
 PLAN_REVIEW_PROFILE_KEY = "plan_reviewer"
 # Ключ профиля правки плана: `profiles.plan_fixer`, иначе исполнитель плана (D3).
 PLAN_FIX_PROFILE_KEY = "plan_fixer"
-# Кругов ревью плана — не больше двух: первый `REQUEST_CHANGES` даёт один круг правок,
-# второй останавливает цикл и уходит владельцу (D7). Третий раз не заказываем никогда.
+# Лимит автоматических кругов правок плана: каждый `REQUEST_CHANGES` даёт карточку правок,
+# пока не исчерпан `max_fix_rounds` проекта (конституция п.4: одна правка редко закрывает
+# все замечания). Это же число — умолчание для копий движка без ключа в конфиге.
 PLAN_REVIEW_MAX_ROUNDS = 2
 # Уведомление о зависшем конвейере: единый заголовок, частота и файл отметок.
 # Заголовок обязан быть громким и одинаковым: по нему владелец отличает «конвейер
@@ -926,17 +927,24 @@ def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str
         "ГРАНИЦЫ",
         "- План не правишь, шаг не закрываешь, код шагов не пишешь.",
         "- Вердикт — только по плану на текущем HEAD; находки — адресами `файл:строка`.",
-        "- `REQUEST_CHANGES` даёт один круг правок плана; второй уходит владельцу.",
+        "- `REQUEST_CHANGES` даёт круг правок плана, пока не исчерпан лимит "
+        "`max_fix_rounds`; после лимита решение принимает владелец.",
         "",
         f"Профиль карточки — `{profile}`; карточка поставлена стражем конвейера.",
     ])
 
 
 def plan_fix_card_body(p: Paths, plan_rel: str, report_rel: str,
-                       findings: list[str]) -> str:
-    """Тело карточки правки плана: один круг, только план, ревью повторится (D7)."""
+                       findings: list[str], round_no: int = 1,
+                       max_rounds: int = 0) -> str:
+    """Тело карточки правки плана: круг правок, только план, ревью повторится (D7).
+
+    *round_no* — номер этого круга правок, *max_rounds* — лимит кругов проекта: по ним
+    исполнитель видит, сколько попыток осталось, а не «круг 1» в каждой карточке.
+    """
+    limit = f" из {max_rounds}" if max_rounds else ""
     lines = [
-        f"# Правки плана {p.plan_id} по ревью (круг 1)",
+        f"# Правки плана {p.plan_id} по ревью (круг {round_no}{limit})",
         "",
         f"Ревью плана вернуло REQUEST_CHANGES. План: `{plan_rel}`. Отчёт: `{report_rel}`.",
         "",
@@ -950,7 +958,7 @@ def plan_fix_card_body(p: Paths, plan_rel: str, report_rel: str,
         "- Правится только план: замысел, шаги, файлы, гейты, стоп-сигналы.",
         "- Разведка остаётся учтённой: раздел «## Разведка» и отметка правок на месте.",
         "- Код шагов в этой карточке не пишется и не правится.",
-        "- После правки ревью повторится само (круг 2); второй REQUEST_CHANGES",
+        "- После правки ревью повторится само; когда круги правок исчерпаны, отказ",
         "  останавливает цикл и уходит владельцу с разбором.",
         "",
         "ЗАКРЫТИЕ",
@@ -1824,7 +1832,7 @@ def approval_reset_at(record: dict) -> int:
 
 
 def _plan_review_decision(ctx: dict) -> dict | None:
-    """Ревью плана: карточка, ожидание, вердикт, один круг правок, эскалация (C6, D1-D7).
+    """Ревью плана: карточка, ожидание, вердикт, круги правок по лимиту, эскалация (C6, D1-D7).
 
     Чистое решение планового уровня: `None` — ревью не нужно либо уже позади, и план идёт
     обычным порядком. Поля `step` в решении нет намеренно: иначе инвариант «одно действие
@@ -1931,7 +1939,8 @@ def _plan_review_decision(ctx: dict) -> dict | None:
                            f"({verdict['verdict']}): {Path(verdict['path']).name}")}
     if verdict["verdict"] == "APPROVE":
         return None                    # замысел принят — шаг начинается обычным порядком
-    # REQUEST_CHANGES: один круг правок плана, второй отказ — решение владельца (D7).
+    # REQUEST_CHANGES: круг правок плана, пока не исчерпан лимит `max_fix_rounds`
+    # (конституция п.4); после лимита решает владелец.
     if not _report_written_after(verdict, card):
         return {"action": "stop",
                 "reason": (f"отчёт {rel} не обновлён после карточки {card.get('id')} — "
@@ -1958,40 +1967,48 @@ def _plan_review_decision(ctx: dict) -> dict | None:
     fixes = ctx.get("plan_fix_cards") or []
     epoch_fixes = ([f for f in fixes if int(f.get("created_at") or 0) >= reset_at]
                    if reset_at else fixes)
-    if not epoch_fixes:
-        return {"action": "create_plan_fix", "round": 1,
+    # Бюджет автоматических кругов правок — `max_fix_rounds` проекта (тот же ключ, что у
+    # правок шага, конституция п.4) и считается по КАРТОЧКАМ ПРАВОК. До 0.25.2 он считался
+    # по карточкам ревью, а правка заказывалась только когда карточек правок нет вовсе:
+    # второй REQUEST_CHANGES давал не вторую правку, а ещё одно ревью того же текста —
+    # 2–4 ревью подряд и owner-stop при живом лимите кругов правок.
+    max_rounds = max(int(ctx.get("max_fix_rounds") or PLAN_REVIEW_MAX_ROUNDS), 1)
+    last_fix = epoch_fixes[-1] if epoch_fixes else None
+    if last_fix is not None:
+        fix_status = str(last_fix.get("status") or "")
+        if fix_status not in TERMINAL:
+            return {"action": "idle", "plan_review": True,
+                    "reason": (f"ждёт правку плана {plan_id}: карточка {last_fix.get('id')} "
+                               f"({fix_status})")}
+        if fix_status != "done":
+            detail = " ".join(str(last_fix.get("error") or last_fix.get("result")
+                                  or "").split())[:300]
+            return {"action": "stop",
+                    "reason": (f"правка плана {plan_id} упала: карточка {last_fix.get('id')} "
+                               f"в статусе {fix_status}: {detail}")}
+    # Отказ этого круга ещё не получил своей карточки правок. Признак — счётчики эпохи, а
+    # не метки времени: карточки живут с точностью до секунды, и правка с ревью легко
+    # делят одну секунду (в тестах — всегда). Инвариант простой: сколько карточек ревью,
+    # столько и ответных правок; ревью больше — на последний отказ правки ещё не было.
+    if len(epoch_cards) > len(epoch_fixes):
+        if len(epoch_fixes) >= max_rounds:
+            report = Path(str(verdict["path"]))
+            findings = (_blocking_findings(report, FINDINGS_LIMIT)
+                        or _review_findings(report, FINDINGS_LIMIT))
+            return {"action": "stop", "kind": "owner",
+                    "reason": (f"круги правок плана {plan_id} исчерпаны "
+                               f"({len(epoch_fixes)} из {max_rounds}) после REQUEST_CHANGES — "
+                               f"решает владелец: {rel}"),
+                    "details": ("\n".join(f"- {item}" for item in findings)
+                                or f"Разбор — в отчёте {rel}.")}
+        return {"action": "create_plan_fix", "round": len(epoch_fixes) + 1,
                 # Маркер круга ревью живёт в ключе карточки правки (T3e): по нему бюджет
                 # отличается «первый отказ после круга, заказанного по устаревшему
                 # APPROVE» от настоящего второго отказа. `max(..., 1)` — отчёт, написанный
                 # руками без карточек, не должен превращать первый отказ во второй.
                 "review_round": max(len(epoch_cards), 1),
-                "reason": (f"ревью плана {plan_id} вернуло REQUEST_CHANGES — "
-                           f"правим план один круг: {rel}")}
-    fix = epoch_fixes[-1]
-    fix_status = str(fix.get("status") or "")
-    if fix_status not in TERMINAL:
-        return {"action": "idle", "plan_review": True,
-                "reason": (f"ждёт правку плана {plan_id}: карточка {fix.get('id')} "
-                           f"({fix_status})")}
-    if fix_status != "done":
-        detail = " ".join(str(fix.get("error") or fix.get("result") or "").split())[:300]
-        return {"action": "stop",
-                "reason": (f"правка плана {plan_id} упала: карточка {fix.get('id')} "
-                           f"в статусе {fix_status}: {detail}")}
-    # Бюджет отказов — по числу карточек ревью ЭТОЙ версии плана: два круга на версию,
-    # дальше решает владелец (D7). Круг, заказанный по устаревшему `APPROVE` (S6), — тоже
-    # круг ревью и считается наравне: он писался по тому же тексту плана.
-    # Число кругов — из `max_fix_rounds` проекта (тот же ключ, что у правок шага): владелец
-    # может разрешить больше автоматических кругов, не трогая код.
-    max_rounds = int(ctx.get("max_fix_rounds") or PLAN_REVIEW_MAX_ROUNDS)
-    if len(epoch_cards) >= max_rounds:
-        report = Path(str(verdict["path"]))
-        findings = (_blocking_findings(report, FINDINGS_LIMIT)
-                    or _review_findings(report, FINDINGS_LIMIT))
-        return {"action": "stop", "kind": "owner",
-                "reason": (f"второй REQUEST_CHANGES по плану {plan_id}: решает владелец — {rel}"),
-                "details": ("\n".join(f"- {item}" for item in findings)
-                            or f"Разбор — в отчёте {rel}.")}
+                "reason": (f"ревью плана {plan_id} вернуло REQUEST_CHANGES — правим план "
+                           f"кругом {len(epoch_fixes) + 1} из {max_rounds}: {rel}")}
     return {"action": "create_plan_review", "round": len(cards) + 1,
             "reason": (f"план {plan_id} поправлен по ревью — повторное ревью "
                        f"(круг {len(cards) + 1})")}
@@ -3802,7 +3819,9 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                     or _review_findings(plan_review_path(p), FINDINGS_LIMIT))
         cid = create_card(p, f"[правки плана {plan_id}] Правки плана по ревью (круг {key_round})",
                           plan_fix_card_body(p, p.cfg.rel(Path(p.plan_file)), report_rel,
-                                             findings),
+                                             findings, round_no=key_round,
+                                             max_rounds=max(int(ctx.get("max_fix_rounds")
+                                                                or PLAN_REVIEW_MAX_ROUNDS), 1)),
                           profile, key, plan_fix_skills(p.cfg),
                           max_runtime=plan_fix_runtime(p.cfg))
         if reused_card(cid, key, "правка плана по ревью"):
@@ -3811,8 +3830,9 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         if cid:
             touch(f"create_plan_fix:{cid}")
         if cid:
-            say(f"план {plan_id}: ревью вернуло REQUEST_CHANGES — правим план один круг "
-                f"(карточка {cid}, профиль {profile}); после правки ревью повторится")
+            say(f"план {plan_id}: ревью вернуло REQUEST_CHANGES — правим план кругом "
+                f"{key_round} (карточка {cid}, профиль {profile}); после правки ревью "
+                f"повторится")
         else:
             say(f"план {plan_id}: не смог поставить правку плана — проверь `hermes kanban ls`")
         return result

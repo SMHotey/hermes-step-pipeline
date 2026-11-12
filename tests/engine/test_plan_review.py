@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Ревью плана как отдельный шаг: карточка, вердикт, один круг правок, эскалация.
+"""Ревью плана как отдельный шаг: карточка, вердикт, круги правок по лимиту, эскалация.
 
 Девять тестов шага S5 плана 5 плюс четыре теста круга правок: гейт не отключает себя сам
 (состояние тика не признак «план идёт»), сбой создания карточки не открывает шаги, а
@@ -320,8 +320,14 @@ def test_request_changes_creates_one_fix_round(stand):
     assert "S2 не опирается на S1" in bodies[0]
 
 
-def test_second_request_changes_escalates_to_owner(stand):
-    """Второй REQUEST_CHANGES останавливает цикл стоп-флагом владельца с находками (D6, D7)."""
+def test_second_request_changes_asks_new_fix_round(stand):
+    """Второй REQUEST_CHANGES даёт ВТОРУЮ карточку правок, а не ревью того же текста.
+
+    Регресс 0.25.2: правка заказывалась только когда карточек правок нет вовсе, поэтому
+    после первого круга каждый следующий отказ давал ещё одно ревью неизменённого плана —
+    до owner-stop. Живой случай — план 6: ревью (14:00) → правки (14:09) → ревью (14:30) →
+    ревью того же sha.
+    """
     root, p, db = stand
     assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
     complete(db, ":planreview")
@@ -333,17 +339,44 @@ def test_second_request_changes_escalates_to_owner(stand):
     assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_fix"
     complete(db, ":planfix:1")
 
-    repeat = gate.run_gate(p, notify_fn=quiet)
-    assert repeat["decision"]["action"] == "create_plan_review", repeat["decision"]
-    assert repeat["decision"]["round"] == 2
+    repeated = gate.run_gate(p, notify_fn=quiet)
+    assert repeated["decision"]["action"] == "create_plan_review", repeated["decision"]
+    assert repeated["decision"]["round"] == 2
     complete(db, ":planreview:2")
+    write_report(root, request)
+
+    decision = gate.run_gate(p, notify_fn=quiet)["decision"]
+    assert decision["action"] == "create_plan_fix", decision
+    assert decision["round"] == 2
+    assert "кругом 2 из 2" in decision["reason"]
+    fixes = [c["key"] for c in cards(db) if c["key"].startswith("planloop:1:planfix")]
+    assert fixes == ["planloop:1:planfix:1", "planloop:1:planfix:2"], fixes
+
+
+def test_fix_rounds_exhausted_escalates_to_owner(stand):
+    """Когда круги правок исчерпаны, отказ останавливает цикл стоп-флагом владельца (D6, D7)."""
+    root, p, db = stand
+    request = ("# Ревью плана 1\n\n- шаг S2 не опирается на S1\n\n"
+               "## ВЕРДИКТ: REQUEST_CHANGES\n")
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview")
+    write_report(root, request)
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_fix"
+    complete(db, ":planfix:1")
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview:2")
+    write_report(root, request)
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_fix"
+    complete(db, ":planfix:2")
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview:3")
     write_report(root, request)
 
     escalated = gate.run_gate(p, notify_fn=quiet)
     decision = escalated["decision"]
     assert decision["action"] == "stop", decision
     assert decision["kind"] == "owner"
-    assert "второй REQUEST_CHANGES" in decision["reason"]
+    assert "круги правок плана 1 исчерпаны (2 из 2)" in decision["reason"]
     assert "plan-1.md" in decision["reason"]
     assert "S2 не опирается на S1" in decision["details"]
     assert gate.load_stop(p)["kind"] == "owner"
@@ -487,7 +520,7 @@ REQUEST = ("# Ревью плана 1\n\n- шаг S2 не опирается н�
 
 
 def _to_owner_stop(root: Path, p, db) -> None:
-    """Довести план до owner-stop: два круга ревью, оба REQUEST_CHANGES (D7)."""
+    """Довести план до owner-stop: круги правок исчерпаны, каждое ревью — REQUEST_CHANGES."""
     assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
     complete(db, ":planreview")
     write_report(root, REQUEST)
@@ -495,6 +528,11 @@ def _to_owner_stop(root: Path, p, db) -> None:
     complete(db, ":planfix:1")
     assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
     complete(db, ":planreview:2")
+    write_report(root, REQUEST)
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_fix"
+    complete(db, ":planfix:2")
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview:3")
     write_report(root, REQUEST)
     stopped = gate.run_gate(p, notify_fn=quiet)["decision"]
     assert stopped["action"] == "stop" and stopped["kind"] == "owner", stopped
@@ -529,7 +567,7 @@ def test_reapproval_after_owner_stop_opens_new_review_round(stand):
 
     decision = gate.run_gate(p, notify_fn=quiet)["decision"]
     assert decision["action"] == "create_plan_review", decision
-    assert decision["round"] == 3
+    assert decision["round"] == 4
     assert "переутверждён" in decision["reason"]
 
 
@@ -541,14 +579,15 @@ def test_reapproval_resets_review_budget(stand):
     gate.clear_stop(p)
     assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
 
-    complete(db, ":planreview:3")
+    complete(db, ":planreview:4")
     write_report(root, REQUEST)
     decision = gate.run_gate(p, notify_fn=quiet)["decision"]
     assert decision["action"] == "create_plan_fix", decision
     fixes = [c for c in cards(db) if c["key"].startswith("planloop:1:planfix")]
     # Ключ правки обязан быть новым: закрытая карточка прошлой версии не переиспользуется
     # (ядро дедуплицирует по ключу и вернуло бы её — правок бы не появилось вовсе).
-    assert [c["key"] for c in fixes] == ["planloop:1:planfix:1", "planloop:1:planfix:2"], fixes
+    assert [c["key"] for c in fixes] == ["planloop:1:planfix:1", "planloop:1:planfix:2",
+                                        "planloop:1:planfix:3"], fixes
     assert fixes[-1]["status"] == "ready"
 
 
