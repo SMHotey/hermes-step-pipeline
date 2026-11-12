@@ -47,6 +47,57 @@ def _line(text: str, needle: str) -> int:
     raise AssertionError(f"в тексте нет строки с {needle!r}")
 
 
+def test_plan_with_stale_line_address_is_a_problem(project: Path):
+    """Адрес `файл.py:строки` за концом файла — находка линтера, а не ревью.
+
+    Проверка появилась в 0.25.6 вместо адресных придирок ревьюера (0.25.5): после правки
+    движка номера строк уезжают, и план с `gate.py:4729` в файле на 4400 строк отправлял
+    шаг по пустому адресу. Здесь это видно на утверждении плана, без круга ревью.
+    """
+    (project / "app").mkdir(parents=True, exist_ok=True)
+    (project / "app" / "x.py").write_text("\n".join(f"line {i}" for i in range(1, 6)),
+                                          encoding="utf-8")
+    path = project / "docs" / "plans" / "2-stale.md"
+    path.write_text(BROKEN.replace("`app/x.py`", "`app/x.py:3-99`"), encoding="utf-8")
+
+    result = plan_lint.lint_project(project, "2")
+
+    # Предупреждение, не ошибка: утверждение плана адрес не блокирует.
+    hits = [problem for problem in result.warnings if "уехал" in problem.text]
+    assert len(hits) == 1, [str(problem) for problem in result.warnings]
+    assert "в файле 5 строк" in hits[0].text
+    assert not [problem for problem in result.problems if "уехал" in problem.text]
+
+
+def test_plan_with_address_inside_file_is_clean(project: Path):
+    """Адрес внутри файла и существующий анкор — не находка."""
+    (project / "app").mkdir(parents=True, exist_ok=True)
+    (project / "app" / "x.py").write_text(
+        "# STEP_LIST\n" + "\n".join(f"line {i}" for i in range(1, 6)), encoding="utf-8")
+    path = project / "docs" / "plans" / "2-fresh.md"
+    path.write_text(BROKEN.replace("`app/x.py`", "`app/x.py:2-5`, `app/x.py#STEP_LIST`"),
+                    encoding="utf-8")
+
+    warnings = plan_lint.lint_warnings(path, project, plan_lint.settings(project))
+
+    assert not [problem for problem in warnings if "уехал" in problem.text
+                or "анкор" in problem.text], [str(problem) for problem in warnings]
+
+
+def test_plan_with_missing_anchor_is_a_problem(project: Path):
+    """`файл.py#ANCHOR` без комментария `# ANCHOR` в файле — находка."""
+    (project / "app").mkdir(parents=True, exist_ok=True)
+    (project / "app" / "x.py").write_text("x = 1\n", encoding="utf-8")
+    path = project / "docs" / "plans" / "2-anchor.md"
+    path.write_text(BROKEN.replace("`app/x.py`", "`app/x.py#STEP_LIST`"), encoding="utf-8")
+
+    warnings = plan_lint.lint_warnings(path, project, plan_lint.settings(project))
+
+    hits = [problem for problem in warnings if "анкор" in problem.text]
+    assert len(hits) == 1, [str(problem) for problem in warnings]
+    assert "# STEP_LIST" in hits[0].text
+
+
 def test_template_plan_is_clean():
     project = helpers.REPO
     path = project / "step_pipeline" / "templates" / "plan-template.md"

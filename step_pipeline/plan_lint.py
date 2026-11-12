@@ -401,6 +401,108 @@ def _research_problems(shown: str, lines: list[str],
     return out
 
 
+# ─────────────────────── ссылки на код в тексте плана ───────────────────────
+
+#: Ссылка в пункте плана: `путь.py`, `путь.py:12`, `путь.py:12-34`, `путь.py#ANCHOR`.
+#: Ловятся только «файловые» ссылки в обратных кавычках: команды, имена и пути каталогов
+#: сюда не попадают, поэтому ложных находок нет.
+_REF_RE = re.compile(
+    r"(?<![\w/.-])(?P<path>(?:[\w.-]+/)*[\w.-]+\.(?P<ext>py|md|json|ya?ml|toml|txt|jsonl|html))"
+    r"(?::(?P<start>\d+)(?:-(?P<end>\d+))?)?"
+    r"(?:#(?P<anchor>[\w-]+))?"
+)
+_TICK_RE = re.compile(r"`([^`\n]+)`")
+_ANCHOR_LIMIT = 20
+
+
+def _anchor_present(text: str, anchor: str) -> bool:
+    """Есть ли в файле комментарий `# ANCHOR` с этим именем (стабильный адрес плана)."""
+    return re.search(rf"^[ \t]*#[ \t]*{re.escape(anchor)}\b", text, re.MULTILINE) is not None
+
+
+def _ref_target(root: Path, rel: str) -> Path | None:
+    """Файл, на который ссылается план: путь от корня или имя движка проекта.
+
+    Планы часто называют файл движка без каталога (`gate.py:1834`, `snapshot.py:615-624`):
+    в проекте-потребителе это `.pipeline/<имя>` — ровно та копия, которую исполняет страж.
+    В репозитории плагина тот же файл лежит в `step_pipeline/engine/`. Порядок поиска
+    фиксирован: сначала путь от корня, потом копия в `.pipeline`, потом движок плагина;
+    ничего не нашли — ссылку не проверяем (файл может создать шаг).
+    """
+    direct = root / rel
+    if direct.is_file():
+        return direct
+    if "/" in rel:
+        return None
+    for folder in (Path(".pipeline"), Path("step_pipeline") / "engine"):
+        candidate = root / folder / rel
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _ref_warnings(shown: str, lines: list[str], project: Path) -> list[Problem]:
+    """Ссылки плана на существующий код: адрес не должен выходить за файл.
+
+    Канал — предупреждения (`warnings`), а не ошибки: адрес, уехавший после правки кода,
+    не повод не утверждать план. Владельцу нужен один способ снять стоп, и «номер строки»
+    в него не входит; показать расхождение человеку — да, блокировать — нет.
+
+    Проверяется только проверяемое без мнения, ровно та дырка, которую ревью плана
+    перестало закрывать (0.25.5): после правки движка `файл.py:1834` может указывать за
+    конец файла, и находку об этом раньше приносил ревьюер — за целый круг правок. Здесь
+    она приходит при утверждении плана (`plan --check`, `plan --accept`, `doctor`).
+
+    Файл, которого нет, и анкор, которого нет, — не находки: план вправе ссылаться на файл
+    и на комментарий, которые создаст шаг. Поэтому проверяются только ссылки в
+    существующие файлы: диапазон в их границах и наличие `# ANCHOR`.
+    """
+    out: list[Problem] = []
+    seen: set[tuple[str, str]] = set()
+    root = Path(project)
+    for number, line in enumerate(lines, 1):
+        for span in _TICK_RE.findall(line):
+            match = _REF_RE.search(span.strip())
+            if not match:
+                continue
+            rel = match.group("path")
+            if rel.startswith(("/", "~")) or "://" in span or "{" in rel:
+                continue
+            target = _ref_target(root, rel)
+            if target is None:
+                continue
+            kind = "range" if match.group("start") else ("anchor" if match.group("anchor") else "")
+            if not kind or (rel, kind) in seen:
+                continue
+            seen.add((rel, kind))
+            try:
+                text = target.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if kind == "anchor":
+                anchor = str(match.group("anchor"))
+                if not _anchor_present(text, anchor):
+                    out.append(Problem(shown, number,
+                                       f"анкор `{rel}#{anchor}` не найден: в файле нет "
+                                       f"комментария `# {anchor}` — шаг пойдёт по устаревшей "
+                                       f"ссылке", ""))
+                continue
+            total = len(text.splitlines())
+            first = int(match.group("start"))
+            last = int(match.group("end") or first)
+            if last < first:
+                out.append(Problem(shown, number,
+                                   f"адрес `{rel}:{first}-{last}`: конец раньше начала", ""))
+            elif last > total:
+                out.append(Problem(shown, number,
+                                   f"адрес `{rel}:{first}-{last}` уехал: в файле {total} строк "
+                                   f"(правка кода сдвинула номера — сверь адрес перед "
+                                   f"исполнением шага)", ""))
+            if len(out) >= _ANCHOR_LIMIT:
+                return out
+    return out
+
+
 def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
     """Все проверки одного файла плана; строки — 1-based, «весь файл» — 0."""
     path = Path(path)
@@ -500,11 +602,16 @@ def lint_warnings(path: Path, project: Path, settings: Settings) -> list[Problem
         return []
     lines = text.splitlines()
     found = _headings(lines)
-    if _constitution_line(lines, found) is not None:
-        return []
-    heading = next((idx for idx, level, _title in found if level == 1), None)
-    return [Problem(_shown(Path(path), project), 1 if heading is None else heading + 1,
-                    _CONSTITUTION_WARNING)]
+    out: list[Problem] = []
+    if _constitution_line(lines, found) is None:
+        heading = next((idx for idx, level, _title in found if level == 1), None)
+        out.append(Problem(_shown(Path(path), project), 1 if heading is None else heading + 1,
+                           _CONSTITUTION_WARNING))
+    # Ссылки плана на существующий код: уехавший адрес и пропавший анкор. Предупреждение,
+    # а не ошибка: блокировать утверждение адресом нельзя — владельцу нужен один способ
+    # снять стоп, и это не «починить номер строки».
+    out.extend(_ref_warnings(_shown(Path(path), project), lines, project))
+    return out
 
 
 def _resolve_plan(project: Path, plans_dir: Path, plan: str) -> Path | None:
