@@ -205,6 +205,10 @@ HISTORY_NAME = "history.jsonl"
 HISTORY_MAX_LINES = 2000
 HISTORY_MAX_BYTES = 512 * 1024
 METRICS_DAYS = 7
+# Маркер ручных кругов правок плана: файл в каталоге состояния (`paths.state`).
+# Имя — часть контракта: тот же файл читает панель (S7), поля — `extra_fix_rounds`,
+# `at`, `reason`. Движок читает только число кругов, остальное — для человека.
+ROUNDS_FILE = "plan_{plan}_rounds.json"
 # Комментарий с находками в карточке правок: автор, предел длины и сколько находок берём.
 COMMENT_AUTHOR = "страж"
 COMMENT_MAX_LEN = 4000
@@ -342,6 +346,39 @@ def clear_stop(p: Paths) -> bool:
     existed = path.is_file()
     path.unlink(missing_ok=True)
     return existed
+
+
+def rounds_path(p: Paths) -> Path:
+    """Маркер ручных кругов правок плана: `plan_<N>_rounds.json` в каталоге состояния."""
+    return Path(p.cfg.state_dir) / ROUNDS_FILE.format(plan=p.plan_id)
+
+
+def load_extra_fix_rounds(p: Paths) -> int:
+    """Сколько дополнительных кругов правок плана разрешил владелец маркером.
+
+    Правила чтения: файла нет, он не читается, это не словарь, ключа `extra_fix_rounds`
+    нет, значение `bool`, отрицательное или не число → 0. Целое ≥ 0 берётся как есть,
+    строка из цифр — тоже (маркер правят руками). Битый маркер — не повод для `GateError`
+    и не повод для стопа: тик идёт дальше с нулём дополнительных кругов.
+    """
+    path = rounds_path(p)
+    if not path.exists():
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    value = data.get("extra_fix_rounds")
+    if isinstance(value, bool):           # `true` — не число кругов
+        return 0
+    if isinstance(value, int):
+        return value if value > 0 else 0
+    if isinstance(value, str):
+        text = value.strip()
+        return int(text) if text.isdigit() else 0
+    return 0
 
 
 # ───────────────────────────── вердикт ─────────────────────────────
@@ -1309,6 +1346,9 @@ def collector(p: Paths, step: str | None = None) -> dict:
 def build_ctx(p: Paths) -> dict:
     state = load_state(p)
     ctx: dict = {"state": state, "stop": load_stop(p), "hold": list(state.get("hold_steps") or []),
+                 # Ручные круги правок плана из маркера владельца (S1 плана 6): считаются
+                 # рядом со стоп-флагом, потому что живут в том же каталоге состояния.
+                 "extra_fix_rounds": load_extra_fix_rounds(p),
                  # Шаги, допуск по которым владелец уже снимал: автоматический риск-hold
                  # по ним не ставится повторно (D4).
                  "released": list(state.get("hold_released") or [])}
@@ -1846,8 +1886,25 @@ def approval_reset_at(record: dict) -> int:
     return 0
 
 
+def plan_fix_budget(ctx: dict) -> int:
+    """Бюджет кругов правок плана: автоматические из конфига плюс ручные из маркера.
+
+    `max_fix_rounds` — ключ проекта (конституция п.4), `extra_fix_rounds` — жест владельца,
+    прочитанный из `plan_<N>_rounds.json` в каталоге состояния. `max(..., 1)` у конфига:
+    отчёт, написанный руками без карточек, не должен превращать первый отказ во второй.
+    У маркера `max(..., 0)`: минус кругов не бывает. Одна точка правила на движок — тем же
+    числом живут причины решения и тело карточки правок.
+    """
+    automatic = max(int(ctx.get("max_fix_rounds") or PLAN_REVIEW_MAX_ROUNDS), 1)
+    manual = max(int(ctx.get("extra_fix_rounds") or 0), 0)
+    return automatic + manual
+
+
 def _plan_review_decision(ctx: dict) -> dict | None:
     """Ревью плана: карточка, ожидание, вердикт, круги правок по лимиту, эскалация (C6, D1-D7).
+
+    Бюджет кругов правок — `plan_fix_budget`: `max_fix_rounds` проекта плюс ручные круги
+    из маркера владельца `plan_<N>_rounds.json`. Исчерпан расширенный бюджет — owner-стоп.
 
     Чистое решение планового уровня: `None` — ревью не нужно либо уже позади, и план идёт
     обычным порядком. Поля `step` в решении нет намеренно: иначе инвариант «одно действие
@@ -1982,12 +2039,12 @@ def _plan_review_decision(ctx: dict) -> dict | None:
     fixes = ctx.get("plan_fix_cards") or []
     epoch_fixes = ([f for f in fixes if int(f.get("created_at") or 0) >= reset_at]
                    if reset_at else fixes)
-    # Бюджет автоматических кругов правок — `max_fix_rounds` проекта (тот же ключ, что у
-    # правок шага, конституция п.4) и считается по КАРТОЧКАМ ПРАВОК. До 0.25.2 он считался
-    # по карточкам ревью, а правка заказывалась только когда карточек правок нет вовсе:
-    # второй REQUEST_CHANGES давал не вторую правку, а ещё одно ревью того же текста —
-    # 2–4 ревью подряд и owner-stop при живом лимите кругов правок.
-    max_rounds = max(int(ctx.get("max_fix_rounds") or PLAN_REVIEW_MAX_ROUNDS), 1)
+    # Бюджет кругов правок — `max_fix_rounds` проекта (тот же ключ, что у правок шага,
+    # конституция п.4) плюс ручные круги из маркера владельца, и считается по КАРТОЧКАМ
+    # ПРАВОК. До 0.25.2 он считался по карточкам ревью, а правка заказывалась только когда
+    # карточек правок нет вовсе: второй REQUEST_CHANGES давал не вторую правку, а ещё одно
+    # ревью того же текста — 2–4 ревью подряд и owner-stop при живом лимите кругов правок.
+    max_rounds = plan_fix_budget(ctx)
     last_fix = epoch_fixes[-1] if epoch_fixes else None
     if last_fix is not None:
         fix_status = str(last_fix.get("status") or "")
@@ -3839,8 +3896,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         cid = create_card(p, f"[правки плана {plan_id}] Правки плана по ревью (круг {display_round})",
                           plan_fix_card_body(p, p.cfg.rel(Path(p.plan_file)), report_rel,
                                              findings, round_no=display_round,
-                                             max_rounds=max(int(ctx.get("max_fix_rounds")
-                                                                or PLAN_REVIEW_MAX_ROUNDS), 1)),
+                                             max_rounds=plan_fix_budget(ctx)),
                           profile, key, plan_fix_skills(p.cfg),
                           max_runtime=plan_fix_runtime(p.cfg))
         if reused_card(cid, key, "правка плана по ревью"):

@@ -524,8 +524,11 @@ REQUEST = ("# Ревью плана 1\n\n- шаг S2 не опирается н�
            "## ВЕРДИКТ: REQUEST_CHANGES\n")
 
 
-def _to_owner_stop(root: Path, p, db) -> None:
-    """Довести план до owner-stop: круги правок исчерпаны, каждое ревью — REQUEST_CHANGES."""
+def _to_owner_stop(root: Path, p, db) -> dict:
+    """Довести план до owner-stop: круги правок исчерпаны, каждое ревью — REQUEST_CHANGES.
+
+    Возвращает решение тика, поставившего стоп: тесты S1 плана 6 сверяют по нему бюджет.
+    """
     assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
     complete(db, ":planreview")
     write_report(root, REQUEST)
@@ -541,6 +544,7 @@ def _to_owner_stop(root: Path, p, db) -> None:
     write_report(root, REQUEST)
     stopped = gate.run_gate(p, notify_fn=quiet)["decision"]
     assert stopped["action"] == "stop" and stopped["kind"] == "owner", stopped
+    return stopped
 
 
 def _reapprove_edited(root: Path, db) -> None:
@@ -665,3 +669,123 @@ def test_closed_card_on_create_raises_alarm(stand):
                       .read_text(encoding="utf-8"))
     assert stop["kind"] == "incident"
     assert any(gate.ATTENTION_HEADER in text for text in said), said
+
+
+# ───────── дополнительный круг правок по маркеру владельца (S1 плана 6) ─────────
+
+def test_marker_adds_fix_round_after_owner_stop(stand):
+    """Жест владельца маркером даёт третий круг правок, и только после него — новый стоп.
+
+    Без маркера бюджет — два круга из конфига: третий REQUEST_CHANGES ставит owner-стоп
+    «2 из 2». Маркер `plan_1_rounds.json` добавляет круг: после `--resume` тик заказывает
+    карточку `planloop:1:planfix:3` с причиной и телом «круг 3 из 3», а исчерпание
+    расширенного бюджета снова упирается в owner-стоп — уже «3 из 3».
+    """
+    root, p, db = stand
+    first_stop = _to_owner_stop(root, p, db)
+    assert "исчерпаны (2 из 2)" in first_stop["reason"], first_stop
+
+    marker = Path(p.cfg.state_dir) / "plan_1_rounds.json"
+    marker.write_text(json.dumps({"extra_fix_rounds": 1, "at": "2026-11-12T18:00:00",
+                                  "reason": "владелец разрешил ещё один круг правок"}),
+                      encoding="utf-8")
+    assert gate.load_extra_fix_rounds(p) == 1
+    gate.clear_stop(p)                     # это делает `gate.py --plan 1 --resume`
+
+    bodies: list[str] = []
+
+    def spy(_p, title, body, assignee, key, skills, parent=None, max_runtime=None):
+        bodies.append(body)
+        return gate._create_card(_p, title, body, assignee, key, skills, parent, max_runtime)
+
+    third = gate.run_gate(p, create_card=spy, notify_fn=quiet)["decision"]
+    assert third["action"] == "create_plan_fix", third
+    assert third["round"] == 3, third
+    assert "кругом 3 из 3" in third["reason"], third
+    assert "круг 3 из 3" in bodies[0], bodies[0][:200]
+    assert "planloop:1:planfix:3" in keys_of(db)
+
+    complete(db, ":planfix:3")
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview:4")
+    write_report(root, REQUEST)
+
+    second_stop = gate.run_gate(p, notify_fn=quiet)["decision"]
+    assert second_stop["action"] == "stop", second_stop
+    assert second_stop["kind"] == "owner", second_stop
+    assert "исчерпаны (3 из 3)" in second_stop["reason"], second_stop
+    assert gate.load_stop(p)["kind"] == "owner"
+
+
+def test_marker_read_from_configured_state_dir(stand, monkeypatch):
+    """Маркер читается из `paths.state`, а не из литерала `.pipeline/state`."""
+    root, _p, db = stand
+    for name in ("PIPELINE_STATE_DIR", "PIPELINE_CONFIG"):
+        monkeypatch.delenv(name, raising=False)
+    raw = json.loads((Path(root) / "pipeline.json").read_text(encoding="utf-8"))
+    raw["paths"] = {"plans": "docs/plans", "reviews": "docs/reviews",
+                    "prompts": "docs/prompts", "state": "run/state"}
+    (Path(root) / "pipeline.json").write_text(json.dumps(raw, ensure_ascii=False),
+                                             encoding="utf-8")
+    p = gate.resolve_paths(config_mod.load(root), "1")
+    assert Path(p.cfg.state_dir) == Path(root) / "run" / "state"
+
+    # Запись утверждения переезжает вместе с каталогом состояния: иначе план «не утверждён»
+    # и ревью не начнётся.
+    record = write_approval(root, Path(root) / "docs" / "plans" / "1-demo.md")
+    moved = Path(p.cfg.state_dir) / record.name
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    record.replace(moved)
+    assert moved.is_file() and not record.exists()
+
+    # Приманка в прежнем каталоге: литерал `.pipeline/state` дал бы бюджет 7, а не 3.
+    (Path(root) / ".pipeline" / "state" / "plan_1_rounds.json").write_text(
+        json.dumps({"extra_fix_rounds": 5}), encoding="utf-8")
+    (Path(p.cfg.state_dir) / "plan_1_rounds.json").write_text(
+        json.dumps({"extra_fix_rounds": 1, "at": "2026-11-12T18:00:00",
+                    "reason": "владелец разрешил ещё один круг правок"}), encoding="utf-8")
+    assert gate.load_extra_fix_rounds(p) == 1
+
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview")
+    write_report(root, REQUEST)
+    for round_no in (1, 2):
+        fix = gate.run_gate(p, notify_fn=quiet)["decision"]
+        assert fix["action"] == "create_plan_fix", fix
+        assert fix["round"] == round_no, fix
+        complete(db, f":planfix:{round_no}")
+        assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+        complete(db, f":planreview:{round_no + 1}")
+        write_report(root, REQUEST)
+
+    third = gate.run_gate(p, notify_fn=quiet)["decision"]
+    assert third["action"] == "create_plan_fix", third
+    assert third["round"] == 3, third
+    assert "кругом 3 из 3" in third["reason"], third
+
+
+def test_broken_marker_gives_zero_extra_rounds(stand):
+    """Битый маркер — ноль доп. кругов, а не падение тика: страж упирается в «2 из 2».
+
+    Маркер правят руки и панель, поэтому неверное значение — не повод для `GateError`:
+    файла нет, он не разбирается, это не словарь, ключа нет, `true`, минус, не число — всё
+    ноль. Строка из цифр считается числом: такой маркер мог прийти из JSON, собранного
+    руками.
+    """
+    root, p, db = stand
+    marker = gate.rounds_path(p)
+    assert marker == Path(p.cfg.state_dir) / "plan_1_rounds.json"
+    broken = [json.dumps("abc"), json.dumps(-1), json.dumps(True), json.dumps([]),
+              json.dumps({"at": "2026-11-12T18:00:00"}), '{"extra_fix_rounds": 1']
+    for payload in broken:
+        marker.write_text(payload, encoding="utf-8")
+        assert gate.load_extra_fix_rounds(p) == 0, payload
+    marker.write_text(json.dumps({"extra_fix_rounds": "1"}), encoding="utf-8")
+    assert gate.load_extra_fix_rounds(p) == 1, "строка из цифр — число кругов"
+    marker.write_text(json.dumps({"extra_fix_rounds": 1}), encoding="utf-8")
+    assert gate.load_extra_fix_rounds(p) == 1     # защита от «функция всегда возвращает 0»
+
+    marker.write_text("{oops", encoding="utf-8")  # тик идёт с нулём доп. кругов
+    stopped = _to_owner_stop(root, p, db)
+    assert "исчерпаны (2 из 2)" in stopped["reason"], stopped
+    assert gate.load_stop(p)["kind"] == "owner"
