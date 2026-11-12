@@ -831,29 +831,41 @@ function renderDrafts(data) {
   // Черновик остаётся в `drafts/` и после утверждения: действующим считается файл в
   // каталоге планов. Поэтому признак приходит из снимка (`d.approved`), а не из наличия
   // файла — иначе кнопка «Утвердить» висела бы вечно и ничего не меняла.
-  box.innerHTML = rows.map((d) => {
-    const approved = Boolean(d.approved);
-    const pill = approved ? `<span class="pill ok">утверждён</span>`
-                          : (d.changed ? `<span class="pill bad">изменён после утверждения</span>`
-                                       : `<span class="pill wait">черновик</span>`);
-    const hint = approved
-      ? `<div class="muted">утверждён ${esc(d.approved_at || "")}`
-        + (d.draft_differs ? " · текст черновика отличается от утверждённого плана" : "")
-        + `</div>`
-      : "";
+  //
+  // Утверждённый черновик — не черновик, а остаток: план с тем же номером уже стоит в
+  // списке планов со своим бейджем «утверждён», а файл из `drafts/` ни на что не влияет
+  // (`--accept` при наличии файла в каталоге планов утверждает именно его). Строку для
+  // него не рисуем — иначе каждый утверждённый план показан дважды, — а число остатков
+  // сообщаем одной строкой: файлы владелец может удалить сам.
+  const pending = rows.filter((d) => !d.approved);
+  const approved = rows.filter((d) => d.approved);
+  const differs = approved.filter((d) => d.draft_differs).length;
+  const leftover = approved.length
+    ? `<div class="muted">в docs/plans/drafts/ остались черновики уже утверждённых `
+      + `планов: ${approved.length}`
+      + (differs ? ` (по тексту отличаются от действующего файла: ${differs})` : "")
+      + ` — действует план из docs/plans/</div>`
+    : "";
+  if (!pending.length) {
+    box.innerHTML = `<span class="muted">черновиков нет — все планы из `
+      + `docs/plans/drafts/ уже утверждены</span>` + leftover;
+    return;
+  }
+  box.innerHTML = pending.map((d) => {
+    const pill = d.changed ? `<span class="pill bad">изменён после утверждения</span>`
+                           : `<span class="pill wait">черновик</span>`;
     return `
     <div class="plan-row" data-draft="${esc(d.id)}">
       <div class="row1">
         ${pill}
         <span>план ${esc(d.id)}</span>
         <span class="muted">${esc(d.title)} · шагов: ${esc(d.steps_total || 0)}</span>
-        ${data.preview || approved ? "" : `<button data-approve="${esc(d.id)}"
+        ${data.preview ? "" : `<button data-approve="${esc(d.id)}"
             title="перенести в каталог планов и записать утверждение">Утвердить</button>`}
       </div>
       <div class="muted mono">${esc(d.file)}</div>
-      ${hint}
     </div>`;
-  }).join("");
+  }).join("") + leftover;
   bindApprove(box);
 }
 

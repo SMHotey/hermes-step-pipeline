@@ -369,3 +369,28 @@ def test_list_drafts_sees_changed_plan(project: Path, monkeypatch):
     assert row["approved"] is False
     assert row["changed"] is True
     assert row["draft_differs"] is True
+
+
+def test_list_drafts_keeps_approved_after_journal_line(project: Path, monkeypatch):
+    """Строка журнала (закрытие шага) — не правка плана: черновик остаётся «утверждён».
+
+    Страж сверяет утверждение по версии плана (`version_sha256`, содержимое журнала
+    исключено), а сверка панели шла по сырым байтам: после первого закрытого шага строка
+    черновика возвращалась в «изменён после утверждения», и один план был виден дважды —
+    «утверждён» в списке планов и «изменён» в черновиках (gapaudit, 12.11.2026).
+    """
+    monkeypatch.setattr(plan_accept, "now_iso", lambda: "2026-01-01T00:00:00")
+    _draft(project, "5-demo.md", helpers.PLAN)
+    assert _cmd(project, accept="5") == 0
+    final = project / "docs" / "plans" / "5-demo.md"
+    # Закрытие шага: строка таблицы внутри раздела «## Журнал выполнения».
+    before = final.read_text(encoding="utf-8")
+    after = before.replace("| — | S1 | — | — | открыт |",
+                           "| 01.01 | S1 | abc1234 | прогон | закрыт |")
+    assert after != before                      # замена состоялась, иначе тест пустой
+    final.write_text(after, encoding="utf-8")
+    _draft(project, "5-demo.md", helpers.PLAN)
+
+    row = next(item for item in plan_accept.list_drafts(project) if item["id"] == "5")
+    assert row["approved"] is True
+    assert row["changed"] is False

@@ -209,6 +209,25 @@ def test_page_has_plan_approval_hooks(server):
         assert needle in html
 
 
+def test_page_hides_approved_drafts(server):
+    """Утверждённый черновик не рисуется строкой — иначе один план показан дважды.
+
+    Владелец видел «план 1» и в «Черновиках планов», и в «Планах» (12.11.2026): файл
+    черновика остаётся в `docs/plans/drafts/` после утверждения, а действует файл из
+    каталога планов. Панель говорит об остатках одной строкой и файлы не трогает.
+    """
+    with urllib.request.urlopen(server["url"] + "/", timeout=10) as response:
+        # Концы строк — как в рабочем дереве (core.autocrlf=true даёт CRLF): границы
+        # функции ищем после нормализации, иначе тест краснеет от формата, не от правки.
+        html = response.read().decode("utf-8").replace("\r\n", "\n")
+    start = html.index("function renderDrafts(data) {")
+    body = html[start:html.index("\n}\n", start)]
+    assert "!d.approved" in body                      # на экране только неутверждённые
+    assert "остались черновики уже утверждённых" in body
+    assert "data-approve" in body                     # кнопка у настоящего черновика жива
+    assert "pill ok" not in body                      # бейджа «утверждён» в блоке нет
+
+
 def test_approve_core_matches_cli_outcome(server):
     """`plan_accept.approve` — тот же путь, что CLI: исход и сообщение без печати."""
     _draft(server["root"])

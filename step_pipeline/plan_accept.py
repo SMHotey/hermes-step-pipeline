@@ -126,8 +126,16 @@ def _draft_state(project, number: str, draft: Path) -> dict:
     except OSError:
         return out
     approved_sha = str(record.get("sha256") or "")
-    out["approved"] = bool(approved_sha) and approved_sha == final_sha
-    out["changed"] = bool(approved_sha) and approved_sha != final_sha
+    saved_version = str(record.get("version_sha256") or "")
+    # Сверка — как у стража (`engine/approval.py:evaluate`): запись с `version_sha256`
+    # сверяется по версии плана. На сырых байтах закрытие шага (строка журнала) выглядело
+    # правкой плана: строка черновика возвращалась в «изменён после утверждения», хотя
+    # план в том же снимке помечен «утверждён». Легаси-запись без поля — по сырым байтам.
+    version = _version_sha256(project, final) if saved_version else ""
+    same = (saved_version == version) if version else (approved_sha == final_sha)
+    has_record = bool(approved_sha or saved_version)
+    out["approved"] = has_record and same
+    out["changed"] = has_record and not same
     out["draft_differs"] = draft_sha != final_sha
     return out
 
