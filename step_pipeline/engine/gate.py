@@ -214,6 +214,12 @@ ROUNDS_FILE = "plan_{plan}_rounds.json"
 COMMENT_AUTHOR = "страж"
 COMMENT_MAX_LEN = 4000
 FINDINGS_LIMIT = 5
+# Реестр находок плана (план 7, S1): закрытые словари классов и статусов, шапка таблицы.
+# Класс выбирает маршрут находки (S3), статус решает вердикт (S2): блокирует только `открыто`.
+FINDING_KINDS = ("замысел", "двусмысленность", "формат-стража", "гейт-исполнение", "стиль")
+FINDING_STATUSES = ("открыто", "закрыто", "не блокирует")
+FINDINGS_HEADER = ("ID", "Шаг", "Класс", "Находка", "Что сделать", "Статус")
+FINDING_ID_RE = re.compile(r"F(\d+)")
 # Постановка следующего шага и ревью постановки (план 2, S6): отметка свежести recon
 # и что считать расхождением постановки с кодом.
 RECON_RE = re.compile(r"recon_commit\s*[:=]\s*`?([0-9a-f]{7,40})", re.IGNORECASE)
@@ -763,6 +769,157 @@ def plan_review_rel(p: Paths) -> str:
     return p.cfg.rel(plan_review_path(p))
 
 
+def plan_findings_path(p: Paths) -> Path:
+    """Реестр находок плана: рядом с отчётом ревью, `plan-N-findings.md`.
+
+    Путь выводится из `plan_review_path`, а не собирается заново: тот привязан к
+    `approval.review_path` и `cfg.reviews_dir`, и второй сборщик молча разошёлся бы с ним.
+    """
+    report = plan_review_path(p)
+    return report.with_name(f"{report.stem}-findings.md")
+
+
+def plan_findings_rel(p: Paths) -> str:
+    """Путь реестра для текстов: карточки и отчёты печатают его, а не абсолютный."""
+    return p.cfg.rel(plan_findings_path(p))
+
+
+def _finding_cells(line: str) -> list[str]:
+    """Ячейки строки таблицы: внешние `|` ячейками не считаются."""
+    return [cell.strip() for cell in str(line).strip().strip("|").split("|")]
+
+
+def _findings_title(path: Path) -> str:
+    """Первая строка реестра: номер плана из имени `plan-N-findings.md`, иначе имя файла."""
+    stem = Path(path).stem
+    if stem.startswith("plan-") and stem.endswith("-findings"):
+        return f"# Реестр находок плана {stem[len('plan-'):-len('-findings')]}"
+    return f"# Реестр находок плана {stem}"
+
+
+def findings_table(findings: list[dict]) -> list[str]:
+    """Строки markdown-таблицы реестра: шапка, разделитель, находки в переданном порядке.
+
+    Один построитель для записи файла и для тела карточки: второй шаблон шапки разошёлся бы
+    с первым, и `load_findings` перестал бы находить таблицу.
+    """
+    rows = ["| " + " | ".join(FINDINGS_HEADER) + " |",
+            "|" + "|".join("---" for _ in FINDINGS_HEADER) + "|"]
+    for item in findings:
+        cells = [item.get(key) or "" for key in ("id", "step", "kind", "text", "action", "status")]
+        rows.append("| " + " | ".join(str(c).replace("|", "/").replace("\n", " ").strip()
+                                      for c in cells) + " |")
+    return rows
+
+
+def load_findings(path) -> list[dict]:
+    """Прочитать реестр находок плана. Файла нет — `[]` (норма, как у `load_state`).
+
+    Битый файл — `GateError`, а не пустой список: молча вернуть `[]` значило бы «открытых
+    находок нет» и открыть дорогу APPROVE по неизвестному реестру.
+
+    Единственное правило блокирования, общее для S2 и S3: блокирует только статус — находка
+    со статусом `открыто` блокирует вердикт, `закрыто` и `не блокирует` — нет. Класс ничего
+    не блокирует: он выбирает маршрут находки (S3).
+    """
+    path = Path(path)
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise GateError(f"реестр находок не читается: {path}: {exc}") from exc
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if tuple(_finding_cells(line)) == FINDINGS_HEADER:
+            start = index + 1
+            break
+    if start is None:
+        if not text.strip():
+            return []
+        raise GateError("в реестре находок нет шапки таблицы "
+                        f"`| {' | '.join(FINDINGS_HEADER)} |`: {path}")
+    found: list[dict] = []
+    seen: set[str] = set()
+    for number, line in enumerate(lines[start:], start=start + 1):
+        if not line.strip().startswith("|"):
+            continue
+        cells = _finding_cells(line)
+        if all(cell and set(cell) <= set("-: ") for cell in cells):
+            continue                                   # строка-разделитель
+        if len(cells) != len(FINDINGS_HEADER):
+            raise GateError(f"реестр находок, строка {number}: ячеек {len(cells)}, "
+                            f"нужно {len(FINDINGS_HEADER)}: {path}")
+        item = dict(zip(("id", "step", "kind", "text", "action", "status"), cells))
+        if not FINDING_ID_RE.fullmatch(item["id"]):
+            raise GateError(f"реестр находок, строка {number}: идентификатор не вида F-N: "
+                            f"{item['id']!r}: {path}")
+        if item["id"] in seen:
+            raise GateError(f"реестр находок: идентификатор {item['id']} повторяется: {path}")
+        if item["kind"] not in FINDING_KINDS:
+            raise GateError(f"реестр находок: класс {item['kind']!r} вне словаря "
+                            f"({' | '.join(FINDING_KINDS)}): {path}")
+        if item["status"] not in FINDING_STATUSES:
+            raise GateError(f"реестр находок: статус {item['status']!r} вне словаря "
+                            f"({' | '.join(FINDING_STATUSES)}): {path}")
+        seen.add(item["id"])
+        found.append(item)
+    return found
+
+
+def write_findings(path, findings: list[dict]) -> Path:
+    """Записать реестр целиком: порядок находок сохраняется, дубль ID — ошибка.
+
+    Запись атомарная (`state_io.atomic_write_text`): kill посреди записи оставляет прежний
+    реестр целым, а не обрезанным на середине таблицы.
+    """
+    path = Path(path)
+    rows = list(findings or [])
+    ids = [str(item.get("id") or "") for item in rows]
+    repeat = sorted({item for item in ids if ids.count(item) > 1})
+    if repeat:
+        raise GateError(f"реестр находок: идентификаторы повторяются: {', '.join(repeat)}: {path}")
+    for item, item_id in zip(rows, ids):
+        if not FINDING_ID_RE.fullmatch(item_id):
+            raise GateError(f"реестр находок: идентификатор не вида F-N: {item_id!r}: {path}")
+        if item.get("kind") not in FINDING_KINDS:
+            raise GateError(f"реестр находок: класс {item.get('kind')!r} вне словаря "
+                            f"({' | '.join(FINDING_KINDS)}): {path}")
+        if item.get("status") not in FINDING_STATUSES:
+            raise GateError(f"реестр находок: статус {item.get('status')!r} вне словаря "
+                            f"({' | '.join(FINDING_STATUSES)}): {path}")
+    state_io.atomic_write_text(path, "\n".join([_findings_title(path), ""]
+                                               + findings_table(rows)) + "\n")
+    return path
+
+
+def add_findings(path, items: list[dict]) -> list[dict]:
+    """Добавить находки: ID присваивает функция — следующий свободный F-N по плану.
+
+    `status` по умолчанию `открыто`. Поле `id` во входных словарях игнорируется: иначе после
+    ручной правки файла в реестре появятся дубли, а ведущий реестра — не тот, кто считает.
+    """
+    path = Path(path)
+    current = load_findings(path)
+    numbers = [int(FINDING_ID_RE.fullmatch(item["id"]).group(1)) for item in current]
+    next_number = max(numbers, default=0) + 1
+    added: list[dict] = []
+    for raw in items or []:
+        added.append({
+            "id": f"F{next_number}",
+            "step": str(raw.get("step") or "").strip(),
+            "kind": str(raw.get("kind") or "").strip(),
+            "text": str(raw.get("text") or "").strip(),
+            "action": str(raw.get("action") or "").strip(),
+            "status": str(raw.get("status") or "открыто").strip(),
+        })
+        next_number += 1
+    result = current + added
+    write_findings(path, result)
+    return result
+
+
 def prompt_verdict(p: Paths, step_id: str) -> dict | None:
     """Вердикт ревью постановки + `recon` из отчёта: сверять надо ту же версию (D1)."""
     result = verdict_at(prompt_review_path(p, step_id))
@@ -936,7 +1093,14 @@ def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str
     `plan-1.md`, `APPROVE`, «Конституция». Роль берёт их отсюда, а не из скилла: карточка
     самодостаточна. С шага 5-S9 в карточке есть конституция проекта: вердикт без ссылки
     на её пункт (`approval.CONSTITUTION_REF_RE`) страж считает непригодным (`unreferenced`).
+    С шага 7-S1 тело несёт реестр находок плана (`plan_findings_rel`) целиком — путь, правило
+    блокирования и таблицу: закрыть все открытые ID можно, только если они перед глазами.
     """
+    findings_now = load_findings(plan_findings_path(p))
+    if findings_now:
+        registry_lines = findings_table(findings_now)
+    else:
+        registry_lines = ["- реестра ещё нет: первая находка создаёт файл с шапкой выше."]
     return "\n".join([
         f"# Ревью плана {p.plan_id}: замысел до кода",
         "",
@@ -970,6 +1134,16 @@ def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str
         "- арифметика числа тестов и суммы гейтов по шагам;",
         "- имена внутренних функций и полей, если шаг называет источник данных;",
         "- формулировки, стиль, пунктуация, полнота перечня пунктов.",
+        "",
+        "РЕЕСТР НАХОДОК (обязательно)",
+        f"- Файл: `{plan_findings_rel(p)}`; шапка таблицы — `{findings_table([])[0]}`.",
+        "- Открытые ID (`открыто`) закрыть фактом или подтвердить, новые находки добавлять",
+        "  строками с новым F-N; закрытые повторно не поднимаются. Блокирует вердикт только",
+        "  статус `открыто`: класс (`замысел`, `двусмысленность`, `формат-стража`,",
+        "  `гейт-исполнение`, `стиль`) выбирает маршрут находки, а не вердикт.",
+        "",
+        "РЕЕСТР СЕЙЧАС",
+        *registry_lines,
         "",
         "ГРАНИЦЫ",
         "- План не правишь, шаг не закрываешь, код шагов не пишешь.",

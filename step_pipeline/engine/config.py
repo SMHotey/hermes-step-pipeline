@@ -44,6 +44,8 @@ DEFAULTS: dict = {
         "review": ["pipeline-reviewer"],
         "prompt": ["pipeline-prompter", "agent-prompt-authoring"],
     },
+    # Каталог ревью хранит и реестр находок плана (`plan-N-findings.md`): путь реестра
+    # выводится из отчёта ревью, отдельного ключа нет — второй источник пути разошёлся бы.
     "paths": {
         "plans": "docs/plans",
         "reviews": "docs/reviews",
