@@ -39,6 +39,10 @@
                            запись утверждения, стоп-флаг, состояние, круги и номер в
                            driven_plans; 409, пока у плана есть карточки в работе;
                            заголовок X-Pipeline-Panel обязателен
+    POST /api/plan/add     добавить план файлом: {"project": "demo",
+                           "path": "C:/tmp/plan.md"} — без path открывается системный
+                           диалог; проверка линтером, копия в каталог планов под именем
+                           N-слаг.md; заголовок X-Pipeline-Panel обязателен
     POST /api/notify       настройки уведомлений: {"global": true, "enabled": ...} или
                            {"project": id, "enabled": ..., "events": [...]}; запись в projects.json
                            (ровно одна из двух форм, иначе 400)
@@ -75,6 +79,7 @@ try:
     from . import plan_accept
     from . import plan_lint
     from . import plan_mode
+    from . import plans_add
     from . import plans_api
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
@@ -86,6 +91,7 @@ except ImportError:  # pragma: no cover
     import plan_accept  # type: ignore
     import plan_lint  # type: ignore
     import plan_mode  # type: ignore
+    import plans_add  # type: ignore
     import plans_api  # type: ignore
     import project as proj  # type: ignore
     import setup_flow  # type: ignore
@@ -2479,6 +2485,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/plan/delete":
             self._post_plan_command("delete")
             return
+        if path == "/api/plan/add":
+            self._post_plan_add()
+            return
         if path == "/api/setup":
             self._post_setup()
             return
@@ -2637,6 +2646,44 @@ class Handler(BaseHTTPRequestHandler):
         self.state.projects_cache = None
         panel_pause.clear_cache()             # строки планов тоже устарели (план 6 S2)
         self._json(200 if result.get("ok") else (409 if result.get("busy") else 400), result)
+
+    def _post_plan_add(self) -> None:
+        """Добавить план файлом: диалог или поле `path`, линтер, копия `N-слаг.md`.
+
+        Каркас тот же, что у `_post_plan_command`: маршрут не входит в `ACTIONS` (проект
+        выбирается полем тела), требует метку панели и в предпросмотре отвечает 403.
+
+        Таймаут диалога берётся из `plans_add.DIALOG_TIMEOUT`, а не из тела запроса: иначе
+        клиент задавал бы поведение сервера. «Ручной путь» — тоже 400: странице нужно
+        отличить «не вышло» от «получилось», а текст `message` говорит, что делать.
+        """
+        if getattr(self.state, "preview", False):
+            self._drain_body()
+            self._json(403, {"ok": False,
+                             "error": "предпросмотр только читает: добавление плана недоступно"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        state = self._choose_project(payload.get("project"))
+        if state is None:
+            return
+        source = str(payload.get("path") or "").strip()
+        try:
+            result = plans_add.add(state.project, source)
+        except Exception as exc:                                # noqa: BLE001
+            self._json(500, {"ok": False, "project": {"id": state.id, "name": state.name},
+                             "error": f"{type(exc).__name__}: {exc}"})
+            return
+        result.setdefault("action", "plan_add")
+        result["project"] = {"id": state.id, "name": state.name}
+        # Новый файл в каталоге планов: все три кэша устарели, как в accept.
+        snap.clear_cache()
+        self.state.projects_cache = None
+        panel_pause.clear_cache()             # строки планов тоже устарели (план 6 S2)
+        self._json(200 if result.get("ok") else 400, result)
 
     def _post_plan_mode(self) -> None:
         """Переключить режим планировщика: одно идемпотентное действие, без второго «применить»."""
