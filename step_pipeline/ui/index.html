@@ -1202,7 +1202,7 @@ function planRowCommand(kind, project, plan) {
   api(item.endpoint, {
     method: "POST",
     headers: PANEL_HEADERS,
-    body: JSON.stringify({project: project.id, plan: String(plan.id)}),
+    body: JSON.stringify({project: project.id, plan: plan.id}),
   }).then((data) => {
     planStatus(data.message || data.error || "готово", !data.ok);
     if (!data.ok) toast(data.error || data.message || "ошибка", true);
@@ -1210,16 +1210,6 @@ function planRowCommand(kind, project, plan) {
     return refresh();
   }).catch((err) => planStatus(String(err), true))
     .finally(() => setBusy(false));
-}
-
-// Кнопки `unblock` и `cron` не повторяют команду движка: страница показывает её как есть
-// и предлагает скопировать, иначе у одной команды было бы два источника.
-function planRowCommandText(plan) {
-  const command = String((plan.action && plan.action.command) || "");
-  if (!command) { planStatus("движок не прислал команду действия", true); return; }
-  planStatus("команда: " + command + (navigator.clipboard
-    ? " — скопирована" : ""), false);
-  if (navigator.clipboard) navigator.clipboard.writeText(command).catch(() => {});
 }
 
 // Утверждение — тот же жест, что у черновиков: проверки и запись делает сервер (S13).
@@ -1233,14 +1223,32 @@ function planRowApprove(project, plan) {
   api("/api/plan/accept", {
     method: "POST",
     headers: PANEL_HEADERS,
-    body: JSON.stringify({plan: String(plan.id), project: project.id}),
+    body: JSON.stringify({project: project.id, plan: plan.id}),
   }).then((data) => {
+    // Находки линтера сервер отдаёт списком `errors`, а `message` — только их число:
+    // без списка владелец видит «ошибок 3» и не знает, какие именно.
+    const errors = (data.errors || []).map((item) => String(item)).filter(Boolean);
     planStatus(data.ok ? "план " + plan.id + " утверждён"
-      : "план не утверждён: " + (data.message || data.error || "ошибка"), !data.ok);
+      : [data.error || data.message || "план не утверждён", ...errors].join("\n"), !data.ok);
     etag = null;
     return refresh();
   }).catch((err) => planStatus(String(err), true))
     .finally(() => setBusy(false));
+}
+
+// Кнопки `unblock` и `cron` не повторяют команду движка: страница показывает её как есть
+// и предлагает скопировать, иначе у одной команды было бы два источника.
+function planRowCommandText(plan) {
+  const command = String((plan.action && plan.action.command) || "");
+  if (!command) { planStatus("движок не прислал команду действия", true); return; }
+  planStatus("команда: " + command, false);
+  // Отметка «скопирована» — по исходу записи в буфер, а не до неё: иначе строка
+  // утверждает факт, которого не проверяла.
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(command)
+      .then(() => planStatus("команда: " + command + " — скопирована", false))
+      .catch(() => {});
+  }
 }
 
 // Девятая ячейка строки: ровно одна кнопка вида движка (или «без действия») плюс жесты владельца.
