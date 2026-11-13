@@ -827,7 +827,9 @@ def load_findings(path) -> list[dict]:
         return []
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError — это UnicodeDecodeError: реестр, записанный не в UTF-8 (cp1251 — штатная
+        # кодировка консоли на Windows), обязан дать GateError с путём, а не сырое исключение.
         raise GateError(f"реестр находок не читается: {path}: {exc}") from exc
     lines = text.splitlines()
     start = None
@@ -1096,9 +1098,11 @@ def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str
     С шага 7-S1 тело несёт реестр находок плана (`plan_findings_rel`) целиком — путь, правило
     блокирования и таблицу: закрыть все открытые ID можно, только если они перед глазами.
     """
-    findings_now = load_findings(plan_findings_path(p))
-    if findings_now:
-        registry_lines = findings_table(findings_now)
+    findings_path = plan_findings_path(p)
+    if findings_path.is_file():
+        # Реестр есть — печатаем его таблицу даже без находок: файл с одной шапкой значит
+        # «находок пока нет», а не «реестра ещё нет».
+        registry_lines = findings_table(load_findings(findings_path))
     else:
         registry_lines = ["- реестра ещё нет: первая находка создаёт файл с шапкой выше."]
     return "\n".join([

@@ -53,6 +53,12 @@ def test_add_creates_registry_and_card_shows_it(paths_obj):
     assert "РЕЕСТР НАХОДОК (обязательно)" in empty
     assert "реестра ещё нет" in empty
 
+    gate.write_findings(path, [])                   # файл с одной шапкой: реестр есть, находок нет
+    assert path.is_file()
+    empty_file = _card(paths_obj)
+    assert "реестра ещё нет" not in empty_file
+    assert "| ID | Шаг | Класс | Находка | Что сделать | Статус |" in empty_file
+
     gate.add_findings(path, [finding()])
     assert path.is_file()
     assert "| ID | Шаг | Класс | Находка | Что сделать | Статус |" in path.read_text(encoding="utf-8")
@@ -107,7 +113,7 @@ def test_duplicate_id_rejected(registry):
 
 
 def test_broken_file_raises(registry):
-    """Битый файл — `GateError` с путём: без шапки, чужой статус, пять ячеек."""
+    """Битый файл — `GateError` с путём: без шапки, чужой статус, пять ячеек, не-UTF-8."""
     registry.parent.mkdir(parents=True, exist_ok=True)
     header = "| ID | Шаг | Класс | Находка | Что сделать | Статус |\n|---|---|---|---|---|---|\n"
 
@@ -128,6 +134,15 @@ def test_broken_file_raises(registry):
     with pytest.raises(gate.GateError) as bad_cells:
         gate.load_findings(registry)
     assert str(registry) in str(bad_cells.value)
+
+    # Не-UTF-8 реестр (cp1251 — штатная кодировка консоли на Windows): та же ошибка класса
+    # `GateError` с путём, а не сырой `UnicodeDecodeError` из самого чтения.
+    registry.write_bytes((header + "| F1 | S1 | замысел | ёлка | добавить | открыто |\n")
+                         .encode("cp1251"))
+    with pytest.raises(gate.GateError) as bad_encoding:
+        gate.load_findings(registry)
+    assert str(registry) in str(bad_encoding.value)
+    assert "не читается" in str(bad_encoding.value)
 
 
 def test_missing_file_loads_empty(registry):
