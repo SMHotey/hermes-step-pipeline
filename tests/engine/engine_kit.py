@@ -138,13 +138,22 @@ def cards(db: Path) -> list[dict]:
              "key": r[4], "max_runtime": r[5]} for r in rows]
 
 
-def complete(db: Path, key_suffix: str, status: str = "done", result: str = "") -> None:
-    """Отметить карточку завершённой (как это делает воркер)."""
+def complete(db: Path, key_suffix: str, status: str = "done", result: str = "") -> int:
+    """Отметить карточку завершённой (как это делает воркер); вернуть число закрытых.
+
+    Пустой `UPDATE` — это не «уже закрыто», а «такой карточки нет»: раньше помощник молча
+    ничего не делал, и тест терял круг правок, падая потом на другом шаге (мигающий
+    `test_prompt_fix_rounds_exhausted_stops` в полном прогоне). Теперь отказ громкий.
+    """
     con = sqlite3.connect(db)
     try:
-        con.execute("UPDATE tasks SET status=?, completed_at=?, result=?"
-                    " WHERE idempotency_key LIKE ?", (status, int(time.time()), result,
-                                                      "%" + key_suffix))
+        cur = con.execute("UPDATE tasks SET status=?, completed_at=?, result=?"
+                          " WHERE idempotency_key LIKE ?", (status, int(time.time()), result,
+                                                            "%" + key_suffix))
         con.commit()
+        done = cur.rowcount
     finally:
         con.close()
+    if done <= 0:
+        raise AssertionError(f"complete({key_suffix!r}): карточки с таким ключом нет в {db}")
+    return done

@@ -968,9 +968,11 @@ def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
         "ЖЁСТКИЕ ПРАВИЛА",
         "- Работать только по этому шагу, не расширять объём и не начинать следующий.",
         "- Существующие тесты не удалять и не ослаблять; новые — happy path + границы + интеграция.",
-        "- Вывод команд ≤ 200 строк: `pytest -q --tb=line`, `git status --porcelain | head -30`,",
+        "- Вывод команд ≤ 200 строк: `pytest --tb=line`, `git status --porcelain | head -30`,",
         "  большой вывод — в файл и `grep` по нему (объём вывода = токены каждого хода).",
         "- Не перечитывать уже прочитанный файл: адресно `grep`/`read_file offset`.",
+        "- Прогоны: сначала точечные (по затронутым файлам), полный прогон — один раз перед",
+        "  коммитом. `-q` не дублировать, если он уже в `pytest.ini`: второй скрывает итог.",
         "",
         "ЗАВЕРШЕНИЕ (обязательно, иначе конвейер встанет)",
         "1. Гейты зелёные — показать фактические цифры.",
@@ -1473,6 +1475,9 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -> str:
         "- Ничего не расширять за пределы шага; тесты не ослаблять и не удалять.",
         "- Гейты шага перегнать и показать фактические цифры:",
         *[f"  - {g}" for g in step.get("gates") or []],
+        "- Прогоны: точечно по затронутым тестам, полный прогон — один раз перед коммитом",
+        "  (на крупном проекте это десятки минут: круг правок не должен ждать его дважды).",
+        "- `-q` не дублировать, если он уже в `pytest.ini` проекта: второй скрывает итог прогона.",
         "",
         "ЗАВЕРШЕНИЕ",
         "1. Коммит и пуш ТОЛЬКО файлов правок (`git add <файлы>`, НЕ `-A`), сообщение на русском.",
@@ -2595,6 +2600,25 @@ def _comment(p: Paths, card_id: str, text: str) -> bool:
     return True
 
 
+CARD_VISIBLE_TRIES = 6
+CARD_VISIBLE_PAUSE = 0.25
+
+
+def _card_visible(p: Paths, card_id: str, key: str) -> bool:
+    """Карточка видна на борде по своему ключу — с короткими повторами.
+
+    `hermes kanban create` печатает id после записи, но строка может стать видимой
+    чуть позже (чужой процесс, отдельная база, кэш). Ожидание ограничено шестью
+    попытками по 0.25 с: страж остаётся детерминированным, а не «подожди и посмотрим».
+    """
+    for attempt in range(CARD_VISIBLE_TRIES):
+        if card_status(p, card_id, key):
+            return True
+        if attempt + 1 < CARD_VISIBLE_TRIES:
+            time.sleep(CARD_VISIBLE_PAUSE)
+    return False
+
+
 def _create_card(p: Paths, title: str, body: str, assignee: str, key: str,
                  skills: tuple[str, ...], parent: str | None = None,
                  max_runtime: str | None = None) -> str | None:
@@ -2617,7 +2641,20 @@ def _create_card(p: Paths, title: str, body: str, assignee: str, key: str,
     if res.returncode != 0 and not m:
         print(f"[card] не создано: {out.strip()[:300]}", file=sys.stderr)
         return None
-    return m.group(0) if m else None
+    if not m:
+        return None
+    cid = m.group(0)
+    # Заказ без карточки — тихая потеря хода конвейера: на борде карточки нет, страж
+    # видит пустоту, план стоит, а в журнале тиков «заказано». Раньше id из вывода CLI
+    # считался доказательством; при сбое записи (гонка за базу, чужая борда) это давало
+    # зависание на часы и мигающий тест кругов постановки. Теперь это сбой с ключом.
+    if not _card_visible(p, cid, key):
+        raise GateError(
+            f"карточка {cid} заказана, но борды её не знает (ключ {key}, борда "
+            f"{p.cfg.board}): строки нет в {p.kanban_db} — план не двигаю, пока карточки "
+            f"нет; вывод CLI: {out.strip()[:200]}",
+            plan_id=p.plan_id)
+    return cid
 
 
 TG_USER_AGENT = "step-pipeline (+https://github.com/SMHotey/hermes-step-pipeline)"

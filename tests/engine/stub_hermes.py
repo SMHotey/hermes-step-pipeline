@@ -15,6 +15,10 @@
 Переменная `PIPELINE_STUB_COMMENT_RC`: по умолчанию 0 — комментарий пишется; иное
 число — команда печатает причину в stderr и возвращает это число (так тест изображает
 отказ CLI).
+
+Переменная `PIPELINE_STUB_LOST_CREATE`: `1` — карточка не пишется, но id печатается.
+Так изображается тихая потеря: CLI сказал «создано», а строки на борде нет. Страж обязан
+это заметить (`_create_card` сверяет карточку с бордой), а не стоять в простое.
 """
 from __future__ import annotations
 
@@ -109,8 +113,11 @@ def comment(fields: dict, db: str) -> int:
     except ValueError:
         max_len = 0
     body = text[:max_len] if max_len > 0 else text
-    con = sqlite3.connect(db)
+    # timeout: под нагрузкой (полный прогон, несколько агентов) запись ждёт, а не падает
+    # «database is locked» — иначе карточка терялась бы молча.
+    con = sqlite3.connect(db, timeout=15)
     try:
+        con.execute("PRAGMA busy_timeout = 15000")
         con.executescript(SCHEMA)
         con.execute("INSERT INTO comments (task_id, body, author, created_at)"
                     " VALUES (?,?,?,?)",
@@ -135,8 +142,9 @@ def main() -> int:
     if command == "comment":
         return comment(fields, db)
     task_id = ""
-    con = sqlite3.connect(db)
+    con = sqlite3.connect(db, timeout=15)
     try:
+        con.execute("PRAGMA busy_timeout = 15000")
         con.executescript(SCHEMA)
         # Идемпотентность как у настоящего Hermes: на занятый ключ возвращается прежняя
         # карточка ЛЮБОГО статуса (включая done), новая не создаётся. Без этого движок
@@ -150,6 +158,10 @@ def main() -> int:
                 print(row[0])
                 return 0
         task_id = "t_" + uuid.uuid4().hex[:8]
+        if os.environ.get("PIPELINE_STUB_LOST_CREATE") == "1":
+            # Тихая потеря: CLI печатает id, строки на борде нет.
+            print(task_id)
+            return 0
         con.execute(
             "INSERT INTO tasks (id, title, status, assignee, idempotency_key, completed_at,"
             " result, last_failure_error, created_at, tenant, workspace, max_runtime)"
