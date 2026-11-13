@@ -163,10 +163,10 @@ def _fix_rounds(value: object) -> int:
 
 
 def _plan_growth(value: object) -> dict:
-    """Лимит расширения плана правкой: `percent` и `chars_per_finding`.
+    """Лимит расширения плана правкой: `percent` и `chars_per_finding` (план 7, S4).
 
-    Умолчание — 10 % объёма версии плана и 400 символов на закрытую находку. Мусор в
-    `pipeline.json` — ошибка конфигурации, а не молчаливое умолчание (тот же принцип, что
+    Умолчание — 10 % объёма версии плана и 400 символов на каждую закрытую находку. Мусор
+    в `pipeline.json` — ошибка конфигурации, а не молчаливое умолчание (тот же принцип, что
     у `_fix_rounds`): иначе владелец думает, что правило действует, а страж работает по
     прежнему лимиту. Отсутствующий ключ или отсутствующее поле внутри него — умолчание:
     так проект может задать только процент.
@@ -178,7 +178,7 @@ def _plan_growth(value: object) -> dict:
         raise ConfigError(f"max_plan_growth должен быть объектом JSON, получено: {value!r}")
     out = dict(default)
     for key in ("percent", "chars_per_finding"):
-        if key not in value or value[key] is None:
+        if value.get(key) is None:
             continue
         raw = value[key]
         if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
@@ -190,12 +190,10 @@ def _plan_growth(value: object) -> dict:
                               f"получено: {raw!r}") from exc
         if number < 0:
             raise ConfigError(f"max_plan_growth.{key} должен быть ≥ 0, получено: {raw!r}")
-        out[key] = int(number) if key == "chars_per_finding" else number
-    unknown = sorted(set(value) - set(default))
-    if unknown:
-        # Опечатка в ключе лимита иначе выглядела бы как «лимит не действует».
-        raise ConfigError(f"max_plan_growth: неизвестные поля {', '.join(unknown)}; "
-                          f"допустимо: percent, chars_per_finding")
+        if key == "percent" and number != int(number):
+            raise ConfigError(f"max_plan_growth.percent должен быть целым числом процентов, "
+                              f"получено: {raw!r}")
+        out[key] = int(number)
     return out
 
 
