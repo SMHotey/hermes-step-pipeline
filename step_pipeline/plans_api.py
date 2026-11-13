@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Запуск и остановка плана из панели — одна точка правил (план 6 S3).
+"""Жесты владельца над планом из панели — одна точка правил (план 6 S3, S3A).
 
-Два жеста владельца: `POST /api/plan/start` (добавить номер в `driven_plans` и снять
-стоп адресованной командой движка) и `POST /api/plan/stop` (`--plan N --stop "причина"`).
-Правила записи ключа владельца `driven_plans` и вызова движка живут здесь, а `ui_server`
-держит только маршрут: иначе S3A (`/api/plan/delete`) копировал бы ту же правку списка.
+Три жеста: `POST /api/plan/start` (добавить номер в `driven_plans` и снять стоп
+адресованной командой движка), `POST /api/plan/stop` (`--plan N --stop "причина"`) и
+`POST /api/plan/delete` (убрать файл плана и его следы, отказав, пока у плана есть
+карточки в работе). Правила записи ключа владельца `driven_plans` и вызова движка живут
+здесь, а `ui_server` держит только маршруты: иначе каждый следующий жест копировал бы ту
+же правку списка.
 
 Движок как модуль не импортируется — только `proj.run_engine`, как в `ui_server._run_engine`:
 плагин и движок живут раздельно (движок копируется в проект и обязан работать без плагина).
 
-Оба жеста адресные (`--plan N`): без адреса движок берёт план по умолчанию
+Жесты запуска и остановки адресные (`--plan N`): без адреса движок берёт план по умолчанию
 (`registry.default_plan_id`), а при пустом `default_plan` — наименьший номер, и нажатие на
 плане 2 сняло бы стоп плана 1.
 """
@@ -21,9 +23,15 @@ from pathlib import Path
 from typing import Any
 
 try:  # обычный путь — пакет плагина; __main__ — ручная проверка файлом
+    from . import plan_accept
     from . import project as proj
+    from . import setup_flow
+    from . import snapshot as snap
 except ImportError:  # pragma: no cover
+    import plan_accept  # type: ignore[no-redef]
     import project as proj  # type: ignore[no-redef]
+    import setup_flow  # type: ignore[no-redef]
+    import snapshot as snap  # type: ignore[no-redef]
 
 # Порядок источников каталога состояния — как у движка (`engine/config.py:337`):
 # `PIPELINE_STATE_DIR` → `paths.state` из `pipeline.json` → `.pipeline/state`.
@@ -157,6 +165,107 @@ def _engine_error(result: dict) -> dict:
     error = result["stderr"] or result["stdout"] or f"gate.py вышел с {result['code']}"
     return {"ok": False, "status": "engine_error", "error": error,
             "stdout": result["stdout"], "stderr": result["stderr"]}
+
+
+def _busy_cards(project: Path, plan: str, board: str | None = None) -> list[dict]:
+    """Карточки плана в не-терминальном статусе — по ним удаление отказывает.
+
+    Борда берётся в порядке движка: явная борда панели (`--board`), затем
+    `PIPELINE_BOARD`, затем `board` из `pipeline.json` (`proj.board_db`; при явной борде
+    он переменную окружения не читает). Читатель — тот же, что у панели (`snap.cards`),
+    второй не заводится. Префикс с двоеточием (`planloop:2:`) — поэтому номер 2 не поймает
+    карточки плана 20. `limit=500` вместо окна «последние 30»: старая карточка шага не
+    должна выпасть из выборки.
+
+    `archived` отбрасывается отдельно — тем же правилом, каким его отбрасывает движок до
+    сравнения статусов (`engine/gate.py`): иначе архивная карточка навсегда запретила бы
+    удаление плана. Список терминальных статусов берётся из плагина (`setup_flow.TERMINAL`,
+    зеркало `engine/gate.py:TERMINAL`), своей копии здесь нет.
+    """
+    db = proj.board_db(Path(project), board or os.environ.get("PIPELINE_BOARD") or None)
+    busy = []
+    for card in snap.cards(db, limit=500, key_prefix=f"planloop:{plan}:"):
+        status = str(card.get("status") or "")
+        if status in setup_flow.TERMINAL or status == "archived":
+            continue
+        busy.append({"id": str(card.get("id") or ""), "status": status,
+                     "key": str(card.get("idempotency_key") or "")})
+    return busy
+
+
+def _traces(project: Path, plan: str) -> list[Path | None]:
+    """Пять файлов-следов плана в порядке удаления; первый может быть `None`.
+
+    `None` — файла плана в каталоге нет: это отсутствующий след, а не ошибка
+    (`None.is_file()` дал бы 500). Запись утверждения берётся у `plan_accept` (тот же путь,
+    куда пишет `_write_approval`), остальные три — из каталога состояния плагина: порядок
+    движка (`PIPELINE_STATE_DIR` выше `paths.state`) держит только `_state_dir`.
+    """
+    state = _state_dir(project)
+    return [plan_accept.find_plan(project, plan),
+            plan_accept.approval_file(project, plan),
+            stop_flag(project, plan),
+            state / f"plan_{plan}_state.json",
+            state / f"plan_{plan}_rounds.json"]
+
+
+def delete(project: Path, value: Any, board: str | None = None) -> dict:
+    """Удалить план и все его следы; отказ, пока у плана есть карточки в работе.
+
+    Порядок шагов обязателен, и охрана стоит раньше любой записи: иначе отказ пришёл бы
+    после удаления половины следов. Ведение снимается **до** файлов: падение процесса
+    между шагами оставляет план без ведения и файлы-остатки, которые доберёт повторный
+    жест, — обратный порядок оставил бы ведомый план без файла, и страж поставил бы стоп
+    вместо работы. Жест идемпотентен: отсутствующий след не ошибка, `missing` — только
+    когда удалять нечего вовсе.
+
+    `["*"]` и отсутствующий ключ перечислением не заменяются (правило шага S3): при них
+    номер не числится, файлы удаляются, `changed: False` — замена `*` на список молча
+    сняла бы ведение остальных планов.
+    """
+    try:
+        plan = _plan_id(value)
+    except ValueError:
+        return {"ok": False, "status": "errors", "error": NO_PLAN}
+    project = Path(project)
+    cfg = proj.read_config(project)
+    if not cfg:
+        return {"ok": False, "status": "errors", "plan": plan,
+                "error": f"pipeline.json не читается: {project / proj.MARKER}"}
+
+    busy = _busy_cards(project, plan, board)
+    if busy:
+        first = busy[0]
+        return {"ok": False, "status": "busy", "busy": True, "plan": plan, "cards": busy,
+                "error": f"план {plan} не удалён: карточка {first['id']} в статусе "
+                         f"{first['status']} — сначала закройте её"}
+
+    traces = _traces(project, plan)
+    driven = _driven(project)
+    present = [path for path in traces if path is not None and path.is_file()]
+    has_number = plan in {str(int(item)) for item in driven if item.isdigit()}
+    if not present and not has_number:
+        return {"ok": False, "status": "missing", "plan": plan,
+                "error": f"плана {plan} нет: ни файла в каталоге планов, ни следов в состоянии"}
+
+    changed = False
+    if has_number:
+        # Сравнение по каноническому номеру: `["02"]` движок читает как план 2.
+        cfg["driven_plans"] = [item for item in driven
+                               if not (item.isdigit() and str(int(item)) == plan)]
+        _write_config(project, cfg)
+        driven = [str(item) for item in cfg["driven_plans"]]
+        changed = True
+
+    removed = []
+    for path in present:
+        path.unlink()
+        removed.append(plan_accept._shown(path, project))
+    return {"ok": True, "status": "deleted", "plan": plan, "removed": removed,
+            "driven": driven, "changed": changed,
+            "message": f"план {plan} удалён: файлов и записей {len(removed)}"
+                       + (", номер убран из driven_plans" if changed
+                          else ", driven_plans не менялся")}
 
 
 def start(project: Path, value: Any) -> dict:

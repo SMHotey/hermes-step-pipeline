@@ -35,6 +35,10 @@
                            "reason": "...", "project": "<id>"} — адресный
                            `gate.py --plan N --stop "причина"`; заголовок X-Pipeline-Panel
                            обязателен
+    POST /api/plan/delete  удалить план: {"plan": "2", "project": "<id>"} — файл плана,
+                           запись утверждения, стоп-флаг, состояние, круги и номер в
+                           driven_plans; 409, пока у плана есть карточки в работе;
+                           заголовок X-Pipeline-Panel обязателен
     POST /api/notify       настройки уведомлений: {"global": true, "enabled": ...} или
                            {"project": id, "enabled": ..., "events": [...]}; запись в projects.json
                            (ровно одна из двух форм, иначе 400)
@@ -2472,6 +2476,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/plan/stop":
             self._post_plan_command("stop")
             return
+        if path == "/api/plan/delete":
+            self._post_plan_command("delete")
+            return
         if path == "/api/setup":
             self._post_setup()
             return
@@ -2579,14 +2586,18 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200 if result.get("ok") else 400, result)
 
     def _post_plan_command(self, action: str) -> None:
-        """Запуск (`start`) или остановка (`stop`) плана — жесты владельца.
+        """Запуск (`start`), остановка (`stop`) или удаление (`delete`) плана.
 
         Каркас тот же, что у `_post_plan_accept`: маршрут не входит в `ACTIONS` (проект
         выбирается полем тела), требует метку панели и в предпросмотре отвечает 403.
         Адрес плана берётся из тела, а не из плана по умолчанию: иначе жест по плану 2
         бил бы по наименьшему номеру проекта.
+
+        `409` выбирается по полю `busy` в ответе ядра, а не по `action`: `start`/`stop`
+        этого поля не ставят, их коды не меняются. Занятость — не ошибка ввода: странице
+        и владельцу полезно отличать «нельзя сейчас» от «нечего удалять».
         """
-        title = "запуск" if action == "start" else "остановка"
+        title = {"start": "запуск", "stop": "остановка", "delete": "удаление"}[action]
         if getattr(self.state, "preview", False):
             self._drain_body()
             self._json(403, {"ok": False,
@@ -2608,19 +2619,24 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if action == "start":
                 result = plans_api.start(state.project, plan_id)
-            else:
+            elif action == "stop":
                 result = plans_api.stop(state.project, plan_id, payload.get("reason"))
+            else:
+                # Борда — та же, что у панели (`--board`): карточки лежат в ней, а не в
+                # борде конфига, когда панель запущена с флагом.
+                result = plans_api.delete(state.project, plan_id,
+                                          board=getattr(state, "board", None))
         except Exception as exc:                                # noqa: BLE001
             self._json(500, {"ok": False, "project": {"id": state.id, "name": state.name},
                              "error": f"{type(exc).__name__}: {exc}"})
             return
         result.setdefault("action", f"plan_{action}")
         result["project"] = {"id": state.id, "name": state.name}
-        # Жест пишет `pipeline.json` и стоп-флаг: все три кэша устарели, как в accept.
+        # Жест пишет `pipeline.json` и файлы состояния: все три кэша устарели, как в accept.
         snap.clear_cache()
         self.state.projects_cache = None
         panel_pause.clear_cache()             # строки планов тоже устарели (план 6 S2)
-        self._json(200 if result.get("ok") else 400, result)
+        self._json(200 if result.get("ok") else (409 if result.get("busy") else 400), result)
 
     def _post_plan_mode(self) -> None:
         """Переключить режим планировщика: одно идемпотентное действие, без второго «применить»."""
