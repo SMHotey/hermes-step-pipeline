@@ -89,6 +89,23 @@ NO_JOURNAL = """# 5. Совсем без журнала
 """
 
 
+# Требования стража P1/P3 (план 7 S0): `plan --check` печатает P1-P4 и отдаёт 1 при FAIL,
+# поэтому «валидный черновик» обязан пройти и требования стража. Номер артефакта берётся из
+# имени файла (5-demo.md -> docs/research/5-prior-art.md), см. ловушку 1 постановки.
+RESEARCH = """## Разведка
+
+Артефакт: `docs/research/{plan}-prior-art.md`. Лицензии: MIT. Кандидаты: demo/spec-kit.
+Решение: go — берём практики demo/spec-kit.
+
+{mark}"""
+
+
+def _with_research(text: str, plan: str = "5") -> str:
+    """План с разделом «Разведка» перед шагами: P1 и P3 выполнены, P4 — по номеру в имени файла."""
+    block = RESEARCH.format(plan=plan, mark="Правки по разведке: 1\n")
+    return text.replace("## Шаги", block + "\n## Шаги", 1)
+
+
 def _draft(project: Path, name: str, text: str) -> Path:
     """Положить черновик в `docs/plans/drafts` и вернуть путь."""
     folder = plan_accept.drafts_dir(project)
@@ -157,7 +174,8 @@ def test_check_prints_stale_address_as_warning(project: Path, capsys):
     (project / "app" / "api").mkdir(parents=True, exist_ok=True)
     (project / "app" / "api" / "invoices.py").write_text("x = 1\n", encoding="utf-8")
     draft = _draft(project, "5-demo.md",
-                   helpers.PLAN.replace("`app/api/invoices.py`", "`app/api/invoices.py:1-999`"))
+                   _with_research(helpers.PLAN.replace("`app/api/invoices.py`",
+                                                       "`app/api/invoices.py:1-999`")))
 
     assert plan_accept.check_draft(project, draft) == []
     assert _cmd(project, check=str(draft)) == 0
@@ -169,7 +187,7 @@ def test_check_prints_stale_address_as_warning(project: Path, capsys):
 def test_check_without_lint_accepts_valid_draft(project: Path, capsys, monkeypatch):
     """Без линтера валидный черновик проходит: разбор движком и контракт шагов чисты."""
     monkeypatch.setattr(plan_accept, "plan_lint", None)
-    draft = _draft(project, "5-demo.md", helpers.PLAN)
+    draft = _draft(project, "5-demo.md", _with_research(helpers.PLAN))
     before = draft.read_bytes()
 
     assert plan_accept.check_draft(project, draft) == []

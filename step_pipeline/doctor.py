@@ -22,6 +22,13 @@ except ImportError:  # pragma: no cover - отладка файлом
     import snapshot as snap  # type: ignore
     import telegram  # type: ignore
 
+try:  # требования стража: движок на stdlib, состояние проекта не читает
+    from . import plan_accept
+    from .engine import plan_cycle
+except ImportError:  # pragma: no cover - движка рядом нет: строки P1-P4 не печатаются
+    plan_accept = None  # type: ignore
+    plan_cycle = None  # type: ignore
+
 
 @dataclass
 class Report:
@@ -35,6 +42,39 @@ class Report:
     problems: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     lint: plan_lint.LintResult | None = None   # None — линтер не запускали
+
+
+CYCLE_RESEARCH_DEFAULT = "docs/research"
+
+
+def _research_dir(project: Path) -> str:
+    """Каталог разведки путём от проекта — как `gate.scout_research_dir` (gate.py:617-627)."""
+    cfg = proj.read_config(Path(project))
+    raw = str((cfg.get("paths") or {}).get("research") or CYCLE_RESEARCH_DEFAULT).strip()
+    path = Path(raw or CYCLE_RESEARCH_DEFAULT)
+    if path.is_absolute():
+        try:
+            return path.resolve().relative_to(Path(project).resolve()).as_posix()
+        except (ValueError, OSError):
+            return CYCLE_RESEARCH_DEFAULT
+    return path.as_posix().strip("/") or CYCLE_RESEARCH_DEFAULT
+
+
+def plan_cycle_rows(project: Path, path: Path) -> list[tuple[str, str, str]] | None:
+    """Требования стража P1-P4 для файла плана; `None` — проверять нечем.
+
+    Номер плана берётся из имени файла (`plan_accept.plan_number`): заголовок `# План 7. …`
+    шаблон `PLAN_ID_RE` не распознаёт, и P4 молча пропустил бы проверку ссылки на артефакт.
+    Функция только читает файл: утверждение, состояние и каталоги проекта не читаются.
+    """
+    if plan_cycle is None or plan_accept is None:
+        return None
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return plan_cycle.check_plan(text, plan_accept.plan_number(Path(path).name),
+                                 _research_dir(project))
 
 
 def collect(project: Path, plan: str = "", *, with_lint: bool = True,
@@ -79,6 +119,16 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
         # не блокирует, но знать о нём надо (шаг 5-S9).
         for problem in lint.warnings:
             report.warnings.append(f"план {problem}")
+        # Требования стража P1-P4: ровно те, по которым gate.plan_checks заворачивает план
+        # до ревью (gate.py:2764-2771). Печатаются только для адресного плана: панель считает
+        # свой «критично» и зовёт collect с with_lint=False, а legacy-планы каталога — не повод.
+        if plan and lint.files:
+            rows = plan_cycle_rows(project, Path(lint.files[0]))
+            if rows is None:
+                report.warnings.append("P1–P4 не проверены: модуль plan_cycle не найден")
+            else:
+                for level, code, message in rows:
+                    (notes if level == "PASS" else problems).append(f"план {code}: {message}")
     engine_ver = setup_flow.engine_version(project)
     plugin_ver = setup_flow.plugin_version()
     if engine_ver and engine_ver != plugin_ver:

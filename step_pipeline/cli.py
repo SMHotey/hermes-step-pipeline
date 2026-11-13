@@ -376,6 +376,17 @@ def cmd_plan(args) -> int:
         warnings = plan_accept.check_warnings(project, draft)
         for warning in warnings:
             print(f"  ! {warning}")
+        # Требования стража P1-P4: план с проваленным требованием до ревью не дойдёт
+        # (gate.plan_checks), поэтому для автора это ошибка черновика, а не заметка.
+        rows = doctor.plan_cycle_rows(project, draft)
+        if rows is None:
+            print("  ! P1–P4 не проверены: модуль plan_cycle не найден")
+        else:
+            print("Требования стража (P1–P4):")
+            for level, code, message in rows:
+                print(f"  {'✓' if level == 'PASS' else '✗'} {code}: {message}")
+            errors = errors + [f"{code}: {message}"
+                               for level, code, message in rows if level == "FAIL"]
         if errors:
             print(f"ИТОГ: ошибок {len(errors)}"
                   + (f", предупреждений {len(warnings)}" if warnings else ""))
