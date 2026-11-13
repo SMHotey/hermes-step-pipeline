@@ -331,6 +331,8 @@
   <nav class="tabs" role="tablist" aria-label="Разделы панели">
     <button class="tab active" data-tab="overview" id="tab-btn-overview" role="tab"
             aria-selected="true" aria-controls="tab-overview">Обзор</button>
+    <button class="tab" data-tab="plans" id="tab-btn-plans" role="tab"
+            aria-selected="false" aria-controls="tab-plans">Планы</button>
     <button class="tab" data-tab="step" id="tab-btn-step" role="tab"
             aria-selected="false" aria-controls="tab-step">Шаг</button>
     <button class="tab" data-tab="events" id="tab-btn-events" role="tab"
@@ -423,6 +425,49 @@
     </section>
   </div>
   </div>
+  </div>
+
+  <!-- Вкладка «Планы» (план 6 S5): все планы всех проектов реестра, только чтение;
+       данные — из `/api/projects`, своего правила «остановлен» страница не заводит. -->
+  <div class="tab-panel" id="tab-plans">
+    <section>
+      <h2>Планы реестра</h2>
+      <div class="row">
+        <div>
+          <select id="plans-project">
+            <option value="">все проекты</option>
+          </select>
+        </div>
+        <div>
+          <select id="plans-state">
+            <option value="">все состояния</option>
+            <option value="running">идёт</option>
+            <option value="stopped">остановлен</option>
+            <option value="closed">закрыт</option>
+            <option value="not-driven">не ведётся</option>
+          </select>
+        </div>
+        <div>
+          <input type="text" id="plans-text" autocomplete="off"
+                 placeholder="номер, название, проект или стоп">
+        </div>
+      </div>
+      <table id="plans-table">
+        <thead>
+          <tr>
+            <th scope="col">Проект</th>
+            <th scope="col">План</th>
+            <th scope="col">Название</th>
+            <th scope="col">Состояние</th>
+            <th scope="col">Следующий шаг</th>
+            <th scope="col">Закрыто/всего</th>
+            <th scope="col">Утверждение</th>
+            <th scope="col">Стоп</th>
+          </tr>
+        </thead>
+        <tbody id="plans-rows"></tbody>
+      </table>
+    </section>
   </div>
 
   <!-- Экран «Шаг» (план 3 S3): четыре источника на одной странице, только чтение. -->
@@ -1026,6 +1071,63 @@ function renderProjects(data, current) {
   });
 }
 
+// Вкладка «Планы» (план 6 S5): фильтры по проекту, состоянию и тексту строки.
+// Фильтр сравнивает значение состояния из строки, а не подпись: подписи приходят
+// из ответа сервера, и сравнивать их со списком подписей бессмысленно.
+function filterPlansTab() {
+  const project = $("plans-project") ? $("plans-project").value : "";
+  const state = $("plans-state") ? $("plans-state").value : "";
+  const needle = ($("plans-text") && $("plans-text").value || "").trim().toLowerCase();
+  const rows = $("plans-rows").querySelectorAll("tr[data-project]");
+  let shown = 0;
+  rows.forEach((row) => {
+    const ok = (!project || row.dataset.project === project)
+      && (!state || row.dataset.state === state)
+      && (!needle || row.textContent.toLowerCase().includes(needle));
+    row.hidden = !ok;
+    if (ok) shown += 1;
+  });
+  if ($("plans-empty")) $("plans-empty").hidden = shown > 0;
+}
+
+// Строки вкладки — из поля `plans` ответа `/api/projects`: страница ничего не досчитывает.
+function renderPlansTab(data) {
+  const rows = [];
+  (data.projects || []).forEach((project) => {
+    (project.plans || []).forEach((plan) => rows.push({project, plan}));
+  });
+  // Опции проектов пересобираются только при смене набора id, иначе каждый кадр
+  // сбрасывал бы выбор владельца (образец — переключатель проектов).
+  const picker = $("plans-project");
+  const ids = (data.projects || []).map((p) => p.id).join(",");
+  if (picker && picker.dataset.ids !== ids) {
+    picker.dataset.ids = ids;
+    picker.innerHTML = '<option value="">все проекты</option>' +
+      (data.projects || []).map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+  }
+  const body = $("plans-rows");
+  if (!body) return;
+  body.innerHTML = rows.map(({project, plan}) => {
+    const stop = plan.stop
+      ? `${esc(plan.stop.kind || "стоп")}: ${esc(plan.stop.reason || "причина не записана")}`
+      : "—";
+    const approval = plan.approval || {};
+    const label = approval.label ? esc(approval.label) : "—";
+    const stamp = approval.approved_at ? ` title="${esc(approval.approved_at)}"` : "";
+    return `<tr data-project="${esc(project.id)}" data-state="${esc(plan.state || "")}">
+      <td>${esc(project.name)}</td>
+      <td class="mono">${esc(plan.id)}</td>
+      <td>${esc(plan.name || "—")}</td>
+      <td><span class="pill">${esc(plan.state_label || "—")}</span></td>
+      <td class="mono">${esc(plan.next || "—")}</td>
+      <td class="mono">${esc(plan.closed)} / ${esc(plan.total)}</td>
+      <td${stamp}>${label}</td>
+      <td>${stop}</td>
+    </tr>`;
+  }).join("") + '<tr id="plans-empty"><td colspan="8" class="muted">планов нет</td></tr>';
+  filterPlansTab();   // перерисовка не должна снимать введённый фильтр
+}
+
 // Подключение проекта из панели (S8, D2): путь проверяет сервер, объяснение — под вводом.
 async function addProject() {
   const input = $("new-project-path");
@@ -1079,7 +1181,10 @@ async function loadProjects() {
   } catch (err) {
     return;   // сводка не критична: экран проекта работает и без неё
   }
-  if (data && data.ok) renderProjects(data, currentProject || data.default);
+  if (data && data.ok) {
+    renderProjects(data, currentProject || data.default);
+    renderPlansTab(data);
+  }
 }
 
 
@@ -2607,6 +2712,9 @@ $("new-project-path").addEventListener("keydown", (event) => {
   if (event.key === "Enter") { event.preventDefault(); addProject(); }
 });
 $("steps-filter").addEventListener("input", () => filterSteps());
+$("plans-project").addEventListener("change", filterPlansTab);
+$("plans-state").addEventListener("change", filterPlansTab);
+$("plans-text").addEventListener("input", filterPlansTab);
 $("close-hotkeys").onclick = () => $("hotkeys-help").close();
 applyTheme(currentTheme());   // подпись кнопки — по фактической теме
 
