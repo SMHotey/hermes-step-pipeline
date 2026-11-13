@@ -1282,12 +1282,14 @@ def plan_fix_card_body(p: Paths, plan_rel: str, report_rel: str,
         "",
         "ЧТО СДЕЛАТЬ",
         "- Правится только план: замысел, шаги, файлы, гейты, стоп-сигналы.",
-        (f"- Закрывать находку минимальной правкой: не больше {limits['percent']}% объёма "
-         f"версии плана или {limits['chars_per_finding']} символов на каждую закрытую "
-         f"находку — превышение остановит конвейер, план не усекается."),
-        "- Пояснения для ревьюера — в отчёт и журнал, в план не писать.",
         "- Правится только то, что названо в находках: план не переписывается целиком,",
         "  номера строк в коде и суммы тестов не пересчитываются, если находка не об этом.",
+        f"- Находка закрывается минимальной правкой: рост версии плана — не больше "
+        f"{limits['percent']}%",
+        f"  и не больше {limits['chars_per_finding']} символов на закрытую находку.",
+        "- Пояснения для ревьюера в план не писать: их место — отчёт карточки и журнал.",
+        "- Рост сверх лимита останавливает конвейер стоп-сигналом `max_plan_growth`:",
+        "  решает владелец.",
         "- Разведка остаётся учтённой: раздел «## Разведка» и отметка правок на месте.",
         "- Код шагов в этой карточке не пишется и не правится.",
         "- После правки ревью повторится само; когда круги правок исчерпаны, отказ",
@@ -1651,7 +1653,7 @@ def build_ctx(p: Paths) -> dict:
     # считается здесь, а не в `decide`: решение стража остаётся функцией состояния и файлов
     # не читает. `approval` здесь ещё модуль версии плана — ниже это имя переопределяется
     # ответом реестра, поэтому объём считает `plan_version_chars`, а не строки этого места.
-    ctx["max_plan_growth"] = dict(p.cfg.max_plan_growth)
+    ctx["max_plan_growth"] = dict(getattr(p.cfg, "max_plan_growth", None) or {})
     ctx["plan_fix_baseline"] = state.get("plan_fix_baseline") or {}
     ctx["plan_version_chars"] = plan_version_chars(Path(p.plan_file), p.cfg.journal_marker)
     # Утверждение считаем ДО сборщика: при его сбое решение всё равно должно знать,
@@ -1659,6 +1661,17 @@ def build_ctx(p: Paths) -> dict:
     approval = registry.approval_status(p.cfg, p.spec)
     approval["started"] = registry.plan_started(p.cfg, p.spec)
     ctx["approval"] = approval
+    # Снимок расширения плана (7-S4) относится к версии, на которую владелец ещё не отвечал.
+    # Утвердил ДРУГУЮ версию — мерить нечего: рост между старой базой и утверждённым текстом
+    # это его правка, а не правка исполнителя. Без этой оговорки owner-стоп роста срабатывал
+    # бы на законном «владелец поправил план и переутвердил» и держал бы план вместо свежего
+    # круга ревью. Снимок не удаляется, а не передаётся решению: в состоянии он остаётся
+    # диагностикой, а решение работает ровно по пяти условиям контракта.
+    baseline = ctx.get("plan_fix_baseline") or {}
+    if (isinstance(baseline, dict) and baseline and approval.get("state") == "approved"
+            and str(approval.get("version_sha256") or "")
+            != str(baseline.get("version_sha256") or "")):
+        ctx["plan_fix_baseline"] = {}
     try:
         pkg = collector(p)
     except SystemExit as exc:
@@ -2284,16 +2297,27 @@ def plan_version_chars(path, journal_marker: str = "журнал") -> int:
 def _plan_growth_limits(raw) -> dict:
     """Допуск расширения плана: `percent` и `chars_per_finding` из конфига или умолчание.
 
-    `config._plan_growth` проверяет ключ на загрузке, но синтетические `ctx` тестов решений
-    ключа не имеют вовсе — там работает умолчание движка, а не отказ.
+    Разбор тот же, что у `config._plan_growth`: число или числовая строка, не bool, не
+    отрицательное, процент — только целый. Разные правила на одном ключе означали бы, что
+    при живом конфиге и при синтетическом `ctx` действуют разные лимиты. В отличие от
+    конфига, здесь мусор не роняет тик: `decide` — функция состояния, и падать ей нечем,
+    поэтому негодное значение уступает умолчанию.
     """
     limit = {"percent": PLAN_GROWTH_PERCENT,
              "chars_per_finding": PLAN_GROWTH_CHARS_PER_FINDING}
     raw = raw if isinstance(raw, dict) else {}
-    percent = _as_int(raw.get("percent"), limit["percent"])
-    per_finding = _as_int(raw.get("chars_per_finding"), limit["chars_per_finding"])
-    return {"percent": percent if percent >= 0 else limit["percent"],
-            "chars_per_finding": per_finding if per_finding >= 0 else limit["chars_per_finding"]}
+    for key in ("percent", "chars_per_finding"):
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            continue
+        try:
+            number = float(value)
+        except ValueError:
+            continue
+        if number < 0 or (key == "percent" and number != int(number)):
+            continue
+        limit[key] = int(number)
+    return limit
 
 
 def _percent_text(value) -> str:
@@ -2314,6 +2338,11 @@ def plan_growth_report(before: int, after: int, closed: int, percent,
     находку. Большее из них работало бы как «правке всегда выгодная граница»: при плане на
     10000 символов и десяти находках граница находок (4000) перекрывала бы процент (1000),
     и лимит не ограничивал бы ничего.
+
+    `percent` в результате — фактический рост в процентах (`growth * 100 / before`), а не
+    потолок из конфига: цифра читается владельцем в стоп-сигнале и в состоянии плана, и
+    подмена её лимитом показывала бы «10 %» при росте на 15 %. Сравнивать не с чем
+    (`before <= 0`) — превышения нет и допуск нулевой.
     """
     before = max(_as_int(before, 0), 0)
     after = max(_as_int(after, 0), 0)
@@ -2324,38 +2353,35 @@ def plan_growth_report(before: int, after: int, closed: int, percent,
     percent_cap = before * percent // 100
     per_finding_cap = chars_per_finding * closed
     allowed = min(percent_cap, per_finding_cap)
-    return {"before": before, "after": after, "growth": growth, "percent": percent,
+    if before <= 0:
+        # Сравнивать не с чем: не наказываем и не считаем рост долей пустого знаменателя.
+        return {"before": before, "after": after, "growth": growth, "percent": 0.0,
+                "percent_cap": 0, "per_finding_cap": per_finding_cap,
+                "allowed": 0, "closed": closed, "over": False}
+    return {"before": before, "after": after, "growth": growth,
+            "percent": growth * 100.0 / before,
             "percent_cap": percent_cap, "per_finding_cap": per_finding_cap,
             "allowed": allowed, "closed": closed, "over": growth > allowed}
-
-
-def _finding_id(line) -> str:
-    """ID находки из строки реестра (`F1 (S2): …`); пусто — строка не из реестра.
-
-    Строки карточки правок приходят из двух источников: открытые находки реестра (начинаются
-    с ID) и пункты отчёта ревью (произвольный текст). В базу расширения берутся только
-    первые: по чужому тексту «сколько закрыто» из реестра не посчитать, и такая база дала бы
-    нулевой допуск на любой правке.
-    """
-    head = str(line or "").strip().split(" ", 1)[0]
-    return head if re.match(r"^[A-Za-z]{1,3}\d+$", head) else ""
 
 
 def plan_fix_snapshot(p: Paths, round_no: int, ctx: dict, findings: list[str]) -> dict:
     """Версия плана ДО правки: объём, метка и открытые ID реестра находок (S4).
 
     Пишется при заказе карточки правок: после правки файл перезаписан, и сравнивать
-    расширение было бы не с чем. `open_ids` — находки, которые карточка должна закрыть:
-    по ним мера «сколько закрыто» берётся из реестра, а не из длины списка находок карточки.
+    расширение было бы не с чем. `open_ids` берутся из реестра (`ctx["plan_findings"]`,
+    статус `открыто`, порядок реестра), а не из строк карточки: карточка говорит, что
+    чинить, реестр — что закрыто, и «сколько закрыто» считается только по реестру.
     """
     path = Path(p.plan_file)
     marker = approval.journal_marker_of(p.cfg)
+    rows = [item for item in (ctx.get("plan_findings") or []) if isinstance(item, dict)]
+    open_ids = [str(item.get("id") or "").strip() for item in rows
+                if str(item.get("status") or "") == "открыто"]
     return {
         "round": int(round_no),
         "version_sha256": approval.plan_version_sha(path, marker),
         "chars": plan_version_chars(path, marker),
-        "open_ids": [fid for fid in (_finding_id(item) for item in (findings or []))
-                     if fid][:FINDINGS_LIMIT],
+        "open_ids": [fid for fid in open_ids if fid][:FINDINGS_LIMIT],
         "findings_open": max(len(findings or []), 1),
         "at": time.strftime("%d.%m.%Y %H:%M:%S"),
     }
@@ -2397,55 +2423,51 @@ def _plan_growth_decision(ctx: dict) -> dict | None:
     fixes = card_of(ctx.get("plan_fix_cards") or [], PLAN_FIX_KEY)
     if not fixes or str(fixes[-1].get("status") or "") != "done":
         return None                       # правка ещё не закрыта: меряем после неё
-    approval = ctx.get("approval") or {}
-    # Утверждённая запись и не унаследованная: текст утвердил сам владелец (`plan --accept`)
-    # после правки — решение по этой версии плана уже принято человеком. Наследованную
-    # запись (`ensure_approval` идущего плана) за утверждение правки не считаем: иначе
-    # мера отключала бы сама себя на каждом идущем плане, где правку как раз и делают.
-    if approval.get("state") == "approved" and not approval.get("inherited"):
-        return None
     current_sha = str((ctx.get("approval") or {}).get("version_sha256") or "")
     base_sha = str(baseline.get("version_sha256") or "")
-    if current_sha and base_sha and current_sha == base_sha:
-        return None                       # плана правка не изменила — расширять нечем
-    if current_sha and str(baseline.get("reported_version_sha256") or "") == current_sha:
+    if not current_sha or not base_sha or current_sha == base_sha:
+        return None                       # версия неизвестна либо правка её не меняла
+    if str(baseline.get("reported_version_sha256") or "") == current_sha:
         return None                       # по этой версии плана решение уже вынесено
     limits = _plan_growth_limits(ctx.get("max_plan_growth"))
+    percent = limits["percent"]
+    chars_per_finding = limits["chars_per_finding"]
     closed, closed_ids = _closed_findings(ctx, baseline)
     report = plan_growth_report(baseline.get("chars"), ctx.get("plan_version_chars"), closed,
-                                limits["percent"], limits["chars_per_finding"])
-    if not report["before"] or not report["over"]:
+                                percent, chars_per_finding)
+    if not report["over"]:
         return None
-    percent_text = _percent_text(report["growth"] * 100.0 / report["before"])
+    percent_text = _percent_text(report["percent"])
     card_id = str(fixes[-1].get("id") or "")
     reason = (f"правка плана расширила план на {percent_text}% ({report['growth']} символов: "
-              f"было {report['before']}, стало {report['after']}) — сверх допуска "
-              f"{report['allowed']} ({report['percent']}% версии = {report['percent_cap']} "
-              f"против {limits['chars_per_finding']} × {report['closed']} = "
+              f"было {report['before']}, стало {report['after']}) — сверх лимита "
+              f"{report['allowed']} ({percent}% версии = {report['percent_cap']} "
+              f"против {chars_per_finding} × {report['closed']} = "
               f"{report['per_finding_cap']}, берётся меньшее); находок закрыто "
               f"{report['closed']}; страж план не усекает — решает владелец")
     details = "\n".join([
         f"- версия плана: было {report['before']} символов, стало {report['after']} "
         f"(+{report['growth']}, {percent_text}%)",
-        f"- допустимо {report['allowed']}: меньшее из {report['percent']}% версии "
-        f"({report['percent_cap']}) и {limits['chars_per_finding']} × {report['closed']} "
+        f"- допустимо {report['allowed']}: меньшее из {percent}% версии "
+        f"({report['percent_cap']}) и {chars_per_finding} × {report['closed']} "
         f"закрытых находок ({report['per_finding_cap']})",
         f"- карточка правок: {card_id or '—'}; закрыто находок реестра: "
         f"{', '.join(closed_ids) if closed_ids else (report['closed'] or '—')}",
         "- варианты: вернуть план к объёму правки, поднять `max_plan_growth` в "
         "`pipeline.json` или принять как есть (`--resume`)",
     ])
-    comment = "\n".join([
+    comment_text = "\n".join([
         f"СТОП-СИГНАЛ СТРАЖА: правка расширила план на {percent_text}% "
         f"(было {report['before']} символов, стало {report['after']})",
         f"находок закрыто {report['closed']}; допустимый рост {report['allowed']} символов — "
-        f"меньшее из {report['percent']}% версии ({report['percent_cap']}) и "
-        f"{limits['chars_per_finding']} на находку ({report['per_finding_cap']})",
+        f"меньшее из {percent}% версии ({report['percent_cap']}) и "
+        f"{chars_per_finding} на находку ({report['per_finding_cap']})",
         "страж план не усекает: вернуть план к объёму правки, поднять max_plan_growth "
         "в pipeline.json или принять как есть (python .pipeline/gate.py --resume)",
     ])
     return {"action": "stop", "plan_review": True, "kind": "owner", "growth": report,
-            "reason": reason, "details": details, "comment": comment}
+            "reason": reason, "details": details,
+            "comment": {"card": card_id, "text": comment_text}}
 
 
 def _plan_review_decision(ctx: dict) -> dict | None:
@@ -4800,7 +4822,9 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             if isinstance(baseline, dict):
                 baseline["reported_version_sha256"] = str(
                     (ctx.get("approval") or {}).get("version_sha256") or "")
-                baseline["reported_growth"] = growth.get("growth")
+                # Отчёт целиком, а не одна дельта: по состоянию должны читаться и границы,
+                # и число закрытых находок — иначе «доложено» не диагностируется по цифрам.
+                baseline["reported_growth"] = dict(growth)
                 baseline["reported_at"] = state["plan_growth_report"]["at"]
         previous = (ctx.get("stop") or {}).get("reason")
         # `kind` из решения: эскалация владельцу (`owner`) не должна сниматься тиком сама (D6).
@@ -4808,18 +4832,17 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         result.update(applied=True, detail=reason)
         touch("stop")
         # Замер — комментарием в карточку правок: без него лимит выглядел бы молчаливым
-        # запретом (исполнитель не узнал бы, за что получил стоп). Отказ `_comment` —
+        # запретом (исполнитель не узнал бы, за что получил стоп). Карточка названа в самом
+        # решении: второй раз искать её перебором `ctx` незачем. Отказ `_comment` —
         # предупреждение, а не тишина: цифры остались в состоянии плана, и владелец узнаёт,
         # что исполнитель их не увидел.
-        comment = str(decision.get("comment") or "")
-        if comment:
-            fixes = card_of(ctx.get("plan_fix_cards") or [], PLAN_FIX_KEY)
-            card_id = str(fixes[-1].get("id") or "") if fixes else ""
-            if card_id and _comment(p, card_id, comment):
-                say("📏 замер расширения плана — комментарием в карточку правок")
+        comment = decision.get("comment") or {}
+        if growth and comment.get("card") and comment.get("text"):
+            if _comment(p, str(comment["card"]), str(comment["text"])):
+                say(f"📏 замер расширения плана — комментарием в карточку {comment['card']}")
             else:
                 say(f"  замер расширения плана не ушёл комментарием "
-                    f"(карточка {card_id or '—'}) — он остался в состоянии плана: "
+                    f"(карточка {comment['card']}) — он остался в состоянии плана: "
                     f"plan_growth_report")
         if previous != reason:
             extra = decision.get("details") or ""
