@@ -153,23 +153,29 @@ def post(url: str, path: str, payload: dict, headers: dict | None = None) -> tup
         return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
 
 
-def repeat_stop_same_bytes(url: str, reason: str, first: dict,
-                           attempts: int = 12) -> tuple[int, dict]:
-    """Повторять `stop` тем же телом, пока запись не попадёт в ту же секунду, что прежняя.
+FIXED_AT = "12.11.2026 10:00:00"
 
-    `at` у движка секундный (`engine/gate.py:336`), поэтому две записи в одну секунду
-    дают побайтово одинаковый флаг — только на такой паре и проверяется признак «флаг
-    записан». На границе секунды payload отличается, и повтор ничего не доказывает,
-    поэтому жест повторяется, а попадание подтверждается по `at` ответа.
+
+def stub_engine(calls: list[tuple[str, ...]], reason: str):
+    """Заглушка движка вместо подпроцесса: ставит стоп-флаг плана 2 фиксированными байтами.
+
+    Живой `gate.py --plan 2 --stop` занимает почти секунду, а `at` в нём секундный
+    (`engine/gate.py:336`): два подряд идущих жеста на этой машине в одну секунду не
+    попадают, поэтому проверка «повтор с той же причиной» ждала попадания в секунду и
+    зависела от скорости и загрузки машины. Заглушка пишет тот же флаг так же, как движок
+    (`state_io.save_json` → `atomic_write_text` → `os.replace`): содержимое остаётся
+    побайтово прежним, а отметка записи (`plans_api._flag_stamp`) меняется всегда.
     """
-    previous = first["stop"]
-    for _ in range(attempts):
-        status, data = post(url, "/api/plan/stop", {"plan": "2", "reason": reason}, PANEL)
-        assert status == 200, data           # равенство payload как признак давало здесь 400
-        if data["stop"]["at"] == previous["at"]:
-            return status, data
-        previous = data["stop"]
-    pytest.fail(f"повтор жеста не попал в ту же секунду за {attempts} попыток")
+    def fake(project: Path, *args: str) -> dict:
+        calls.append(args)
+        path = plans_api.stop_flag(project, "2")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"reason": reason, "source": "owner", "kind": "owner", "at": FIXED_AT}
+        tmp = path.with_name(f"{path.name}.tmp-stub")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        return {"ok": True, "code": 0, "stdout": "стоп-флаг поставлен (заглушка)", "stderr": ""}
+    return fake
 
 
 def test_start_adds_plan_to_driven_and_clears_its_stop(server):
@@ -199,12 +205,14 @@ def test_start_adds_plan_to_driven_and_clears_its_stop(server):
     assert json.loads(flag.read_text(encoding="utf-8"))["reason"] == "стоп плана 1"
 
 
-def test_stop_writes_owner_flag_for_named_plan(server):
+def test_stop_writes_owner_flag_for_named_plan(server, monkeypatch):
     """`stop` на плане 2: owner-стоп с причиной, `driven_plans` не тронут.
 
     Здесь же две ветки признака «команда применена»: занятый тик даёт отказ с
     неизменным флагом, а повторный жест тем же телом — `200 stopped`, хотя файл
-    переписан теми же байтами (`at` у движка секундный).
+    переписан теми же байтами (`at` у движка секундный). Повтор проверяется на
+    заглушке движка: живой жест занимает ~1 с, и пара «в ту же секунду» на нём
+    недостижима.
     """
     root = server["root"]
     flag_1 = stop_path(root, "1")
@@ -242,13 +250,33 @@ def test_stop_writes_owner_flag_for_named_plan(server):
     assert flag_1.read_bytes() == before_1
     assert read_cfg(root)["driven_plans"] == ["1"]
 
-    # Двойное нажатие «остановить»: та же причина в ту же секунду переписывает флаг теми
-    # же байтами, и жест обязан ответить 200 — признак «payload изменился» давал здесь 400.
-    status, again = repeat_stop_same_bytes(server["url"], reason, data)
+    # Двойное нажатие «остановить»: та же причина пишет флаг теми же байтами, и жест
+    # обязан ответить 200 — признак «payload изменился» давал здесь 400. Движок подменён
+    # заглушкой: живой жест занимает ~1 с при секундном `at`, поэтому пара «в ту же
+    # секунду» на живой команде недостижима, и тест плавал бы от загрузки машины.
+    calls: list[tuple[str, ...]] = []
+    with monkeypatch.context() as scoped:
+        scoped.setattr(plans_api, "_engine", stub_engine(calls, reason))
+        status, first_again = post(server["url"], "/api/plan/stop",
+                                   {"plan": "2", "reason": reason}, PANEL)
+        assert status == 200, first_again
+        bytes_after_first = literal.read_bytes()
+        status, again = post(server["url"], "/api/plan/stop",
+                             {"plan": "2", "reason": reason}, PANEL)
+        assert status == 200, again
+        bytes_after_second = literal.read_bytes()
+
+    # Жест остался адресным и с причиной: заглушка видит те же аргументы, что живой движок.
+    assert calls == [("--plan", "2", "--stop", reason)] * 2
+    assert first_again["ok"] is True and first_again["status"] == "stopped"
     assert again["ok"] is True
     assert again["status"] == "stopped"
     assert again["stop"]["reason"] == reason
     assert again["stop"]["kind"] == "owner"
+    assert again["stop"]["at"] == FIXED_AT
+    # Повтор переписал флаг теми же байтами: содержимое то же, отметка записи сменилась.
+    assert again["stop"] == first_again["stop"]
+    assert bytes_after_second == bytes_after_first
     assert json.loads(literal.read_text(encoding="utf-8")) == again["stop"]
     assert flag_1.read_bytes() == before_1
 
