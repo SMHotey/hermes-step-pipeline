@@ -614,6 +614,10 @@ def _overview(root: Path, cfg: dict, out: dict) -> dict:
 
     progress: list[dict] = []
     for row in out.get("plans") or []:
+        # `driven` уже посчитан стражем (`engine/gate.py`): снимок ничего не выводит заново,
+        # и снятый с ведения план полосы в «Обзоре» не получает.
+        if not row.get("driven"):
+            continue
         progress.append({
             "id": str(row.get("id")),
             "closed": int(row.get("closed") or 0),

@@ -379,6 +379,10 @@
         <div class="ov-item"><span>риск шага</span><b class="mono" id="ov-risk">—</b></div>
       </div>
       <div id="ov-bars"><span class="muted">—</span></div>
+      <!-- Планы в работе (S6): данные приходят ключом `running` из /api/projects.
+           Своего фильтра и своего простоя страница не считает — правило отрисовки одно. -->
+      <div class="plans-title">Планы в работе</div>
+      <div class="plans" id="ov-running"><span class="muted">—</span></div>
       <!-- Черновики планов (S13): владелец утверждает их кнопкой, а не командой в
            терминале. Утверждение переносит файл и пишет запись с sha256 — по ней страж
            открывает шаги; в предпросмотре кнопок нет. -->
@@ -1391,6 +1395,7 @@ async function loadProjects() {
   if (data && data.ok) {
     renderProjects(data, currentProject || data.default);
     renderPlansTab(data);
+    renderRunning(data);
   }
 }
 
@@ -1706,6 +1711,35 @@ function renderEvents(data) {
   $("events-empty").hidden = !!eventsRows.length;
   if (!eventsRows.length) $("events-rows").innerHTML = `<li class="muted">—</li>`;
   drawEvents();
+}
+
+function renderRunning(data) {
+  // Планы в работе (S6): плоский список пар «проект + план» из ключа `running` ответа
+  // /api/projects. Страница не фильтрует и простоя своего не считает: `idle.text` готов.
+  const rows = [];
+  (data.projects || []).forEach((project) => {
+    (project.running || []).forEach((plan) => rows.push({project, plan}));
+  });
+  const body = $("ov-running");
+  if (!body) return;
+  if (!rows.length) {
+    body.innerHTML = '<span class="muted">планов в работе нет</span>';
+    return;
+  }
+  const head = '<tr><th scope="col">Проект</th><th scope="col">План</th>' +
+    '<th scope="col">Название</th><th scope="col">Следующий шаг</th>' +
+    '<th scope="col">Закрыто/всего</th><th scope="col">Висит</th></tr>';
+  body.innerHTML = `<table><thead>${head}</thead><tbody>` + rows.map(({project, plan}) => {
+    const idle = plan.idle && plan.idle.text ? esc(plan.idle.text) : "—";
+    return `<tr data-project="${esc(project.id)}" data-plan-id="${esc(plan.id)}">
+      <td>${esc(project.name)}</td>
+      <td class="mono">${esc(plan.id)}</td>
+      <td>${esc(plan.name || "—")}</td>
+      <td class="mono">${esc(plan.next || "—")}</td>
+      <td class="mono">${esc(plan.closed)} / ${esc(plan.total)}</td>
+      <td class="mono">${idle}</td>
+    </tr>`;
+  }).join("") + '</tbody></table>';
 }
 
 function renderOverview(data) {

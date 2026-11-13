@@ -12,7 +12,8 @@
     GET  /api/checks       проверки: doctor и линтер планов (?refresh=1 — перепроверить,
                            ?plan=<N> — только один план); действий не выполняют
     GET  /api/projects     сводка реестра: проект, план, следующий шаг, закрыто, стоп, простой,
-                           занятость слотов (capacity: лимиты, running, очередь)
+                           занятость слотов (capacity: лимиты, running, очередь) и планы
+                           в работе списком `running`
     GET  /api/notify       уведомления панели: глобальный выключатель, строки проектов реестра
                            с видами событий и каналом Telegram, история доставок; только чтение
     GET  /api/setup        мастер установки: шаги, следующий шаг, значения формы (без токена)
@@ -1753,7 +1754,7 @@ class Handler(BaseHTTPRequestHandler):
                    "plan": "", "next": "—", "closed": 0, "total": 0,
                    "state": "", "state_label": "",
                    "stop": None, "idle": None, "error": "", "capacity": None,
-                   "plans": []}
+                   "plans": [], "running": []}
         if not summary["installed"] and not state.preview:
             return summary
         # Занятость слотов от плана не зависит: считается до ранних выходов ниже (D5).
@@ -1770,6 +1771,9 @@ class Handler(BaseHTTPRequestHandler):
             summary["error"] = f"{type(exc).__name__}: {exc}"
             return summary
         summary["plans"] = plans
+        # «В работе» — решение стража (`plan_view`), а не наличие стоп-файла: строки те же,
+        # что в `plans`, отфильтрованные по состоянию. Второго сборщика нет.
+        summary["running"] = [row for row in plans if row.get("state") == "running"]
         if not plans:
             return summary
         # План, у которого есть открытые шаги, иначе первый — как в снимке.
