@@ -1090,7 +1090,29 @@ def scout_card_body(p: Paths, steps: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str) -> str:
+def plan_review_freeze_lines(round_no: int) -> list[str]:
+    """Блок заморозки для карточки ревью круга ≥ 2 (S2 плана 7); круг 1 — пусто.
+
+    Смысл: после правки площадь проверки не растёт. Ревьюер смотрит изменённый текст и его
+    стыки, а не перечитывает план заново — иначе каждый круг рождает находки в неизменённых
+    местах, и цикл не сходится.
+    """
+    if int(round_no or 1) < 2:
+        return []
+    return [
+        f"ЗАМОРОЗКА НАХОДОК (круг {round_no})",
+        "- Новые находки — только по строкам, изменённым последней правкой плана, и по их",
+        "  стыкам с соседними шагами: находка вне изменённого текста возвращается автору",
+        "  без правки плана.",
+        "- Незакрытые ID прошлого круга остаются в реестре и закрываются фактом, а не новой",
+        "  строкой; закрытые повторно не открываются.",
+        "- Правка сломала соседний шаг — это новая находка с новым F-N и ссылкой на прежний ID.",
+        "",
+    ]
+
+
+def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str,
+                          round_no: int = 1) -> str:
     """Тело карточки ревью плана: замысел до кода, чек-лист, формат вердикта (C1, C5).
 
     Ключевые слова карточки проверяются тестом: «НЕ code review», «связность», «1.5»,
@@ -1099,6 +1121,8 @@ def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str
     на её пункт (`approval.CONSTITUTION_REF_RE`) страж считает непригодным (`unreferenced`).
     С шага 7-S1 тело несёт реестр находок плана (`plan_findings_rel`) целиком — путь, правило
     блокирования и таблицу: закрыть все открытые ID можно, только если они перед глазами.
+    С круга 2 (S2 плана 7) тело несёт заморозку находок: новые — только по строкам,
+    изменённым последней правкой.
     """
     findings_path = plan_findings_path(p)
     if findings_path.is_file():
@@ -1148,6 +1172,7 @@ def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str
         "  статус `открыто`: класс (`замысел`, `двусмысленность`, `формат-стража`,",
         "  `гейт-исполнение`, `стиль`) выбирает маршрут находки, а не вердикт.",
         "",
+        *plan_review_freeze_lines(round_no),
         "РЕЕСТР СЕЙЧАС",
         *registry_lines,
         "",
@@ -1677,6 +1702,23 @@ def build_ctx(p: Paths) -> dict:
     # на втором тике любого ожидания (находка 1 ревью 5-S5).
     ctx["plan_started_journal"] = bool(ctx.get("closed"))
     ctx["plan_review_rel"] = plan_review_rel(p)
+    # Реестр находок плана — источник действующего вердикта (S2 плана 7). Путь берётся у S1
+    # (`plan_findings_rel`), второго сборщика нет. Файла нет — пусто; битый файл — `GateError`,
+    # и он уходит в ctx строкой: `decide` получает только ctx и обязан остаться чистым.
+    # Реестром считается файл с непустым текстом: `load_findings` отдаёт `[]` и для пустого,
+    # и для пробельного файла, а вердикт по ним был бы `APPROVE` без единого ревью (Р3).
+    findings_file = plan_findings_path(p)
+    ctx["plan_findings_rel"] = plan_findings_rel(p)
+    ctx["plan_findings"] = []
+    ctx["plan_findings_exists"] = False
+    try:
+        ctx["plan_findings"] = load_findings(findings_file)
+        ctx["plan_findings_error"] = ""
+        ctx["plan_findings_exists"] = bool(findings_file.is_file()
+                                           and findings_file.read_text(encoding="utf-8").strip())
+    except (GateError, OSError, ValueError) as exc:
+        ctx["plan_findings"] = []
+        ctx["plan_findings_error"] = str(exc)
     ctx["plan_review_profile"] = plan_review_profile(p.cfg)
     ctx["plan_fix_cards"] = read_cards(p, f"planloop:{p.plan_id}:{PLAN_FIX_KEY}")
     # Правка плана по разведке (0.20.0): артефакт, круги и профиль карточки. Артефакт —
@@ -2087,6 +2129,58 @@ def plan_fix_budget(ctx: dict) -> int:
     return automatic + manual
 
 
+def effective_plan_verdict(ctx: dict) -> dict | None:
+    """Действующий вердикт ревью плана: реестр находок сильнее отчёта (S2 плана 7).
+
+    Отчёта нет — вердикта нет: реестр его не выдумывает (`None`). Реестр переопределяет
+    только распознанный вердикт отчёта (`APPROVE`/`REQUEST_CHANGES`): `NONE`/`AMBIGUOUS`
+    остаются как есть, иначе нечитаемый отчёт «лечился» бы чистым реестром.
+
+    Ключи: `verdict` — действующий, `report` — из отчёта, `open` — ID со статусом
+    `открыто` в порядке файла, `total` — строк в реестре, `registry` — файл реестра есть,
+    `discrepancy` — действующий вердикт расходится с отчётом, `error` — реестр не читается.
+    """
+    report = str((ctx.get("plan_review_verdict") or {}).get("verdict") or "")
+    if not report:
+        return None
+    rows = ctx.get("plan_findings") or []
+    open_ids = [str(item.get("id") or "") for item in rows
+                if str(item.get("status") or "") == "открыто"]
+    registry = bool(ctx.get("plan_findings_exists"))
+    known = report in ("APPROVE", "REQUEST_CHANGES")
+    verdict = ("REQUEST_CHANGES" if open_ids else "APPROVE") if (registry and known) else report
+    return {"verdict": verdict, "report": report, "open": open_ids, "total": len(rows),
+            "registry": registry, "discrepancy": bool(registry and known and verdict != report),
+            "error": str(ctx.get("plan_findings_error") or "")}
+
+
+def open_findings_lines(ctx: dict) -> list[str]:
+    """Открытые находки реестра строками для карточки: ID, шаг, что не так и что сделать."""
+    return [f"{item.get('id')} ({item.get('step')}): {item.get('text')} — {item.get('action')}"
+            for item in (ctx.get("plan_findings") or [])
+            if str(item.get("status") or "") == "открыто"]
+
+
+def verdict_discrepancy_text(ctx: dict) -> str:
+    """Строка о расхождении вердикта отчёта с реестром; пустая строка — расхождения нет.
+
+    Уходит комментарием в карточку ревью: это она породила отчёт, вердикт которого
+    разошёлся с тем, чем страж руководствуется.
+    """
+    view = effective_plan_verdict(ctx)
+    if not view or not view["discrepancy"]:
+        return ""
+    rel = ctx.get("plan_review_rel") or f"docs/reviews/plan-{ctx.get('plan_id')}.md"
+    if view["verdict"] == "REQUEST_CHANGES":
+        return (f"Вердикт по реестру находок: REQUEST_CHANGES (открыты "
+                f"{', '.join(view['open'])}) — в отчёте {rel} записано {view['report']}. "
+                f"Вердикт считается по реестру (шаг 7-S2): ревьюеру закрыть эти ID фактом "
+                f"или подтвердить статус.")
+    return (f"Вердикт по реестру находок: APPROVE (открытых находок нет) — в отчёте {rel} "
+            f"записано {view['report']}. Вердикт считается по реестру (шаг 7-S2): если "
+            f"находка осталась, оставь её в реестре открытой строкой.")
+
+
 def _plan_review_decision(ctx: dict) -> dict | None:
     """Ревью плана: карточка, ожидание, вердикт, круги правок по лимиту, эскалация (C6, D1-D7).
 
@@ -2112,6 +2206,13 @@ def _plan_review_decision(ctx: dict) -> dict | None:
     plan_id = ctx.get("plan_id")
     rel = ctx.get("plan_review_rel") or f"docs/reviews/plan-{plan_id}.md"
     verdict = ctx.get("plan_review_verdict")
+    # S2 плана 7: действующий вердикт считает реестр находок. Битый реестр — инцидент, а не
+    # «открытых нет»: ошибку поймал `build_ctx`, решение её только называет. Инцидентный стоп
+    # снимается сам, как только файл починили (`decide` снимает его при смене решения).
+    view = effective_plan_verdict(ctx)
+    if view and view["error"]:
+        return {"action": "stop", "plan_review": True,
+                "reason": f"реестр находок плана {plan_id} не читается: {view['error']}"}
     # План правился карточкой правки по разведке (0.20.0): sha256 изменился, и утверждение
     # обновляет владелец. Страж его не наследует и не подделывает, а просит переутвердить
     # готовой командой; до этого ревью не заказывается — оно было бы ревью неутверждённого
@@ -2124,7 +2225,7 @@ def _plan_review_decision(ctx: dict) -> dict | None:
                            f"hermes pipeline plan --accept {plan_id}")}
     # C9: дверь к шагам — сам вердикт, а не карточка. План, прошедший ревью раньше
     # (например, идущий план или ревью задним числом), шаги не ждёт.
-    if verdict is not None and verdict["verdict"] == "APPROVE":
+    if view is not None and view["verdict"] == "APPROVE":
         # Отклонение от порядка ветвей §4.3 (названо в отчёте шага): свежий вердикт,
         # написанный по текущей версии плана, и есть дверь — иначе фикстура
         # `tests/engine/test_scout.py:167` (план без раздела «Разведка» плюс готовый
@@ -2196,7 +2297,7 @@ def _plan_review_decision(ctx: dict) -> dict | None:
         return {"action": "stop",
                 "reason": (f"вердикт ревью плана {plan_id} не распознан "
                            f"({verdict['verdict']}): {Path(verdict['path']).name}")}
-    if verdict["verdict"] == "APPROVE":
+    if view is not None and view["verdict"] == "APPROVE":
         return None                    # замысел принят — шаг начинается обычным порядком
     # REQUEST_CHANGES: круг правок плана, пока не исчерпан лимит `max_fix_rounds`
     # (конституция п.4); после лимита решает владелец.
@@ -2260,14 +2361,21 @@ def _plan_review_decision(ctx: dict) -> dict | None:
                                f"решает владелец: {rel}"),
                     "details": ("\n".join(f"- {item}" for item in findings)
                                 or f"Разбор — в отчёте {rel}.")}
+        # Источник действующего вердикта называем в причине: «ревью» и «реестр» — разные поводы
+        # править план, и владелец должен видеть, какой сработал. Подстроки «кругом N из M» и
+        # путь отчёта остаются: по ним читают журнал тиков и тесты прошлых шагов.
+        verdict_source = (f"реестр находок плана {plan_id} держит REQUEST_CHANGES "
+                          f"(открыты {', '.join(view['open'])})"
+                          if view and view["registry"] and view["open"]
+                          else f"ревью плана {plan_id} вернуло REQUEST_CHANGES")
         return {"action": "create_plan_fix", "round": len(epoch_fixes) + 1,
                 # Маркер круга ревью живёт в ключе карточки правки (T3e): по нему бюджет
                 # отличается «первый отказ после круга, заказанного по устаревшему
                 # APPROVE» от настоящего второго отказа. `max(..., 1)` — отчёт, написанный
                 # руками без карточек, не должен превращать первый отказ во второй.
                 "review_round": max(len(epoch_cards), 1),
-                "reason": (f"ревью плана {plan_id} вернуло REQUEST_CHANGES — правим план "
-                           f"кругом {len(epoch_fixes) + 1} из {max_rounds}: {rel}")}
+                "reason": (f"{verdict_source} — правим план кругом "
+                           f"{len(epoch_fixes) + 1} из {max_rounds}: {rel}")}
     return {"action": "create_plan_review", "round": len(cards) + 1,
             "reason": (f"план {plan_id} поправлен по ревью — повторное ревью "
                        f"(круг {len(cards) + 1})")}
@@ -4076,6 +4184,16 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 lines.append(f"  готово, когда: {dod[:240]}")
             lines.append(f"  карточка {cid}")
             say("\n".join(lines))
+            # Расхождение «отчёт говорит одно, реестр другое» уходит в карточку ревью: именно она
+            # вела реестр. Шаг пишется комментарием только пока журнал открыт — после первой
+            # строки журнала план уже не плановый, и ревью задним числом не догоняем.
+            note = verdict_discrepancy_text(ctx)
+            review_cards = ctx.get("plan_review_cards") or []
+            if note and review_cards and not ctx.get("plan_started_journal"):
+                if _comment(p, str(review_cards[-1]["id"]),
+                            "ЗАМЕЧАНИЕ СТРАЖА\n" + note):
+                    say("  замечание о расхождении вердикта — комментарием в карточку ревью "
+                        f"{review_cards[-1]['id']}")
         else:
             say(f"не смог создать карточку шага {step['id']} — проверь `hermes kanban ls`")
         return result
@@ -4110,7 +4228,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         report_rel = plan_review_rel(p)
         cid = create_card(p, f"[ревью плана {plan_id}] Ревью плана: замысел до кода",
                           plan_review_card_body(p, p.cfg.rel(Path(p.plan_file)), report_rel,
-                                                profile),
+                                                profile, round_no=round_no),
                           profile, key, plan_review_skills(p.cfg),
                           max_runtime=plan_review_runtime(p.cfg))
         if reused_card(cid, key, "ревью плана"):
@@ -4144,7 +4262,10 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         display_round = int(decision.get("round") or key_round)
         profile = plan_fix_profile(p.cfg)
         report_rel = plan_review_rel(p)
-        findings = (_blocking_findings(plan_review_path(p), FINDINGS_LIMIT)
+        # Открытые ID реестра — первыми: ими и продиктован вердикт, когда реестр сильнее отчёта.
+        # Отчёт остаётся запасным путём для планов без реестра (и для шагов до 7-S1).
+        findings = (open_findings_lines(ctx)
+                    or _blocking_findings(plan_review_path(p), FINDINGS_LIMIT)
                     or _review_findings(plan_review_path(p), FINDINGS_LIMIT))
         cid = create_card(p, f"[правки плана {plan_id}] Правки плана по ревью (круг {display_round})",
                           plan_fix_card_body(p, p.cfg.rel(Path(p.plan_file)), report_rel,
@@ -4157,6 +4278,14 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         result.update(applied=bool(cid), detail=f"карточка правок плана: {cid}")
         if cid:
             touch(f"create_plan_fix:{cid}")
+            # Правит план не тот, кто пишет отчёт: расхождение вердикта адресуется автору отчёта.
+            note = verdict_discrepancy_text(ctx)
+            review_cards = ctx.get("plan_review_cards") or []
+            if note and review_cards:
+                if _comment(p, str(review_cards[-1]["id"]),
+                            "ЗАМЕЧАНИЕ СТРАЖА\n" + note):
+                    say("  замечание о расхождении вердикта — комментарием в карточку ревью "
+                        f"{review_cards[-1]['id']}")
         if cid:
             say(f"план {plan_id}: ревью вернуло REQUEST_CHANGES — правим план кругом "
                 f"{key_round} (карточка {cid}, профиль {profile}); после правки ревью "
