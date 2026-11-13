@@ -256,3 +256,103 @@ def test_registry_only_non_blocking_approves(stand):
     assert view["open"] == [] and view["total"] == 1
     assert view["verdict"] == "APPROVE", view
     assert gate._plan_review_decision(ctx) is None
+
+
+def write_findings_rows(p, *rows: dict) -> Path:
+    """Реестр из готовых строк: класс и шаг задаёт тест, `write_registry` их зашивает."""
+    items = [{"action": f"учесть {row['id']}", **row} for row in rows]
+    path = gate.plan_findings_path(p)
+    gate.write_findings(path, items)
+    return path
+
+
+def test_gate_class_does_not_block(stand):
+    """Класс `гейт-исполнение` со статусом `не блокирует` вердикт не держит: APPROVE по реестру."""
+    root, p = stand
+    write_report(root, "REQUEST_CHANGES")
+    write_findings_rows(p, {"id": "F1", "step": "S1", "kind": "гейт-исполнение",
+                            "text": "каталог `build/` для вывода не создан",
+                            "status": "не блокирует"})
+    ctx = ctx_with_card(p)
+
+    view = gate.effective_plan_verdict(ctx)
+    assert view["verdict"] == "APPROVE", view
+    assert view["open"] == [] and view["total"] == 1
+    assert view["discrepancy"] is True              # отчёт сказал REQUEST_CHANGES, решает реестр
+    assert gate._plan_review_decision(ctx) is None  # дверь к шагам открыта
+
+
+def test_gate_without_command_blocks(stand):
+    """Гейт без команды блокирует: находка того же класса со статусом `открыто` держит вердикт."""
+    root, p = stand
+    write_report(root, "APPROVE")
+    write_findings_rows(p, {"id": "F1", "step": "S3", "kind": "гейт-исполнение",
+                            "text": "у гейта нет команды — только фраза «тесты зелёные»",
+                            "status": "открыто"})
+    ctx = ctx_with_card(p)
+
+    view = gate.effective_plan_verdict(ctx)
+    assert view["verdict"] == "REQUEST_CHANGES", view
+    assert view["open"] == ["F1"]
+
+    decision = gate._plan_review_decision(ctx)
+    assert decision["action"] == "create_plan_fix", decision
+    assert "F1" in decision["reason"]
+
+
+def test_gate_findings_go_to_step_card(stand):
+    """Находки класса по шагу уходят в его карточку блоком; чужие шаг, класс и `закрыто` — нет."""
+    root, p = stand
+    write_findings_rows(
+        p,
+        {"id": "F1", "step": "S1", "kind": "гейт-исполнение",
+         "text": "каталог `build/` не создан", "status": "не блокирует"},
+        {"id": "F2", "step": "S1", "kind": "замысел",
+         "text": "шаг без входа", "status": "не блокирует"},
+        {"id": "F3", "step": "S2", "kind": "гейт-исполнение",
+         "text": "бинаря нет на PATH", "status": "не блокирует"},
+        {"id": "F4", "step": "S1", "kind": "гейт-исполнение",
+         "text": "закрытая придирка", "status": "закрыто"},
+        {"id": "F5", "step": "S1,S2", "kind": "гейт-исполнение",
+         "text": "`grep` считает не то", "status": "не блокирует"},
+    )
+    s1 = gate.step_card_body(p, {"id": "S1", "title": "Старт", "goal": "демо-шаг"})
+    s2 = gate.step_card_body(p, {"id": "S2", "title": "Интеграция", "goal": "демо-шаг"})
+
+    assert "проверить при исполнении" in s1
+    assert "F1" in s1 and "F5" in s1            # свой шаг и парный адрес «S1,S2»
+    assert "F4" not in s1                       # закрытая находка не проверяется
+    assert "шаг без входа" not in s1            # чужой класс в карточку шага не идёт
+    assert "бинаря нет на PATH" not in s1       # чужой шаг
+    assert "F3" in s2 and "F5" in s2 and "F1" not in s2
+
+    # Реестра нет — блока нет вовсе: пустой блок не печатается (D2).
+    gate.plan_findings_path(p).unlink()
+    plain = gate.step_card_body(p, {"id": "S1", "title": "Старт", "goal": "демо-шаг"})
+    assert "проверить при исполнении" not in plain and "Гейты" in plain
+
+
+def test_gate_class_not_counted_in_open(stand):
+    """Открытые считаются по статусу: две находки класса `не блокирует` в `open` не попадают."""
+    root, p = stand
+    write_report(root, "APPROVE")
+    write_findings_rows(
+        p,
+        {"id": "F1", "step": "S1", "kind": "гейт-исполнение",
+         "text": "первая", "status": "не блокирует"},
+        {"id": "F2", "step": "S2", "kind": "гейт-исполнение",
+         "text": "вторая", "status": "не блокирует"},
+        {"id": "F3", "step": "S3", "kind": "замысел", "text": "третья", "status": "открыто"},
+    )
+    view = gate.effective_plan_verdict(ctx_with_card(p))
+    assert view["total"] == 3 and view["open"] == ["F3"], view
+    assert view["verdict"] == "REQUEST_CHANGES", view
+
+    # Переставили статус открытой находки — открытых нет. Реестр перечитывается новым ctx:
+    # `effective_plan_verdict` берёт находки из `ctx`, а не с диска на каждом вызове (S2).
+    write_findings_rows(
+        p,
+        {"id": "F3", "step": "S3", "kind": "замысел", "text": "третья", "status": "не блокирует"},
+    )
+    again = gate.effective_plan_verdict(ctx_with_card(p))
+    assert again["open"] == [] and again["verdict"] == "APPROVE", again
