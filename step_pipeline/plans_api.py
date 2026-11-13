@@ -68,6 +68,36 @@ def read_stop(project: Path, value: Any) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _flag_stamp(project: Path, value: Any) -> tuple[bool, int, int]:
+    """Отметка стоп-флага для сверки «до/после»: `(файл есть, метка записи, индекс)`.
+
+    Признак «команда применилась» строится по событию записи файла, а не по равенству
+    содержимого: `at` у движка секундный (`engine/gate.py:336`), а причина у жеста без
+    поля `reason` всегда одна — повторный `stop` в ту же секунду перезаписал бы флаг
+    теми же байтами, и верный стоп выглядел бы неприменённым.
+
+    В отметке две пары глаз: `st_mtime_ns` и `st_ino`. На Windows метка времени
+    обновляется с шагом системных часов, а `os.replace` (`engine/state_io.py:44-66`)
+    отдаёт цели индекс нового временного файла — второй признак различает две записи,
+    попавшие в один шаг часов.
+    """
+    try:
+        st = stop_flag(project, value).stat()
+    except OSError:
+        return (False, 0, 0)
+    return (True, st.st_mtime_ns, st.st_ino)
+
+
+def _written(before: tuple[bool, int, int], after: tuple[bool, int, int]) -> bool:
+    """Флаг записан командой: его не было — появился, был — отметка сменилась."""
+    return after[0] and (not before[0] or after != before)
+
+
+def _removed(before: tuple[bool, int, int], after: tuple[bool, int, int]) -> bool:
+    """Флаг снят командой: до команды файл был, после — нет."""
+    return before[0] and not after[0]
+
+
 def _driven(project: Path) -> list[str]:
     """`driven_plans` как список строк — в том виде, в каком его прочитает движок.
 
@@ -136,9 +166,10 @@ def start(project: Path, value: Any) -> dict:
     отказа остаётся нетронутым — неудавшийся жест не портит конфигурацию. Обратный порядок
     записал бы «план ведётся» у несуществующего плана.
 
-    Стоп-флаг сверяется **до и после** команды: при занятом тике движок печатает «тик уже идёт
-    … команда resume не применена» и выходит с кодом 0, оставляя флаг на месте. Снимок «до»
-    в одиночку доложил бы «стоп снят» и записал бы `driven_plans` поверх неудавшегося жеста.
+    Стоп-флаг сверяется **до и после** команды по отметке записи (`_flag_stamp`): при
+    занятом тике движок печатает «тик уже идёт … команда resume не применена» и выходит
+    с кодом 0, оставляя флаг на месте. Снимок «до» в одиночку доложил бы «стоп снят»
+    и записал бы `driven_plans` поверх неудавшегося жеста.
     """
     try:
         plan = _plan_id(value)
@@ -150,18 +181,19 @@ def start(project: Path, value: Any) -> dict:
         return {"ok": False, "status": "errors",
                 "error": f"pipeline.json не читается: {project / proj.MARKER}"}
 
-    before = read_stop(project, plan)
+    before = _flag_stamp(project, plan)
 
     engine = _engine(project, "--plan", plan, "--resume")
     if not engine["ok"]:
         return _engine_error(engine)
-    after = read_stop(project, plan)
-    if before is not None and after == before:
+    after = _flag_stamp(project, plan)
+    if before[0] and not _removed(before, after):
+        # Флаг был и остался на месте, хотя движок вышел с кодом 0 — это занятый тик.
         detail = engine["stdout"] or "движок не снял стоп-флаг"
         return {"ok": False, "status": "engine_error", "plan": plan, "error": detail,
                 "stdout": engine["stdout"], "stderr": engine["stderr"],
                 "message": f"план {plan} не запущен: {detail}"}
-    cleared = before is not None and after is None
+    cleared = _removed(before, after)
 
     driven = _driven(project)
     changed = False
@@ -194,9 +226,11 @@ def stop(project: Path, value: Any, reason: Any = "") -> dict:
     `--stop --plan 2` не разбирается — причиной стал бы `--plan`. `driven_plans` не
     трогается: остановленный план остаётся ведомым, как и после `--stop` в терминале.
 
-    Флаг сверяется **до и после** команды, а не «поставлен ли он вообще»: при занятом тике
-    движок печатает «тик уже идёт … команда stop не применена» и выходит с кодом 0, оставляя
-    прежний флаг. Проверка «флаг есть» вернула бы `ok: true` со **старой** причиной.
+    Флаг сверяется **до и после** команды по отметке записи, а не по содержимому: при
+    занятом тике движок печатает «тик уже идёт … команда stop не применена» и выходит с
+    кодом 0, оставляя прежний флаг, — проверка «флаг есть» вернула бы `ok: true` со
+    **старой** причиной. Равенство payload признаком быть не может: `at` секундный, и
+    повторный жест той же причиной переписывает флаг теми же байтами (`_flag_stamp`).
     """
     try:
         plan = _plan_id(value)
@@ -204,13 +238,14 @@ def stop(project: Path, value: Any, reason: Any = "") -> dict:
         return {"ok": False, "status": "errors", "error": NO_PLAN}
     project = Path(project)
     reason = str(reason or "").strip() or "остановка владельца"
-    before = read_stop(project, plan)
+    before = _flag_stamp(project, plan)
     engine = _engine(project, "--plan", plan, "--stop", reason)
     if not engine["ok"]:
         return _engine_error(engine)
+    after = _flag_stamp(project, plan)
     payload = read_stop(project, plan)
-    if payload is None or payload == before:
-        # Флага нет вовсе или он остался прежним (`at`/`reason` те же) — жест не применился.
+    if payload is None or not _written(before, after):
+        # Файла нет либо движок его не переписал (занятый тик) — жест не применился.
         detail = engine["stdout"] or "движок не поставил стоп-флаг"
         return {"ok": False, "status": "engine_error", "plan": plan, "error": detail,
                 "stdout": engine["stdout"], "stderr": engine["stderr"],

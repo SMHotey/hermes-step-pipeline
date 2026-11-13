@@ -14,7 +14,10 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -27,7 +30,8 @@ import ui_server
 from step_pipeline import plans_api
 
 PANEL = {"X-Pipeline-Panel": "1"}
-STOP = Path(".pipeline") / "state" / "plan_{plan}_stop.json"
+STATE = Path(".pipeline") / "state"
+STOP = STATE / "plan_{plan}_stop.json"
 
 SECOND_PLAN = """# 2. Второй план
 
@@ -61,6 +65,22 @@ def stop_path(root: Path, plan_id: str) -> Path:
     return root / str(STOP).format(plan=plan_id)
 
 
+def hold_tick(root: Path) -> Path:
+    """Занять тик так, как его держит `state_io.acquire`: живой pid, наш хост, свежее время.
+
+    Протухшую блокировку движок снимает сам (`state_io._stale` снимает её по возрасту,
+    чужому хосту или мёртвому pid), поэтому pid обязан быть живым: иначе команда
+    применится и ветка отказа не исполнится.
+    """
+    path = root / STATE / "tick.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname(),
+                                "at": time.strftime("%d.%m.%Y %H:%M:%S"),
+                                "at_ts": time.time(), "what": "tick"}, ensure_ascii=False),
+                    encoding="utf-8")
+    return path
+
+
 def read_cfg(root: Path) -> dict:
     return json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
 
@@ -89,6 +109,9 @@ def server(tmp_path: Path, monkeypatch, hermes_stub: Path):
     monkeypatch.delenv("PIPELINE_STATE_DIR", raising=False)
     monkeypatch.delenv("PIPELINE_PLANS", raising=False)
     monkeypatch.delenv("PIPELINE_CONFIG", raising=False)
+    # Ожидание занятой блокировки в тестах не нужно: отказ движка одинаков и при нуле,
+    # а штатные 5 с на каждый жест с занятым тиком растянули бы прогон вчетверо.
+    monkeypatch.setenv("PIPELINE_LOCK_WAIT", "0")
     root = install_project(tmp_path / "plans-start", board="uiboard")
     (root / "docs" / "plans" / "2-second.md").write_text(SECOND_PLAN, encoding="utf-8")
     cfg = read_cfg(root)
@@ -130,6 +153,25 @@ def post(url: str, path: str, payload: dict, headers: dict | None = None) -> tup
         return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
 
 
+def repeat_stop_same_bytes(url: str, reason: str, first: dict,
+                           attempts: int = 12) -> tuple[int, dict]:
+    """Повторять `stop` тем же телом, пока запись не попадёт в ту же секунду, что прежняя.
+
+    `at` у движка секундный (`engine/gate.py:336`), поэтому две записи в одну секунду
+    дают побайтово одинаковый флаг — только на такой паре и проверяется признак «флаг
+    записан». На границе секунды payload отличается, и повтор ничего не доказывает,
+    поэтому жест повторяется, а попадание подтверждается по `at` ответа.
+    """
+    previous = first["stop"]
+    for _ in range(attempts):
+        status, data = post(url, "/api/plan/stop", {"plan": "2", "reason": reason}, PANEL)
+        assert status == 200, data           # равенство payload как признак давало здесь 400
+        if data["stop"]["at"] == previous["at"]:
+            return status, data
+        previous = data["stop"]
+    pytest.fail(f"повтор жеста не попал в ту же секунду за {attempts} попыток")
+
+
 def test_start_adds_plan_to_driven_and_clears_its_stop(server):
     """`start` на плане 2: номер в `driven_plans`, снят именно стоп плана 2."""
     root = server["root"]
@@ -158,11 +200,31 @@ def test_start_adds_plan_to_driven_and_clears_its_stop(server):
 
 
 def test_stop_writes_owner_flag_for_named_plan(server):
-    """`stop` на плане 2: owner-стоп с причиной, `driven_plans` не тронут."""
+    """`stop` на плане 2: owner-стоп с причиной, `driven_plans` не тронут.
+
+    Здесь же две ветки признака «команда применена»: занятый тик даёт отказ с
+    неизменным флагом, а повторный жест тем же телом — `200 stopped`, хотя файл
+    переписан теми же байтами (`at` у движка секундный).
+    """
     root = server["root"]
     flag_1 = stop_path(root, "1")
     before_1 = flag_1.read_bytes()
+    before_2 = stop_path(root, "2").read_bytes()
     reason = "ждём решения владельца по разведке"
+
+    # Занятый тик: движок выходит с кодом 0, но команду не применяет. Жест обязан
+    # ответить отказом, а не выдать прежнюю причину из стоящего флага.
+    lock = hold_tick(root)
+    status, refused = post(server["url"], "/api/plan/stop",
+                           {"plan": "2", "reason": reason}, PANEL)
+    assert status == 400, refused
+    assert refused["ok"] is False
+    assert refused["status"] == "engine_error"
+    assert "тик уже идёт" in refused["error"]
+    assert "не применена" in refused["error"]
+    assert stop_path(root, "2").read_bytes() == before_2
+    lock.unlink()
+
     status, data = post(server["url"], "/api/plan/stop", {"plan": "2", "reason": reason}, PANEL)
     assert status == 200, data
     assert data["action"] == "plan_stop"
@@ -180,10 +242,41 @@ def test_stop_writes_owner_flag_for_named_plan(server):
     assert flag_1.read_bytes() == before_1
     assert read_cfg(root)["driven_plans"] == ["1"]
 
+    # Двойное нажатие «остановить»: та же причина в ту же секунду переписывает флаг теми
+    # же байтами, и жест обязан ответить 200 — признак «payload изменился» давал здесь 400.
+    status, again = repeat_stop_same_bytes(server["url"], reason, data)
+    assert again["ok"] is True
+    assert again["status"] == "stopped"
+    assert again["stop"]["reason"] == reason
+    assert again["stop"]["kind"] == "owner"
+    assert json.loads(literal.read_text(encoding="utf-8")) == again["stop"]
+    assert flag_1.read_bytes() == before_1
+
 
 def test_repeated_start_does_not_duplicate_number(server):
-    """Второй `start` не дублирует номер и не переписывает файл."""
+    """Второй `start` не дублирует номер и не переписывает файл.
+
+    Плюс ветка отказа: при занятом тике `--resume` не применяется, и жест не должен
+    записывать `driven_plans` поверх неудавшейся команды.
+    """
     root = server["root"]
+    before_cfg = (root / "pipeline.json").read_bytes()
+    flag_2 = stop_path(root, "2")
+    before_flag = flag_2.read_bytes()
+
+    # Занятый тик: движок печатает «команда resume не применена» и выходит с кодом 0.
+    lock = hold_tick(root)
+    status, refused = post(server["url"], "/api/plan/start", {"plan": "2"}, PANEL)
+    assert status == 400, refused
+    assert refused["ok"] is False
+    assert refused["status"] == "engine_error"
+    assert "тик уже идёт" in refused["error"]
+    assert "не применена" in refused["error"]
+    assert (root / "pipeline.json").read_bytes() == before_cfg
+    assert read_cfg(root)["driven_plans"] == ["1"]
+    assert flag_2.read_bytes() == before_flag
+    lock.unlink()
+
     status, first = post(server["url"], "/api/plan/start", {"plan": "2"}, PANEL)
     assert status == 200, first
     assert first["changed"] is True and first["cleared"] is True
