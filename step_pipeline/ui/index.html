@@ -432,6 +432,24 @@
   <div class="tab-panel" id="tab-plans">
     <section>
       <h2>Планы реестра</h2>
+      <!-- Добавление плана файлом (план 6 S5A): проект и путь; пустой путь — диалог на сервере. -->
+      <div class="row" id="plans-add">
+        <div>
+          <label for="plans-add-project">Проект</label>
+          <select id="plans-add-project">
+            <option value="">проект панели</option>
+          </select>
+        </div>
+        <div>
+          <label for="plans-add-path">Файл плана</label>
+          <input type="text" id="plans-add-path" autocomplete="off" placeholder="пусто — откроется окно выбора файла">
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <button type="button" id="plans-add-btn" class="primary">Добавить план</button>
+        </div>
+      </div>
+      <div class="clip" id="plans-status"></div>
       <div class="row">
         <div>
           <select id="plans-project">
@@ -463,6 +481,7 @@
             <th scope="col">Закрыто/всего</th>
             <th scope="col">Утверждение</th>
             <th scope="col">Стоп</th>
+            <th scope="col">Действие</th>
           </tr>
         </thead>
         <tbody id="plans-rows"></tbody>
@@ -1096,6 +1115,7 @@ function renderPlansTab(data) {
   (data.projects || []).forEach((project) => {
     (project.plans || []).forEach((plan) => rows.push({project, plan}));
   });
+  plansRows = rows;   // пары «проект + план» последнего рендера: имена для подтверждений
   // Опции проектов пересобираются только при смене набора id, иначе каждый кадр
   // сбрасывал бы выбор владельца (образец — переключатель проектов).
   const picker = $("plans-project");
@@ -1105,6 +1125,16 @@ function renderPlansTab(data) {
     picker.innerHTML = '<option value="">все проекты</option>' +
       (data.projects || []).map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
   }
+  // Форма добавления пересобирается по тому же правилу: выбор владельца не сбрасывается кадром.
+  const addPicker = $("plans-add-project");
+  const addIds = (data.projects || []).map((p) => p.id).join(",");
+  if (addPicker && addPicker.dataset.ids !== addIds) {
+    addPicker.dataset.ids = addIds;
+    addPicker.innerHTML = '<option value="">проект панели</option>' +
+      (data.projects || []).map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+  }
+  // В предпросмотре формы нет: инлайн-стиль, а не атрибут `hidden` (у `.row` свой `display: flex`).
+  $("plans-add").style.display = data.preview ? "none" : "";
   const body = $("plans-rows");
   if (!body) return;
   body.innerHTML = rows.map(({project, plan}) => {
@@ -1114,7 +1144,7 @@ function renderPlansTab(data) {
     const approval = plan.approval || {};
     const label = approval.label ? esc(approval.label) : "—";
     const stamp = approval.approved_at ? ` title="${esc(approval.approved_at)}"` : "";
-    return `<tr data-project="${esc(project.id)}" data-state="${esc(plan.state || "")}">
+    return `<tr data-project="${esc(project.id)}" data-state="${esc(plan.state || "")}" data-plan-id="${esc(plan.id)}">
       <td>${esc(project.name)}</td>
       <td class="mono">${esc(plan.id)}</td>
       <td>${esc(plan.name || "—")}</td>
@@ -1123,9 +1153,178 @@ function renderPlansTab(data) {
       <td class="mono">${esc(plan.closed)} / ${esc(plan.total)}</td>
       <td${stamp}>${label}</td>
       <td>${stop}</td>
+      ${planActionsCell(project, plan, Boolean(data.preview))}
     </tr>`;
-  }).join("") + '<tr id="plans-empty"><td colspan="8" class="muted">планов нет</td></tr>';
+  }).join("") + '<tr id="plans-empty"><td colspan="9" class="muted">планов нет</td></tr>';
   filterPlansTab();   // перерисовка не должна снимать введённый фильтр
+}
+
+// Пары «проект + план» последнего рендера: обработчик кнопки берёт из них имя проекта
+// для текста подтверждения, а поля строки — для вида действия (S5A).
+let plansRows = [];
+
+// Вид действия движка (`plan.action.kind`) → подпись кнопки и канал панели (план 6 S5A).
+// Команду страница не собирает: `unblock` и `cron` показывают `plan.action.command` как есть.
+const ENGINE_ACTIONS = {
+  resume:  {label: "Продолжить",              run: (project, plan) => planRowCommand("start", project, plan)},
+  approve: {label: "Утвердить",               run: (project, plan) => planRowApprove(project, plan)},
+  drive:   {label: "Запустить",               run: (project, plan) => planRowCommand("start", project, plan)},
+  unblock: {label: "Разблокировать карточку", run: (project, plan) => planRowCommandText(plan)},
+  unhold:  {label: "Снять ручной допуск",     run: (project, plan) => act("unhold", {project: project.id, plan: plan.id, step: plan.next})},
+  tick:    {label: "Тик",                     run: (project, plan) => act("tick", {project: project.id, plan: plan.id})},
+  cron:    {label: "Включить джобу стража",   run: (project, plan) => planRowCommandText(plan)},
+  none:    {label: "без действия"},
+};
+
+// Жесты владельца поверх тех же полей строки (план 6 S5A): маршрут и правило «когда рисовать».
+// `start` отдельной кнопки не имеет: его исполняют виды движка `resume` и `drive` — один жест, одна кнопка.
+const PANEL_ACTIONS = {
+  start:  {label: "Запустить",             endpoint: "/api/plan/start"},
+  stop:   {label: "Остановить после шага", endpoint: "/api/plan/stop",   when: "running"},
+  delete: {label: "Удалить",               endpoint: "/api/plan/delete", when: "any"},
+};
+
+// Строка отчёта под формой: успех и отказ читаются в одном месте, тост не заменяет текст.
+function planStatus(text, bad) {
+  const el = $("plans-status");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = "clip" + (bad ? " bad" : "");
+}
+
+// Команда движка уходит панели телом: адрес плана называет проект, а не умолчание сервера.
+function planRowCommand(kind, project, plan) {
+  const item = PANEL_ACTIONS[kind];
+  if (!item) { planStatus("неизвестный жест панели: " + kind, true); return; }
+  if (window.__preview) { toast("предпросмотр только читает", true); return; }
+  setBusy(true);
+  planStatus("");
+  api(item.endpoint, {
+    method: "POST",
+    headers: PANEL_HEADERS,
+    body: JSON.stringify({project: project.id, plan: String(plan.id)}),
+  }).then((data) => {
+    planStatus(data.message || data.error || "готово", !data.ok);
+    if (!data.ok) toast(data.error || data.message || "ошибка", true);
+    etag = null;
+    return refresh();
+  }).catch((err) => planStatus(String(err), true))
+    .finally(() => setBusy(false));
+}
+
+// Кнопки `unblock` и `cron` не повторяют команду движка: страница показывает её как есть
+// и предлагает скопировать, иначе у одной команды было бы два источника.
+function planRowCommandText(plan) {
+  const command = String((plan.action && plan.action.command) || "");
+  if (!command) { planStatus("движок не прислал команду действия", true); return; }
+  planStatus("команда: " + command + (navigator.clipboard
+    ? " — скопирована" : ""), false);
+  if (navigator.clipboard) navigator.clipboard.writeText(command).catch(() => {});
+}
+
+// Утверждение — тот же жест, что у черновиков: проверки и запись делает сервер (S13).
+function planRowApprove(project, plan) {
+  if (window.__preview) { toast("предпросмотр только читает", true); return; }
+  const ok = confirm("Утвердить план " + plan.id + " проекта " + project.name + "?\n\n"
+    + "Утверждение привязывается к sha256 файла; дальше план ведёт страж.");
+  if (!ok) return;
+  setBusy(true);
+  planStatus("");
+  api("/api/plan/accept", {
+    method: "POST",
+    headers: PANEL_HEADERS,
+    body: JSON.stringify({plan: String(plan.id), project: project.id}),
+  }).then((data) => {
+    planStatus(data.ok ? "план " + plan.id + " утверждён"
+      : "план не утверждён: " + (data.message || data.error || "ошибка"), !data.ok);
+    etag = null;
+    return refresh();
+  }).catch((err) => planStatus(String(err), true))
+    .finally(() => setBusy(false));
+}
+
+// Девятая ячейка строки: ровно одна кнопка вида движка (или «без действия») плюс жесты владельца.
+// В предпросмотре кнопок нет вовсе: панель только читает.
+function planActionsCell(project, plan, preview) {
+  if (preview) return '<td class="mono">—</td>';
+  const action = plan.action || {};
+  const entry = ENGINE_ACTIONS[action.kind];
+  const parts = [];
+  if (!entry) {
+    // Молчать нельзя: неизвестный вид действия — это стоп, а не «без действия».
+    parts.push(`<span class="clip bad">неизвестный вид действия: ${esc(action.kind || "—")}</span>`);
+  } else if (action.kind === "none") {
+    parts.push('<span class="muted">без действия</span>');
+  } else {
+    parts.push(`<button type="button" data-plan-act="${esc(action.kind)}"` +
+      ` title="${esc(action.command || action.text || "")}">${esc(entry.label)}</button>`);
+  }
+  Object.keys(PANEL_ACTIONS).forEach((kind) => {
+    const item = PANEL_ACTIONS[kind];
+    if (kind === "start") return;   // start уже покрыт видами resume и drive: один жест — одна кнопка
+    if (item.when === "running" && plan.state !== "running") return;
+    parts.push(`<button type="button" data-plan-panel="${esc(kind)}">${esc(item.label)}</button>`);
+  });
+  return `<td data-plan-actions="1">${parts.join(" ")}</td>`;
+}
+
+// «Добавление плана» (S5A): пустой путь — сервер откроет системный диалог, занятый — 400 с причиной.
+function planAdd(project, path) {
+  if (window.__preview) { toast("предпросмотр только читает", true); return; }
+  setBusy(true);
+  planStatus("");
+  return api("/api/plan/add", {
+    method: "POST",
+    headers: PANEL_HEADERS,
+    body: JSON.stringify({project: project || "", path: path || ""}),
+  }).then((data) => {
+    if (data.ok) {
+      planStatus(data.message || "план добавлен", false);
+      $("plans-add-path").value = "";
+    } else if (data.status === "cancelled") {
+      planStatus(data.error || "выбор файла отменён", false);
+    } else if (data.status === "manual") {
+      planStatus(data.error || "окно выбора файла недоступно — введите путь руками", true);
+    } else {
+      planStatus([data.error || "план не добавлен", ...(data.errors || [])].join("\n"), true);
+    }
+    etag = null;
+    return refresh();
+  }).catch((err) => planStatus(String(err), true))
+    .finally(() => setBusy(false));
+}
+
+// Один обработчик на таблицу: кнопки перерисовываются каждый кадр, привязки на них не живут.
+function bindPlansActions() {
+  const table = $("plans-table");
+  if (!table) return;
+  table.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-plan-act], [data-plan-panel]");
+    if (!button) return;
+    const row = button.closest("tr[data-project]");
+    if (!row) return;
+    const project = {id: row.dataset.project, name: row.dataset.project};
+    const plan = {id: row.dataset.planId};
+    const found = plansRows.find((item) => item.project.id === project.id && item.plan.id === plan.id);
+    if (found) {
+      project.name = found.project.name || project.name;
+      Object.assign(plan, found.plan);
+    }
+    if (button.dataset.planPanel) {
+      const kind = button.dataset.planPanel;
+      if (kind === "delete"
+          && !confirm("Удалить план " + plan.id + " проекта " + project.name + "?\n\n"
+            + "Удаляются файл плана, запись утверждения, стоп-флаг и отметки состояния.")) return;
+      planRowCommand(kind, project, plan);
+      return;
+    }
+    const entry = ENGINE_ACTIONS[button.dataset.planAct];
+    if (!entry || !entry.run) {
+      planStatus("у вида действия нет кнопки: " + button.dataset.planAct, true);
+      return;
+    }
+    entry.run(project, plan);
+  });
 }
 
 // Подключение проекта из панели (S8, D2): путь проверяет сервер, объяснение — под вводом.
@@ -2715,6 +2914,14 @@ $("steps-filter").addEventListener("input", () => filterSteps());
 $("plans-project").addEventListener("change", filterPlansTab);
 $("plans-state").addEventListener("change", filterPlansTab);
 $("plans-text").addEventListener("input", filterPlansTab);
+$("plans-add-btn").onclick = () => planAdd($("plans-add-project").value, $("plans-add-path").value);
+$("plans-add-path").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    planAdd($("plans-add-project").value, $("plans-add-path").value);
+  }
+});
+bindPlansActions();
 $("close-hotkeys").onclick = () => $("hotkeys-help").close();
 applyTheme(currentTheme());   // подпись кнопки — по фактической теме
 

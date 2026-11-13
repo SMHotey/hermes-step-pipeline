@@ -139,13 +139,13 @@ def test_plans_tab_button_and_panel_are_in_order():
     assert 'panel.id === "tab-" + name' in html
 
 
-def test_plans_table_has_eight_columns_in_order():
-    """Восемь колонок в порядке §4.1 и источники ячеек — поля строки плана, не текст."""
+def test_plans_table_has_eight_data_columns_and_action_in_order():
+    """Восемь колонок данных плюс «Действие» (S5A) — в порядке §4.1, источники — поля строки."""
     html = page()
     panel = block(html, 'id="tab-plans"', "</table>")
     headers = re.findall(r'<th scope="col">([^<]+)', panel)
     assert headers == ["Проект", "План", "Название", "Состояние", "Следующий шаг",
-                       "Закрыто/всего", "Утверждение", "Стоп"]
+                       "Закрыто/всего", "Утверждение", "Стоп", "Действие"]
     body = block(html, "function renderPlansTab(", "// Подключение проекта из панели")
     for needle in ("project.name", "plan.id", "plan.name", "plan.state_label", "plan.next",
                    "plan.closed", "plan.total", "plan.approval", "plan.stop",
@@ -177,7 +177,7 @@ def test_empty_answer_draws_plans_none_and_render_hangs_on_load_projects(
     html = page()
     body = block(html, "function renderPlansTab(", "// Подключение проекта из панели")
     assert 'id="plans-empty"' in body
-    assert 'colspan="8"' in body
+    assert 'colspan="9"' in body
     assert "планов нет" in body
     # Ряд один: в статической разметке панели его нет, иначе вхождений было бы два.
     assert html.count("планов нет") == 1
