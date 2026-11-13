@@ -84,14 +84,28 @@ def ctx_with_fix(p, base: dict, *, after_chars: int, statuses=(), findings: int 
     return ctx
 
 
+def accept_version(p, root: Path) -> None:
+    """Переутвердить текущую (выросшую) версию плана — как `hermes pipeline plan --accept`."""
+    record = approval.approval_file_for(p.cfg, "1")
+    data = json.loads(record.read_text(encoding="utf-8"))
+    data["version_sha256"] = approval.plan_version_sha(
+        plan_path(root), approval.journal_marker_of(p.cfg))
+    record.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def quiet(_text: str) -> None:
     """Заглушка уведомлений: тексты проверяются там, где они обязательны."""
     return None
 
 
 def no_cards(*_args, **_kwargs):
-    """Заглушка заказа карточек: owner-стоп не имеет права ничего заказывать."""
-    return None
+    """Заглушка заказа карточек: owner-стоп не имеет права ничего заказывать.
+
+    Именно вызов роняет тест (§4.7 т.7а): возврат `None` проверял бы только то, что
+    `create_card` на этом пути случайно не позвали, и заказ карточки в тике стопа
+    прошёл бы незамеченным.
+    """
+    raise AssertionError("тик owner-стопа не имеет права заказывать карточки")
 
 
 def write_cfg(root: Path, value) -> None:
@@ -132,6 +146,16 @@ def test_growth_over_percent_stops(stand):
     comment = decision["comment"]
     assert comment["card"] == "t_fix01", comment
     assert "СТОП-СИГНАЛ" in comment["text"] and "11500" in comment["text"], comment
+
+    # Владелец переутвердил выросшую версию (`plan --accept`) — замер не отменяется:
+    # версия плана та же выросшая, стоп тот же, с теми же числами. Иначе перерасход
+    # проходил бы молча именно в самом частом случае «поправил план и переутвердил».
+    approved = dict(ctx, approval=dict(ctx["approval"], state="approved"))
+    again = gate._plan_growth_decision(approved)
+    assert again is not None, "переутверждённая выросшая версия прошла без стопа"
+    assert again["action"] == "stop" and again["kind"] == "owner", again
+    assert again["growth"]["over"] is True, again["growth"]
+    assert "на 15%" in again["reason"] and "1500" in again["reason"], again["reason"]
 
 
 def test_growth_over_per_finding_cap_stops(stand):
@@ -193,6 +217,10 @@ def test_stop_logged_once_and_plan_not_truncated(stand, monkeypatch):
     # таблицы, — журнал `plan_version_text` нормализует, обычный текст входит в версию.
     append_to_plan(root, "\n" + "Правка плана по находке ревью. " * 50 + "\n")
     before_bytes = plan_path(root).read_bytes()
+    # Владелец переутвердил выросшую версию (`plan --accept`): замер обязан работать и в этой
+    # ветке — снимок не выбрасывается при утверждённой версии, иначе перерасход прошёл бы
+    # молча ровно в самом частом случае «поправил план и переутвердил» (круг правок 3).
+    accept_version(p, root)
     calls: list = []
 
     def spy(_p, card_id, text):
@@ -201,11 +229,15 @@ def test_stop_logged_once_and_plan_not_truncated(stand, monkeypatch):
 
     monkeypatch.setattr(gate, "_comment", spy)
     ctx2 = gate.build_ctx(p)
+    assert (ctx2.get("approval") or {}).get("state") == "approved", ctx2.get("approval")
+    assert ctx2["plan_fix_baseline"], "снимок версии выброшен при утверждённой версии"
     ctx2["plan_fix_cards"] = [fix_card()]
     result = gate.run_gate(p, ctx=ctx2, create_card=no_cards, notify_fn=quiet)
     decision = result["decision"]
     assert decision["action"] == "stop", decision
     assert decision["kind"] == "owner", decision
+    assert decision["growth"]["over"] is True, decision
+    assert "символов: было" in decision["reason"], decision["reason"]
     assert result["applied"] is True, result
     saved = gate.load_state(p)["plan_fix_baseline"]
     assert saved["reported_version_sha256"] == ctx2["approval"]["version_sha256"], saved

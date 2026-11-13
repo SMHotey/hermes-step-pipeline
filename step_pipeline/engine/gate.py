@@ -1661,17 +1661,10 @@ def build_ctx(p: Paths) -> dict:
     approval = registry.approval_status(p.cfg, p.spec)
     approval["started"] = registry.plan_started(p.cfg, p.spec)
     ctx["approval"] = approval
-    # Снимок расширения плана (7-S4) относится к версии, на которую владелец ещё не отвечал.
-    # Утвердил ДРУГУЮ версию — мерить нечего: рост между старой базой и утверждённым текстом
-    # это его правка, а не правка исполнителя. Без этой оговорки owner-стоп роста срабатывал
-    # бы на законном «владелец поправил план и переутвердил» и держал бы план вместо свежего
-    # круга ревью. Снимок не удаляется, а не передаётся решению: в состоянии он остаётся
-    # диагностикой, а решение работает ровно по пяти условиям контракта.
-    baseline = ctx.get("plan_fix_baseline") or {}
-    if (isinstance(baseline, dict) and baseline and approval.get("state") == "approved"
-            and str(approval.get("version_sha256") or "")
-            != str(baseline.get("version_sha256") or "")):
-        ctx["plan_fix_baseline"] = {}
+    # Снимок расширения плана (7-S4) уходит решению как есть, в том числе при утверждённой
+    # версии: переутверждение (в том числе `plan --accept` выросшей версии) не снимает замер,
+    # иначе владелец узнавал бы о перерасходе только при устаревшем утверждении, а стоп
+    # роста снимается его `--resume` — как и любой owner-стоп (D5, D7).
     try:
         pkg = collector(p)
     except SystemExit as exc:
@@ -2382,7 +2375,9 @@ def plan_fix_snapshot(p: Paths, round_no: int, ctx: dict, findings: list[str]) -
         "version_sha256": approval.plan_version_sha(path, marker),
         "chars": plan_version_chars(path, marker),
         "open_ids": [fid for fid in open_ids if fid][:FINDINGS_LIMIT],
-        "findings_open": max(len(findings or []), 1),
+        # Ровно столько находок карточка получила (§4.2): минимум 1 подменял бы «закрывать
+        # нечего» допуском в 400 символов, которого контракт не даёт.
+        "findings_open": len(findings or []),
         "at": time.strftime("%d.%m.%Y %H:%M:%S"),
     }
 
