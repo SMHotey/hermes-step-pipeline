@@ -39,6 +39,10 @@
   "prefetch_prompt": true,
   "prompt_review": "auto",
   "max_fix_rounds": 2,
+  "max_plan_growth": {
+    "percent": 10,
+    "chars_per_finding": 400
+  },
   "max_actions": 1,
   "runtimes": {
     "step": "3h",

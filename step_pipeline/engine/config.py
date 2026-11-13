@@ -72,6 +72,12 @@ DEFAULTS: dict = {
     # владельца. Останавливает лимит, а не первый отказ: у ревью плана каждый
     # `REQUEST_CHANGES` даёт карточку правок, пока круги не исчерпаны (0.25.2).
     "max_fix_rounds": 2,
+    # Лимит расширения плана правкой (план 7, S4). Правка по ревью закрывает находки,
+    # а не объясняет план ревьюеру: площадь проверки иначе растёт быстрее, чем закрываются
+    # находки. Допуск — большее из `percent` процентов версии плана (без журнала) и
+    # `chars_per_finding` символов на каждую закрытую находку. Превышение не режется
+    # молча: карточка правок получает owner-стоп с цифрой, решает владелец.
+    "max_plan_growth": {"percent": 10, "chars_per_finding": 400},
     "runtimes": {"step": "3h", "review": "150m", "prompt": "45m"},
     "kanban": {"tenant": "plan"},
     "git": {"commit": True, "push": True},
@@ -156,6 +162,43 @@ def _fix_rounds(value: object) -> int:
     return rounds
 
 
+def _plan_growth(value: object) -> dict:
+    """Лимит расширения плана правкой: `percent` и `chars_per_finding`.
+
+    Умолчание — 10 % объёма версии плана и 400 символов на закрытую находку. Мусор в
+    `pipeline.json` — ошибка конфигурации, а не молчаливое умолчание (тот же принцип, что
+    у `_fix_rounds`): иначе владелец думает, что правило действует, а страж работает по
+    прежнему лимиту. Отсутствующий ключ или отсутствующее поле внутри него — умолчание:
+    так проект может задать только процент.
+    """
+    default = DEFAULTS["max_plan_growth"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict):
+        raise ConfigError(f"max_plan_growth должен быть объектом JSON, получено: {value!r}")
+    out = dict(default)
+    for key in ("percent", "chars_per_finding"):
+        if key not in value or value[key] is None:
+            continue
+        raw = value[key]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            raise ConfigError(f"max_plan_growth.{key} должен быть числом, получено: {raw!r}")
+        try:
+            number = float(raw)
+        except ValueError as exc:
+            raise ConfigError(f"max_plan_growth.{key} должен быть числом, "
+                              f"получено: {raw!r}") from exc
+        if number < 0:
+            raise ConfigError(f"max_plan_growth.{key} должен быть ≥ 0, получено: {raw!r}")
+        out[key] = int(number) if key == "chars_per_finding" else number
+    unknown = sorted(set(value) - set(default))
+    if unknown:
+        # Опечатка в ключе лимита иначе выглядела бы как «лимит не действует».
+        raise ConfigError(f"max_plan_growth: неизвестные поля {', '.join(unknown)}; "
+                          f"допустимо: percent, chars_per_finding")
+    return out
+
+
 @dataclass(frozen=True)
 class Config:
     """Разобранная конфигурация одного проекта."""
@@ -182,6 +225,7 @@ class Config:
     prefetch_prompt: bool
     prompt_review: str
     max_fix_rounds: int
+    max_plan_growth: dict
     step_runtime: str
     review_runtime: str
     prompt_runtime: str
@@ -377,6 +421,7 @@ def load(repo: Path | str | None = None) -> Config:
         prefetch_prompt=bool(raw.get("prefetch_prompt", True)),
         prompt_review=prompt_review,
         max_fix_rounds=_fix_rounds(raw.get("max_fix_rounds")),
+        max_plan_growth=_plan_growth(raw.get("max_plan_growth")),
         step_runtime=str(runtimes.get("step") or "3h"),
         review_runtime=str(runtimes.get("review") or "150m"),
         prompt_runtime=str(runtimes.get("prompt") or "45m"),
