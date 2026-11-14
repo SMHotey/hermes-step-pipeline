@@ -56,6 +56,13 @@
                            в предпросмотре 403, второй жест во время работы 409;
                            итог (версия до/после, ошибка) — в ответ и в projects.json
                            профиля (rollout.plugin)
+    POST /api/rollout/engine
+                           раздать движок по всем проектам реестра, дожидаясь окна
+                           между шагами: ответ 200 — раскатка пошла, итог по каждому
+                           проекту в projects.json профиля (rollout.engine); проект,
+                           где идёт тик или шаг, ждёт до 30 минут; проект без
+                           .pipeline/gate.py — skipped; заголовок X-Pipeline-Panel
+                           обязателен, в предпросмотре 403, второй жест 409
     POST /api/projects     подключить проект: {"path": ..., "name": ...}, заголовок
                            X-Pipeline-Panel; запись в projects.json профиля
     DELETE /api/projects?id=<id>
@@ -2555,6 +2562,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/rollout/plugin":
             self._post_rollout_plugin()
             return
+        if path == "/api/rollout/engine":
+            self._post_rollout_engine()
+            return
         if path == "/api/projects":
             self._post_projects()
             return
@@ -2651,6 +2661,44 @@ class Handler(BaseHTTPRequestHandler):
             snap.clear_cache()          # итог попал в реестр: сводка устарела
             self.state.projects_cache = None
         self._json(200 if result.get("ok") else (409 if result.get("busy") else 400), result)
+
+    def _post_rollout_engine(self) -> None:
+        """Раздать движок по всем проектам реестра, дожидаясь окна между шагами.
+
+        Маршрут не входит в `ACTIONS` и проекта из тела не выбирает: раскатка — жест по
+        всему реестру, а не по одному проекту. Ответ 200 значит «пошло», а не «готово»:
+        ожидание окна идёт в фоне `rollout.start_engine`, итог по каждому проекту —
+        в реестре профиля (`rollout.engine`). Второй жест во время работы — 409 по полю
+        `busy` (занятость — не ошибка ввода), в предпросмотре — 403 и до метки панели,
+        и до чтения тела (D11).
+        """
+        if getattr(self.state, "preview", False):
+            self._drain_body()
+            self._json(403, {"ok": False,
+                             "error": "предпросмотр только читает: раскатка движка "
+                                      "недоступна"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        self._drain_body()
+        try:
+            result = rollout.start_engine(proj.read_projects())
+        except ValueError as exc:
+            # Битый реестр: писатель обязан отказать, а не затереть чужие записи (D3).
+            self._json(400, {"ok": False,
+                             "error": f"реестр проектов не разбирается: {exc}"})
+            return
+        except (OSError, TypeError) as exc:
+            # Отказ записи реестра и не-словарь в `rollout` — не ответ раскатки (D3).
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        if result.get("running"):
+            # Строки проектов уже в реестре: сводка и планы панели устарели.
+            snap.clear_cache()
+            self.state.projects_cache = None
+            panel_pause.clear_cache()
+        self._json(200 if result.get("running") else (409 if result.get("busy") else 400),
+                   result)
 
     def _post_plan_accept(self) -> None:
         """Утвердить план: проверки → перенос черновика → запись с sha256.
