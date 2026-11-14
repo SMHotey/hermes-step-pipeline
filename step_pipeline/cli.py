@@ -387,6 +387,14 @@ def cmd_plan(args) -> int:
                 print(f"  {'✓' if level == 'PASS' else '✗'} {code}: {message}")
             errors = errors + [f"{code}: {message}"
                                for level, code, message in rows if level == "FAIL"]
+        # A6-A8: гейт, который не выполнится (план 7, S5). Предупреждение, не ошибка.
+        findings = doctor.analyze_rows(project, draft)
+        if findings is None:
+            print(f"  ! {doctor.ANALYZE_UNAVAILABLE}")
+        else:
+            for finding in findings:
+                print(f"  ! {finding}")
+            warnings = warnings + findings
         if errors:
             print(f"ИТОГ: ошибок {len(errors)}"
                   + (f", предупреждений {len(warnings)}" if warnings else ""))

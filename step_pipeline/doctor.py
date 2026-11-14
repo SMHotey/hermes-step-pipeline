@@ -24,10 +24,18 @@ except ImportError:  # pragma: no cover - отладка файлом
 
 try:  # требования стража: движок на stdlib, состояние проекта не читает
     from . import plan_accept
+except ImportError:  # pragma: no cover - плагина рядом нет: P4 молча пропускается
+    plan_accept = None  # type: ignore
+
+try:  # P1-P4 отдельным блоком: падение одного импорта не уносит остальные проверки
     from .engine import plan_cycle
 except ImportError:  # pragma: no cover - движка рядом нет: строки P1-P4 не печатаются
-    plan_accept = None  # type: ignore
     plan_cycle = None  # type: ignore
+
+try:  # A6-A8 (план 7, S5) — свой блок по той же причине
+    from .engine import analyze
+except ImportError:  # pragma: no cover - движка рядом нет: A6-A8 не проверяются
+    analyze = None  # type: ignore
 
 
 @dataclass
@@ -45,6 +53,9 @@ class Report:
 
 
 CYCLE_RESEARCH_DEFAULT = "docs/research"
+
+ANALYZE_UNAVAILABLE = ("A6–A8 не проверены: анализатор недоступен "
+                       "(нет модуля analyze или конфиг проекта)")
 
 
 def _research_dir(project: Path) -> str:
@@ -75,6 +86,22 @@ def plan_cycle_rows(project: Path, path: Path) -> list[tuple[str, str, str]] | N
         return None
     return plan_cycle.check_plan(text, plan_accept.plan_number(Path(path).name),
                                  _research_dir(project))
+
+
+def analyze_rows(project: Path, path: Path) -> list[str] | None:
+    """Находки A6-A8 анализатора для файла плана; `None` — проверять нечем."""
+    if analyze is None:
+        return None
+    try:
+        findings = analyze.analyze(Path(path), Path(project))
+    except (OSError, RuntimeError):      # RuntimeError — ConfigError движка (config.py:30)
+        return None
+    try:
+        plan_rel = Path(path).resolve().relative_to(Path(project).resolve()).as_posix()
+    except (OSError, ValueError):
+        plan_rel = Path(path).as_posix()
+    return [finding.render(plan_rel) for finding in findings
+            if finding.code in ("A6", "A7", "A8")]
 
 
 def collect(project: Path, plan: str = "", *, with_lint: bool = True,
@@ -129,6 +156,12 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
             else:
                 for level, code, message in rows:
                     (notes if level == "PASS" else problems).append(f"план {code}: {message}")
+            findings = analyze_rows(project, Path(lint.files[0]))
+            if findings is None:
+                report.warnings.append(ANALYZE_UNAVAILABLE)
+            else:
+                for finding in findings:
+                    report.warnings.append(f"план {finding}")
     engine_ver = setup_flow.engine_version(project)
     plugin_ver = setup_flow.plugin_version()
     if engine_ver and engine_ver != plugin_ver:

@@ -35,7 +35,7 @@ STEP1 = "\n".join([
 ])
 
 STEP2 = "\n".join([
-    "- Файл: `app/api/invoices.py`",
+    "- Файл: `app/api/invoices.py`, `tests/test_api_invoice.py`",
     "- Тесты/гейты: `python -m pytest tests/test_api_invoice.py -q` → 5 passed",
     "- Готово = `GET /invoices` отдаёт 200 и список",
 ])

@@ -20,6 +20,11 @@
     A4  нет раздела «Разведка» у плана действующего формата
     A5  ссылка на несуществующий файл: тот же скан, что у A2, но файла в дереве нет и
         ни один шаг его не объявляет; A2 и A5 взаимоисключающие по построению
+    A6  каталог вывода не создан: гейт пишет в каталог, которого нет в дереве и который
+        шаг не создаёт
+    A7  путь не существует и не объявлен: путь команды гейта отсутствует в дереве и ни в
+        одном «Файл:»
+    A8  cd в несуществующий каталог: команда гейта начинается с cd туда, где пусто
 
 Запуск:
 
@@ -75,13 +80,31 @@ DECISION_RE = re.compile(r"Решение\s*:\s*([A-Za-z][A-Za-z-]*)")
 LINK_MARKERS = ("://", "http", "www", "mailto")
 #: Хвост ссылки, которого нет в имени файла: `#ANCHOR`, `:196`, `:44-60`.
 ANCHOR_RE = re.compile(r"[#:].*$")
+#: Метки пунктов гейтов — те же три, по которым `next_step` собирает `Step.gates`.
+GATE_LABELS = ("тест", "гейт", "проверк")
+#: Перенаправление со слиянием дескрипторов (`2>&1`, `>&2`) — не путь (D11).
+REDIRECT_MERGE_RE = re.compile(r"^[0-9]?>&[0-9]?$")
+#: `N>путь`, `N>>путь` — номер дескриптора перед знаками (D11).
+REDIRECT_NUM_RE = re.compile(r"^[0-9]+(?P<signs>>>?)")
+#: `>путь`, `>>путь` — знаки без номера дескриптора (D11).
+REDIRECT_RE = re.compile(r"^(?P<signs>>>?)")
+#: Ключи команды, за которыми стоит путь вывода (D11).
+OUT_OPTIONS = ("--out", "--output", "-o")
+#: Хвосты токена команды: кавычки и знаки оболочки.
+TOKEN_TAILS = "`'\";,)|&"
+#: Разделитель команд в аргументах `mkdir`: дальше начинается другая команда.
+SEPARATOR_RE = re.compile(r"[;&|<>#]")
+#: Абсолютный путь (`/…`, `X:…`) — дерево автора плана, A6-A8 его не проверяют (D4).
+ABSOLUTE_RE = re.compile(r"^(?:/|[A-Za-z]:)")
+#: Глоба: существование по маске одной командой не проверяется (D4).
+GLOB_MARKS = ("*", "?")
 
 
 @dataclass(frozen=True)
 class Finding:
-    """Одна находка: код A1-A5, строка файла плана (1-based), шаг и текст."""
+    """Одна находка: код A1-A8, строка файла плана (1-based), шаг и текст."""
 
-    code: str        # "A1".."A5"
+    code: str        # "A1".."A8"
     line: int        # строка файла плана, 1-based
     step: str        # "S1"; "" для плановых находок A3/A4
     message: str
@@ -353,6 +376,169 @@ def _path_findings(lines: list[str], spans: list[tuple[str, int, int]],
     return out
 
 
+def _token(part: str) -> str:
+    """Токен команды без кавычек и хвостов `;` `,` `)` `|` `&`."""
+    return part.strip().strip("`'\"").rstrip(TOKEN_TAILS + "`'\" \t").strip()
+
+
+def _command_paths(command: str) -> tuple[list[str], list[str], list[str]]:
+    """Пути одной команды: (вывода для A6, ввода для A7, цели `cd` для A8) (D11).
+
+    Разбор идёт по токенам фрагмента в обратных кавычках, а не регуляркой на весь
+    фрагмент: `2>&1` — слияние дескрипторов, `N>путь` — путь вывода, `cd` берёт
+    следующий не-флаг, остальное с `/` — кандидат в путь ввода.
+    """
+    outputs: list[str] = []
+    inputs: list[str] = []
+    targets: list[str] = []
+    tokens = [_token(part) for part in command.split()]
+    pos = 0
+    while pos < len(tokens):
+        token = tokens[pos]
+        pos += 1
+        if not token or REDIRECT_MERGE_RE.match(token):
+            continue
+        m = REDIRECT_NUM_RE.match(token) or REDIRECT_RE.match(token)
+        if m:
+            rest = token[m.end():]
+            if rest:
+                outputs.append(rest)
+            elif pos < len(tokens):
+                outputs.append(tokens[pos])
+                pos += 1
+            continue
+        if token == "tee" or token in OUT_OPTIONS:
+            if pos < len(tokens):
+                outputs.append(tokens[pos])
+                pos += 1
+            continue
+        option = next((name for name in OUT_OPTIONS if token.startswith(name + "=")), "")
+        if option:
+            outputs.append(token[len(option) + 1:])
+            continue
+        if token == "cd":
+            while pos < len(tokens):
+                target = tokens[pos]
+                pos += 1
+                if target.startswith("-"):     # флаги `cd -P x`; `cd -` остаётся без цели
+                    continue
+                targets.append(target)
+                break
+            continue
+        if "/" in token:
+            inputs.append(token)
+    return outputs, inputs, targets
+
+
+def _gate_path(token: str) -> str:
+    """Путь токена для A6-A8; `""` — не проверяется (D4, D11).
+
+    Абсолютные пути (`/…`, `X:…`), адреса и глобы молчат: первый — дерево автора
+    плана, второй не файл, третий не проверяется одной командой.
+    """
+    value = _clean_path(token)
+    if not value or _is_link(value) or ABSOLUTE_RE.match(value):
+        return ""
+    if any(mark in value for mark in GLOB_MARKS):
+        return ""
+    return value
+
+
+def _declared_dirs(declared: set[str]) -> set[str]:
+    """Каталоги, под которыми объявлен путь: `tests` при объявленном `tests/test_x.py` (D6)."""
+    out: set[str] = set()
+    for path in declared:
+        parts = path.split("/")
+        for pos in range(1, len(parts)):
+            out.add("/".join(parts[:pos]))
+    return out
+
+
+def _mkdir_dirs(lines: list[str], heading: int, body_end: int) -> set[str]:
+    """Каталоги, которые тело шага создаёт `mkdir` (D6).
+
+    Читается **сырой** текст строк тела шага: обратные кавычки в команде создания
+    каталога — не правило, `- Работа: mkdir -p logs` обычный случай. Аргументы
+    сравниваются с каталогом вывода по границе сегмента, не подстрокой: `logs/sub`
+    создаёт `logs/`, `logs2` — нет.
+    """
+    made: set[str] = set()
+    for idx in range(heading + 1, body_end):
+        tokens = [_token(part) for part in lines[idx].split()]
+        for pos, token in enumerate(tokens):
+            if token != "mkdir":
+                continue
+            for arg in tokens[pos + 1:]:
+                if not arg or arg.startswith("-"):
+                    continue
+                if SEPARATOR_RE.search(arg):    # `&& echo ok` — уже другая команда
+                    break
+                value = _clean_path(arg).rstrip("/")
+                if value:
+                    made.add(value)
+    return made
+
+
+def _gate_path_findings(lines: list[str], spans: list[tuple[str, int, int]],
+                        declared: set[str], root: Path) -> list[Finding]:
+    """A6-A8: путь вывода, путь ввода и цель `cd` в пунктах гейтов шага (D4-D6, D11).
+
+    Область — только пункты гейтов: метка ведётся как в `_path_findings` (продолжение
+    строки наследует метку), проверяются метки `тест`/`гейт`/`проверк` — те же три, по
+    которым `next_step` собирает `Step.gates`. Единица разбора — команда в обратных
+    кавычках; путь вывода проверяет только A6, путь ввода — только A7, поэтому классы
+    не пересекаются. Порядок находок не сортируется: это делает `_findings`.
+    """
+    dirs = _declared_dirs(declared)
+    out: list[Finding] = []
+    for sid, heading, body_end in spans:
+        made = _mkdir_dirs(lines, heading, body_end)
+        label = ""
+        for idx in range(heading + 1, body_end):
+            line = lines[idx]
+            mark = _bullet_label(line)
+            if mark is not None:
+                label = mark
+            if not label.startswith(GATE_LABELS):
+                continue
+            for command in next_step._backticks(line):
+                outputs, inputs, targets = _command_paths(command)
+                for path in outputs:
+                    value = _gate_path(path)
+                    if not value or "/" not in value:
+                        continue                   # `> out.log` каталога не называет
+                    folder = value.rsplit("/", 1)[0] + "/"
+                    if _exists(folder, root) or folder[:-1] in dirs:
+                        continue
+                    if any(arg == folder[:-1] or arg.startswith(folder) for arg in made):
+                        continue                   # каталог создан в этом же шаге
+                    out.append(Finding(
+                        "A6", idx + 1, sid,
+                        f"каталог вывода не создан: `{folder}` — гейт пишет в `{value}`, "
+                        f"а каталога нет в дереве и шаг его не создаёт"))
+                for path in inputs:
+                    value = _gate_path(path)
+                    if not value or value in declared or value.rstrip("/") in dirs:
+                        continue
+                    if _exists(value, root):
+                        continue
+                    out.append(Finding(
+                        "A7", idx + 1, sid,
+                        f"путь не существует и не объявлен: `{value}` — файла нет в дереве "
+                        f"и ни один шаг его не объявляет"))
+                for target in targets:
+                    value = _gate_path(target)
+                    if not value or value.rstrip("/") in dirs:
+                        continue
+                    if _exists(value, root):
+                        continue
+                    out.append(Finding(
+                        "A8", idx + 1, sid,
+                        f"cd в несуществующий каталог: `{value}` — команда гейта "
+                        f"не выполнится"))
+    return out
+
+
 def _research_dir(cfg: config_mod.Config, root: Path) -> Path:
     """Каталог артефактов разведки: ключ `paths.research`, умолчание `docs/research`.
 
@@ -425,7 +611,7 @@ def _research_findings(cfg: config_mod.Config, text: str, lines: list[str],
 
 
 def analyze(plan_file: Path, root: Path) -> list[Finding]:
-    """Находки A1-A5 по плану и дереву проекта: порядок — строка, затем код.
+    """Находки A1-A8 по плану и дереву проекта: порядок — строка, затем код.
 
     `root` — корень проекта с `pipeline.json`: из него берётся конфигурация (маркеры,
     регулярка шагов, каталог разведки) и относительно него проверяются пути.
@@ -444,6 +630,7 @@ def _findings(cfg: config_mod.Config, plan_file: Path, root: Path) -> list[Findi
     findings: list[Finding] = []
     findings += _gates_findings(steps, spans)
     findings += _path_findings(lines, spans, declared, root)
+    findings += _gate_path_findings(lines, spans, declared, root)
     findings += _research_findings(cfg, text, lines, plan_file, root, plan_number(cfg, plan_file))
     return sorted(findings, key=lambda item: (item.line, item.code))
 
