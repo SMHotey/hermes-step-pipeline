@@ -464,7 +464,7 @@ no-op), `|` в значениях заменяется на `/`, чтобы та
 | `prompt_review` | `auto` | `auto` / `always` / `never` |
 | `max_fix_rounds` | `2` | автоматические круги правок (шага и плана) |
 | `max_actions` | `1` | действий за тик |
-| `max_plan_growth` | `{percent:10, chars_per_finding:400}` | допуск роста плана правкой |
+| `max_plan_growth` | `{percent:10, chars_per_finding:400, enforce:true}` | допуск роста плана правкой; `enforce:false` — замер без стопа |
 | `runtimes` | `step 3h`, `review 150m`, `prompt 45m` (+ `scout`, `plan_review`, `plan_fix`) | лимиты карточек |
 | `kanban.tenant` | `plan` | tenant карточек |
 | `git` | `commit:true, push:true` | коммит и пуш при закрытии |
