@@ -2316,8 +2316,11 @@ def _plan_growth_limits(raw) -> dict:
     поэтому негодное значение уступает умолчанию.
     """
     limit = {"percent": PLAN_GROWTH_PERCENT,
-             "chars_per_finding": PLAN_GROWTH_CHARS_PER_FINDING}
+             "chars_per_finding": PLAN_GROWTH_CHARS_PER_FINDING,
+             "enforce": True}
     raw = raw if isinstance(raw, dict) else {}
+    if isinstance(raw.get("enforce"), bool):
+        limit["enforce"] = raw["enforce"]
     for key in ("percent", "chars_per_finding"):
         value = raw.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float, str)):
@@ -2451,6 +2454,8 @@ def _plan_growth_decision(ctx: dict) -> dict | None:
                                 percent, chars_per_finding)
     if not report["over"]:
         return None
+    if not limits["enforce"]:
+        return None                       # владелец выключил стоп: план растёт, шаги идут
     percent_text = _percent_text(report["percent"])
     card_id = str(fixes[-1].get("id") or "")
     reason = (f"правка плана расширила план на {percent_text}% ({report['growth']} символов: "

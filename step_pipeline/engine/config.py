@@ -77,7 +77,7 @@ DEFAULTS: dict = {
     # находки. Допуск — большее из `percent` процентов версии плана (без журнала) и
     # `chars_per_finding` символов на каждую закрытую находку. Превышение не режется
     # молча: карточка правок получает owner-стоп с цифрой, решает владелец.
-    "max_plan_growth": {"percent": 10, "chars_per_finding": 400},
+    "max_plan_growth": {"percent": 10, "chars_per_finding": 400, "enforce": True},
     "runtimes": {"step": "3h", "review": "150m", "prompt": "45m"},
     "kanban": {"tenant": "plan"},
     "git": {"commit": True, "push": True},
@@ -188,6 +188,12 @@ def _plan_growth(value: object) -> dict:
     if not isinstance(value, dict):
         raise ConfigError(f"max_plan_growth должен быть объектом JSON, получено: {value!r}")
     out = dict(default)
+    if value.get("enforce") is not None:
+        raw = value["enforce"]
+        if not isinstance(raw, bool):
+            raise ConfigError(f"max_plan_growth.enforce должен быть true или false, "
+                              f"получено: {raw!r}")
+        out["enforce"] = raw
     for key in ("percent", "chars_per_finding"):
         if value.get(key) is None:
             continue

@@ -23,7 +23,7 @@ import approval  # noqa: E402 - движок импортирует соседе
 import config as config_mod  # noqa: E402
 import gate  # noqa: E402
 
-DEFAULT_LIMIT = {"percent": 10, "chars_per_finding": 400}
+DEFAULT_LIMIT = {"percent": 10, "chars_per_finding": 400, "enforce": True}
 SHA_BEFORE = "a" * 64
 SHA_AFTER = "b" * 64
 
@@ -252,3 +252,24 @@ def test_stop_logged_once_and_plan_not_truncated(stand, monkeypatch):
     second = gate.run_gate(p, ctx=ctx3, create_card=no_cards, notify_fn=quiet)
     assert second["decision"]["action"] == "idle", second["decision"]
     assert len(calls) == 1, calls
+
+
+def test_growth_enforce_off_keeps_steps_running(stand):
+    """`enforce: false` — стоп выключен владельцем: план вырос, а шаги продолжают идти.
+
+    Стоп `max_plan_growth` блокировал план 12 после каждой правки по ревью: правка
+    закрывала находки, но росла на 365 символов, а допуск считается по числу находок,
+    закрытых на том же круге (`_closed_findings`), — на первом круге их ноль. Владелец
+    выключил остановку ключом, замер остался: решение `None`, счёт `over` не врёт.
+    """
+    _root, p = stand
+    statuses = ("закрыто",) * 10
+    ctx = ctx_with_fix(p, baseline(10000, [f"F{index}" for index in range(1, 11)]),
+                       after_chars=11500, statuses=statuses, findings=10)
+    ctx["max_plan_growth"] = {"percent": 10, "chars_per_finding": 400, "enforce": False}
+    assert gate._plan_growth_decision(ctx) is None, "стоп не выключился ключом enforce"
+    assert gate.plan_growth_report(10000, 11500, 10, 10, 400)["over"] is True
+    # Остальные ветки не тронуты: без ключа тот же ctx даёт owner-стоп.
+    ctx["max_plan_growth"] = {"percent": 10, "chars_per_finding": 400}
+    decision = gate._plan_growth_decision(ctx)
+    assert decision is not None and decision["action"] == "stop", decision
