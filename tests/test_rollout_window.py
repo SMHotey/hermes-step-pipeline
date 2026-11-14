@@ -3,8 +3,9 @@
 
 Проверяется то, чего нет у `setup_flow.upgrade`: окно между шагами (живая блокировка тика
 и карточка в работе), пометка `skipped` для проекта без конвейера, сходимость маркера
-после настоящего обновления и три отказа маршрута (предпросмотр, второй жест, отсутствие
-метки панели) без следов в реестре.
+после настоящего обновления и два отказа маршрута (предпросмотр, второй жест) без следов
+в реестре. Прогресс раскатки проверяется по записям реестра, а не по телу ответа: ответ
+`start_engine` отдаёт `running` и без записи.
 """
 from __future__ import annotations
 
@@ -135,6 +136,23 @@ def upgrade_spy(monkeypatch) -> list:
     return calls
 
 
+def write_engine_spy(monkeypatch) -> list[dict]:
+    """Шпион на запись реестра: копит записи и пишет их по-настоящему.
+
+    Итоговая запись скрывает промежуточные (`running: True` после каждого проекта), поэтому
+    прогресс по ходу прохода виден только так (D8, находка 1 ревью 6-S8A).
+    """
+    real = rollout.write_engine
+    entries: list[dict] = []
+
+    def spy(entry: dict) -> None:
+        entries.append(json.loads(json.dumps(entry, default=str)))
+        real(entry)
+
+    monkeypatch.setattr(rollout, "write_engine", spy)
+    return entries
+
+
 def fake_hermes(monkeypatch) -> list:
     """Поддельный `hermes`: доверие ролям и enable не трогают настоящий профиль.
 
@@ -236,10 +254,42 @@ def test_running_card_defers_until_card_is_done(project: Path, hermes_stub: Path
     assert engine_entry()["ok"] is True
 
 
+def test_zero_interval_does_not_hold_window_forever(project: Path, hermes_stub: Path,
+                                                   monkeypatch):
+    """Нулевой интервал не крутит цикл ожидания вечно: предел копится секундами (D5).
+
+    Сон подменён счётчиком с отсечкой: без ограды `waited += 0` не дошёл бы до предела
+    никогда и блокировка осталась бы захваченной, поэтому тест падает на отсечке, а не
+    висит.
+    """
+    calls = upgrade_spy(monkeypatch)
+    hold_tick(project)
+    write_registry([project])
+    sleeps: list[float] = []
+
+    def counting_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        assert len(sleeps) < 50, "цикл ожидания не ограничен: интервал не применяется"
+
+    result = rollout.run_engine(proj.read_projects(), interval=0, limit=0.05,
+                                sleep=counting_sleep)
+
+    assert 0 < len(sleeps) <= 10            # предел 0.05 с при ограде 0.01 с
+    assert min(sleeps) > 0                  # ограда дошла до сна
+    assert engine_row(project)["status"] == "failed"
+    assert calls == []
+    assert result["ok"] is False and result["running"] is False
+
+
 def test_project_without_pipeline_is_skipped(tmp_path: Path, project: Path,
                                              hermes_stub: Path, monkeypatch):
-    """Проект без конвейера — `skipped`, движок в нём не запускается и не `failed` (D7)."""
+    """Проект без конвейера — `skipped`, движок в нём не запускается и не `failed` (D7).
+
+    Реестр из двух проектов нужен и для прогресса: после каждого проекта пишется запись
+    `running: True` с уже пройденными строками (D8), иначе панель не видит хода раскатки.
+    """
     calls = upgrade_spy(monkeypatch)
+    entries = write_engine_spy(monkeypatch)
     bare = tmp_path / "bare"
     bare.mkdir()
     write_registry([project, bare])
@@ -252,6 +302,9 @@ def test_project_without_pipeline_is_skipped(tmp_path: Path, project: Path,
     assert not (bare / ".pipeline").exists()
     assert [path.name for path in calls] == [project.name]
     assert result["ok"] is True             # `skipped` — не отказ раскатки
+    # Записи по ходу прохода: строка за строкой, `running` до самого конца прохода.
+    assert [len(entry["projects"]) for entry in entries if entry["running"]] == [1, 2]
+    assert [entry["running"] for entry in entries][-1] is False
 
 
 # ───────────────────────────── настоящее обновление ─────────────────────────────
@@ -318,6 +371,10 @@ def test_rollout_route_guards_refuse_without_side_effects(project: Path, hermes_
         assert status == 200
         assert data["step"] == "engine" and data["running"] is True
         assert entered.wait(10), "фоновая раскатка не дошла до upgrade"
+        # `running` ответа ничего не доказывает: он есть и без записи. Держим окно по
+        # файлу реестра — стартовая запись пишется до старта потока (D9, находка 1).
+        assert engine_entry()["running"] is True
+        assert engine_entry()["projects"] == []
         busy_status, busy = post(server["url"], {})
         assert busy_status == 409
         assert busy["busy"] is True and busy["ok"] is False

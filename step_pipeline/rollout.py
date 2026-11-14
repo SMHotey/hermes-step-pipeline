@@ -253,6 +253,10 @@ def run_engine(rows: list[dict], *, interval: float = ROLLOUT_INTERVAL,
     `sleep`, `interval` и `limit` — параметры, чтобы тест не ждал настоящие полчаса.
     """
     begin = started or _stamp()
+    # Нулевой (или отрицательный) интервал не должен крутить цикл ожидания вечно:
+    # `waited += interval` тогда не дойдёт до предела, окно будет считаться занятым
+    # навсегда и блокировка раскатки останется захваченной (ревью 6-S8A, находка 5).
+    interval = max(float(interval), 0.01)
     results: list[dict] = []
     ok = True
     for row in rows:
