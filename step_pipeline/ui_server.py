@@ -49,6 +49,13 @@
                            (ровно одна из двух форм, иначе 400)
     POST /api/notify/test  тестовое уведомление: {"project": id}; только ответ браузеру,
                            в историю доставок и в Telegram ничего не пишет
+    POST /api/rollout/plugin
+                           обновить плагин до последнего GitHub-релиза:
+                           {"tag": "v0.26.0"} — поле необязательное, пусто значит
+                           «последний релиз»; заголовок X-Pipeline-Panel обязателен;
+                           в предпросмотре 403, второй жест во время работы 409;
+                           итог (версия до/после, ошибка) — в ответ и в projects.json
+                           профиля (rollout.plugin)
     POST /api/projects     подключить проект: {"path": ..., "name": ...}, заголовок
                            X-Pipeline-Panel; запись в projects.json профиля
     DELETE /api/projects?id=<id>
@@ -84,6 +91,7 @@ try:
     from . import plans_add
     from . import plans_api
     from . import project as proj
+    from . import rollout
     from . import setup_flow, snapshot as snap, telegram
     from . import update
 except ImportError:  # pragma: no cover
@@ -97,6 +105,7 @@ except ImportError:  # pragma: no cover
     import plans_add  # type: ignore
     import plans_api  # type: ignore
     import project as proj  # type: ignore
+    import rollout  # type: ignore
     import setup_flow  # type: ignore
     import snapshot as snap  # type: ignore
     import telegram  # type: ignore
@@ -947,25 +956,35 @@ def checks_summary(state: State) -> dict | None:
             "notes": list(payload.get("notes") or [])}
 
 
+def _remember_install(state: State, result: dict) -> None:
+    """Положить итог установки в состояние сервера вместо сетевой проверки (D8).
+
+    `watch_updates` ходит в GitHub раз в 6 часов (`ui_server.py:2767-2780`): без этой
+    записи бейдж после установки до шести часов показывал бы «есть обновление». Ответ
+    установки знает обе версии, поэтому сеть в жесте не нужна.
+    """
+    to = str(result.get("to") or "")
+    latest = str(result.get("latest") or to)
+    info = {"current": to, "latest": latest,
+            "update_available": update.parse_version(latest) > update.parse_version(to),
+            "error": ""}
+    with state.update_lock:
+        state.update_info = info
+
+
 def act_update(state: State, payload: dict) -> dict:
     """Обновить плагин из GitHub (кнопка в панели).
 
     Плагин один на профиль, поэтому действие не привязано к проекту и не требует
     `.pipeline/` в нём: отказ «конвейер не установлен» здесь был бы неправдой.
+    Установка идёт тем же `rollout.update_plugin`, что и `POST /api/rollout/plugin`:
+    один путь установки в панели, одна запись итога в реестре, один 409 на занятость.
     """
     tag = str(payload.get("tag") or "")
-    try:
-        result = update.install(tag=tag)
-    except update.UpdateError as exc:
-        return {"ok": False, "error": f"обновление не удалось: {exc}",
-                "current": update.local_version()}
-    state.note(result.get("message") or "плагин обновлён")
-    try:
-        fresh = update.check()
-        with state.update_lock:
-            state.update_info = fresh
-    except Exception as exc:                                   # noqa: BLE001
-        proj.debug_note("update", exc)
+    result = rollout.update_plugin(tag=tag)
+    if result.get("ok"):
+        state.note(result.get("message") or "плагин обновлён")
+        _remember_install(state, result)
     return result
 
 
@@ -2533,6 +2552,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/notify/test":
             self._post_notify_test()
             return
+        if path == "/api/rollout/plugin":
+            self._post_rollout_plugin()
+            return
         if path == "/api/projects":
             self._post_projects()
             return
@@ -2590,6 +2612,45 @@ class Handler(BaseHTTPRequestHandler):
         # 409 — жест паузы уже идёт: это не кривой ввод, а занятость фоновой работы.
         code = 200 if result.get("ok") else (409 if result.get("busy") else 400)
         self._json(code, result)
+
+    def _post_rollout_plugin(self) -> None:
+        """Обновить плагин до последнего GitHub-релиза одним жестом владельца.
+
+        Маршрут не входит в `ACTIONS`: плагин один на профиль, поэтому проект из тела не
+        выбирается (поле `project`, если пришло, игнорируется). Установка — существующая
+        `update.install` через `rollout.update_plugin`: своей загрузки и распаковки здесь
+        нет. Итог (версия до/после, ошибка) пишет `rollout` в реестр профиля и возвращает
+        тем же ответом. Второй жест во время работы — 409 по полю `busy` (занятость — не
+        ошибка ввода), в предпросмотре — 403 и до метки панели, и до чтения тела.
+        """
+        if getattr(self.state, "preview", False):
+            self._drain_body()
+            self._json(403, {"ok": False,
+                             "error": "предпросмотр только читает: обновление плагина "
+                                      "недоступно"})
+            return
+        if not self._guard_post(panel_header=True):
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            return
+        tag = str(payload.get("tag") or "")
+        try:
+            result = rollout.update_plugin(tag=tag)
+        except ValueError as exc:
+            # Битый реестр: писатель обязан отказать, а не затереть чужие записи (D3).
+            self._json(400, {"ok": False,
+                             "error": f"реестр проектов не разбирается: {exc}"})
+            return
+        except (OSError, TypeError) as exc:
+            # Отказ записи реестра и не-словарь в `rollout` — не ответ установки (D3).
+            self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        if result.get("ok"):
+            _remember_install(self.state, result)
+            snap.clear_cache()          # итог попал в реестр: сводка устарела
+            self.state.projects_cache = None
+        self._json(200 if result.get("ok") else (409 if result.get("busy") else 400), result)
 
     def _post_plan_accept(self) -> None:
         """Утвердить план: проверки → перенос черновика → запись с sha256.
