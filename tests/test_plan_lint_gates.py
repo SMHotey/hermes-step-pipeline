@@ -9,11 +9,16 @@
 `install_project` предупреждение про cron есть всегда, а строка деградации сама
 начинается с `A6–A8`. Плагин и алиасы модулей поднимает `import helpers`, CLI зовётся в
 процессе — как в `tests/test_plan_check_cycle.py`.
+
+Отдельный случай — артефакт сборки (D12, п.6): путь под `.gitignore` A6–A8 не
+спрашивают, поэтому ему нужен git-репозиторий (`git_init`), а без git тест пропускается.
 """
 from __future__ import annotations
 
 import argparse
 import re
+import shutil
+import subprocess
 
 import pytest
 
@@ -89,6 +94,16 @@ def write_draft(project, step_text: str, plan: str = "2"):
 def plan_check(project, target: str = "2") -> int:
     """Вызов CLI в процессе: код возврата и печать — как у `hermes pipeline plan --check`."""
     return cli.cmd_plan(argparse.Namespace(project=str(project), check=target))
+
+
+def git_init(project) -> None:
+    """Репозиторий в тестовом проекте: без него `.gitignore` ничего не значит (D12, п.6).
+
+    `git check-ignore` без репозитория отвечает кодом 128, движок это глотает — правило
+    об артефактах сборки молчит, и тест проверял бы прежнее поведение.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=str(project), check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 @pytest.fixture()
@@ -331,6 +346,37 @@ def test_broken_cd_still_single_finding(project, capsys, quiet_snapshot):
     out = capsys.readouterr().out
     assert gate_codes(out) == ["A8"]
     assert "cd в несуществующий каталог: `нет_такого`" in out
+
+
+def test_build_artifact_ignored_by_git_silent(project, capsys, quiet_snapshot):
+    """Артефакт сборки (D12, п.6): путь под `.gitignore` до сборки существовать не обязан.
+
+    Живой план 34: `grep -o '<loc>' landing/dist/sitemap-0.xml` — файл производит
+    `npm run build` в гейте того же шага, объявить его в «Файл:» шаг не может, а до
+    первого прогона сборки файла нет. Утверждать нечего — молчание. Настоящая находка
+    (файл в версионируемом каталоге) при этом остаётся находкой.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("нет git: правило об артефактах сборки без него молчит")
+    git_init(project)
+    write_draft(project, step("grep -o '<loc>' dist/sitemap-0.xml | wc -l"))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == ["A7"]      # без .gitignore — находка
+
+    (project / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == []          # артефакт сборки — тишина
+
+    # путь записан от каталога шага: прочтение `landing/dist/...` тоже под `.gitignore`
+    (project / "landing").mkdir()
+    (project / "landing" / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    write_draft(project, step_raw("`cd landing && grep -o '<loc>' dist/sitemap-0.xml | wc -l`"))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == []
+
+    write_draft(project, step_raw("`python -m pytest tests/нет_такого.py -q` → 3 passed"))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == ["A7"]      # не артефакт сборки
 
 
 def test_no_gates_block_degrades(project, capsys, monkeypatch, quiet_snapshot):

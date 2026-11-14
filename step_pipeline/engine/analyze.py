@@ -37,7 +37,11 @@
     4. два прочтения: путь проверяется от каталога шага и от корня проекта — находка
        только если не сошёлся ни в одном;
     5. объявления: путь из «Файл:», плюс упоминание в «Работе» и «Готово»; хвост-маска
-       (`<n>`, `**`) объявляет свой каталог-префикс.
+       (`<n>`, `**`) объявляет свой каталог-префикс;
+    6. артефакт сборки: путь, который проект не версионирует (`.gitignore` — `dist/`,
+       `node_modules/`), существовать до сборки не обязан и объявлен быть не может —
+       A6-A8 его не спрашивают. Ответ даёт git (`check-ignore`); нет git, нет репозитория
+       или ошибка вызова — правило молчит, и A6-A8 работают как раньше.
 
 Запуск:
 
@@ -64,6 +68,7 @@ from __future__ import annotations
 import argparse
 import posixpath
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,6 +125,9 @@ NON_PATH_MARKS = ("=", "$", "{", "}", "@", "<", ">", "`", '"', "…", "«", "»"
 SEGMENT_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
 #: Пункты, упоминание пути в которых считается объявлением (D12, п.5).
 DECLARE_HEADS = ("работа", "готово")
+#: Таймаут вопроса к git о версионируемости пути (D12, п.6): ответ мгновенный, но
+#: зависший процесс не должен держать `plan --check`.
+GIT_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -222,6 +230,36 @@ def _exists(value: str, root: Path) -> bool:
     if not path.is_absolute():
         path = root / path
     return path.exists()
+
+
+def _git_ignored(values: set[str], root: Path) -> set[str]:
+    """Пути, которые проект не версионирует: артефакт сборки, а не файл дерева (D12, п.6).
+
+    Спрашивается у git одним вызовом на план (`check-ignore --stdin`): каталог `dist/`
+    под правилом `.gitignore` — это выход сборки. Объявить такой файл в «Файл:» шаг не
+    может (его создаёт `npm run build`, а не правка), и требовать его существования до
+    первого прогона сборки нечестно: живой план 34 получал за это две A7 на `sitemap-0.xml`.
+
+    Правило только снимает находки, а не создаёт: без git, без репозитория и при ошибке
+    вызова возвращается пустое множество, и A6-A8 работают как раньше.
+    """
+    paths = sorted({value.rstrip("/") for value in values if value.strip("/")})
+    if not paths:
+        return set()
+    # `-z`: вход и выход разделены NUL, без кавычек и экранирования юникодных имён
+    # (`core.quotePath`), которые иначе не совпали бы с путём из плана. Байтами, а не
+    # текстом: на Windows текстовый режим превратил бы разделитель в `\r\n`.
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "-z", "--stdin"],
+            input=("\0".join(paths) + "\0").encode("utf-8"),
+            capture_output=True, timeout=GIT_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError):   # нет git, таймаут, отказ запуска
+        return set()
+    if proc.returncode != 0:        # 1 — ни один путь не игнорируется, 128 — не репозиторий
+        return set()
+    text = proc.stdout.decode("utf-8", "replace")
+    return {line for line in text.split("\0") if line}
 
 
 def _research_heading(lines: list[str]) -> int:
@@ -620,21 +658,26 @@ def _gate_path_findings(lines: list[str], spans: list[tuple[str, int, int]],
     (`cd landing`, D12 п.3) переносится на следующие сегменты и команды шага, а путь
     проверяется в двух прочтениях — от каталога шага и от корня (п.4). Порядок находок
     не сортируется: это делает `_findings`. Повтор пути на той же строке шага не
-    печатается дважды (п.2).
+    печатается дважды (п.2). Путь, который проект не версионирует (артефакт сборки,
+    п.6), находкой не становится: его существование обеспечивает сборка, а не автор плана.
     """
     known = set(declared)
     for _sid, heading, body_end in spans:
         known.update(_step_declarations(lines, heading, body_end))
     dirs = _declared_dirs(known)
-    out: list[Finding] = []
+    # Находки копятся, а не печатаются на месте: вопрос к git об игнорируемых путях
+    # (п.6) задаётся один раз на план, после обхода.
+    pending: list[tuple[str, int, str, tuple[str, ...], str]] = []   # код, строка, шаг, прочтения, текст
     seen: set[tuple[int, str, str]] = set()          # (строка, шаг, путь) — дедуп (п.2)
 
-    def report(code: str, line: int, sid: str, value: str, message: str) -> None:
+    def report(code: str, line: int, sid: str, value: str, message: str,
+               cwd: str) -> None:
+        """Находка с обоими прочтениями пути: артефакт сборки проверяется по каждому (п.6)."""
         key = (line, sid, value)
         if key in seen:
             return
         seen.add(key)
-        out.append(Finding(code, line, sid, message))
+        pending.append((code, line, sid, tuple(_readings(value, cwd)) or (value,), message))
 
     for sid, heading, body_end in spans:
         made = _mkdir_dirs(lines, heading, body_end)
@@ -662,14 +705,15 @@ def _gate_path_findings(lines: list[str], spans: list[tuple[str, int, int]],
                                 continue       # каталог создан в этом же шаге
                             report("A6", idx + 1, sid, value,
                                    f"каталог вывода не создан: `{folder}` — гейт пишет в "
-                                   f"`{value}`, а каталога нет в дереве и шаг его не создаёт")
+                                   f"`{value}`, а каталога нет в дереве и шаг его не создаёт",
+                                   cwd)
                     for path in inputs:
                         value = _gate_path(path)
                         if not value or _declared_ok(value, cwd, known, dirs, root):
                             continue
                         report("A7", idx + 1, sid, value,
                                f"путь не существует и не объявлен: `{value}` — файла нет в "
-                               f"дереве и ни один шаг его не объявляет")
+                               f"дереве и ни один шаг его не объявляет", cwd)
                     for target in targets:
                         value = _gate_path(target)
                         if not value:
@@ -677,10 +721,15 @@ def _gate_path_findings(lines: list[str], spans: list[tuple[str, int, int]],
                         if not _declared_ok(value, cwd, known, dirs, root):
                             report("A8", idx + 1, sid, value,
                                    f"cd в несуществующий каталог: `{value}` — команда гейта "
-                                   f"не выполнится")
+                                   f"не выполнится", cwd)
                         cwd = _step_cwd(value, cwd, root)   # каталог шага (п.3)
-    return out
-
+    if not pending:
+        return []
+    ignored = _git_ignored({path for _code, _line, _sid, readings, _text in pending
+                            for path in readings}, root)
+    return [Finding(code, line, sid, message)
+            for code, line, sid, readings, message in pending
+            if not any(path.rstrip("/") in ignored for path in readings)]   # сборка (п.6)
 
 
 def _research_dir(cfg: config_mod.Config, root: Path) -> Path:
