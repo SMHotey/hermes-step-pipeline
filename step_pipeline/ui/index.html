@@ -535,6 +535,19 @@
             </div>
           </details>
 
+          <details class="block" id="step-plan-review">
+            <summary>Ревью плана <span class="pill" id="plan-review-round">—</span></summary>
+            <div class="body">
+              <div id="plan-review-stage">—</div>
+              <div class="muted mono" id="plan-review-times">—</div>
+              <div id="plan-review-findings"></div>
+              <div class="step-actions">
+                <button id="btn-plan-fix" disabled>Ещё круг правок</button>
+                <span class="muted" id="plan-review-note"></span>
+              </div>
+            </div>
+          </details>
+
           <details class="block" id="step-commit">
             <summary>Коммит шага</summary>
             <div class="body">
@@ -845,6 +858,7 @@ function act(action, payload = {}) {
 function actionLabel(action) {
   return {tick: "Тик", stop: "Стоп", resume: "Продолжить",
           hold: "Допуск", unhold: "Снят допуск", update: "Обновление",
+          plan_fix: "Круг правок плана",
           pause_all: "Остановка после шага", resume_all: "Запуск всех",
           autostart: "Автозагрузка",
           plan_accept: "Утверждение плана"}[action] || action;
@@ -1995,6 +2009,44 @@ function renderStepProgress(data) {
   $("step-flow").innerHTML = (pr.tiles || []).map(tileHtml).join("");
 }
 
+function renderPlanReview(data) {
+  // Блок «Ревью плана» (S7 плана 6): этап, круг из бюджета, времена по кругам и находки.
+  // Числа считает сервер (`plan_review` в снимке и в `/api/step`), страница их не выводит.
+  const pr = data.plan_review;
+  const box = $("step-plan-review");
+  const btn = $("btn-plan-fix");
+  if (!pr) {
+    // Плана без распознанных шагов страж не ведёт — ревью плана в нём показывать нечего.
+    box.hidden = true;
+    btn.disabled = true;
+    btn.title = "";
+    $("plan-review-note").textContent = "";
+    return;
+  }
+  box.hidden = false;
+  $("plan-review-round").textContent = pr.label || "—";
+  $("plan-review-stage").textContent = pr.stage || "—";
+  $("plan-review-times").textContent =
+    `ревью: ${pr.review_duration || "—"} · правки: ${pr.fix_duration || "—"}`;
+  const pairs = (pr.rounds || []).map((row) => {
+    const rev = row.review || {};
+    const fix = row.fix || {};
+    return `<div class="muted">круг ${Number(row.round) || 0} · ревью ${esc(rev.duration || "—")}`
+      + ` · правки ${esc(fix.duration || "—")} · ${esc(row.state || "—")}</div>`;
+  }).join("");
+  const findings = pr.findings || {};
+  const found = findings.exists === false || !findings.label ? ""
+    : `<div class="muted">находки: ${esc(findings.label)}</div>`;
+  $("plan-review-findings").innerHTML = (pairs + found)
+    || `<div class="muted">кругов ревью плана нет</div>`;
+  // Кнопка активна только при исчерпанном бюджете и неистраченном ручном круге (решение D4),
+  // и никогда — в предпросмотре: там действия запрещены.
+  const canFix = pr.can_fix === true && !window.__preview;
+  btn.disabled = !canFix;
+  btn.title = canFix ? "" : (pr.note || "");
+  $("plan-review-note").textContent = canFix ? "" : (pr.note || "");
+}
+
 function renderStep(data) {
   const contract = data.contract || {};
   $("step-id").textContent = data.step || "—";
@@ -2050,6 +2102,7 @@ function renderStep(data) {
 
   renderTimes(data);
   renderStepProgress(data);
+  renderPlanReview(data);
 
   $("step-cards").innerHTML = (data.cards || []).map((card) => {
     const cls = card.status === "done" ? "ok"
@@ -3016,6 +3069,14 @@ function stepAction(action) {
 }
 $("btn-hold").onclick = () => stepAction("hold");
 $("btn-unhold").onclick = () => stepAction("unhold");
+// «Ещё круг правок» плана: номер плана уходит телом, шаг жесту не нужен — правки плана
+// касаются всего плана. После жеста карточка перечитывается: бюджет в блоке изменился.
+$("btn-plan-fix").onclick = () => {
+  const plan = planIdOf();
+  if (!currentStep) { toast("шаг не выбран", true); return; }
+  if (!plan) { toast("план не выбран", true); return; }
+  act("plan_fix", {plan}).finally(() => loadStep());
+};
 $("btn-checks-refresh").onclick = () => loadChecks(true);
 $("btn-stop").onclick = () => {
   const reason = prompt("Причина остановки (после текущего шага):", "остановка владельца");

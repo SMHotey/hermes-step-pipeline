@@ -80,6 +80,7 @@ try:
     from . import plan_accept
     from . import plan_lint
     from . import plan_mode
+    from . import plan_rounds
     from . import plans_add
     from . import plans_api
     from . import project as proj
@@ -92,6 +93,7 @@ except ImportError:  # pragma: no cover
     import plan_accept  # type: ignore
     import plan_lint  # type: ignore
     import plan_mode  # type: ignore
+    import plan_rounds  # type: ignore
     import plans_add  # type: ignore
     import plans_api  # type: ignore
     import project as proj  # type: ignore
@@ -301,6 +303,35 @@ def act_stop(state: State, payload: dict) -> dict:
 
 def act_resume(state: State, payload: dict) -> dict:
     return _run_engine(state, "--resume")
+
+
+def act_plan_fix(state: State, payload: dict) -> dict:
+    """Ещё один ручной круг правок плана: маркер `plan_N_rounds.json` и снятие owner-стопа.
+
+    Жест состоит из двух шагов, и порядок обязателен: сначала маркер на диске (его читает
+    следующий тик), потом адресное снятие стопа — `python .pipeline/gate.py --plan N
+    --resume`. Без `--plan` команда сняла бы стоп плану по умолчанию, что и случилось бы
+    на вкладке с соседним планом (та же ошибка, что у `act_hold`). Первый круг из панели
+    разрешён только при исчерпанном бюджете, но сервер это правило не перепроверяет:
+    решение о лимите — у стража, а жест «+1 круг» идемпотентным не является.
+    """
+    raw = str(payload.get("plan") or "").strip()
+    if not raw.isdigit():
+        return {"ok": False, "error": "нужно поле plan: номер плана"}
+    plan = str(int(raw))
+    marker = plan_rounds.grant(state.project, plan, "ручной круг правок из панели")
+    result = _run_engine(state, "--plan", plan, "--resume")
+    extra = int(marker.get("extra_fix_rounds") or 0)
+    budget = plan_rounds.budget(proj.read_config(Path(state.project)), extra)
+    result.update({
+        "marker": os.path.relpath(plan_rounds.marker_path(state.project, plan),
+                                  state.project),
+        "extra_fix_rounds": extra,
+        # Номер круга берётся из борды, а жест борду не читает: называем бюджет и жест,
+        # иначе сообщение обещало бы число, которого обработчик не знает.
+        "message": f"ручной круг правок: +1, бюджет {budget} (ручных: {extra})",
+    })
+    return result
 
 
 def act_hold(state: State, payload: dict) -> dict:
@@ -944,6 +975,7 @@ ACTIONS = {
     "resume": act_resume,
     "hold": act_hold,
     "unhold": act_unhold,
+    "plan_fix": act_plan_fix,
     "pause_all": act_pause_all,
     "resume_all": act_resume_all,
     "autostart": act_autostart,

@@ -32,11 +32,15 @@ from typing import Any
 
 try:  # обычный путь — пакет плагина; __main__ — ручная проверка файлом
     from . import plan_accept
+    from . import plan_review_progress
+    from . import plan_rounds
     from . import progress
     from . import project as proj
     from . import stats
 except ImportError:  # pragma: no cover
     import plan_accept  # type: ignore[no-redef]
+    import plan_review_progress  # type: ignore[no-redef]
+    import plan_rounds  # type: ignore[no-redef]
     import progress  # type: ignore[no-redef]
     import project as proj  # type: ignore[no-redef]
     import stats  # type: ignore[no-redef]
@@ -835,8 +839,19 @@ def _plan_progress(root: Path, cfg: dict, plan_row: dict, board: str | None,
         if step_id:
             # Текст отчёта здесь не нужен: считаются вердикт и раздел находок.
             reviews[step_id] = _review(root, cfg, plan_id, step_id, limit=1)
-    return progress.plan(steps, plan_cards, runs, plan_row.get("closed") or [], now=now,
+    data = progress.plan(steps, plan_cards, runs, plan_row.get("closed") or [], now=now,
                          ui=_progress_settings(cfg), reviews=reviews)
+    # Блок «Ревью плана» (S7 плана 6): бюджет и эпоха — из тех же правил, что у стража,
+    # карточки — уже прочитанные выше, отчёт — `docs/reviews/plan-<N>.md`. Второго чтения
+    # борды и второго запуска движка не появляется: это запрет плана (6-plany-panel:265-266).
+    extra = plan_rounds.extra_fix_rounds(root, plan_id)
+    data["plan_review"] = plan_review_progress.build(
+        plan_id, plan_cards, runs, plan_rounds.budget(cfg, extra), extra,
+        plan_rounds.reset_at(root, plan_id),
+        # Имя отчёта ревью плана — `<план>-<шаг>.md` в каталоге отчётов: `plan-6.md`.
+        _review(root, cfg, "plan", plan_id, limit=1),
+        now if now is not None else time.time())
+    return data
 
 
 def _bullets(lines: list[str]) -> list[str]:
@@ -1442,10 +1457,16 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
     step_progress = progress.step(raw_cards, runs, weight_rows,
                                   closed=step in _closed_steps(root, cfg, plan),
                                   review=review, now=now)
+    # Блок «Ревью плана» для вкладки «Шаг»: карточки и прогоны плана уже прочитаны выше,
+    # поэтому второго запроса к борде нет — только сборка формы.
+    extra = plan_rounds.extra_fix_rounds(root, plan)
+    plan_review = plan_review_progress.build(
+        plan, plan_cards, plan_runs, plan_rounds.budget(cfg, extra), extra,
+        plan_rounds.reset_at(root, plan), _review(root, cfg, "plan", plan, cap), now)
     return {"ok": True, "plan": plan, "step": step, "title": contract.get("title") or "",
             "contract": contract, "prompt": prompt, "review": review,
             "commit": _git_show(root, review.get("commit") or "", cap),
-            "cards": step_cards, "progress": step_progress,
+            "cards": step_cards, "progress": step_progress, "plan_review": plan_review,
             "times": times, "stages": stages,
             "roles": _plan_roles(plan_cards, cfg, plan_runs, now),
             "step_roles": _step_roles(stages),
