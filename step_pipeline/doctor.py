@@ -185,6 +185,11 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
                                 f"({shown}) — hermes pipeline setup --upgrade")
             else:
                 notes.append("движок: копия совпадает с плагином")
+        # Лишние `.py` в каталоге движка — не дрейф и не в хеше (S7 0.27.0): вспомогательные
+        # скрипты проекта законны. Строка остаётся предупреждением, чтобы мусор был виден,
+        # но не поднимала код возврата и не запрещала обновление.
+        for name in setup_flow.engine_extra(project):
+            report.warnings.append(f"в каталоге движка лежит не-движковый файл: {name}")
     if not plans:
         notes.append("! ни одного плана — конвейеру нечего вести")
     db = proj.board_db(project, board or None)

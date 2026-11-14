@@ -110,6 +110,32 @@ class TestEngineDrift:
 
         assert engine_problems(report) == []
 
+    def test_extra_python_file_is_a_warning_not_a_problem(self, engine_project: Path):
+        """Лишний `.py` в каталоге движка — предупреждение, а не красный doctor (S7)."""
+        write_versions(engine_project)
+        setup_flow.write_engine_marker(engine_project)
+        (engine_project / ".pipeline" / "check_concurrent_pytest.py").write_text(
+            "print(1)\n", encoding="utf-8")
+
+        report = doctor.collect(engine_project, with_lint=False)
+
+        assert engine_problems(report) == []
+        assert "движок: копия совпадает с плагином" in engine_notes(report)
+        assert any("в каталоге движка лежит не-движковый файл: check_concurrent_pytest.py"
+                   in item for item in report.warnings)
+
+    def test_missing_engine_file_is_a_problem(self, engine_project: Path):
+        """Пропавший файл списка — проблема по имени файла (тик на такой копии встанет)."""
+        write_versions(engine_project)
+        setup_flow.write_engine_marker(engine_project)
+        (engine_project / ".pipeline" / "state_io.py").unlink()
+
+        report = doctor.collect(engine_project, with_lint=False)
+
+        problems = engine_problems(report)
+        assert len(problems) == 1, problems
+        assert "нет файла движка: state_io.py" in problems[0]
+
 
 class TestEngineDriftFunctions:
     def test_drift_lists_exact_files(self, engine_project: Path):
@@ -144,6 +170,31 @@ class TestEngineDriftFunctions:
     def test_marker_problem_of_clean_copy_is_empty(self, engine_project: Path):
         assert setup_flow.engine_marker_problem(engine_project) == ""
 
+    def test_extra_python_file_is_not_drift_and_not_in_marker(self, engine_project: Path):
+        """Свой скрипт проекта в `.pipeline/` — не файл движка (S7 0.27.0).
+
+        Прецедент раскатки 07.11.2026: три скрипта проверок в DoorSystem считались дрейфом,
+        а после их удаления не сходился маркер — doctor был красным при исправном движке.
+        """
+        setup_flow.write_engine_marker(engine_project)
+        for name in ("check_concurrent_pytest.py", "s3_import_check.py", "s3_proof.py"):
+            (engine_project / ".pipeline" / name).write_text("print(1)\n", encoding="utf-8")
+
+        assert setup_flow.engine_drift(engine_project) == []
+        assert setup_flow.engine_marker_problem(engine_project) == ""
+        assert setup_flow.engine_extra(engine_project) == [
+            "check_concurrent_pytest.py", "s3_import_check.py", "s3_proof.py"]
+
+    def test_missing_engine_file_is_named_in_marker_problem(self, engine_project: Path):
+        """Пропавший файл списка — проблема с именем файла, а не «движок изменён»."""
+        setup_flow.write_engine_marker(engine_project)
+        (engine_project / ".pipeline" / "state_io.py").unlink()
+
+        problem = setup_flow.engine_marker_problem(engine_project)
+
+        assert problem == "в копии нет файла движка: state_io.py"
+        assert "state_io.py" in setup_flow.engine_drift(engine_project)
+
     def test_marker_problem_matches_gate_verdict(self, engine_project: Path):
         """Семантика доктора и стража совпадает: маркер тот же, вывод — тот же."""
         import sys
@@ -175,6 +226,31 @@ def test_cli_doctor_exit_code_on_drift(engine_project: Path, capsys):
     assert code == 1
     assert "ИТОГ: ЕСТЬ ПРОБЛЕМЫ" in out
     assert "копия расходится с плагином" in out
+
+
+def test_cli_doctor_green_with_extra_python_file(engine_project: Path, capsys, monkeypatch):
+    """Лишний `.py` в `.pipeline/` не краснит `doctor`: код 0, `ИТОГ: OK`, строка `!`.
+
+    Это вторая половина шага S7: раньше такой файл давал «копия расходится с плагином»
+    и `upgrade` не проходил; теперь он предупреждение, а не проблема. Доверие и ключи
+    профилей подменены согласием — иначе `doctor` красный по причине, к дрейфу не
+    относящейся (фикстура поднимает пустой каталог профилей).
+    """
+    from step_pipeline import cli
+
+    monkeypatch.setattr(setup_flow, "is_project_trusted", lambda role, path: True)
+    monkeypatch.setattr(setup_flow, "has_saved_credential", lambda role: (True, "demo"))
+    write_versions(engine_project)
+    setup_flow.write_engine_marker(engine_project)
+    (engine_project / ".pipeline" / "helper.py").write_text("print(1)\n", encoding="utf-8")
+
+    code = cli.cmd_doctor(SimpleNamespace(project=str(engine_project), plan=""))
+
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "ИТОГ: OK" in out
+    assert "копия расходится с плагином" not in out
+    assert "! в каталоге движка лежит не-движковый файл: helper.py" in out
 
 
 def test_drift_is_not_reported_for_preview(project: Path, monkeypatch, tmp_path: Path):

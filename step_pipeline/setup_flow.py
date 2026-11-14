@@ -27,15 +27,17 @@ try:
     from . import plan_lint
     from . import project as proj
     from . import telegram
+    from .engine import config as engine_config
 except ImportError:  # pragma: no cover - запуск файлом при отладке
     import plan_lint  # type: ignore
     import project as proj  # type: ignore
     import telegram  # type: ignore
+    import config as engine_config  # type: ignore
 
-ENGINE_FILES = ("__init__.py", "config.py", "registry.py", "next_step.py", "gate.py",
-                "step_card.py", "check_task_prompt.py", "scout_report.py", "plan_cycle.py",
-                "approval.py", "tick.py", "analyze.py",
-                "state_io.py")
+#: Список файлов движка — один на весь конвейер: живёт в движке (`engine/config.py`),
+#: потому что движок копируется в проект и обязан работать без плагина. Мастер установки
+#: берёт его оттуда, чтобы список не разъехался с содержимым каталога (S7).
+ENGINE_FILES = engine_config.ENGINE_FILES
 #: Маркер целостности: хеш содержимого движка, а не только номер версии.
 #: Без него копия в проекте может молча разойтись с плагином при равном VERSION
 #: (прецедент 02.11.2026: 527 строк разницы в gate.py при 0.2.0 у обоих).
@@ -45,13 +47,21 @@ ROLES_BACKUP = ".pipeline/roles-backup"
 
 
 def engine_digest(base) -> str:
-    """sha256 по всем .py движка: имя + байты, стабильный порядок."""
+    """sha256 по файлам движка из `ENGINE_FILES`: имя + байты, стабильный порядок.
+
+    Ровно файлы движка, а не все `*.py` каталога: вспомогательный скрипт проекта в
+    `.pipeline/` (прецедент DoorSystem, раскатка 07.11.2026) не должен менять маркер.
+    Семантика обязана совпадать со `gate.engine_digest` — согласие стережёт тест.
+    """
     import hashlib as _hashlib
     from pathlib import Path as _Path
 
     digest = _hashlib.sha256()
-    for path in sorted(_Path(base).glob("*.py")):
-        digest.update(path.name.encode("utf-8"))
+    for name in sorted(ENGINE_FILES):
+        path = _Path(base) / name
+        if not path.is_file():
+            continue
+        digest.update(name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
@@ -310,6 +320,7 @@ def engine_marker_problem(project: Path) -> str:
     Семантика та же, что у `gate.verify_engine_integrity`: маркера нет — легаси-установка,
     это не поломка (тик на ней работает); маркер есть и не сходится — поломка, при которой
     тик отказывается работать (код 3), поэтому в отчёте это проблема, а не заметка.
+    Пропавший файл движка называется по имени — так же, как у стража.
     """
     base = Path(project) / ".pipeline"
     marker = base / ENGINE_MARKER
@@ -322,6 +333,9 @@ def engine_marker_problem(project: Path) -> str:
     expected = text.split()[0].removeprefix("sha256:") if text else ""
     if not expected:
         return "маркер целостности пуст"
+    missing = [name for name in sorted(ENGINE_FILES) if not (base / name).is_file()]
+    if missing:
+        return f"в копии нет файла движка: {missing[0]}"
     actual = engine_digest(base)
     if actual != expected:
         return f"движок изменён после установки: {actual[:12]} != {expected[:12]}"
@@ -333,13 +347,15 @@ def engine_drift(project: Path) -> list[str]:
 
     Нужен doctor'у: прецедент 02.11.2026 — копия и плагин с одинаковым VERSION несли
     разную логику. Сверка по байтам ловит это без запуска тика, ещё до стопа стража.
+
+    Сверяются только имена `ENGINE_FILES`: вспомогательные `.py` проекта в `.pipeline/`
+    (скрипты проверок) — не дрейф движка, о них отдельно говорит `engine_extra`.
     """
     base = Path(project) / ".pipeline"
     if not base.is_dir():
         return []
-    names = {path.name for path in base.glob("*.py")} | set(ENGINE_FILES)
     drift = []
-    for name in sorted(names):
+    for name in sorted(ENGINE_FILES):
         mine = proj.ENGINE_SRC / name
         theirs = base / name
         if not mine.is_file() or not theirs.is_file():
@@ -347,6 +363,22 @@ def engine_drift(project: Path) -> list[str]:
         elif mine.read_bytes() != theirs.read_bytes():
             drift.append(name)
     return drift
+
+
+def engine_extra(project: Path) -> list[str]:
+    """Лишние `.py` в каталоге движка проекта: не файлы движка, но и не дрейф.
+
+    Вспомогательный скрипт проекта (прецедент DoorSystem, раскатка 07.11.2026) в хеш и
+    в дрейф не входит — иначе doctor вечно красный, а upgrade его удаление не лечит.
+    Называем список отдельным предупреждением: мусор в каталоге движка виден, но тик
+    из-за него не встаёт.
+    """
+    base = Path(project) / ".pipeline"
+    if not base.is_dir():
+        return []
+    known = set(ENGINE_FILES)
+    return sorted(path.name for path in base.glob("*.py")
+                  if path.name not in known and path.is_file())
 
 
 def hermes_home() -> Path:

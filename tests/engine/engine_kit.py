@@ -22,10 +22,9 @@ KIT = Path(__file__).resolve().parents[2]
 ENGINE = KIT / "step_pipeline" / "engine"
 sys.path.insert(0, str(ENGINE))
 
-ENGINE_FILES = ("config.py", "registry.py", "next_step.py", "gate.py",
-                "step_card.py", "check_task_prompt.py", "scout_report.py", "plan_cycle.py",
-                "approval.py", "tick.py", "analyze.py",
-                "__init__.py", "state_io.py")
+# Список файлов движка — из движка, не копией (план 7, S7): копия в тестах отставала бы
+# ровно так же, как отставал список в мастере установки.
+from config import ENGINE_FILES  # noqa: E402  (импорт после правки sys.path)
 
 PLAN = """# 1. Демо-план конвейера
 

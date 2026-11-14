@@ -59,6 +59,20 @@ def step(gate: str, files: str = "`tests/test_x.py`",
     return "\n".join([f"- Файл: {files}", f"- Тесты/гейты: `{gate}`", f"- Готово = {ready}"])
 
 
+def step_raw(gates: str, files: str = "`tests/test_x.py`",
+             ready: str = "гейт отработал", work: str = "") -> str:
+    """Шаг, у которого пункт гейтов задан как есть: несколько команд и флагов в строке.
+
+    `step` заворачивает команду в обратные кавычки целиком — для строки с несколькими
+    фрагментами это дало бы один «команду»-франкенштейн, поэтому такие случаи пишутся
+    напрямую (D12: правила смотрят на каждый фрагмент отдельно).
+    """
+    lines = [f"- Файл: {files}", f"- Тесты/гейты: {gates}", f"- Готово = {ready}"]
+    if work:
+        lines.insert(2, f"- Работа: {work}")
+    return "\n".join(lines)
+
+
 def write_draft(project, step_text: str, plan: str = "2"):
     """Черновик плана в `docs/plans/drafts/<plan>-demo.md` текстом `PLAN_HEAD.format(step=…)`.
 
@@ -192,6 +206,131 @@ def test_unicode_path_intact(project, capsys, quiet_snapshot):
     assert gate_codes(out) == ["A7"]
     assert ("путь не существует и не объявлен: "
             "`docs/research/2-разведка-ё-prior-art.md`") in out
+
+
+def test_duplicate_path_reported_once(project, capsys, quiet_snapshot):
+    """Дедуп (D12, п.2): один путь дважды на строке шага — одна находка, не две.
+
+    Живой случай плана 34: `dist/index.html` встречался в строке четыре раза, и каждая
+    копия была отдельной строкой A7 — предупреждений становилось вчетверо больше правды.
+    """
+    gates = ("`grep -o 'data-section=' dist/index.html | wc -l` → 6; "
+             "`grep -o 'data-reveal=' dist/index.html | wc -l` → 6")
+    write_draft(project, step_raw(gates))
+
+    assert plan_check(project) == 0
+    out = capsys.readouterr().out
+    assert gate_codes(out) == ["A7"]
+    assert out.count("путь не существует и не объявлен: `dist/index.html`") == 1
+
+
+def test_non_path_tokens_silent(project, capsys, quiet_snapshot):
+    """Токен-не-путь (D12, п.1): флаг, `--ключ=значение`, подстановка, адрес пакета.
+
+    Флаг сам по себе путём не является, значение флага с `=` — не файл дерева,
+    `${HOME}/dist` — подстановка, `@scope/pkg@ver` — спецификация npm.
+    """
+    gates = ("`node s.mjs --screenshot=docs/shots/a.png`; `${HOME}/dist`; "
+             "`@scope/pkg@1.2.3`; `python -m pytest --no-color -q`")
+    write_draft(project, step_raw(gates))
+
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == []
+
+
+def test_cd_sets_step_directory(project, capsys, quiet_snapshot):
+    """Рабочий каталог шага (D12, п.3): `cd landing` переносится на следующую команду.
+
+    План 34 пишет `node scripts/build.mjs` там, где скрипт лежит в `landing/scripts/`, и
+    помечает «там же, из `landing`». От корня проекта такого файла нет.
+    """
+    (project / "landing" / "scripts").mkdir(parents=True)
+    (project / "landing" / "scripts" / "build.mjs").write_text("", encoding="utf-8")
+    gates = "`cd landing && node scripts/build.mjs` → 0 ошибок"
+
+    # объявлен как `landing/scripts/...` — молчание
+    write_draft(project, step_raw(gates, files="`landing/scripts/build.mjs`"))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == []
+
+    # без объявления путь находится только прочтением от каталога шага
+    write_draft(project, step_raw(gates))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == []
+
+    # а без `cd` тот же путь не находится ни в одном прочтении — A7
+    write_draft(project, step_raw("`node scripts/build.mjs` → 0 ошибок"))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == ["A7"]
+
+
+def test_ready_mention_declares_path(project, capsys, quiet_snapshot):
+    """Объявления шире «Файл:» (D12, п.5): «Готово» объявляет путь наравне с «Файл:».
+
+    План 34 проверяет сборку `dist/index.html` гейтом, а объявляет её в «Готово =
+    страница собирается в dist/index.html»: файла до шага нет, и A7 тут ложен.
+    """
+    gates = "`cd landing && grep -o data-section dist/index.html | wc -l` → 6"
+    ready = "страница собирается в dist/index.html"
+    (project / "landing").mkdir()
+
+    write_draft(project, step_raw(gates, ready=ready))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == []
+
+    # без упоминания в «Готово» тот же гейт — A7
+    write_draft(project, step_raw(gates))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == ["A7"]
+
+
+def test_glob_declaration_covers_prefix(project, capsys, quiet_snapshot):
+    """Глоб-хвост объявляет свой каталог (D12, п.5): `docs/x/**` покрывает `../docs/x`."""
+    (project / "landing").mkdir()
+    gates = "`cd landing && node s.mjs --dir ../docs/x` → 0 расхождений"
+
+    write_draft(project, step_raw(gates, files="`docs/x/**`"))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == []
+
+    write_draft(project, step_raw(gates, files="`tests/test_x.py`"))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == ["A7"]
+
+
+def test_work_mention_declares_path(project, capsys, quiet_snapshot):
+    """Путь, объявленный только в «Работа», находкой не становится (D12, п.5)."""
+    (project / "tests").mkdir()
+    gates = "`python -m pytest build/tests -q` → 3 passed"
+
+    write_draft(project, step_raw(gates, work="тесты переезжают в build/tests"))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == []
+
+    write_draft(project, step_raw(gates))
+    assert plan_check(project) == 0
+    assert gate_codes(capsys.readouterr().out) == ["A7"]
+
+
+def test_real_missing_test_still_found(project, capsys, quiet_snapshot):
+    """Правила не глушат настоящую находку: отсутствующего теста ровно одна A7."""
+    (project / "tests").mkdir()
+    write_draft(project, step_raw("`python -m pytest tests/нет_такого.py -q` → 3 passed"))
+
+    assert plan_check(project) == 0
+    out = capsys.readouterr().out
+    assert gate_codes(out) == ["A7"]
+    assert "путь не существует и не объявлен: `tests/нет_такого.py`" in out
+
+
+def test_broken_cd_still_single_finding(project, capsys, quiet_snapshot):
+    """`cd` в несуществующий каталог — по-прежнему одна A8 (D12, п.3)."""
+    write_draft(project, step_raw("`cd нет_такого && ls` → 1 файл"))
+
+    assert plan_check(project) == 0
+    out = capsys.readouterr().out
+    assert gate_codes(out) == ["A8"]
+    assert "cd в несуществующий каталог: `нет_такого`" in out
 
 
 def test_no_gates_block_degrades(project, capsys, monkeypatch, quiet_snapshot):

@@ -20,11 +20,24 @@
     A4  нет раздела «Разведка» у плана действующего формата
     A5  ссылка на несуществующий файл: тот же скан, что у A2, но файла в дереве нет и
         ни один шаг его не объявляет; A2 и A5 взаимоисключающие по построению
-    A6  каталог вывода не создан: гейт пишет в каталог, которого нет в дереве и который
-        шаг не создаёт
+    A6  каталог вывода не создан: гейт пишет в каталог, которого нет в дереве, шаг его не
+        создаёт `mkdir` и он не объявлен («Файл:», «Работа», «Готово»)
     A7  путь не существует и не объявлен: путь команды гейта отсутствует в дереве и ни в
-        одном «Файл:»
+        одном «Файл:», «Работа» или «Готово»
     A8  cd в несуществующий каталог: команда гейта начинается с cd туда, где пусто
+        (объявленный каталог молчит, как у A6)
+
+Правила A6-A8 (D12, шаг 7-S7) — чтобы пред-гейт не шумел на живых планах:
+
+    1. не пути: флаги CLI, присваивания и подстановки (`X=…`, `${HOME}/dist`), адреса
+       пакетов (`@scope/pkg@ver`), плейсхолдеры (`<n>`, `…`), хвосты оболочки, глобы;
+    2. дедуп: повтор пути на той же строке шага печатается один раз;
+    3. рабочий каталог шага: `cd landing` переносится на следующие сегменты команды и на
+       следующие команды шага; цель выше корня каталог не задаёт;
+    4. два прочтения: путь проверяется от каталога шага и от корня проекта — находка
+       только если не сошёлся ни в одном;
+    5. объявления: путь из «Файл:», плюс упоминание в «Работе» и «Готово»; хвост-маска
+       (`<n>`, `**`) объявляет свой каталог-префикс.
 
 Запуск:
 
@@ -49,6 +62,7 @@
 from __future__ import annotations
 
 import argparse
+import posixpath
 import re
 import sys
 from dataclasses import dataclass
@@ -98,6 +112,14 @@ SEPARATOR_RE = re.compile(r"[;&|<>#]")
 ABSOLUTE_RE = re.compile(r"^(?:/|[A-Za-z]:)")
 #: Глоба: существование по маске одной командой не проверяется (D4).
 GLOB_MARKS = ("*", "?")
+#: Признаки «не путь» в токене команды (D12, п.1 шага): присваивание и подстановка
+#: (`X=…`, `${HOME}/dist`), адрес пакета (`@scope/pkg@ver`), плейсхолдер (`<n>`, `…`),
+#: кавычка внутри токена. Ни один из них не файл дерева, поэтому A6-A8 их не смотрят.
+NON_PATH_MARKS = ("=", "$", "{", "}", "@", "<", ">", "`", '"', "…", "«", "»")
+#: Разделители команд внутри одного фрагмента в обратных кавычках (`cd landing && …`).
+SEGMENT_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
+#: Пункты, упоминание пути в которых считается объявлением (D12, п.5).
+DECLARE_HEADS = ("работа", "готово")
 
 
 @dataclass(frozen=True)
@@ -431,26 +453,134 @@ def _command_paths(command: str) -> tuple[list[str], list[str], list[str]]:
 
 
 def _gate_path(token: str) -> str:
-    """Путь токена для A6-A8; `""` — не проверяется (D4, D11).
+    """Путь токена для A6-A8; `""` — не проверяется (D4, D11, D12).
 
-    Абсолютные пути (`/…`, `X:…`), адреса и глобы молчат: первый — дерево автора
-    плана, второй не файл, третий не проверяется одной командой.
+    Молчат: абсолютные пути (`/…`, `X:…`) — дерево автора плана; адреса и глобы — не один
+    файл; флаги CLI (`-o`, `--output-path=…`) — значение флага разбирается отдельно, а сам
+    флаг путём не является; присваивания и подстановки (`X=…`, `${HOME}/dist`), адреса
+    пакетов (`@scope/pkg@ver`), плейсхолдеры (`<n>`, `…`) и хвосты оболочки — не файлы
+    дерева. Прецедент плана 34: без этой проверки три четверти находок A7 были шумом.
     """
     value = _clean_path(token)
-    if not value or _is_link(value) or ABSOLUTE_RE.match(value):
+    if not value or value.startswith("-") or _is_link(value) or ABSOLUTE_RE.match(value):
         return ""
-    if any(mark in value for mark in GLOB_MARKS):
+    if any(mark in value for mark in GLOB_MARKS + NON_PATH_MARKS):
         return ""
     return value
 
 
+def _glob_prefix(path: str) -> str:
+    """Каталог-префикс объявления с маской: `docs/x/**` → `docs/x` (D12, п.5).
+
+    Хвост от первого символа маски (`<n>`, `**`, `{a,b}`) отбрасывается: объявлением
+    такого пути считается его каталог — именно туда пишут команды с плейсхолдером.
+    """
+    marks = GLOB_MARKS + ("{", "[", "<")
+    cuts = [path.find(mark) for mark in marks if mark in path]
+    if not cuts:
+        return path
+    return path[:min(cuts)].rstrip("/")
+
+
 def _declared_dirs(declared: set[str]) -> set[str]:
-    """Каталоги, под которыми объявлен путь: `tests` при объявленном `tests/test_x.py` (D6)."""
+    """Каталоги, под которыми объявлен путь: `tests` при объявленном `tests/test_x.py` (D6).
+
+    У объявления с маской (`docs/x/**`) объявленным считается каталог-префикс и все его
+    родители (D12, п.5).
+    """
     out: set[str] = set()
     for path in declared:
-        parts = path.split("/")
-        for pos in range(1, len(parts)):
+        prefix = _glob_prefix(path)
+        parts = prefix.split("/") if prefix else []
+        for pos in range(1, len(parts) + 1):
             out.add("/".join(parts[:pos]))
+    return out
+
+
+def _join(base: str, value: str) -> str:
+    """Путь `value` относительно каталога `base` (`""` — корень проекта), нормализованный."""
+    joined = f"{base}/{value}" if base else value
+    norm = posixpath.normpath(joined)
+    return "" if norm == "." else norm
+
+
+def _readings(value: str, cwd: str) -> list[str]:
+    """Два прочтения пути: от корня проекта и от рабочего каталога шага (D12, п.4).
+
+    В плане путь пишут и от корня (`landing/dist/index.html`), и от каталога, в который
+    шаг переходит (`cd landing` + `dist/index.html`). Проверяются оба: находка — только
+    если путь не сошёлся ни в одном прочтении, иначе A7 шумит на верных планах.
+    """
+    out: list[str] = []
+    for candidate in (_join("", value), _join(cwd, value) if cwd else ""):
+        if candidate and candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def _declared_ok(value: str, cwd: str, declared: set[str], dirs: set[str], root: Path) -> bool:
+    """Путь есть в дереве или объявлен хотя бы в одном прочтении (D12, пп.4-5)."""
+    for candidate in _readings(value, cwd):
+        flat = candidate.rstrip("/")
+        if candidate in declared or flat in declared or flat in dirs:
+            return True
+        if _exists(flat, root):
+            return True
+    return False
+
+
+def _step_cwd(value: str, cwd: str, root: Path) -> str:
+    """Новый рабочий каталог шага после `cd value` (D12, п.3).
+
+    Сначала цель читается от текущего каталога шага; не сошлась — от корня проекта:
+    в плане `cd landing` повторяют в каждой команде одного шага, имея в виду каталог от
+    корня (`cd landing && …` дважды — не `landing/landing`). Цель, которой нет ни в одном
+    прочтении, каталог не меняет: про неё уже сказал A8, а следующий шаг работал бы в
+    каталоге, которого не существует.
+    """
+    for candidate in (_join(cwd, value), _join("", value)):
+        if candidate and not candidate.startswith("..") and _exists(candidate, root):
+            return candidate
+    return cwd
+
+
+def _raw_paths(text: str) -> list[str]:
+    """Пути из сырого текста пункта — не только в обратных кавычках (D12, п.5).
+
+    Так пишут «Готово» и «Работу»: `собирается в dist/index.html`, `лиды в
+    var/landing/leads.jsonl`. Возвращаются и пути с маской — их каталог тоже объявлен.
+    """
+    out: list[str] = []
+    for token in text.replace("`", " ").split():
+        value = _token(token)
+        if not value or value.startswith("-") or _is_link(value) or ABSOLUTE_RE.match(value):
+            continue
+        if any(mark in value for mark in NON_PATH_MARKS):
+            continue
+        if "/" not in value and "." not in value:
+            continue
+        cleaned = _clean_path(value)
+        if cleaned and cleaned not in out:
+            out.append(cleaned)
+    return out
+
+
+def _step_declarations(lines: list[str], heading: int, body_end: int) -> list[str]:
+    """Пути из пунктов «Работа:» и «Готово =» тела шага — тоже объявления (D12, п.5).
+
+    Пункт «Файл:» — не единственное объявление: шаг по-русски пишет, что и куда собирает,
+    и гейт по этому же пути потом читает. Строки-продолжения наследуют метку пункта,
+    пустые строки её не сбрасывают — разбор тот же, что у `next_step.section_blocks`.
+    """
+    out: list[str] = []
+    inside = False
+    for idx in range(heading + 1, body_end):
+        line = lines[idx]
+        if next_step._BULLET_RE.match(line):
+            head = line.lstrip().lstrip("-*+0123456789.) \t").lstrip("*").strip().lower()
+            inside = head.startswith(DECLARE_HEADS)
+        if inside:
+            out += _raw_paths(line)
     return out
 
 
@@ -481,19 +611,35 @@ def _mkdir_dirs(lines: list[str], heading: int, body_end: int) -> set[str]:
 
 def _gate_path_findings(lines: list[str], spans: list[tuple[str, int, int]],
                         declared: set[str], root: Path) -> list[Finding]:
-    """A6-A8: путь вывода, путь ввода и цель `cd` в пунктах гейтов шага (D4-D6, D11).
+    """A6-A8: путь вывода, путь ввода и цель `cd` в пунктах гейтов шага (D4-D6, D11, D12).
 
     Область — только пункты гейтов: метка ведётся как в `_path_findings` (продолжение
     строки наследует метку), проверяются метки `тест`/`гейт`/`проверк` — те же три, по
     которым `next_step` собирает `Step.gates`. Единица разбора — команда в обратных
-    кавычках; путь вывода проверяет только A6, путь ввода — только A7, поэтому классы
-    не пересекаются. Порядок находок не сортируется: это делает `_findings`.
+    кавычках, внутри команды — сегменты по `&&`, `||`, `;`, `|`: рабочий каталог шага
+    (`cd landing`, D12 п.3) переносится на следующие сегменты и команды шага, а путь
+    проверяется в двух прочтениях — от каталога шага и от корня (п.4). Порядок находок
+    не сортируется: это делает `_findings`. Повтор пути на той же строке шага не
+    печатается дважды (п.2).
     """
-    dirs = _declared_dirs(declared)
+    known = set(declared)
+    for _sid, heading, body_end in spans:
+        known.update(_step_declarations(lines, heading, body_end))
+    dirs = _declared_dirs(known)
     out: list[Finding] = []
+    seen: set[tuple[int, str, str]] = set()          # (строка, шаг, путь) — дедуп (п.2)
+
+    def report(code: str, line: int, sid: str, value: str, message: str) -> None:
+        key = (line, sid, value)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(Finding(code, line, sid, message))
+
     for sid, heading, body_end in spans:
         made = _mkdir_dirs(lines, heading, body_end)
         label = ""
+        cwd = ""                                     # рабочий каталог шага, "" — корень
         for idx in range(heading + 1, body_end):
             line = lines[idx]
             mark = _bullet_label(line)
@@ -502,41 +648,39 @@ def _gate_path_findings(lines: list[str], spans: list[tuple[str, int, int]],
             if not label.startswith(GATE_LABELS):
                 continue
             for command in next_step._backticks(line):
-                outputs, inputs, targets = _command_paths(command)
-                for path in outputs:
-                    value = _gate_path(path)
-                    if not value or "/" not in value:
-                        continue                   # `> out.log` каталога не называет
-                    folder = value.rsplit("/", 1)[0] + "/"
-                    if _exists(folder, root) or folder[:-1] in dirs:
-                        continue
-                    if any(arg == folder[:-1] or arg.startswith(folder) for arg in made):
-                        continue                   # каталог создан в этом же шаге
-                    out.append(Finding(
-                        "A6", idx + 1, sid,
-                        f"каталог вывода не создан: `{folder}` — гейт пишет в `{value}`, "
-                        f"а каталога нет в дереве и шаг его не создаёт"))
-                for path in inputs:
-                    value = _gate_path(path)
-                    if not value or value in declared or value.rstrip("/") in dirs:
-                        continue
-                    if _exists(value, root):
-                        continue
-                    out.append(Finding(
-                        "A7", idx + 1, sid,
-                        f"путь не существует и не объявлен: `{value}` — файла нет в дереве "
-                        f"и ни один шаг его не объявляет"))
-                for target in targets:
-                    value = _gate_path(target)
-                    if not value or value.rstrip("/") in dirs:
-                        continue
-                    if _exists(value, root):
-                        continue
-                    out.append(Finding(
-                        "A8", idx + 1, sid,
-                        f"cd в несуществующий каталог: `{value}` — команда гейта "
-                        f"не выполнится"))
+                for segment in SEGMENT_SPLIT_RE.split(command):
+                    outputs, inputs, targets = _command_paths(segment)
+                    for path in outputs:
+                        value = _gate_path(path)
+                        if not value or "/" not in value:
+                            continue               # `> out.log` каталога не называет
+                        for candidate in _readings(value, cwd):
+                            folder = candidate.rsplit("/", 1)[0] + "/"
+                            if _exists(folder, root) or folder[:-1] in dirs:
+                                continue
+                            if any(arg == folder[:-1] or arg.startswith(folder) for arg in made):
+                                continue       # каталог создан в этом же шаге
+                            report("A6", idx + 1, sid, value,
+                                   f"каталог вывода не создан: `{folder}` — гейт пишет в "
+                                   f"`{value}`, а каталога нет в дереве и шаг его не создаёт")
+                    for path in inputs:
+                        value = _gate_path(path)
+                        if not value or _declared_ok(value, cwd, known, dirs, root):
+                            continue
+                        report("A7", idx + 1, sid, value,
+                               f"путь не существует и не объявлен: `{value}` — файла нет в "
+                               f"дереве и ни один шаг его не объявляет")
+                    for target in targets:
+                        value = _gate_path(target)
+                        if not value:
+                            continue
+                        if not _declared_ok(value, cwd, known, dirs, root):
+                            report("A8", idx + 1, sid, value,
+                                   f"cd в несуществующий каталог: `{value}` — команда гейта "
+                                   f"не выполнится")
+                        cwd = _step_cwd(value, cwd, root)   # каталог шага (п.3)
     return out
+
 
 
 def _research_dir(cfg: config_mod.Config, root: Path) -> Path:

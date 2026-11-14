@@ -107,10 +107,20 @@ ENGINE_MARKER = "ENGINE.sha256"
 
 
 def engine_digest(base: Path) -> str:
-    """sha256 по содержимому всех .py движка: имя + байты, порядок стабилен."""
+    """sha256 по содержимому файлов движка из `ENGINE_FILES`: имя + байты, порядок стабилен.
+
+    Хешируются ровно файлы движка, а не все `*.py` каталога: в `.pipeline/` проекта
+    законно лежат вспомогательные скрипты (свой `check_*.py`, проверки), и раньше их
+    появление меняло хеш — маркер «расходился» без единой правки движка, а удаление
+    скрипта роняло тик (раскатка 07.11.2026 в DoorSystem). Пропущенный файл списка
+    здесь не ошибка: о нём отдельно говорит `verify_engine_integrity`.
+    """
     digest = hashlib.sha256()
-    for path in sorted(Path(base).glob("*.py")):
-        digest.update(path.name.encode("utf-8"))
+    for name in sorted(config_mod.ENGINE_FILES):
+        path = Path(base) / name
+        if not path.is_file():
+            continue
+        digest.update(name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
@@ -118,7 +128,12 @@ def engine_digest(base: Path) -> str:
 
 
 def verify_engine_integrity(base: Path) -> tuple[bool, str]:
-    """Сверить движок с маркером. Маркера нет — легаси-установка, не мешаем."""
+    """Сверить движок с маркером. Маркера нет — легаси-установка, не мешаем.
+
+    Порядок проверок — от дешёвой к дорогой: пустой маркер, пропавший файл движка,
+    затем хеш. Пропавший файл называется по имени: «движок изменён» на вопрос «почему
+    тик не идёт» не отвечает.
+    """
     marker = Path(base) / ENGINE_MARKER
     if not marker.is_file():
         return True, "маркер целостности отсутствует (легаси-установка)"
@@ -127,9 +142,13 @@ def verify_engine_integrity(base: Path) -> tuple[bool, str]:
     except OSError as exc:
         return False, f"маркер не читается: {exc}"
     expected = text.split()[0].removeprefix("sha256:") if text else ""
-    actual = engine_digest(base)
     if not expected:
         return False, "маркер пуст"
+    missing = [name for name in sorted(config_mod.ENGINE_FILES)
+               if not (Path(base) / name).is_file()]
+    if missing:
+        return False, f"нет файла движка: {missing[0]}"
+    actual = engine_digest(base)
     if actual != expected:
         return False, (f"движок изменён после установки: {actual[:12]} != {expected[:12]}")
     return True, "движок соответствует маркеру"
