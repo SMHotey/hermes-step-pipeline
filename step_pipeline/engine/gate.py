@@ -494,6 +494,17 @@ def append_journal_row(p: Paths, step_id: str, title: str, commit: str, evidence
     return True
 
 
+def _git_ignored(p: Paths, rel: str) -> bool:
+    """Путь не отслеживается git (`.gitignore`): `git check-ignore -q` вернул 0.
+
+    Нужен коммиту шага: отчёт ревью лежит в `docs/reviews/`, а этот каталог проект держит
+    вне репозитория. Раньше `git add` на такой путь возвращал 1, и коммит шага навсегда
+    оставался в `pending_commit` — журнальная строка не попадала в git никогда.
+    """
+    result = _run(["git", "check-ignore", "-q", "--", rel], p.repo)
+    return result.returncode == 0
+
+
 def commit_and_push(p: Paths, files: list[str], message: str) -> tuple[bool, str]:
     """Закоммитить ТОЛЬКО перечисленные файлы; чужие правки в индексе остаются в индексе."""
     if not p.cfg.git_commit:
@@ -505,6 +516,15 @@ def commit_and_push(p: Paths, files: list[str], message: str) -> tuple[bool, str
     strangers = [d for d in dirty if d.replace("\\", "/") not in allowed]
     if strangers:
         print("[commit] в дереве чужие правки — не трогаю: " + ", ".join(strangers[:5]))
+    # Игнорируемые файлы (например `docs/reviews/` в `.gitignore`) не ошибка: `git add` на
+    # такой путь возвращает 1, и раньше это навсегда вешало коммит шага в `pending_commit`.
+    # Отчёт ревью живёт вне репозитория по решению проекта — коммитим только то, что git
+    # действительно отслеживает.
+    tracked = [f for f in files if not _git_ignored(p, f)]
+    if not tracked:
+        sha = _run(["git", "rev-parse", "--short", "HEAD"], p.repo).stdout.strip()
+        return True, f"нечего коммитить: своих отслеживаемых изменений нет (HEAD {sha})"
+    files = tracked
     add = _run(["git", "add", "--", *files], p.repo)
     if add.returncode != 0:
         return False, f"git add: {add.stderr.strip()[:200]}"

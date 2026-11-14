@@ -104,6 +104,47 @@ def test_nothing_to_commit_is_success(tmp_path: Path) -> None:
     assert staged(root) == ["stranger.txt"]
 
 
+def test_ignored_report_does_not_block_plan_commit(tmp_path: Path) -> None:
+    """Отчёт ревью в игнорируемом каталоге не мешает коммиту журнала шага.
+
+    Живой дефект: `close_step` коммитит `[журнал плана, отчёт ревью]`, а `docs/reviews/`
+    стоит в `.gitignore`. `git add` на игнорируемый путь возвращает 1, и коммит шага
+    навсегда оставался в `pending_commit`: журнальная строка не попадала в git, а каждый
+    тик печатал «в дереве чужие правки». Тест держит оба конца: журнал попадает в коммит,
+    отчёт остаётся вне репозитория и не ломает результат.
+    """
+    root = make_repo(tmp_path)
+    (root / ".gitignore").write_text("docs/reviews/\n", encoding="utf-8")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-m", "ignore: отчёты ревью вне git")
+    (root / REPORT_REL).parent.mkdir(parents=True, exist_ok=True)
+    (root / REPORT_REL).write_text("# ревью\n", encoding="utf-8")
+    touch_plan(root)
+
+    ok, detail = gate.commit_and_push(paths(root), [PLAN_REL, REPORT_REL], MSG)
+
+    assert ok is True, detail
+    assert head_files(root) == [PLAN_REL], "в коммит попал игнорируемый отчёт"
+    assert git(root, "status", "--porcelain", "--", PLAN_REL) == "", "журнал не закоммичен"
+
+
+def test_only_ignored_files_means_nothing_to_commit(tmp_path: Path) -> None:
+    """Один игнорируемый файл в списке — успех «нечего коммитить», а не отказ."""
+    root = make_repo(tmp_path)
+    (root / ".gitignore").write_text("docs/reviews/\n", encoding="utf-8")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-m", "ignore: отчёты ревью вне git")
+    (root / REPORT_REL).parent.mkdir(parents=True, exist_ok=True)
+    (root / REPORT_REL).write_text("# ревью\n", encoding="utf-8")
+    count_before = commit_count(root)
+
+    ok, detail = gate.commit_and_push(paths(root), [REPORT_REL], MSG)
+
+    assert ok is True, detail
+    assert "нечего коммитить" in detail
+    assert commit_count(root) == count_before
+
+
 def test_second_call_after_commit_makes_no_new_commit(tmp_path: Path) -> None:
     root = make_repo(tmp_path)
     touch_plan(root)
