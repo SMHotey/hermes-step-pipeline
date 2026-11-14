@@ -6,10 +6,11 @@
 постановки — конвейер вставал на формальном расхождении (инцидент 09.11.2026, план 29
 шаг R1-C: 8.5 часа простоя).
 
-Правило после правки: расхождение отметок — стоп, НО если текст постановки на коммите
-из отчёта совпадает с текущим файлом или обе отметки указывают на один коммит, вердикт
-принимается. Подмены нет: вердикт, написанный про переписанную постановку, находит на
-своём коммите другой текст и по-прежнему останавливает конвейер.
+Правило после правки: расхождение отметок не останавливает конвейер — страж заказывает
+пересборку постановки (`:promptfix-stale:`) и повторное ревью. Ветка «не про эту версию»
+остаётся только там, где сверять нечего: в отчёте нет строки `recon_commit:`. Приём
+формальной путаницы отметок — по тексту постановки или по одному коммиту — сохранён:
+вердикт, написанный про ту же редакцию, шаг не тормозит.
 """
 from __future__ import annotations
 
@@ -196,22 +197,24 @@ def test_short_marker_of_prompt_commit_keeps_the_pipeline_moving(stale):
     assert "planloop:1:S1:step" in {card["key"] for card in cards(db)}
 
 
-def test_marker_of_revision_with_other_text_stops(stale):
-    """Отметка коммита, где постановка была другой, — честный стоп «не про эту версию»."""
+def test_marker_of_revision_with_other_text_rebuilds(stale):
+    """Отметка коммита, где постановка была другой, — пересборка постановки, а не стоп."""
     root, p, db, sha = stale
     gate.run_gate(p, execute=True, notify_fn=quiet)
     complete(db, ":promptreview")
     write_report(root, "APPROVE", sha["draft"])
 
-    stopped = gate.run_gate(p, execute=True, notify_fn=quiet)
-    assert stopped["decision"]["action"] == "stop", stopped["decision"]
-    assert "не про эту версию" in stopped["detail"]
+    rebuilt = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert rebuilt["decision"]["action"] == "create_prompt_fix", rebuilt["decision"]
+    assert rebuilt["decision"]["stale"] is True
+    assert rebuilt["decision"]["rebuild"] == 1
+    assert "planloop:1:S1:promptfix-stale:1" in {card["key"] for card in cards(db)}
     assert "planloop:1:S1:step" not in {card["key"] for card in cards(db)}
-    assert gate.load_stop(p) is not None
+    assert gate.load_stop(p) is None
 
 
 def test_ctx_keeps_marker_keys_on_collector_failure(project: Path, monkeypatch):
-    """Сбой сборщика шагов не оставляет решение без ключей D6 — иначе `NameError`."""
+    """Сбой сборщика шагов не оставляет решение без ключей D6 и отпечатка — иначе `NameError`."""
     def boom(_p):
         raise SystemExit("шагов не видно")
 
@@ -219,3 +222,9 @@ def test_ctx_keeps_marker_keys_on_collector_failure(project: Path, monkeypatch):
     ctx = gate.build_ctx(paths(project))
     assert ctx["prompt_marker_text_same"] is False
     assert ctx["prompt_marker_same_commit"] is False
+    # План 12, S1: без шагов признак входа молчит, но ключи обязаны быть — решение читает их
+    # напрямую, и `NameError` на сбое сборщика стоил бы тика.
+    assert ctx["prompt_input_parts"] == {}
+    assert ctx["prompt_input_fp"] == ""
+    assert ctx["prompt_input_baseline"] == {}
+    assert ctx["max_stale_rebuilds"] == 2

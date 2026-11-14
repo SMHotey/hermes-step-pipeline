@@ -651,6 +651,72 @@ def prompt_rel(p: Paths, step_id: str) -> str | None:
     return p.cfg.rel(matches[-1])
 
 
+# ───────────── отпечаток входа постановки: второй признак устаревания (план 12, S1) ─────────────
+
+#: Литерал вместо `sha256` для входа, которого нет на диске (или это не файл).
+INPUT_ABSENT = "absent"
+
+
+def prompt_input_parts(p: Paths, step: dict) -> dict[str, str]:
+    """`{путь: sha256}` по входам постановки: файлы из «Файл:» шага плюс сама постановка.
+
+    Вход — то, с чего снята постановка. Отпечаток считается по **рабочему дереву**, а не по
+    git: несохранённая в коммит правка входа — тоже изменение (решение D3 шага). Нет файла
+    постановки — пустой словарь: признак молчит, решение принимается по `recon_commit`.
+
+    Стоимость — только чтение файлов, ни одного `subprocess`: тик по-прежнему делает один
+    `git diff` (`build_ctx`).
+    """
+    sid = str((step or {}).get("id") or "")
+    prompt = prompt_rel(p, sid) if sid else None
+    if not prompt:
+        return {}
+    rels = {str(item).strip() for item in ((step or {}).get("files") or []) if str(item).strip()}
+    rels.add(prompt)
+    parts: dict[str, str] = {}
+    for rel in sorted(rels):
+        try:
+            parts[rel] = hashlib.sha256((Path(p.repo) / rel).read_bytes()).hexdigest()
+        except (OSError, ValueError):
+            # Нет файла, это каталог, путь битый — литерал `absent`, а не исключение наружу.
+            parts[rel] = INPUT_ABSENT
+    return parts
+
+
+def prompt_input_fp(parts: dict[str, str]) -> str:
+    """Агрегат отпечатка для показа в карточке: `sha256` от склейки `путь\\0hash\\n`.
+
+    Решение принимается по пофайловому `parts`, а не по агрегату: «другой отпечаток»
+    одинаково звучит и при подмене одного файла другим, а карточка обязана назвать, что
+    именно изменилось.
+    """
+    if not parts:
+        return ""
+    joined = "".join(f"{rel}\0{parts[rel]}\n" for rel in sorted(parts))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def prompt_input_changed(ctx: dict) -> dict[str, tuple[str, str]]:
+    """`{путь: (было, стало)}` по разошедшимся входам; пусто — изменения нет.
+
+    Опора (`state["prompt_input"][шаг]`) пишется в момент заказа ревью постановки: «эта
+    редакция уходит ревьюеру». Опора есть и что-то разошлось — признак сработал; нет опоры,
+    нет в ней `parts` или текущие `parts` пусты — признак молчит (иначе первый же тик после
+    правки состояния пересобирал бы постановку без причины, решение D10).
+    """
+    baseline = (ctx.get("prompt_input_baseline") or {}).get("parts") or {}
+    current = ctx.get("prompt_input_parts") or {}
+    if not baseline or not current:
+        return {}
+    changed: dict[str, tuple[str, str]] = {}
+    for rel in sorted(set(baseline) | set(current)):
+        was = str(baseline.get(rel) or INPUT_ABSENT)
+        now = str(current.get(rel) or INPUT_ABSENT)
+        if was != now:
+            changed[rel] = (was, now)
+    return changed
+
+
 def prompt_recon(path: Path | str | None) -> str | None:
     """`recon_commit` из шапки постановки: короткий или полный sha; нет отметки — None.
 
@@ -760,7 +826,8 @@ def prompt_text_same(p: Paths, prompt: str | None, sha: str | None) -> bool:
     Единственное, что разрешает принять вердикт при расхождении отметок: ревьюер помечает
     отчёт sha HEAD вместо sha постановки (инцидент 09.11.2026, план 29 R1-C — 8.5 часа
     простоя на формальном расхождении). Подмены вердикта здесь нет: переписанная
-    постановка даёт на своём коммите ДРУГОЙ текст и по-прежнему останавливает. Нет файла,
+    постановка даёт на своём коммите ДРУГОЙ текст и по-прежнему не принимается — страж
+    заказывает пересборку постановки (`:promptfix-stale:`). Нет файла,
     нет коммита или sha вне репозитория — подтвердить версию нечем, ответ `False`.
     """
     if not prompt:
@@ -1597,6 +1664,91 @@ def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -
     return "\n".join(lines)
 
 
+def _short_hash(value: str | None) -> str:
+    """Первые 8 знаков sha256 для карточки; литерал `absent` остаётся словом."""
+    text = str(value or "")
+    if not text or text == INPUT_ABSENT:
+        return INPUT_ABSENT
+    return text[:8]
+
+
+def prompt_stale_card_body(p: Paths, step: dict, decision: dict, report_rel: str) -> str:
+    """Тело карточки «пересобрать протухшую постановку»: почему протухла и что делать.
+
+    Всё печатаемое берётся из решения и `Paths`: в состояние функция не смотрит, поэтому её
+    можно звать в тесте руками. Отпечаток показывается агрегатом (12 знаков) плюс пофайловым
+    перечнем: `sha256` целиком человеку и агенту ничего не даёт, а перечень называет, что
+    именно изменилось.
+    """
+    sid = step["id"]
+    plan_id = p.plan_id
+    plan_rel = p.cfg.rel(Path(p.plan_file))
+    prompt_path = prompt_rel(p, sid) or ""
+    head = head_commit(p) or "—"
+    rebuild = int(decision.get("rebuild") or 1)
+    limit = int(decision.get("limit") or 0)
+    fp = str(decision.get("fp") or "")
+    changed = decision.get("changed") or {}
+    lines = [
+        f"ПЕРЕСОБРАТЬ ПРОТУХШУЮ ПОСТАНОВКУ ШАГА {sid} плана {plan_id} — "
+        f"{step['title']} (пересборка {rebuild} из {limit})",
+        "",
+        f"Постановка: `{prompt_path}`. Контракт шага — `{plan_rel}` §{sid}.",
+        f"Отчёт прошлого ревью: `{report_rel}`.",
+        "",
+        "ПОЧЕМУ ПРОТУХЛА",
+        f"- Прошлый recon_commit: `{decision.get('prev_recon') or '—'}`; текущий HEAD: `{head}`.",
+        f"- Причина: {decision.get('reason') or 'расхождение версий'}",
+    ]
+    if fp:
+        lines.append(f"- Отпечаток входа (первые 12 знаков): `{fp[:12]}`")
+    if changed:
+        lines.append("- Изменившиеся входы:")
+        for rel in sorted(changed):
+            was, now = changed[rel]
+            lines.append(f"  - `{rel}`: было {_short_hash(was)}, стало {_short_hash(now)}")
+    elif decision.get("stale_reason") == "stale-recon":
+        lines.append("- Вход не менялся: причина — отметка версии.")
+    else:
+        lines.append("- Опоры нет: признак по отметке.")
+    prev = _resolve_commit(Path(p.repo), decision.get("prev_recon"))
+    commits: list[str] = []
+    if prev:
+        try:
+            res = _run(["git", "log", "--oneline", f"{prev}..HEAD"], Path(p.repo), timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            res = None
+        if res is not None and res.returncode == 0:
+            commits = [line for line in (res.stdout or "").splitlines() if line.strip()]
+    if commits:
+        lines.append("- Коммиты между версиями (не больше 20):")
+        lines += [f"  - {line}" for line in commits[:20]]
+        if len(commits) > 20:
+            lines.append(f"  - … и ещё {len(commits) - 20}")
+    else:
+        lines.append("- Отметка не разрешается в коммит: список коммитов не собрать.")
+    lines += [
+        "",
+        "ЧТО ДЕЛАТЬ",
+        "- Пересобрать постановку от текущего HEAD: адреса `path:line`, имена символов,",
+        "  числа тестов и гейты должны совпадать с кодом на этом коммите.",
+        f"- Обновить в шапке `recon_commit:` на текущий HEAD (`{head}`).",
+        "- Принятые находки прошлого ревью НЕ переоткрывать: закрытое остаётся закрытым,",
+        "  пересборка возвращает постановку к факту, а не начинает ревью заново.",
+        f"- Прогнать `python .pipeline/check_task_prompt.py {prompt_path}` → `ИТОГ: PASS`.",
+        "",
+        "ЗАПРЕТЫ",
+        "- Не менять код, тесты, план и журнал; «ЗАКРЫТ» не ставить и версию не поднимать.",
+        "- Не расширять объём шага и не смягчать гейты.",
+        "- Ревью постановки заказывает страж: сам его не заказывай.",
+        f"- После пересборки ревью пойдёт кругом {int(decision.get('review_round') or 2)}.",
+        "",
+        "ЗАВЕРШЕНИЕ",
+        "kanban_complete: путь постановки, что пересобрано, новый recon_commit, вывод гейта.",
+    ]
+    return "\n".join(lines)
+
+
 def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -> str:
     plan_rel = p.cfg.rel(Path(p.plan_file))
     return "\n".join([
@@ -1716,6 +1868,10 @@ def build_ctx(p: Paths) -> dict:
                    # D6: расхождение отметок проверять не на чем — обе сверки `False`,
                    # и решение по ревью постановки остаётся стопом, а не падением.
                    prompt_marker_text_same=False, prompt_marker_same_commit=False,
+                   # План 12, S1: без шагов входов постановки не видно — отпечаток и опора
+                   # пусты, лимит пересборок берётся из конфигурации, как в рабочей ветке.
+                   prompt_input_parts={}, prompt_input_fp="", prompt_input_baseline={},
+                   max_stale_rebuilds=int(getattr(p.cfg, "max_stale_rebuilds", 0) or 0),
                    next_prompt=None, next_cards=[],
                    # Та же форма `ctx`, что и в нормальной ветке (D4): решение разведки
                    # не должно падать `NameError` на сбое сборщика.
@@ -1761,6 +1917,15 @@ def build_ctx(p: Paths) -> dict:
     ctx["prompt_fresh"] = prompt_fresh(p, recon) if prompt else False
     ctx["prompt_report"] = prompt_review_rel(p, step["id"]) if step else None
     ctx["prompt_verdict"] = prompt_verdict(p, step["id"]) if step else None
+    # Второй признак устаревания постановки (план 12, S1): пофайловый отпечаток входов и
+    # опора, снятая в момент заказа ревью. Только чтение файлов — тик по-прежнему делает
+    # один `git diff`, стоимость не растёт.
+    ctx["prompt_input_parts"] = prompt_input_parts(p, step) if step else {}
+    ctx["prompt_input_fp"] = prompt_input_fp(ctx["prompt_input_parts"])
+    saved_input = (state.get("prompt_input") or {}).get(step["id"]) if step else None
+    ctx["prompt_input_baseline"] = dict(saved_input) if isinstance(saved_input, dict) else {}
+    # `getattr`: старый кэш конфига в тестах и в чужом коде не обязан знать новый ключ.
+    ctx["max_stale_rebuilds"] = int(getattr(p.cfg, "max_stale_rebuilds", 0) or 0)
     # D6: отметка версии в отчёте и `recon_commit` постановки сверяются не как строки.
     # Ревьюер пишет sha HEAD (иногда короткий) вместо sha постановки — формальное
     # расхождение стоило 8.5 часа простоя (план 29 R1-C, 09.11.2026). Сверка по тексту
@@ -2751,18 +2916,45 @@ def _prompt_review_cards(ctx: dict, sid: str) -> list[dict]:
     return [c for c in (ctx.get("cards") or []) if pat in (c.get("key") or "")]
 
 
+def _round_of_key(card: dict) -> int:
+    """Номер круга из ключа карточки `...:<N>`; не число — 0."""
+    try:
+        return int((card.get("key") or "").rsplit(":", 1)[-1])
+    except ValueError:
+        return 0
+
+
 def _prompt_fix_cards(ctx: dict, sid: str) -> list[dict]:
     """Круги автопереписывания постановки `:promptfix:{N}` по возрастанию номера."""
     pat = f":{sid}:promptfix:"
     cards = [c for c in (ctx.get("cards") or []) if pat in (c.get("key") or "")]
+    return sorted(cards, key=_round_of_key)
 
-    def _num(card: dict) -> int:
-        try:
-            return int((card.get("key") or "").rsplit(":", 1)[-1])
-        except ValueError:
-            return 0
 
-    return sorted(cards, key=_num)
+def _prompt_stale_cards(ctx: dict, sid: str) -> list[dict]:
+    """Пересборки протухшей постановки `:promptfix-stale:{N}` по возрастанию номера.
+
+    Отдельная серия от `:promptfix:`: шаблоны не пересекаются, поэтому счётчики не сливаются
+    и пересбор по свежести не съедает бюджет правок (`max_fix_rounds`).
+    """
+    pat = f":{sid}:promptfix-stale:"
+    cards = [c for c in (ctx.get("cards") or []) if pat in (c.get("key") or "")]
+    return sorted(cards, key=_round_of_key)
+
+
+def _prompt_latest_card(fixes: list[dict], stales: list[dict]) -> tuple[dict, str, str] | None:
+    """Самая свежая карточка двух серий, её глагол и существительное для причины.
+
+    Работают по одной постановке, поэтому «идёт / упала» смотрит на объединённую серию:
+    `cards` приходят в порядке `created_at`, серии сортируются по номеру круга; при равном
+    `created_at` (тик поставил обе в одну секунду) решает номер круга.
+    """
+    candidates = ([(c, "переписывается", "переписывание") for c in fixes]
+                  + [(c, "пересобирается", "пересборка") for c in stales])
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (int(item[0].get("created_at") or 0),
+                                             _round_of_key(item[0])))
 
 
 def _prompt_review_of_round(ctx: dict, sid: str, round_no: int) -> dict | None:
@@ -2789,32 +2981,67 @@ def _report_written_after(verdict: dict | None, card: dict) -> bool:
 
 
 def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
-    """Ревью постановки до старта шага (правило 3): заказ, автопереписывание, стоп или None.
+    """Ревью постановки до старта шага (правило 3): заказ, пересборка, стоп или None.
 
     REQUEST_CHANGES не останавливает конвейер: постановку переписывает роль prompter
-    (`:promptfix:{N}`), после каждого круга ревью повторяется. Стоп — только когда круги
-    исчерпаны (`max_fix_rounds`), упала карточка или вердикт не про эту версию.
+    (`:promptfix:{N}`), после каждого круга ревью повторяется. Протухшая постановка (отчёт
+    снят по другой версии или вход изменился после ревью) конвейер тоже не останавливает:
+    страж заказывает пересборку (`:promptfix-stale:{N}`, свой лимит `max_stale_rebuilds`,
+    не входящий в `max_fix_rounds`) и повторное ревью. Стоп — когда исчерпаны
+    соответствующие круги, упала карточка или вердикт не распознан.
     """
     sid = step["id"]
     if not ctx.get("prompt"):
         return None                        # постановки нет: решает обычная ветка create_step
     report_rel = ctx.get("prompt_report") or prompt_review_rel_of(ctx, sid)
     fixes = _prompt_fix_cards(ctx, sid)
+    stales = _prompt_stale_cards(ctx, sid)
     mode = str(ctx.get("prompt_review") or "auto").strip().lower()
-    if mode == "never" and not fixes:
+    if mode == "never" and not fixes and not stales:
         return None                        # владелец выключил ревью постановок
-    if fixes:
-        last_fix = fixes[-1]
-        if last_fix["status"] not in TERMINAL:
+    # «Идёт / упала» смотрит на самую свежую карточку объединённой серии: и правка, и
+    # пересборка работают по той же постановке, вторая карточка поверх первой не нужна.
+    latest = _prompt_latest_card(fixes, stales)
+    if latest is not None:
+        last_card, verb, noun = latest
+        if last_card["status"] not in TERMINAL:
             return {"action": "idle", "step": sid,
-                    "reason": (f"постановка {sid} переписывается: карточка "
-                               f"{last_fix['id']} ({last_fix['status']})")}
-        if last_fix["status"] != "done":
-            detail = (last_fix.get("error") or last_fix.get("result") or "")[:300]
+                    "reason": (f"постановка {sid} {verb}: карточка "
+                               f"{last_card['id']} ({last_card['status']})")}
+        if last_card["status"] != "done":
+            detail = (last_card.get("error") or last_card.get("result") or "")[:300]
             return {"action": "stop", "step": sid,
-                    "reason": (f"переписывание постановки {sid} упало "
-                               f"({last_fix['status']}): {detail}")}
-    round_no = len(fixes) + 1
+                    "reason": f"{noun} постановки {sid} упало ({last_card['status']}): {detail}"}
+    # Номер круга ревью: и круг правок, и пересборка сдвигают его на единицу. Без пересборок
+    # в счёте повторное ревью взяло бы закрытую карточку круга 1 и прочитало вердикт прошлой
+    # редакции — пересборка пошла бы по кругу до лимита.
+    round_no = len(fixes) + len(stales) + 1
+
+    def _stale(reason_code: str, changed: dict | None = None) -> dict:
+        """Оба признака устаревания: пересборка, а после лимита — стоп владельцу."""
+        limit = int(ctx.get("max_stale_rebuilds") or 0)
+        if len(stales) >= limit:
+            # `kind: owner`, а не инцидент: инцидентный стоп страж снимает сам, как только
+            # причина ушла, — после исчерпания бюджета любая правка отметки вернула бы
+            # конвейер в работу без решения владельца.
+            return {"action": "stop", "step": sid, "kind": "owner",
+                    "reason": (f"постановка {sid} протухла, пересборок исчерпано "
+                               f"({len(stales)} из {limit}, ключ max_stale_rebuilds) — "
+                               f"решает владелец")}
+        prev_recon = (str(((ctx.get("prompt_input_baseline") or {}).get("recon") or ""))
+                      or str(ctx.get("prompt_recon") or ""))
+        report_recon = str((ctx.get("prompt_verdict") or {}).get("recon") or "")
+        detail = (f"в отчёте recon_commit {report_recon}, "
+                  f"в постановке {ctx.get('prompt_recon') or '—'}"
+                  if reason_code == "stale-recon" else "вход изменился после ревью")
+        return {"action": "create_prompt_fix", "step": sid, "data": step,
+                "stale": True, "stale_reason": reason_code,
+                "rebuild": len(stales) + 1, "limit": limit, "review_round": round_no,
+                "fp": ctx.get("prompt_input_fp") or "",
+                "changed": changed or {}, "prev_recon": prev_recon,
+                "reason": (f"постановка {sid} протухла: {detail} — пересобираю "
+                           f"({len(stales) + 1} из {limit})")}
+
     need = _prompt_review_needed(ctx) or round_no > 1
     card = _prompt_review_of_round(ctx, sid, round_no)
     if card is None:
@@ -2865,13 +3092,18 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
         # Формальная путаница отметок конвейер не роняет (D6, инцидент 09.11.2026): если
         # текст постановки на sha из отчёта тот же, что в файле сейчас, или обе отметки —
         # один коммит (короткий sha против полного), вердикт относится к этой редакции.
-        # Подмены нет: переписанная постановка даёт другой текст и по-прежнему стоп.
         if ctx.get("prompt_marker_text_same") or ctx.get("prompt_marker_same_commit"):
             return None
-        return {"action": "stop", "step": sid,
-                "reason": (f"ревью постановки {sid} не про эту версию: в отчёте recon_commit "
-                           f"{verdict['recon']}, в постановке "
-                           f"{ctx.get('prompt_recon') or '—'}")}
+        # Расхождение отметок — не стоп, а протухшая постановка: пересобираем её от текущего
+        # HEAD и ревьюим заново (план 12, S1). Стоп остаётся только на исчерпанном лимите
+        # пересборок внутри `_stale`.
+        return _stale("stale-recon")
+    # Отметка совпала — второй признак устаревания: вход постановки (файлы шага и её файл)
+    # изменился после того, как эта редакция ушла ревьюеру. Правка мимо git не двигает
+    # `recon_commit`, поэтому без отпечатка она прошла бы незамеченной.
+    changed = prompt_input_changed(ctx)
+    if changed:
+        return _stale("stale-input", changed)
     return None                            # APPROVE по той же версии — шаг стартует
 
 
@@ -2991,6 +3223,12 @@ def status_text(ctx: dict, decision: dict) -> str:
     lines.append(f"Ручной допуск (hold): {', '.join(hold) or '—'}")
     # Шага нет — и риска нет: «normal» у пустой строки читается как «риск обычный».
     lines.append(f"Риск шага: {((step.get('risk') or 'normal') if step else '—')}")
+    # Пересборки постановки по свежести видны всегда (план 12, S1): по цифре владелец решает,
+    # поднимать ли лимит. При нуле строка тоже есть — иначе счётчик невидим.
+    if step:
+        rebuilds = _prompt_stale_cards(ctx, str(step.get("id") or ""))
+        lines.append("Пересборок постановки по свежести: "
+                     f"{len(rebuilds)} из {int(ctx.get('max_stale_rebuilds') or 0)}")
     if ctx.get("verdict"):
         v = ctx["verdict"]
         lines.append(f"Вердикт: {v['verdict']} (строк: {v['occurrences']}, "
@@ -4708,6 +4946,19 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                           p.cfg.reviewer, key, p.cfg.review_skills,
                           max_runtime=p.cfg.review_runtime)
         result.update(applied=bool(cid), detail=f"карточка ревью постановки: {cid}")
+        if cid:
+            # Опора отпечатка входа (план 12, S1): «эта редакция уходит ревьюеру». Пишется и
+            # тогда, когда идемпотентный ключ вернул прежнюю карточку: ревью относится именно
+            # к этой редакции, а не к той, что была на момент прошлого заказа.
+            saved = state.get("prompt_input")
+            saved = dict(saved) if isinstance(saved, dict) else {}
+            saved[step["id"]] = {
+                "recon": ctx.get("prompt_recon") or "",
+                "parts": ctx.get("prompt_input_parts") or {},
+                "fp": ctx.get("prompt_input_fp") or "",
+                "at": time.strftime("%d.%m.%Y %H:%M:%S"),
+            }
+            state["prompt_input"] = saved
         touch(f"create_prompt_review:{cid}")
         if cid:
             why = "старше кода" if round_no <= 1 else f"переписана, круг {round_no}"
@@ -4719,17 +4970,41 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
     if action == "create_prompt_fix":
         step = decision["data"]
         round_no = int(decision.get("round") or 1)
-        key = f"planloop:{plan_id}:{step['id']}:promptfix:{round_no}"
+        stale = bool(decision.get("stale"))
         report_rel = prompt_review_rel(p, step["id"])
-        cid = create_card(p, f"[переписать постановку {plan_id} {step['id']}] {step['title']}",
-                          prompt_fix_card_body(p, step, round_no, report_rel),
-                          p.cfg.prompter, key, p.cfg.prompt_skills,
+        if stale:
+            # Номер пересборки, а не номер круга правок: серии нумеруются отдельно, иначе
+            # пересбор по свежести съедает бюджет кругов (6-S8A: два круга из шести).
+            rebuild = int(decision.get("rebuild") or 1)
+            limit = int(decision.get("limit") or 0)
+            key = f"planloop:{plan_id}:{step['id']}:promptfix-stale:{rebuild}"
+            title = (f"Пересобрать протухшую постановку шага {step['id']} — {step['title']} "
+                     f"(пересборка {rebuild} из {limit})")
+            body = prompt_stale_card_body(p, step, decision, report_rel)
+        else:
+            key = f"planloop:{plan_id}:{step['id']}:promptfix:{round_no}"
+            title = f"[переписать постановку {plan_id} {step['id']}] {step['title']}"
+            body = prompt_fix_card_body(p, step, round_no, report_rel)
+        cid = create_card(p, title, body, p.cfg.prompter, key, p.cfg.prompt_skills,
                           max_runtime=p.cfg.prompt_runtime)
         result.update(applied=bool(cid), detail=f"карточка переписывания постановки: {cid}")
+        if cid and stale:
+            # Зеркало счётчика в состоянии плана: источник истины — карточки, но цифра должна
+            # читаться в `--status` даже без борды.
+            mirrors = state.get("stale_rebuilds")
+            mirrors = dict(mirrors) if isinstance(mirrors, dict) else {}
+            mirrors[step["id"]] = int(decision.get("rebuild") or 1)
+            state["stale_rebuilds"] = mirrors
         touch(f"create_prompt_fix:{cid}")
         if cid:
-            say(f"план {plan_id}: ревью постановки шага {step['id']} вернуло REQUEST_CHANGES — "
-                f"переписываю постановку автоматически, круг {round_no} (карточка {cid})")
+            if stale:
+                say(f"план {plan_id}: постановка шага {step['id']} протухла — "
+                    f"пересобираю автоматически ({decision.get('rebuild')} из "
+                    f"{decision.get('limit')}, карточка {cid})")
+            else:
+                say(f"план {plan_id}: ревью постановки шага {step['id']} вернуло "
+                    f"REQUEST_CHANGES — переписываю постановку автоматически, круг {round_no} "
+                    f"(карточка {cid})")
         else:
             say(f"план {plan_id}: не смог поставить переписывание постановки шага {step['id']}")
         return result

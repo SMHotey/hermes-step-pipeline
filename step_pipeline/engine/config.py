@@ -72,6 +72,12 @@ DEFAULTS: dict = {
     # владельца. Останавливает лимит, а не первый отказ: у ревью плана каждый
     # `REQUEST_CHANGES` даёт карточку правок, пока круги не исчерпаны (0.25.2).
     "max_fix_rounds": 2,
+    # Лимит автоматических пересборок протухшей постановки (план 12, S1). Считается по
+    # карточкам `:promptfix-stale:` и НЕ входит в `max_fix_rounds`: сдвиг HEAD и правка по
+    # ревью — разные события, иначе пересбор по свежести съедает бюджет правок (6-S8A
+    # израсходовал два круга из шести на сдвиг HEAD). 0 — пересборок нет, расхождение
+    # версий снова останавливает конвейер.
+    "max_stale_rebuilds": 2,
     # Лимит расширения плана правкой (план 7, S4). Правка по ревью закрывает находки,
     # а не объясняет план ревьюеру: площадь проверки иначе растёт быстрее, чем закрываются
     # находки. Допуск — большее из `percent` процентов версии плана (без журнала) и
@@ -173,6 +179,29 @@ def _fix_rounds(value: object) -> int:
     return rounds
 
 
+def _stale_rebuilds(value: object) -> int:
+    """Лимит пересборок протухшей постановки: целое ≥ 0 (по умолчанию 2).
+
+    Форма та же, что у `_fix_rounds`, с одним осознанным отличием: **0 разрешён** и означает
+    «пересборок нет, расхождение версий снова останавливает конвейер» — выключатель без
+    второго ключа, как `prompt_review: never` у ревью постановок. Мусор в `pipeline.json` —
+    ошибка конфигурации, а не молчаливое умолчание: иначе владелец будет думать, что
+    лимит действует, а страж остановится на первом же расхождении.
+    """
+    if value is None:
+        return 2
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ConfigError(f"max_stale_rebuilds должен быть целым числом, получено: {value!r}")
+    try:
+        rounds = int(value)
+    except ValueError as exc:
+        raise ConfigError(f"max_stale_rebuilds должен быть целым числом, "
+                          f"получено: {value!r}") from exc
+    if rounds < 0:
+        raise ConfigError(f"max_stale_rebuilds должен быть ≥ 0, получено: {rounds}")
+    return rounds
+
+
 def _plan_growth(value: object) -> dict:
     """Лимит расширения плана правкой: `percent` и `chars_per_finding` (план 7, S4).
 
@@ -240,6 +269,7 @@ class Config:
     prefetch_prompt: bool
     prompt_review: str
     max_fix_rounds: int
+    max_stale_rebuilds: int
     max_plan_growth: dict
     step_runtime: str
     review_runtime: str
@@ -436,6 +466,7 @@ def load(repo: Path | str | None = None) -> Config:
         prefetch_prompt=bool(raw.get("prefetch_prompt", True)),
         prompt_review=prompt_review,
         max_fix_rounds=_fix_rounds(raw.get("max_fix_rounds")),
+        max_stale_rebuilds=_stale_rebuilds(raw.get("max_stale_rebuilds")),
         max_plan_growth=_plan_growth(raw.get("max_plan_growth")),
         step_runtime=str(runtimes.get("step") or "3h"),
         review_runtime=str(runtimes.get("review") or "150m"),

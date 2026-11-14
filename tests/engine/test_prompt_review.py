@@ -200,13 +200,22 @@ def test_prompt_review_verdict_controls_start(stand):
     complete(db, ":promptreview:2")
 
     write_report(root, "APPROVE", recon="2222222")      # ревью не про эту версию (D6)
-    mismatched = gate.run_gate(p, execute=True, notify_fn=quiet)
-    assert mismatched["decision"]["action"] == "stop", mismatched["decision"]
-    assert "не про эту версию" in mismatched["detail"]
+    rebuilt = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert rebuilt["decision"]["action"] == "create_prompt_fix", rebuilt["decision"]
+    assert rebuilt["decision"]["stale"] is True
+    assert rebuilt["decision"]["rebuild"] == 1
+    assert "planloop:1:S1:promptfix-stale:1" in keys_of(db)
     assert "planloop:1:S1:step" not in keys_of(db)
+    assert gate.load_stop(p) is None                    # конвейер не встал
 
-    Path(p.stop_file).unlink()
-    write_report(root, "APPROVE", recon="1111111")
+    complete(db, ":promptfix-stale:1")                  # промптер пересобрал постановку
+    again2 = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert again2["decision"]["action"] == "create_prompt_review", again2["decision"]
+    assert again2["decision"]["round"] == 3             # 1 круг правок + 1 пересборка + 1
+    assert "planloop:1:S1:promptreview:3" in keys_of(db)
+    complete(db, ":promptreview:3")
+
+    write_report(root, "APPROVE", recon="1111111")      # та же редакция постановки
     started = gate.run_gate(p, execute=True, notify_fn=quiet)
     assert started["decision"]["action"] == "create_step", started["decision"]
     assert "planloop:1:S1:step" in keys_of(db)
