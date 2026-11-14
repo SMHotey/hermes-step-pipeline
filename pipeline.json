@@ -2,7 +2,7 @@
   "project": "hermes-step-pipeline",
   "board": "step-pipeline",
   "ui_port": 8770,
-  "max_fix_rounds": 4,
+  "max_fix_rounds": 6,
   "max_actions": 2,
   "profiles": {
     "driver": "pipeline",
@@ -45,8 +45,7 @@
   "step_id_regex": "(?P<id>[A-Za-z]{1,4}\\d+[A-Za-z]?(?:-\\d+)?)",
   "default_plan": null,
   "driven_plans": [
-    "6",
-    "7"
+    "12"
   ],
   "require_prompt": true,
   "runtimes": {
