@@ -73,7 +73,9 @@ def test_slow_files_are_deselected_whole():
 def test_full_run_stays_full():
     """В `addopts` нет `-m`: закрепление урезало бы полный прогон и CI (стоп-сигнал плана)."""
     parser = configparser.ConfigParser(interpolation=None)
-    parser.read(ROOT / "pytest.ini")
+    # Кодировка указана явно: на windows-раннере умолчание `cp1252`, а в `pytest.ini` есть
+    # русский текст — `read` без encoding падал на UnicodeDecodeError ещё до проверок.
+    parser.read(ROOT / "pytest.ini", encoding="utf-8")
     addopts = parser.get("pytest", "addopts", fallback="")
     tokens = addopts.split()
     assert "-m" not in tokens, f"в addopts закреплён -m: {addopts!r}"

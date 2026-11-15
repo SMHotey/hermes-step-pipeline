@@ -150,15 +150,25 @@ class TestEngineDriftFunctions:
         assert setup_flow.engine_drift(tmp_path) == []
 
     def test_crlf_copy_is_refreshed_by_upgrade(self, engine_project: Path):
-        """Копия с виндовыми переводами строк — дрейф; upgrade её перезаписывает.
+        """Копия с другими переводами строк — дрейф; upgrade её перезаписывает.
 
         Регресс 0.25.3: `copy_engine` сверял текст (`read_text` съедает CRLF) и считал такую
         копию идентичной, поэтому файл не перезаписывался, а `doctor` сравнивал байты и
         вечно требовал `setup --upgrade` (живой случай — registry.py, scout_report.py).
+
+        Форма копии выбирается противоположной источнику, а не «всегда CRLF»: на windows-
+        раннере git выкладывает движок с CRLF (`core.autocrlf`), и «CRLF-копия» совпадала
+        с источником байт в байт — тест падал не на регрессе, а на форме выкладки.
         """
         src = proj.ENGINE_SRC / "registry.py"
         target = engine_project / ".pipeline" / "registry.py"
-        target.write_bytes(src.read_text(encoding="utf-8").replace("\n", "\r\n").encode("utf-8"))
+        raw = src.read_bytes()
+        if b"\r\n" in raw:
+            variant = raw.replace(b"\r\n", b"\n")          # LF-копия при CRLF-источнике
+        else:
+            variant = raw.replace(b"\n", b"\r\n")          # CRLF-копия при LF-источнике
+        assert variant != raw, "копия совпала с источником — тест ничего не проверяет"
+        target.write_bytes(variant)
         assert "registry.py" in setup_flow.engine_drift(engine_project)
 
         copied = setup_flow.copy_engine(engine_project, force=False)
