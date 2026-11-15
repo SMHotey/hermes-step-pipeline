@@ -19,7 +19,7 @@
 > Смежные документы: `docs/CONTEXT.md` (§4, §6, §8, §9), `docs/research/8-prior-art.md`.
 > Планы-смежники: 6-S4 живёт в `plans_add.py`/`ui_server.py`; план 7 закрыт целиком (его
 > реестр находок — образец механизма для S5). Общие файлы есть — шаги идут по одному:
-> `gate.py` — S2, S2A, S2B, S5; `templates/task-prompt.md` — S2, S2A, S5;
+> `gate.py` — S2, S2A, S2B, S5; `templates/task-prompt.md` — S2, S2A, S2B, S5;
 > `roles/pipeline-prompter/SKILL.md` — S2A, S2B, S5; `tests/test_ui_server.py` — S2, S5;
 > `docs/CONTEXT.md` — S3, S4.
 
@@ -477,8 +477,8 @@ MIT; новых зависимостей план не добавляет, `pyte
 
 - Декомпозиция `gate.py` и копирование движка по `*.py` — только после план 6 S8A
   (окно раскатки) и порядок из §9 CONTEXT; резать файл до раскатки опасно.
-- Расширение golden-корпуса — за планом 7 (S2 «вердикт по реестру» уже переписывает
-  `_plan_review_decision`; новые golden-сценарии строить после его закрытия).
+- Расширение golden-корпуса не ограничено: план 7 закрыт (`_plan_review_decision`
+  переписан в его S2), S2B заводит `08-risk-spec`.
 - Покрытие `tick.py`/`step_card.py` до 80 % — отдельный шаг (1-S12), не в этом плане.
 - Правки `pipeline.json` и `driven_plans` — зона владельца.
 - Изменение порогов покрытия в `.coveragerc` или CI — порог остаётся 78/78.
