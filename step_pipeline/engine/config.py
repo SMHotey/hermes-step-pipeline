@@ -76,6 +76,12 @@ DEFAULTS: dict = {
     # владельца. Останавливает лимит, а не первый отказ: у ревью плана каждый
     # `REQUEST_CHANGES` даёт карточку правок, пока круги не исчерпаны (0.25.2).
     "max_fix_rounds": 2,
+    # Предел кругов правок для шага с `Риск: high` (план 12, S3). 6 — цена ошибки в опасном
+    # шаге — разбор плана, а не ещё один круг; ступеней выше `high` нет, потому что `_risk_of`
+    # знает три значения (`low`/`normal`/`high`) и любую нераспознанную пометку сводит к `high`.
+    # `high < база` разрешён и означает «для опасного шага строже» — выключатель без второго
+    # ключа, как `max_stale_rebuilds: 0`.
+    "max_fix_rounds_high": 6,
     # Лимит автоматических пересборок протухшей постановки (план 12, S1). Считается по
     # карточкам `:promptfix-stale:` и НЕ входит в `max_fix_rounds`: сдвиг HEAD и правка по
     # ревью — разные события, иначе пересбор по свежести съедает бюджет правок (6-S8A
@@ -183,6 +189,28 @@ def _fix_rounds(value: object) -> int:
     return rounds
 
 
+def _fix_rounds_high(value: object) -> int:
+    """Предел кругов правок для шага `Риск: high`: целое ≥ 1 (по умолчанию 6).
+
+    Форма — копия `_stale_rebuilds`: мусор в `pipeline.json` — ошибка конфигурации, а не
+    молчаливое умолчание, иначе владелец думает, что ступень действует, а страж работает по
+    базе. Перекрёстной проверки «не меньше базы» нет: `high < база` — законный выключатель
+    «для опасного шага строже».
+    """
+    if value is None:
+        return 6
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ConfigError(f"max_fix_rounds_high должен быть целым числом, получено: {value!r}")
+    try:
+        rounds = int(value)
+    except ValueError as exc:
+        raise ConfigError(f"max_fix_rounds_high должен быть целым числом, "
+                          f"получено: {value!r}") from exc
+    if rounds < 1:
+        raise ConfigError(f"max_fix_rounds_high должен быть ≥ 1, получено: {rounds}")
+    return rounds
+
+
 def _stale_rebuilds(value: object) -> int:
     """Лимит пересборок протухшей постановки: целое ≥ 0 (по умолчанию 2).
 
@@ -273,6 +301,7 @@ class Config:
     prefetch_prompt: bool
     prompt_review: str
     max_fix_rounds: int
+    max_fix_rounds_high: int
     max_stale_rebuilds: int
     max_plan_growth: dict
     step_runtime: str
@@ -470,6 +499,7 @@ def load(repo: Path | str | None = None) -> Config:
         prefetch_prompt=bool(raw.get("prefetch_prompt", True)),
         prompt_review=prompt_review,
         max_fix_rounds=_fix_rounds(raw.get("max_fix_rounds")),
+        max_fix_rounds_high=_fix_rounds_high(raw.get("max_fix_rounds_high")),
         max_stale_rebuilds=_stale_rebuilds(raw.get("max_stale_rebuilds")),
         max_plan_growth=_plan_growth(raw.get("max_plan_growth")),
         step_runtime=str(runtimes.get("step") or "3h"),

@@ -245,8 +245,11 @@ def test_metrics_tiles_and_empty_project(tmp_path: Path) -> None:
     assert data["by_plan"] == []
     assert data["errors"] == []
     tiles = stats.cycle_tiles(data)
-    assert len(tiles) == 4
+    assert len(tiles) == 5
     assert all(tile["label"] and tile["value"] for tile in tiles)
+    # Планов нет — кругов правок считать не на что: значение плитки «—», не «0.00».
+    assert tiles[4]["label"] == "кругов правок на план"
+    assert tiles[4]["value"] == "—"
 
     root = make_project(
         tmp_path / "project",
@@ -260,12 +263,16 @@ def test_metrics_tiles_and_empty_project(tmp_path: Path) -> None:
     tiles = stats.cycle_tiles(data)
     assert [tile["label"] for tile in tiles] == [
         "планов с разведкой", "вердиктов без готового решения",
-        "правок по разведке на план", "ревью плана с первого раза"]
+        "правок по разведке на план", "ревью плана с первого раза",
+        "кругов правок на план"]
+    # Планы есть, кругов правок нет — «0.00», а не «—» (D10 шага 12-S3).
+    assert tiles[4]["value"] == "0.00"
     line = stats.render_cycle(data)
     assert "\n" not in line
     assert line.startswith("Цикл:")
     assert "с разведкой 1" in line
     assert "из 3" in line
+    assert "кругов правок" in line
 
 
 def test_metrics_counts_unreferenced_review(tmp_path: Path) -> None:
@@ -279,3 +286,64 @@ def test_metrics_counts_unreferenced_review(tmp_path: Path) -> None:
 
     assert data["plan_reviews_unreferenced"] == 1
     assert data["plan_reviews"] == 0
+
+
+def test_metrics_counts_step_fix_rounds(tmp_path: Path) -> None:
+    """История: правки, пересборки и повторные ревью считаются по классам (R10)."""
+    root = make_project(
+        tmp_path / "project",
+        {"1-plan.md": plan_text("1. План 1"), "2-plan.md": plan_text("2. План 2")},
+        history=[
+            {"action": "create_fix", "plan": 1, "step": "S1", "detail": "карточка правок: t1"},
+            {"action": "create_fix", "plan": 1, "step": "S1", "detail": "карточка правок: t2"},
+            {"action": "create_fix", "plan": 1, "step": "S1", "detail": "карточка правок: t3"},
+            {"action": "create_prompt_fix", "plan": 1, "step": "S1", "stale": True,
+             "detail": "пересборка протухшей постановки: t4"},
+            {"action": "create_prompt_fix", "plan": 1, "step": "S1", "stale": True,
+             "detail": "пересборка протухшей постановки: t5"},
+            {"action": "create_rereview", "plan": 1, "step": "S1", "detail": "повторное ревью"},
+            {"action": "create_prompt_fix", "plan": 2, "step": "S1",
+             "detail": "переписать постановку: t6"},
+        ],
+    )
+
+    data = metrics(root)
+
+    plan1 = {item["plan"]: item for item in data["by_plan"]}["1"]
+    assert plan1["fix_rounds"] == 3
+    assert plan1["stale_rebuilds"] == 2
+    assert plan1["rereview"] == 1
+    # Переписывание постановки без `stale` — тоже круг правок шага (R10).
+    assert data["fix_rounds_total"] == 4
+    assert data["stale_rebuilds_total"] == 2
+    assert data["rereview_total"] == 1
+    assert data["fix_rounds_per_plan"] == 2.0
+    assert data["zero_fix_rounds"] == 0
+    assert data["zero_fix_share"] == 0.0       # ни один круг не сообщил «закрыто 0»
+
+
+def test_metrics_counts_zero_finding_rounds(tmp_path: Path) -> None:
+    """Доля кругов, закрывших 0 находок, считается парой с числом кругов (R11)."""
+    root = make_project(
+        tmp_path / "project",
+        {"1-plan.md": plan_text("1. План 1")},
+        history=[
+            {"action": "create_fix", "plan": 1, "step": "S1",
+             "detail": "карточка правок: t1, закрыто 0 находок"},
+            {"action": "create_fix", "plan": 1, "step": "S1", "detail": "карточка правок: t2"},
+            {"action": "stop", "plan": 1, "step": "S1",
+             "detail": "правка постановки не закрыла ни одной находки (круг 2: F-1 — открыты)"},
+        ],
+    )
+
+    data = metrics(root)
+
+    assert data["fix_rounds_total"] == 2
+    assert data["zero_fix_rounds"] == 2
+    assert data["zero_fix_share"] == 1.0
+    tiles = stats.cycle_tiles(data)
+    assert tiles[4]["value"] == "2.00"        # 2 круга на 1 план
+    assert "2 из 2" in tiles[4]["hint"]
+    line = stats.render_cycle(data)
+    assert "кругов правок 2" in line
+    assert "с 0 находок 1" in line

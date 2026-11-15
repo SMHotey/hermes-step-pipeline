@@ -37,6 +37,20 @@ R7. Круги ревью плана — записи `create_plan_review` из 
 R8. Нечитаемый файл попадает строкой в `errors`, его числа считаются нулём;
     отсутствие каталогов — не ошибка (механизм ещё не работал).
 R9. `by_plan` — по записи на план, по возрастанию номера.
+R10. Круги правок шагов — записи истории `create_fix` (правка кода шага) и
+    `create_prompt_fix` без `stale` (переписывание постановки): обе серии —
+    круг правок шага и обе берут лимит по риску (`gate.step_fix_limit`).
+    `create_prompt_fix` с `stale: true` — пересборка протухшей постановки, она
+    идёт своим лимитом `max_stale_rebuilds` и в круги правок не входит (6-S8A
+    израсходовал два круга из шести на сдвиг HEAD). `create_rereview` — повтор
+    прогона ревью, не правка. Источник классификации: `gate.rounds_classification`.
+R11. Круг, закрывший 0 находок, — запись истории, в `detail` которой стоит либо
+    «закрыто 0» (карточка правок сообщает, сколько находок закрыла), либо стоп
+    стража «правка постановки не закрыла ни одной находки» (`gate._prompt_zero_fix`).
+    Доля считается по всем кругам правок (R10): круг без находок — работа без
+    результата, и она видна только в паре с числом кругов.
+R12. Пустая история — не ошибка (R8): план без записей получает нули, а доля
+    кругов без находок при нуле кругов — `None` (не «0 %»: делить не на что).
 """
 from __future__ import annotations
 
@@ -76,6 +90,15 @@ DEFAULT_PATHS = {"plans": "docs/plans", "reviews": "docs/reviews",
 DEFAULT_JOURNAL_MARKER = "журнал"
 #: Действие истории, считающее круг ревью плана.
 PLAN_REVIEW_ACTION = "create_plan_review"
+#: Действия истории для кругов правок шага (R10): правка кода, переписывание постановки
+#: (пересборка отличается полем `stale`), повторное ревью.
+FIX_ACTION = "create_fix"
+PROMPT_FIX_ACTION = "create_prompt_fix"
+REREVIEW_ACTION = "create_rereview"
+#: Признак круга, закрывшего 0 находок (R11): `detail` истории — «закрыто 0» из карточки
+#: правок либо стоп стража «не закрыла ни одной находки».
+ZERO_FINDINGS_RE = re.compile(r"закрыт\w*\s+0\b|не\s+закрыла\s+ни\s+одной\s+находки",
+                              re.IGNORECASE)
 
 _HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>\S.*?)\s*$")
 _MAX_HASHES = 6
@@ -330,17 +353,17 @@ def _version_sha(plan_file: Path) -> str | None:
         return None
 
 
-def _rounds(state_dir: Path, errors: list[str]) -> dict[str, int]:
-    """Круги ревью плана по истории тиков (R7): номер плана → число записей."""
-    rounds: dict[str, int] = {}
+def _history(state_dir: Path, errors: list[str]) -> list[dict]:
+    """Записи истории тиков (`state/history.jsonl`); битые строки — в `errors` (R8)."""
     path = state_dir / "history.jsonl"
     if not path.is_file():
-        return rounds
+        return []
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as exc:
         errors.append(f"история {path.name}: {exc}")
-        return rounds
+        return []
+    records: list[dict] = []
     bad = 0
     for line in lines:
         line = line.strip()
@@ -354,13 +377,53 @@ def _rounds(state_dir: Path, errors: list[str]) -> dict[str, int]:
         if not isinstance(record, dict):
             bad += 1
             continue
+        records.append(record)
+    if bad:
+        errors.append(f"история: пропущено строк {bad}")
+    return records
+
+
+def _rounds(records: list[dict]) -> dict[str, int]:
+    """Круги ревью плана по истории тиков (R7): номер плана → число записей."""
+    rounds: dict[str, int] = {}
+    for record in records:
         if record.get("action") != PLAN_REVIEW_ACTION:
             continue
         plan = str(record.get("plan"))
         rounds[plan] = rounds.get(plan, 0) + 1
-    if bad:
-        errors.append(f"история: пропущено строк {bad}")
     return rounds
+
+
+def _step_rounds(records: list[dict]) -> dict[str, dict]:
+    """Круги правок, пересборки, повторные ревью и круги без находок (R10–R12).
+
+    Возвращает номер плана → `{"fix", "stale", "rereview", "zero"}`. Поле `stale`
+    различает две серии одной записи `create_prompt_fix`: пересборка протухшей
+    постановки (`stale: true`) бюджет правок не тратит, переписывание постановки
+    тратит. Круг без находок ищется по тексту `detail` любой записи: стоп стража
+    «не закрыла ни одной находки» — тоже событие круга (R11).
+    """
+    data: dict[str, dict] = {}
+
+    def row(plan: str) -> dict:
+        return data.setdefault(plan, {"fix": 0, "stale": 0, "rereview": 0, "zero": 0})
+
+    for record in records:
+        action = str(record.get("action") or "")
+        plan = str(record.get("plan"))
+        if action in (FIX_ACTION, PROMPT_FIX_ACTION, REREVIEW_ACTION):
+            item = row(plan)
+            if action == FIX_ACTION:
+                item["fix"] += 1
+            elif action == REREVIEW_ACTION:
+                item["rereview"] += 1
+            elif record.get("stale"):
+                item["stale"] += 1
+            else:
+                item["fix"] += 1
+        if ZERO_FINDINGS_RE.search(str(record.get("detail") or "")):
+            row(plan)["zero"] += 1
+    return data
 
 
 def _rel(root: Path, path: Path) -> str:
@@ -403,7 +466,9 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
             plans.append({"plan": str(int(match.group(1))), "file": path, "text": text})
     plans.sort(key=lambda item: int(item["plan"]))
 
-    rounds = _rounds(state_dir, errors)
+    records = _history(state_dir, errors)
+    rounds = _rounds(records)
+    step_rounds = _step_rounds(records)
     artifacts: dict[Path, dict[str, int]] = {}
     by_plan: list[dict] = []
     plans_with_research = 0
@@ -437,6 +502,7 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
         if edits is not None:
             edits_total += edits
             edits_plans += 1
+        step_data = step_rounds.get(plan_id) or {}
         by_plan.append({
             "plan": plan_id,
             "research": research,
@@ -446,9 +512,18 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
             "edits": edits,
             "review": _review_state(text, plan["file"], reviews_dir / f"plan-{plan_id}.md"),
             "rounds": rounds.get(plan_id, 0),
+            "fix_rounds": int(step_data.get("fix") or 0),
+            "stale_rebuilds": int(step_data.get("stale") or 0),
+            "rereview": int(step_data.get("rereview") or 0),
+            "zero_fix_rounds": int(step_data.get("zero") or 0),
         })
 
     states = [item["review"] for item in by_plan]
+    fix_total = sum(item["fix_rounds"] for item in by_plan)
+    stale_total = sum(item["stale_rebuilds"] for item in by_plan)
+    rereview_total = sum(item["rereview"] for item in by_plan)
+    zero_total = sum(item["zero_fix_rounds"] for item in by_plan)
+    rounds_plans = sum(1 for item in by_plan if item["fix_rounds"])
     return {
         "plans_total": len(by_plan),
         "plans_with_research": plans_with_research,
@@ -460,6 +535,13 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
         "edits_total": edits_total,
         "edits_plans": edits_plans,
         "edits_per_plan": round(edits_total / edits_plans, 1) if edits_plans else None,
+        "fix_rounds_total": fix_total,
+        "fix_rounds_plans": rounds_plans,
+        "fix_rounds_per_plan": round(fix_total / len(by_plan), 2) if by_plan else None,
+        "stale_rebuilds_total": stale_total,
+        "rereview_total": rereview_total,
+        "zero_fix_rounds": zero_total,
+        "zero_fix_share": round(zero_total / fix_total, 2) if fix_total else None,
         "plan_reviews": states.count("fresh"),
         "plan_reviews_stale": states.count("stale"),
         "plan_reviews_unbound": states.count("unbound"),
@@ -509,6 +591,19 @@ def cycle_tiles(metrics: dict) -> list[dict]:
     skipped = int(metrics.get("plan_reviews_skipped") or 0)
     fresh = int(metrics.get("plan_reviews") or 0)
 
+    # Круги правок шагов (12-S3): значение — доля на план в два знака; у проекта без
+    # планов считать не на что («—»), у проекта с планами и без кругов — «0.00».
+    per_step = metrics.get("fix_rounds_per_plan")
+    if per_step is None:
+        rounds_value = "0.00" if total else "—"
+    else:
+        rounds_value = f"{float(per_step):.2f}"
+    fix_total = int(metrics.get("fix_rounds_total") or 0)
+    zero_share = metrics.get("zero_fix_share")
+    zero_text = ("—" if zero_share is None
+                 else f"{int(metrics.get('zero_fix_rounds') or 0)} из {fix_total} "
+                      f"({float(zero_share):.2f})")
+
     return [
         {"label": "планов с разведкой",
          "value": f"{with_research} из {total}",
@@ -525,6 +620,11 @@ def cycle_tiles(metrics: dict) -> list[dict]:
          "hint": (f"свежих вердиктов {fresh}, непригодных {stale + unbound + unreferenced} "
                   f"(не привязано к версии {stale + unbound}, без ссылки на конституцию "
                   f"{unreferenced}), ждут {pending}, без ревью {skipped}")},
+        {"label": "кругов правок на план",
+         "value": rounds_value,
+         "hint": (f"правок {fix_total}, пересборок "
+                  f"{int(metrics.get('stale_rebuilds_total') or 0)}, повторных ревью "
+                  f"{int(metrics.get('rereview_total') or 0)}; кругов с 0 находок: {zero_text}")},
     ]
 
 
@@ -537,9 +637,15 @@ def render_cycle(metrics: dict) -> str:
         metrics.get("candidates_unknown") or 0)
     per_plan = metrics.get("edits_per_plan")
     edits = "—" if per_plan is None else _num(per_plan)
+    per_step = metrics.get("fix_rounds_per_plan")
+    rounds = "—" if per_step is None else _num(per_step)
+    zero_share = metrics.get("zero_fix_share")
+    zero = "—" if zero_share is None else _num(zero_share)
     return (f"Цикл: планов {total}, с разведкой {int(metrics.get('plans_with_research') or 0)}, "
             f"кандидатов {candidates} (готовых {ready}, без готового {without}), "
             f"правок по разведке {edits}, "
+            f"кругов правок {rounds} (с 0 находок {zero}, пересборок "
+            f"{int(metrics.get('stale_rebuilds_total') or 0)}), "
             f"ревью плана {int(metrics.get('plan_reviews') or 0)} из {total} "
             f"(с первого раза {int(metrics.get('plan_reviews_first') or 0)})")
 

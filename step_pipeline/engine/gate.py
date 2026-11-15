@@ -226,6 +226,22 @@ MAX_ACTIONS_DEFAULT = 1
 # `max_fix_rounds`. Два круга — правило владельца: одна правка редко закрывает все замечания,
 # а второй отказ уже требует решения человека.
 DEFAULT_FIX_ROUNDS = 2
+# Предел кругов правок для шага с `Риск: high` (план 12, S3): умолчание проекта — ключ
+# `max_fix_rounds_high`. Ступеней выше `high` нет — `_risk_of` знает три значения и любую
+# нераспознанную пометку сводит к `high`.
+DEFAULT_FIX_ROUNDS_HIGH = 6
+# ANCHOR:rounds_classification
+# Классификация серий карточек кругов: что считает бюджет правок шага, а что нет.
+# «Бюджет» — находка ревью по существу, серия `:fix:{N}` (правка кода шага) и
+# `:promptfix:{N}` (переписывание постановки шага): обе — круг правок шага, обе берут лимит
+# по риску (`step_fix_limit`).
+# «Не бюджет»: `:promptfix-stale:{N}` — пересборка протухшей постановки, у неё свой лимит
+# `max_stale_rebuilds` (сдвиг HEAD и правка по ревью — разные события); `:rereview:{N}` —
+# повтор прогона ревью, а не правка.
+# Классы держат тесты `tests/engine/test_fix_rounds_risk.py`: пункт 5 (пересборка не съедает
+# бюджет `:fix:`), пункт 6 (`:rereview:` не двигает ни один из двух бюджетов).
+# Упавшая карточка круга в классификацию не входит: бюджет считает карточки независимо от
+# статуса, а при упавшей карточке тик уходит в стоп — это поведение не меняется.
 # Сколько записей о действиях держим в состоянии плана: это краткая выжимка, полная
 # история — в `history.jsonl`.
 LAST_ACTIONS_KEPT = 20
@@ -1875,10 +1891,37 @@ def prompt_stale_card_body(p: Paths, step: dict, decision: dict, report_rel: str
     return "\n".join(lines)
 
 
-def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -> str:
+def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
+                  max_rounds: int = 0) -> str:
+    """Карточка правок шага. `max_rounds` — предел кругов по риску шага (`step_fix_limit`).
+
+    Умолчание `0` сохраняет прежний вид карточки: без числа кругов «(круг N)» и прежняя
+    строка про последний круг. Когда предел известен, шапка печатает «(круг N из M)», а
+    фраза «это последний автоматический круг» остаётся только на последнем круге — на
+    `high`-шаге прежний текст врал бы про единственный круг.
+    """
     plan_rel = p.cfg.rel(Path(p.plan_file))
+    round_label = f"(круг {round_no} из {max_rounds})" if max_rounds else f"(круг {round_no})"
+    if max_rounds and round_no >= max_rounds:
+        tail = [
+            "ВАЖНО: это последний автоматический круг правок. Второй REQUEST_CHANGES "
+            "останавливает",
+            "конвейер и уходит владельцу — доведи находки до конца.",
+        ]
+    elif max_rounds:
+        tail = [
+            f"Осталось кругов: {max(0, max_rounds - round_no)} из {max_rounds}. "
+            "Исчерпание лимита — стоп владельцу:",
+            "следующий отказ после последнего круга останавливает конвейер.",
+        ]
+    else:
+        tail = [
+            "ВАЖНО: это последний автоматический круг правок. Второй REQUEST_CHANGES "
+            "останавливает",
+            "конвейер и уходит владельцу — доведи находки до конца.",
+        ]
     return "\n".join([
-        f"ПРАВКИ ПО РЕВЬЮ шага {step['id']} плана {p.plan_id} — {step['title']} (круг {round_no})",
+        f"ПРАВКИ ПО РЕВЬЮ шага {step['id']} плана {p.plan_id} — {step['title']} {round_label}",
         "",
         f"Ревьюер вернул REQUEST_CHANGES. Отчёт: `{report_rel}`.",
         f"Контракт шага — `{plan_rel}` §{step['id']}, критерий: {step.get('dod', '')}",
@@ -1899,8 +1942,7 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -> str:
         "2. kanban_complete: какие находки закрыты (по номерам), прогоны с цифрами, sha коммита.",
         "   Журнал плана не трогать. Следующий круг ревью ставит страж.",
         "",
-        "ВАЖНО: это последний автоматический круг правок. Второй REQUEST_CHANGES останавливает",
-        "конвейер и уходит владельцу — доведи находки до конца.",
+        *tail,
     ])
 
 
@@ -1965,6 +2007,7 @@ def build_ctx(p: Paths) -> dict:
     # Лимит автоматических кругов правок по ревью: решение чистым остаётся, но правило
     # живёт в конфигурации проекта, а не в коде.
     ctx["max_fix_rounds"] = int(p.cfg.max_fix_rounds)
+    ctx["max_fix_rounds_high"] = int(p.cfg.max_fix_rounds_high)
     # Лимит расширения плана правкой (S4): правило из конфигурации проекта, базовая версия —
     # из состояния (`plan_fix_snapshot` при заказе карточки правок). Объём версии плана
     # считается здесь, а не в `decide`: решение стража остаётся функцией состояния и файлов
@@ -2217,6 +2260,27 @@ def decide(ctx: dict) -> dict:
     return base
 
 
+def step_fix_limit(ctx: dict, step: dict | None) -> int:
+    """Предел автоматических кругов правок шага: ступень по риску шага (план 12, S3).
+
+    Риск читается так же, как в `hold_risk` — пометка `Риск:` шага, иначе `normal`;
+    нераспознанная пометка уже сведена `next_step._risk_of` к `high`. Классов ровно три:
+    `low` и `normal` получают базу `max_fix_rounds`, `high` — `max_fix_rounds_high`.
+    Ступени выше `high` нет: четвёртое значение читалось бы как `high` и лестницу не меняло.
+
+    Бюджет **плана** (`plan_fix_budget`/`PLAN_REVIEW_MAX_ROUNDS`) в лестнице не участвует:
+    у плана класса риска нет. Серии `:fix:{N}` и `:promptfix:{N}` — обе круг правок шага и
+    обе берут этот предел; `:promptfix-stale:{N}` и `:rereview:{N}` — нет (ANCHOR
+    `rounds_classification`).
+    """
+    risk = str((step or {}).get("risk") or "normal").lower()
+    if risk == "high":
+        limit = int(ctx.get("max_fix_rounds_high") or DEFAULT_FIX_ROUNDS_HIGH)
+    else:
+        limit = int(ctx.get("max_fix_rounds") or DEFAULT_FIX_ROUNDS)
+    return max(limit, 1)
+
+
 def _decide_base(ctx: dict) -> dict:
     """Решение без учёта стоп-флага."""
     step = ctx.get("next")
@@ -2387,15 +2451,17 @@ def _decide_base(ctx: dict) -> dict:
                     "after_close": True, "reason": reason}
         return {"action": "close_step", "step": sid, "data": step, "verdict": verdict,
                 "journal_closed": ctx.get("journal_closed")}
-    max_fix_rounds = int(ctx.get("max_fix_rounds") or DEFAULT_FIX_ROUNDS)
+    max_fix_rounds = step_fix_limit(ctx, step)
     if len(fixes) < max_fix_rounds:
         # Круги правок не бесконечны, но и не один: после первого REQUEST_CHANGES исполнитель
         # получает ещё круг, и только исчерпание лимита останавливает конвейер (правило 4).
         return {"action": "create_fix", "step": sid, "data": step,
                 "round": len(fixes) + 1, "parent": last_review["id"]}
     findings = _review_findings(Path(verdict["path"]), 5)
+    high = str((step or {}).get("risk") or "normal").lower() == "high"
+    tier = " (класс риска: high)" if high else ""
     reason = (f"REQUEST_CHANGES по шагу {sid} — исчерпан лимит автоматических кругов правок "
-              f"({max_fix_rounds})")
+              f"({max_fix_rounds}){tier}")
     details = [f"Замечания ревью ({Path(verdict['path']).name}):"]
     details += [f"  - {f}" for f in findings] or ["  - пунктов в отчёте не нашёл, смотри отчёт целиком"]
     recs = _review_recommendations(Path(verdict["path"]), 3)
@@ -2406,8 +2472,13 @@ def _decide_base(ctx: dict) -> dict:
         "  1) принять как есть, если замечания непринципиальны: gate.py --resume и закрыть шаг;",
         "  2) переписать постановку шага в docs/prompts/ и вернуть шаг в работу;",
         "  3) доправить вручную по замечаниям и запустить тик: ревью пойдёт заново.",
-        "Стоп инцидентный: снимется сам, как только появится вердикт APPROVE.",
     ]
+    if high:
+        details += [
+            "Лимит `high` — это предел, а не настройка: повышение не предусмотрено —",
+            "нужен разбор плана и решение владельца.",
+        ]
+    details += ["Стоп инцидентный: снимется сам, как только появится вердикт APPROVE."]
     return {"action": "stop", "step": sid, "reason": reason, "details": "\n".join(details)}
 
 
@@ -3363,11 +3434,13 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
         # Бюджет считает действующий вердикт: отчёт APPROVE при открытой находке круги
         # расходует так же, как REQUEST_CHANGES. Текст и число стопа прежние — они
         # закреплены тестом `test_prompt_fix_rounds_exhausted_stops`.
-        max_rounds = int(ctx.get("max_fix_rounds") or DEFAULT_FIX_ROUNDS)
+        max_rounds = step_fix_limit(ctx, step)
         if len(fixes) >= max_rounds:
+            high = str((step or {}).get("risk") or "").lower() == "high"
+            tier = ", класс риска: high" if high else ""
             return {"action": "stop", "step": sid,
                     "reason": (f"ревью постановки {sid} вернуло REQUEST_CHANGES, круги "
-                               f"автопереписывания исчерпаны ({len(fixes)}) — решает владелец: "
+                               f"автопереписывания исчерпаны ({len(fixes)}{tier}) — решает владелец: "
                                f"{Path(verdict['path']).name}")}
         # Правило приёмки — только когда следующий круг ещё можно открыть: круг правок,
         # закрывший 0 находок, нового круга не открывает, а уходит владельцу.
@@ -5261,11 +5334,10 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             key = f"planloop:{plan_id}:{step['id']}:promptfix:{round_no}"
             title = f"[переписать постановку {plan_id} {step['id']}] {step['title']}"
             # Открытые ID реестра — в тело карточки (12-S2): реестр решает вердикт, и правка
-            # обязана закрыть именно его строки. Предел кругов — из конфигурации проекта.
+            # обязана закрыть именно его строки. Предел кругов — по риску шага (12-S3).
             body = prompt_fix_card_body(p, step, round_no, report_rel,
                                         findings=open_prompt_findings_lines(ctx),
-                                        max_rounds=int(ctx.get("max_fix_rounds")
-                                                       or DEFAULT_FIX_ROUNDS),
+                                        max_rounds=step_fix_limit(ctx, step),
                                         report_verdict=str(decision.get("report") or ""))
         cid = create_card(p, title, body, p.cfg.prompter, key, p.cfg.prompt_skills,
                           max_runtime=p.cfg.prompt_runtime)
@@ -5335,16 +5407,17 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             return result
         key = f"planloop:{plan_id}:{step['id']}:fix:{round_no}"
         report_rel = _report_rel(p, step["id"])
+        max_rounds = step_fix_limit(ctx, step)
         cid = create_card(p, f"[правки {plan_id} {step['id']} #{round_no}] {step['title']}",
-                          fix_card_body(p, step, round_no, report_rel),
+                          fix_card_body(p, step, round_no, report_rel, max_rounds=max_rounds),
                           assignee, key, p.cfg.step_skills,
                           parent=decision.get("parent"), max_runtime=p.cfg.step_runtime)
         result.update(applied=bool(cid), detail=f"карточка правок: {cid}")
         touch(f"create_fix:{cid}")
         if cid:
             findings = _review_findings(Path(p.repo) / report_rel, 3)
-            msg = [f"план {plan_id}, ревью {step['id']}: нужны правки, это единственный "
-                   f"автоматический круг"]
+            msg = [f"план {plan_id}, ревью {step['id']}: нужны правки, круг {round_no} "
+                   f"из {max_rounds}"]
             if findings:
                 msg.append("  что нашёл ревьюер:")
                 msg += [f"  - {f}" for f in findings]
@@ -5857,7 +5930,9 @@ def remember_action(p: Paths, plan_id: str, decision: dict, detail: str,
 
     В историю (`history.jsonl`) — строка на действие: `ts` (epoch, для окна и разностей),
     `at` тем же форматом, что в состоянии, план, шаг, действие, длительность в секундах,
-    `detail` (те же 200 символов) и sha коммита, если он был (D4).
+    `detail` (те же 200 символов), sha коммита, если он был (D4), и `stale` — признак
+    пересборки протухшей постановки: по нему метрика (`stats._step_rounds`) отличает правки
+    от пересборок, не разбирая `detail` (12-S3).
     """
     at = time.strftime("%d.%m.%Y %H:%M:%S")
     action = str(decision.get("action") or "")
@@ -5872,7 +5947,8 @@ def remember_action(p: Paths, plan_id: str, decision: dict, detail: str,
     save_state(p, state)
     append_history(p.cfg, {"ts": time.time(), "at": at, "plan": plan_id, "step": step,
                            "action": action, "duration_s": round(float(duration), 3),
-                           "detail": text, "commit": str(commit or "")})
+                           "detail": text, "commit": str(commit or ""),
+                           "stale": bool(decision.get("stale"))})
 
 
 
