@@ -431,6 +431,7 @@ def test_snapshot_etag_and_304_do_not_touch_engine(server, monkeypatch):
     assert len(calls) == 3                      # 304 движок не запускает
 
 
+@pytest.mark.slow
 def test_events_stream_first_frame_is_snapshot(server):
     event = open_events(server["url"] + "/api/events?plan=1")
     try:
@@ -448,6 +449,7 @@ def test_events_stream_first_frame_is_snapshot(server):
         close_events(event)
 
 
+@pytest.mark.slow
 def test_events_stream_pushes_on_change(server, monkeypatch):
     calls = engine_counter(monkeypatch)
     event = open_events(server["url"] + "/api/events?plan=1")
@@ -465,6 +467,7 @@ def test_events_stream_pushes_on_change(server, monkeypatch):
         close_events(event)
 
 
+@pytest.mark.slow
 def test_tick_pushes_event_with_new_card(server):
     event = open_events(server["url"] + "/api/events?plan=1")
     try:
@@ -1507,6 +1510,7 @@ def test_extra_project_joins_registry_from_command_line(tmp_path: Path, hermes_s
     assert rows["gamma"]["source"] == "command line"
 
 
+@pytest.mark.slow
 def test_action_by_one_project_does_not_touch_another(tmp_path: Path, hermes_stub: Path,
                                                       isolated_hermes_home: Path):
     """Действие адресуется выбранному проекту и подписано его именем (§4.3)."""

@@ -13,6 +13,10 @@ import pytest
 
 from engine_kit import make_project
 
+# Весь модуль — субпроцессный e2e: в точечный прогон исполнителя и ревьюера не входит
+# (`pytest -m "not slow"`), полный прогон и CI его не теряют (шаг 8-S2).
+pytestmark = pytest.mark.slow
+
 
 def sh(cmd: list[str], cwd: Path, env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,

@@ -137,22 +137,37 @@ def cards(db: Path) -> list[dict]:
              "key": r[4], "max_runtime": r[5]} for r in rows]
 
 
+# Ритм повторов `complete()` — как у `_card_visible` в движке: попытки с паузой, последняя
+# без паузы. Гонка настоящая: строки карточки может ещё не быть в базе к моменту вызова.
+COMPLETE_TRIES = 3
+COMPLETE_PAUSE = 0.25
+
+
 def complete(db: Path, key_suffix: str, status: str = "done", result: str = "") -> int:
     """Отметить карточку завершённой (как это делает воркер); вернуть число закрытых.
 
     Пустой `UPDATE` — это не «уже закрыто», а «такой карточки нет»: раньше помощник молча
     ничего не делал, и тест терял круг правок, падая потом на другом шаге (мигающий
-    `test_prompt_fix_rounds_exhausted_stops` в полном прогоне). Теперь отказ громкий.
+    `test_prompt_fix_rounds_exhausted_stops` в полном прогоне).
+
+    Попыток до `COMPLETE_TRIES` с паузой `COMPLETE_PAUSE`: карточку пишет другой процесс,
+    и к моменту вызова её строки может ещё не быть в базе (гонка `promptfix:2`). Отказ
+    остаётся громким: исчерпав попытки, помощник поднимает `AssertionError` тем же
+    текстом, а не превращает промах в тихий no-op.
     """
-    con = sqlite3.connect(db)
-    try:
-        cur = con.execute("UPDATE tasks SET status=?, completed_at=?, result=?"
-                          " WHERE idempotency_key LIKE ?", (status, int(time.time()), result,
-                                                            "%" + key_suffix))
-        con.commit()
-        done = cur.rowcount
-    finally:
-        con.close()
-    if done <= 0:
-        raise AssertionError(f"complete({key_suffix!r}): карточки с таким ключом нет в {db}")
-    return done
+    done = 0
+    for attempt in range(1, COMPLETE_TRIES + 1):
+        con = sqlite3.connect(db)
+        try:
+            cur = con.execute("UPDATE tasks SET status=?, completed_at=?, result=?"
+                              " WHERE idempotency_key LIKE ?",
+                              (status, int(time.time()), result, "%" + key_suffix))
+            con.commit()
+            done = cur.rowcount
+        finally:
+            con.close()
+        if done > 0:
+            return done
+        if attempt < COMPLETE_TRIES:
+            time.sleep(COMPLETE_PAUSE)
+    raise AssertionError(f"complete({key_suffix!r}): карточки с таким ключом нет в {db}")

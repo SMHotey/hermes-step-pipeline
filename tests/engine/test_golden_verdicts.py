@@ -23,6 +23,10 @@ import golden_kit as kit
 
 CASES = kit.case_dirs()
 
+# Весь модуль — эталонные прогоны настоящего движка: в точечный прогон не входит
+# (`pytest -m "not slow"`), полный прогон и CI его не теряют (шаг 8-S2).
+pytestmark = pytest.mark.slow
+
 
 def pytest_generate_tests(metafunc):
     """Корпус — данные: новый каталог с `case.json` попадает в прогон сам."""
