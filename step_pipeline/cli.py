@@ -71,6 +71,8 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     run.add_argument("--plan", default="")
     run.add_argument("--max-actions", type=int, default=None,
                      help="сколько действий за тик (по умолчанию — из pipeline.json)")
+    run.add_argument("--pause", action="store_true",
+                     help="показать паузу по расписанию: окна и действует ли сейчас")
     run.set_defaults(handler=cmd_run)
 
     ui = sub.add_parser("ui", help="локальный UI с визуализацией конвейера")
@@ -232,6 +234,12 @@ def render_status(data: dict) -> str:
 
 def cmd_run(args) -> int:
     project = _project(args.project)
+    if getattr(args, "pause", False):
+        # Пауза по расписанию считается движком проекта, а не плагином: у копии движка
+        # и у репозитория один и тот же ответ, и `--pause` не притворяется тиком.
+        res = proj.run_engine(project, "gate.py", "--pause", timeout=60)
+        print((res.stdout or "").strip() or (res.stderr or "").strip())
+        return res.returncode
     extra = ["--plan", args.plan] if args.plan else []
     # Флаг не задан — движок берёт предел из pipeline.json проекта (D2).
     if args.max_actions is not None:

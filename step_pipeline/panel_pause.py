@@ -68,7 +68,10 @@ def plans(root: Path) -> list[dict]:
     data = proj.engine_json(root, "gate.py", "--plans", timeout=90)
     rows = [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
     with _CACHE_LOCK:
-        _PLANS_CACHE[root] = (now, rows)
+        # Метка — после запуска движка, а не до: на медленной машине разбор плана
+        # занимает секунды, и запись со временем «до» съедала TTL ещё до того, как
+        # строки появлялись. Панель после этого поднимала движок дважды на запрос.
+        _PLANS_CACHE[root] = (time.monotonic(), rows)
     return rows
 
 

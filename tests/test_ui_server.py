@@ -1845,6 +1845,98 @@ def test_index_has_config_diff_and_rollback_markup():
         assert call in html, call
 
 
+# ─────────────── пауза по расписанию (0.28.2) ───────────────
+
+PAUSE_PATCH = {"enabled": True,
+               "windows": [{"from": "23:00", "to": "07:00"},
+                           {"from": "13:00", "to": "14:00"}]}
+
+
+def test_save_config_writes_quiet_hours(server):
+    """Форма сохраняет два окна как есть: порядок и значения переживают круговой рейс."""
+    status, data = post(server["url"], {"action": "save_config",
+                                        "config": {"quiet_hours": PAUSE_PATCH}})
+    assert status == 200 and data["ok"], data
+    saved = json.loads(config_file(server).read_text(encoding="utf-8"))["quiet_hours"]
+    assert saved == PAUSE_PATCH
+    assert data["changed"] == ["quiet_hours"]
+
+
+def test_preview_config_shows_pause_window(server):
+    """Предпросмотр показывает окна в диффе и файл не трогает (D4)."""
+    before = config_file(server).read_bytes()
+    status, data = post(server["url"], {"action": "preview_config",
+                                        "config": {"quiet_hours": PAUSE_PATCH}})
+    assert status == 200 and data["ok"], data
+    assert '"from": "23:00"' in data["diff"] and '"enabled": true' in data["diff"]
+    assert config_file(server).read_bytes() == before
+
+
+@pytest.mark.parametrize("bad, anchor", [
+    ({"enabled": True, "windows": [{"from": "7:00", "to": "07:30"}]}, "windows[1].from"),
+    ({"enabled": True, "windows": [{"from": "25:00", "to": "07:00"}]}, "windows[1].from"),
+    ({"enabled": True, "windows": [{"from": "23:00", "to": "23:00"}]}, "совпадают"),
+    ({"enabled": True, "windows": [{"from": "23:00", "to": "07:00"},
+                                   {"from": "23:00", "to": "07:00"}]}, "уже задан"),
+    ({"enabled": True, "windows": [{"from": "01:00", "to": "02:00"},
+                                   {"from": "03:00", "to": "04:00"},
+                                   {"from": "05:00", "to": "06:00"}]}, "не больше 2"),
+    ({"enabled": "да", "windows": []}, "quiet_hours.enabled"),
+    (["23:00-07:00"], "quiet_hours"),
+])
+def test_save_config_rejects_bad_quiet_hours(server, bad, anchor: str):
+    """Мусор в окнах отклоняется с именем поля: файл, который движок не прочитает, не пишем."""
+    before = config_file(server).read_bytes()
+    status, data = post(server["url"], {"action": "save_config",
+                                       "config": {"quiet_hours": bad}})
+    assert status == 400 and not data["ok"], data
+    assert anchor in data["error"], data["error"]
+    assert config_file(server).read_bytes() == before
+
+
+def test_quiet_hours_notes_when_pause_is_idle(server):
+    """Правка без последствий объясняется запиской, а не тонет в диффе."""
+    status, data = post(server["url"], {"action": "preview_config",
+                                        "config": {"quiet_hours": {"enabled": True,
+                                                                   "windows": []}}})
+    assert status == 200 and data["ok"], data
+    assert any("интервалы не заданы" in note for note in data["notes"]), data["notes"]
+    status, data = post(server["url"], {"action": "preview_config",
+                                        "config": {"quiet_hours": {"enabled": False,
+                                                                   "windows": PAUSE_PATCH["windows"]}}})
+    assert any("пауза выключена" in note for note in data["notes"]), data["notes"]
+
+
+def test_pause_rules_match_engine():
+    """Панель судит окна теми же правилами, что движок: шаблон и предел — не «примерно»."""
+    engine = (PLUGIN / "step_pipeline" / "engine" / "config.py").read_text(encoding="utf-8")
+    pattern = re.search(r'^PAUSE_TIME_RE = re\.compile\((r".+")\)$', engine, re.M)
+    limit = re.search(r"^PAUSE_WINDOWS_MAX = (\d+)$", engine, re.M)
+    assert pattern and limit, "в движке нет правил паузы — панель разошлась с ним"
+    assert ui_server.PAUSE_TIME_RE.pattern == pattern.group(1).strip('r"')
+    assert ui_server.PAUSE_WINDOWS_MAX == int(limit.group(1))
+
+
+def test_index_has_pause_fields():
+    """Поля паузы в диалоге настроек и бейдж «ПАУЗА» в шапке — на месте (§6.6)."""
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+    for anchor in ('name="pause_enabled"', 'id="pause-from-1"', 'name="pause_from_1"',
+                   'id="pause-to-2"', 'name="pause_to_2"', 'id="pause-hint"',
+                   "quiet_hours:", '"ПАУЗА"', "data.pause"):
+        assert anchor in html, anchor
+
+
+def test_snapshot_carries_pause_state(server):
+    """Снимок несёт паузу: по ней панель отличает «окно расписания» от «сломалось»."""
+    status, data = get(server["url"] + "/api/snapshot")
+    assert status == 200 and data["ok"]
+    quiet = data.get("quiet_hours") or {}
+    assert quiet.get("enabled") is False and quiet.get("paused") is False, quiet
+    assert quiet.get("windows") == []
+    # `pause` в снимке занят глобальной паузой панели: пауза по расписанию живёт отдельно.
+    assert "all_paused" in (data.get("pause") or {})
+
+
 # ─────────────── подключение проектов (план 3 S8) ───────────────
 
 def post_to(url: str, route: str, payload: dict | None = None,

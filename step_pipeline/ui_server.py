@@ -149,11 +149,16 @@ def busy_version(host: str, port: int, timeout: float = 0.5) -> str | None:
     return str(data.get("version") or "?")
 
 # Ключи конфигурации, которыми форма настроек управляет на верхнем уровне (6.6).
-CONFIG_KEYS = ("project", "board", "driven_plans", "require_prompt")
+CONFIG_KEYS = ("project", "board", "driven_plans", "require_prompt", "quiet_hours")
 # Значения таймаутов движка: только `45m`/`3h` (D2). Единица обязательна, дробных
 # и нулевых нет: `0m` — тот же вечный ожидатель, что и `-5m` (только под видом времени).
 RUNTIME_RE = re.compile(r"^\d+[mh]$")
 RUNTIME_KEYS = ("step", "review", "prompt")
+# Окна паузы по расписанию: правила те же, что у движка (`engine/config.py`). Плагин
+# движок не импортирует (инвариант `project.py`), поэтому шаблон и предел продублированы
+# и стерегутся тестом: разойтись с движком панель не имеет права — она пишет файл.
+PAUSE_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+PAUSE_WINDOWS_MAX = 2
 # Каталоги, которые панель ведёт (D3): только эти подключи `paths` проверяются на
 # выход за корень; остальные сохраняются как есть.
 CONFIG_PATH_KEYS = ("plans", "reviews", "prompts", "state")
@@ -628,6 +633,62 @@ def _validate_patch(cfg: dict, patch: dict, root: Path) -> tuple[dict, list[str]
                     merged[name] = text
             if not bad:
                 candidate["runtimes"] = merged
+        elif key == "quiet_hours":
+            # Пауза по расписанию (0.28.2): панель обязана судить окна теми же правилами,
+            # что движок, — иначе форма запишет файл, который движок потом не прочитает.
+            if not isinstance(value, dict):
+                errors.append('quiet_hours: нужен объект вида {"enabled": true, '
+                              '"windows": [{"from": "23:00", "to": "07:00"}]}')
+                continue
+            enabled = value.get("enabled", False)
+            if not isinstance(enabled, bool):
+                errors.append("quiet_hours.enabled: true или false")
+                continue
+            raw_windows = value.get("windows")
+            if raw_windows is None:
+                raw_windows = []
+            if not isinstance(raw_windows, list):
+                errors.append("quiet_hours.windows: список интервалов")
+                continue
+            if len(raw_windows) > PAUSE_WINDOWS_MAX:
+                errors.append(f"quiet_hours.windows: интервалов не больше {PAUSE_WINDOWS_MAX}")
+                continue
+            parsed: list[dict] = []
+            bad = False
+            for index, item in enumerate(raw_windows, start=1):
+                if not isinstance(item, dict):
+                    errors.append(f"quiet_hours.windows[{index}]: нужен объект "
+                                  '{"from": "23:00", "to": "07:00"}')
+                    bad = True
+                    continue
+                start = str(item.get("from") if item.get("from") is not None else "").strip()
+                end = str(item.get("to") if item.get("to") is not None else "").strip()
+                item_bad = False
+                for name, text in (("from", start), ("to", end)):
+                    if not PAUSE_TIME_RE.match(text):
+                        errors.append(f"quiet_hours.windows[{index}].{name}: "
+                                      "ожидается время ЧЧ:ММ (например, 23:00)")
+                        item_bad = True
+                if item_bad:
+                    bad = True
+                    continue
+                if start == end:
+                    errors.append(f"quiet_hours.windows[{index}]: начало и конец совпадают")
+                    bad = True
+                    continue
+                if {"from": start, "to": end} in parsed:
+                    errors.append(f"quiet_hours.windows[{index}]: интервал {start}–{end} "
+                                  "уже задан")
+                    bad = True
+                    continue
+                parsed.append({"from": start, "to": end})
+            if bad:
+                continue
+            candidate["quiet_hours"] = {"enabled": enabled, "windows": parsed}
+            if enabled and not parsed:
+                notes.append("пауза включена, но интервалы не заданы — тики идут круглосуточно")
+            if parsed and not enabled:
+                notes.append("интервалы заданы, но пауза выключена — тики идут круглосуточно")
         elif key == "paths":
             if not isinstance(value, dict):
                 errors.append("paths: нужен объект вида {\"plans\": \"docs/plans\"}")

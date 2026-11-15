@@ -49,6 +49,10 @@
     "scout": "30m",
     "plan_review": "45m"
   },
+  "quiet_hours": {
+    "enabled": false,
+    "windows": []
+  },
   "ui": {
     "progress": {
       "learn": true,

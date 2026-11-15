@@ -1495,6 +1495,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         "require_prompt": cfg.get("require_prompt", True),
         "telegram": telegram_state(root),
         "preview": preview,
+        "quiet_hours": {},
         "plans": [],
         "drafts": [],
         "plan": None,
@@ -1530,6 +1531,10 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         out["decision"] = decision.get("decision") or {}
         out["status"] = decision.get("status") or ""
         out["metrics"] = decision.get("metrics") or {}
+        # Пауза по расписанию (0.28.2) приходит тем же ответом `--status`: своего запуска
+        # движка у неё нет. Ключ называется `quiet_hours`, а не `pause`: `pause` в снимке —
+        # глобальная пауза панели (projects.json), это другая вещь.
+        out["quiet_hours"] = decision.get("pause") or {}
     except Exception as exc:                                    # noqa: BLE001
         out["errors"].append(f"решение: {exc}")
     try:

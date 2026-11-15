@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -95,6 +96,11 @@ DEFAULTS: dict = {
     # молча: карточка правок получает owner-стоп с цифрой, решает владелец.
     "max_plan_growth": {"percent": 10, "chars_per_finding": 400, "enforce": True},
     "runtimes": {"step": "3h", "review": "150m", "prompt": "45m"},
+    # Пауза по расписанию: окна локального времени ОС, в которые тик не работает.
+    # Выключено — поведение проектов не меняется. Интервалов не больше двух: владелец
+    # просил два (ночь и обед), а длинный список настраивать руками никто не будет.
+    # Окно может идти через полночь (`23:00`–`07:00`); конец окна — не включается.
+    "quiet_hours": {"enabled": False, "windows": []},
     "kanban": {"tenant": "plan"},
     "git": {"commit": True, "push": True},
     # Уведомления владельцу. Выключено — сообщения идут в stdout (видит `hermes cron runs`).
@@ -149,6 +155,13 @@ SUBJECT_AREAS = ("frontend", "backend", "devops", "designer", "security")
 
 # Ключ маршрута — то же ограничение, что у токена владельца в заголовке шага.
 ROUTING_KEY_RE = re.compile(r"[a-z][a-z0-9_-]{1,30}")
+
+# Время окна паузы: 24-часовой формат `ЧЧ:ММ`, только цифры с ведущим нулём — «7:00» и
+# «25:00» в pipeline.json означали бы окно не там, где его ждёт владелец.
+PAUSE_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+# Предел интервалов паузы: два. Больше окон — это уже расписание смен, а не «поставить
+# паузу на ночь и на обед»; предел держится и в панели, и в движке одним числом.
+PAUSE_WINDOWS_MAX = 2
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -275,6 +288,115 @@ def _plan_growth(value: object) -> dict:
     return out
 
 
+def _pause_time(value: object, where: str) -> int:
+    """Время окна паузы в минутах суток; всё, кроме `ЧЧ:ММ`, — ошибка конфигурации.
+
+    Молчаливого умолчания здесь нет намеренно (тот же принцип, что у `_fix_rounds`):
+    пауза выключает конвейер, и окно, тихо прочитанное не так, означало бы простой
+    или работу не в те часы, которых ждёт владелец.
+    """
+    text = str(value if value is not None else "").strip()
+    match = PAUSE_TIME_RE.match(text)
+    if not match:
+        raise ConfigError(f"{where}: ожидается время ЧЧ:ММ (например, 23:00), "
+                          f"получено: {value!r}")
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _quiet_hours(value: object) -> dict:
+    """Окна паузы по расписанию: `enabled` и до двух интервалов `ЧЧ:ММ`–`ЧЧ:ММ`.
+
+    Пустой список окон законен и при `enabled: true`: пауза включена, но расписания нет —
+    тики идут круглосуточно (так настройка, начатая в панели, не выключает конвейер, пока
+    интервалы не заданы). Пересечение окон не ошибка: два окна — это «когда не работать»,
+    и лишнее покрытие ни на что не влияет.
+    """
+    default = DEFAULTS["quiet_hours"]
+    if value is None:
+        return {"enabled": bool(default["enabled"]), "windows": []}
+    if not isinstance(value, dict):
+        raise ConfigError(f"quiet_hours должен быть объектом JSON, получено: {value!r}")
+    enabled = value.get("enabled", default["enabled"])
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"quiet_hours.enabled должен быть true или false, "
+                          f"получено: {enabled!r}")
+    raw_windows = value.get("windows")
+    if raw_windows is None:
+        raw_windows = []
+    if not isinstance(raw_windows, list):
+        raise ConfigError(f"quiet_hours.windows должен быть списком интервалов, "
+                          f"получено: {raw_windows!r}")
+    if len(raw_windows) > PAUSE_WINDOWS_MAX:
+        raise ConfigError(f"quiet_hours.windows: интервалов не больше {PAUSE_WINDOWS_MAX}, "
+                          f"получено: {len(raw_windows)}")
+    windows: list[dict] = []
+    for index, item in enumerate(raw_windows, start=1):
+        if not isinstance(item, dict):
+            raise ConfigError(f"quiet_hours.windows[{index}]: нужен объект "
+                              f'{{"from": "23:00", "to": "07:00"}}, получено: {item!r}')
+        start = _pause_time(item.get("from"), f"quiet_hours.windows[{index}].from")
+        end = _pause_time(item.get("to"), f"quiet_hours.windows[{index}].to")
+        if start == end:
+            raise ConfigError(f"quiet_hours.windows[{index}]: начало и конец совпадают — "
+                              f"интервал не задан")
+        window = {"from": _hhmm(start), "to": _hhmm(end)}
+        if window in windows:
+            raise ConfigError(f"quiet_hours.windows[{index}]: интервал "
+                              f"{window['from']}–{window['to']} уже задан")
+        windows.append(window)
+    return {"enabled": enabled, "windows": windows}
+
+
+def _hhmm(minutes: int) -> str:
+    """Минуты суток обратно в `ЧЧ:ММ` — форма, в которой окно живёт в конфиге."""
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _in_window(minute: int, start: int, end: int) -> bool:
+    """Минута суток внутри интервала `[start, end)`; конец раньше начала — через полночь."""
+    if end > start:
+        return start <= minute < end
+    return minute >= start or minute < end
+
+
+def pause_state(cfg: Config, now: float | None = None) -> dict:
+    """Пауза по расписанию на момент *now* (epoch; локальное время ОС, как у сводки).
+
+    Одна форма ответа и для панели, и для CLI, и для тика: `enabled`, `windows`, `paused`,
+    `window` (активное окно или None), `until` (конец окна) и `reason` — готовая строка,
+    которую можно показать владельцу. Часы читаются ровно здесь: решение о паузе —
+    функция состояния и времени, без модели и без истории.
+    """
+    data = cfg.quiet_hours if isinstance(cfg.quiet_hours, dict) else {}
+    windows = list(data.get("windows") or [])
+    enabled = bool(data.get("enabled"))
+    moment = time.time() if now is None else float(now)
+    local = time.localtime(moment)
+    minute = local.tm_hour * 60 + local.tm_min
+    state = {"enabled": enabled, "windows": windows, "paused": False, "window": None,
+             "until": "", "at": time.strftime("%H:%M", local), "reason": ""}
+    if not enabled:
+        state["reason"] = "пауза по расписанию выключена"
+        return state
+    if not windows:
+        state["reason"] = "пауза по расписанию включена, интервалы не заданы"
+        return state
+    for window in windows:
+        start = _pause_time(window.get("from"), "quiet_hours.windows.from")
+        end = _pause_time(window.get("to"), "quiet_hours.windows.to")
+        if _in_window(minute, start, end):
+            state.update({
+                "paused": True, "window": window, "until": window["to"],
+                "reason": (f"пауза по расписанию: окно {window['from']}–{window['to']} "
+                           f"действует (сейчас {state['at']}), тики до {window['to']}"),
+            })
+            return state
+    state["reason"] = ("пауза по расписанию: сейчас не окно ("
+                       + ", ".join(f"{w['from']}–{w['to']}" for w in windows)
+                       + "), тики идут")
+    return state
+
+
 @dataclass(frozen=True)
 class Config:
     """Разобранная конфигурация одного проекта."""
@@ -304,6 +426,7 @@ class Config:
     max_fix_rounds_high: int
     max_stale_rebuilds: int
     max_plan_growth: dict
+    quiet_hours: dict
     step_runtime: str
     review_runtime: str
     prompt_runtime: str
@@ -502,6 +625,7 @@ def load(repo: Path | str | None = None) -> Config:
         max_fix_rounds_high=_fix_rounds_high(raw.get("max_fix_rounds_high")),
         max_stale_rebuilds=_stale_rebuilds(raw.get("max_stale_rebuilds")),
         max_plan_growth=_plan_growth(raw.get("max_plan_growth")),
+        quiet_hours=_quiet_hours(raw.get("quiet_hours")),
         step_runtime=str(runtimes.get("step") or "3h"),
         review_runtime=str(runtimes.get("review") or "150m"),
         prompt_runtime=str(runtimes.get("prompt") or "45m"),

@@ -749,6 +749,15 @@
       <div><label for="path-state">Состояние</label><input type="text" id="path-state" name="path_state"></div>
     </div>
     <label><input type="checkbox" name="require_prompt"> шаг без постановки не начинается</label>
+    <label><input type="checkbox" name="pause_enabled"> пауза по расписанию: в заданные окна тики не работают</label>
+    <div class="row">
+      <div><label for="pause-from-1">Окно 1: с</label><input type="time" id="pause-from-1" name="pause_from_1"></div>
+      <div><label for="pause-to-1">по</label><input type="time" id="pause-to-1" name="pause_to_1"></div>
+      <div><label for="pause-from-2">Окно 2: с</label><input type="time" id="pause-from-2" name="pause_from_2"></div>
+      <div><label for="pause-to-2">по</label><input type="time" id="pause-to-2" name="pause_to_2"></div>
+    </div>
+    <div class="muted" id="pause-hint">время системное (из ОС); окно через полночь задаётся
+      как «с 23:00 по 07:00», конец окна не включается — в 07:00 тик уже работает</div>
     <div class="config-preview">
       <div class="config-preview-head">
         <b>Дифф конфигурации</b>
@@ -2398,6 +2407,11 @@ function render(data) {
   }
   const decision = data.decision || {};
   const stopped = (data.plans || []).some((p) => p.state === "stopped");
+  // Пауза по расписанию (0.28.2): её видно в шапке, иначе «конвейер стоит» выглядит
+  // поломкой — тик в окне выходит с кодом 0 и ничего не двигает. Ключ `quiet_hours`,
+  // а не `pause`: `pause` в снимке — глобальная пауза панели, другая вещь.
+  const quietHours = data.quiet_hours || {};
+  const paused = quietHours.paused === true;
   const mode = $("mode");
   if (data.preview) {
     mode.textContent = "ПРЕДПРОСМОТР";
@@ -2413,8 +2427,12 @@ function render(data) {
     $("btn-tick").title = $("btn-stop").title = $("btn-resume").title =
       "конвейер не установлен в этот проект — вкладка «Установка»";
   } else {
-    mode.textContent = stopped ? "СТОП" : (decision.action || "—");
-    mode.className = "badge " + (stopped ? "stop" : (["idle"].includes(decision.action) ? "" : "run"));
+    mode.textContent = stopped ? "СТОП" : (paused ? "ПАУЗА" : (decision.action || "—"));
+    mode.className = "badge " + (stopped || paused ? "stop"
+      : (["idle"].includes(decision.action) ? "" : "run"));
+    // Подсказка бейджа: окно паузы и его конец. Вне окна — пусто, чтобы не спорить
+    // с решением стража.
+    mode.title = paused ? (quietHours.reason || "пауза по расписанию") : "";
     // Кнопки возвращаются в строй только здесь: предпросмотр и «не установлен» их гасят.
     $("btn-stop").disabled = $("btn-resume").disabled = panelBusy;
   }
@@ -2520,6 +2538,7 @@ function render(data) {
   fillStepPicker();
 
   $("status").textContent = [
+    paused ? quietHours.reason : "",
     `решение: ${decision.action || "—"} — ${decision.reason || ""}`,
     data.status || "",
     ...(data.errors || []).map((e) => "! " + e),
@@ -2880,10 +2899,18 @@ function configPatch() {
   // Тот же патч для проверки и для сохранения: проверенный дифф обязан совпасть
   // с записываемым файлом байт в байт (D4).
   const form = $("form-config");
+  // Окна паузы по расписанию: поле без пары не отправляем вовсе — пустая пара значит
+  // «окна нет», а половина пары ушла бы в файл как ошибка, которую видно только после
+  // сохранения. Проверку «ЧЧ:ММ» и предел в два окна держит сервер: одна правда о формате.
+  const windows = [1, 2].map((index) => ({
+    from: (form[`pause_from_${index}`].value || "").trim(),
+    to: (form[`pause_to_${index}`].value || "").trim(),
+  })).filter((pair) => pair.from || pair.to);
   return {
     board: form.board.value.trim(),
     driven_plans: form.driven_plans.value,
     require_prompt: form.require_prompt.checked,
+    quiet_hours: {enabled: form.pause_enabled.checked, windows: windows},
     runtimes: {step: form.step.value.trim(), review: form.review.value.trim(),
                prompt: form.prompt.value.trim()},
     paths: {plans: form.path_plans.value.trim(), reviews: form.path_reviews.value.trim(),
@@ -2935,6 +2962,16 @@ async function loadConfigForm() {
   form.review.value = rt.review || "";
   form.prompt.value = rt.prompt || "";
   form.require_prompt.checked = cfg.require_prompt !== false;
+  // Пауза по расписанию: окна из файла, по порядку. Отсутствующий ключ — «выключено,
+  // окон нет»: форма не выдумывает расписание там, где его не задавали.
+  const quiet = cfg.quiet_hours || {};
+  const quietWindows = Array.isArray(quiet.windows) ? quiet.windows : [];
+  form.pause_enabled.checked = quiet.enabled === true;
+  [1, 2].forEach((index) => {
+    const pair = quietWindows[index - 1] || {};
+    form[`pause_from_${index}`].value = pair.from || "";
+    form[`pause_to_${index}`].value = pair.to || "";
+  });
   const paths = cfg.paths || {};
   form.path_plans.value = paths.plans || "";
   form.path_reviews.value = paths.reviews || "";

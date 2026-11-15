@@ -53,6 +53,11 @@
 `notify.watchdog_hours` даёт одно напоминание на причину не чаще раза в час, а раз в
 сутки после `notify.digest_at` уходит сводка (закрыто, ждёт, стоп — по строке на план).
 
+Расписание работы: окна паузы из `quiet_hours` (до двух интервалов системного времени,
+окно может идти через полночь) гасят тик целиком — в окне `--run` выходит с кодом 0 и не
+трогает ни доску, ни план, ни сводку. `--pause` отвечает, действует ли окно сейчас.
+Команды владельца (`--stop`, `--resume`, `--hold`) паузы не слушают.
+
 Использование:
     python .pipeline/gate.py --status            # что видно и что было бы сделано
     python .pipeline/gate.py --plans             # таблица планов: шаг, закрыто, стоп
@@ -60,6 +65,7 @@
     python .pipeline/gate.py --run               # тик: до max_actions действий (режим cron)
     python .pipeline/gate.py --run --max-actions 3   # предел на один запуск
     python .pipeline/gate.py --run --plan 3      # тик только по одному плану
+    python .pipeline/gate.py --pause             # пауза по расписанию: окна, действует ли сейчас
     python .pipeline/gate.py --stop "причина"    # остановиться после текущего шага
     python .pipeline/gate.py --resume            # снять стоп
     python .pipeline/gate.py --hold S3a          # шаг требует ручного допуска владельца
@@ -4958,6 +4964,9 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
     result = {"plan_id": plan_id, "decision": decision, "applied": bool(cleared),
               "detail": cleared, "incident_cleared": bool(cleared),
               "status": status_text(ctx, decision)}
+    # Пауза по расписанию едет в ответе `--status`: панель берёт её из того же вызова,
+    # что и решение, — отдельный запуск движка ради одного ключа не нужен.
+    result["pause"] = config_mod.pause_state(p.cfg, _now())
     if not execute:
         result["metrics"] = history_metrics(p.cfg)
         return result
@@ -6189,6 +6198,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="таблица планов: следующий шаг, закрыто, стоп-флаг")
     ap.add_argument("--run", action="store_true",
                     help="выполнить тик: до max_actions действий (режим cron)")
+    ap.add_argument("--pause", action="store_true",
+                    help="показать паузу по расписанию: окна, действует ли сейчас")
     ap.add_argument("--max-actions", type=int, default=None,
                     help="сколько действий за тик (по умолчанию — из pipeline.json)")
     ap.add_argument("--status", action="store_true", help="только показать состояние и решение")
@@ -6215,6 +6226,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # D2: флаг важнее файла; флаг задаёт предел на один запуск и в конфиг не пишется.
     limit = args.max_actions if args.max_actions is not None else max_actions_of(cfg)
+
+    if args.pause:
+        # Пауза по расписанию гасит тики, поэтому про неё спрашивают и панель, и человек:
+        # ответ — та же форма, что у решения стража, без плана и без блокировки.
+        state = config_mod.pause_state(cfg, _now())
+        if args.json:
+            print(json.dumps(state, ensure_ascii=False, indent=2))
+        else:
+            print(state["reason"])
+        return 0
 
     if args.plan_version_sha:
         # Метка `plan_sha256:` в отчёте ревью плана пишется этой командой: ревьюеру нужен
@@ -6253,6 +6274,28 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:  # noqa: BLE001 - уведомление не отменяет код выхода
                 print(f"уведомление не отправлено: {exc}", file=sys.stderr)
             return 3
+        # Пауза по расписанию (окна системного времени): в окне тик не работает вовсе —
+        # ни карточек, ни коммитов, ни сводки. Проверка стоит до блокировки и до разбора
+        # плана: пауза — это «сейчас не тикаем», а не «тик не смог». Ветки `--run` и
+        # `--plan N --run` (её зовут панель и бот) проходят обе через это место.
+        # Команды владельца (`--stop`, `--resume`, `--hold`) паузы не слушают: снять стоп
+        # или допустить шаг можно и ночью.
+        pause = config_mod.pause_state(cfg, _now())
+        if pause["paused"]:
+            if args.json:
+                # Форма ответа та же, что у обычного тика: у паузы `applied: false` и своё
+                # действие в решении, иначе читатель JSON (панель, бот, агент) не отличит
+                # «ничего не сделал» от «не смог».
+                print(json.dumps({"ok": True, "paused": True, "plan_id": args.plan,
+                                  "applied": False, "detail": pause["reason"],
+                                  "status": pause["reason"], "pause": pause,
+                                  "decision": {"action": "paused",
+                                               "reason": pause["reason"]}},
+                                 ensure_ascii=False, indent=2))
+            else:
+                print(pause["reason"])
+            # Код 0: cron не должен считать паузу сбоем джобы и слать ошибки каждое окно.
+            return 0
 
     try:
         if args.plans:
