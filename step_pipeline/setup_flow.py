@@ -471,7 +471,8 @@ def _enable_plugin(profile: str) -> subprocess.CompletedProcess:
     """`hermes -p <профиль> plugins enable step_pipeline`."""
     hermes = shutil.which("hermes") or "hermes"
     return subprocess.run([hermes, "-p", profile, "plugins", "enable", "step_pipeline"],
-                          capture_output=True, text=True, timeout=180)
+                          capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=180)
 
 
 def _plugin_cli_answers(profile: str) -> bool:
@@ -479,7 +480,8 @@ def _plugin_cli_answers(profile: str) -> bool:
     try:
         res = subprocess.run([shutil.which("hermes") or "hermes", "-p", profile,
                               "pipeline", "--help"],
-                             capture_output=True, text=True, timeout=120)
+                             capture_output=True, text=True, encoding="utf-8", errors="replace",
+                             timeout=120)
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0

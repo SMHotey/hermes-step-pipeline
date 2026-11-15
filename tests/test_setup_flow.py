@@ -1133,3 +1133,27 @@ def test_ensure_plugin_enabled_reports_link_failure(monkeypatch):
 
     log = setup_flow.Log(quiet=True)
     assert setup_flow.ensure_plugin_enabled("gapaudit", log) == "плагин не включён"
+
+
+def test_plugin_cli_reads_output_as_utf8_with_replacement(monkeypatch):
+    """Оба вызова CLI читают вывод как UTF-8 с заменой повреждённых байтов, как движок."""
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    setup_flow._enable_plugin("gapaudit")
+    assert setup_flow._plugin_cli_answers("gapaudit") is True
+
+    assert len(calls) == 2
+    first_cmd, second_cmd = calls[0][0], calls[1][0]
+    assert "plugins" in first_cmd and "enable" in first_cmd
+    assert "pipeline" in second_cmd and "--help" in second_cmd
+
+    for num, (_cmd, kwargs) in enumerate(calls, start=1):
+        assert kwargs["text"] is True, f"вызов {num}: text=True не запрошен"
+        assert kwargs["encoding"] == "utf-8", f"вызов {num}: encoding != utf-8"
+        assert kwargs["errors"] == "replace", f"вызов {num}: errors != replace"
