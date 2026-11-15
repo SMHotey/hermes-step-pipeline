@@ -39,6 +39,8 @@
   "prefetch_prompt": true,
   "prompt_review": "auto",
   "max_fix_rounds": 2,
+  "max_fix_rounds_high": 6,
+  "max_stale_rebuilds": 2,
   "max_actions": 1,
   "runtimes": {
     "step": "3h",
