@@ -9,6 +9,7 @@
     python .pipeline/check_task_prompt.py docs/prompts/<файл>.md
     python .pipeline/check_task_prompt.py <файл> --quiet
     python .pipeline/check_task_prompt.py <файл> --role reviewer   # своё имя роли
+    python .pipeline/check_task_prompt.py <файл> --risk high       # спека high-шага
 
 Выход: 0 — промт годен; 1 — есть нарушения; 2 — файл не найден.
 
@@ -19,7 +20,9 @@
     C4  блок «Как проверить» содержит хотя бы одну команду
     C5  в блоке «Как проверить» есть ожидаемый результат (passed/EXIT/ожидается)
     C6  объём промта не меньше 800 символов
-    C7  блок «Ревью» называет роль ревьюера и вердикт APPROVE/REQUEST_CHANGES
+    C7  блок «Ревью» называет роль ревьюера и вердикт APPROVE/REQUEST_CHANGES; у шага
+        с `Риск: high` при `risk_gate: spec` — ещё и блок «Спека» нужного объёма
+        и состава (четыре подраздела, не меньше 600 символов)
     W1  в блоке «Вопросы» не больше 3 вопросительных знаков (предупреждение)
 """
 from __future__ import annotations
@@ -43,6 +46,14 @@ REQUIRED_SECTIONS = (
 
 MIN_PROMPT_CHARS = 800
 MAX_QUESTIONS = 3
+#: Спека высокорискового шага (8-S2B): блок «Спека» с четырьмя подразделами и объёмом
+#: тела не меньше 600 символов — на воде такой объём не набрать, поэтому норма и есть
+#: требование к содержанию. Подразделы ищутся подстрокой в теле блока (D9): оформление
+#: `###` или жирным не важно, важен смысл заголовка.
+SPEC_SECTION = "Спека"
+SPEC_MIN_CHARS = 600
+SPEC_SUBSECTIONS = ("Замысел", "Границы", "Критерии готовности", "Риски")
+RISK_CLASSES = ("low", "normal", "high")
 PLACEHOLDER_TOKENS = ("TBD", "TODO", "FIXME", "???", "заполнить")
 PLACEHOLDER_ANGLE = re.compile(r"<[^<>\n]{0,40}>")
 VERDICT_HINT = re.compile(r"APPROVE|REQUEST_CHANGES", re.IGNORECASE)
@@ -95,9 +106,38 @@ def find_placeholders(text: str) -> list[str]:
     return found
 
 
+def spec_problems(text: str) -> list[str]:
+    """Пункты спеки высокорискового шага: пусто — спека на месте и полная.
+
+    Проверка детерминированная и без модели: блок «Спека» уровня 2, тело не короче
+    `SPEC_MIN_CHARS`, в теле названы все четыре подраздела. Требование предъявляет
+    вызывающий (у постановки это `Риск: high` при `risk_gate: spec`); сама функция
+    отвечает только на вопрос «спека готова?».
+    """
+    body = find_section(split_sections(text), SPEC_SECTION)
+    if body is None:
+        return [f"нет блока «{SPEC_SECTION}»: у шага с «Риск: high» спецификация обязательна"]
+    problems: list[str] = []
+    size = len(body.strip())
+    if size < SPEC_MIN_CHARS:
+        problems.append(f"тело спеки {size} символов из {SPEC_MIN_CHARS}")
+    lowered = body.lower()
+    missing = [name for name in SPEC_SUBSECTIONS if name.lower() not in lowered]
+    if missing:
+        problems.append("в спеке нет подразделов: "
+                        + ", ".join(f"«{name}»" for name in missing))
+    return problems
+
+
 def check_prompt(text: str, reviewer_role: str = "reviewer",
-                 reviewer_skill: str = "") -> list[tuple[str, str, str]]:
-    """Прогнать все проверки. Возвращает список (уровень, код, сообщение)."""
+                 reviewer_skill: str = "", risk: str = "",
+                 risk_gate: str = "spec") -> list[tuple[str, str, str]]:
+    """Прогнать все проверки. Возвращает список (уровень, код, сообщение).
+
+    *risk* — класс риска шага (`low`/`normal`/`high`, пусто — «неизвестен»). Спека
+    проверяется только при `risk == "high"` и `risk_gate == "spec"`: в режиме `hold`
+    высокорисковый шаг держит ручной допуск, и форма постановки прежняя.
+    """
     results: list[tuple[str, str, str]] = []
     sections = split_sections(text)
 
@@ -140,12 +180,20 @@ def check_prompt(text: str, reviewer_role: str = "reviewer",
     review = find_section(sections, "Ревью") or ""
     role_ok = re.search(re.escape(reviewer_role), review, re.IGNORECASE) is not None
     skill_ok = bool(reviewer_skill) and reviewer_skill.lower() in review.lower()
-    if (role_ok or skill_ok) and VERDICT_HINT.search(review):
+    reasons: list[str] = []
+    if not ((role_ok or skill_ok) and VERDICT_HINT.search(review)):
+        reasons.append(f"в блоке «Ревью» нет роли `{reviewer_role}` "
+                       f"и вердикта APPROVE/REQUEST_CHANGES")
+    # Спека — вторая обязанность C7 (D1): отдельного кода не заводим, иначе строка роли
+    # постановщика, ARCHITECTURE.md и «проверок 8» разъехались бы с номером проверки.
+    want_spec = (str(risk or "").strip().lower() == "high"
+                 and str(risk_gate or "spec").strip().lower() == "spec")
+    if want_spec:
+        reasons.extend(spec_problems(text))
+    if not reasons:
         results.append(("PASS", "C7", "блок «Ревью» называет роль и вердикт"))
     else:
-        results.append((
-            "FAIL", "C7",
-            f"в блоке «Ревью» нет роли `{reviewer_role}` и вердикта APPROVE/REQUEST_CHANGES"))
+        results.append(("FAIL", "C7", "; ".join(reasons)))
 
     questions = find_section(sections, "Вопросы") or ""
     marks = questions.count("?")
@@ -178,6 +226,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--role", default="reviewer",
                         help="имя профиля ревьюера (по умолчанию `reviewer`)")
     parser.add_argument("--skill", default="", help="имя скилла ревьюера (необязательно)")
+    parser.add_argument("--risk", default="",
+                        help="класс риска шага: при `high` требуется блок «Спека» "
+                             "(по умолчанию пусто — спека не требуется)")
+    parser.add_argument("--risk-gate", dest="risk_gate", default="spec",
+                        help="режим риск-гейта: spec (по умолчанию) или hold")
     args = parser.parse_args(argv)
 
     path = Path(args.path)
@@ -186,7 +239,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     text = path.read_text(encoding="utf-8")
-    results = check_prompt(text, args.role, args.skill)
+    results = check_prompt(text, args.role, args.skill, risk=args.risk,
+                           risk_gate=args.risk_gate)
 
     for level, code, message in results:
         if args.quiet and level == "PASS":

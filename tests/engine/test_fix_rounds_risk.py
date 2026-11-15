@@ -17,7 +17,7 @@ import pytest
 
 import config as config_mod
 import gate
-from engine_kit import cards, write_approval
+from engine_kit import cards, set_risk_gate, write_approval
 from stub_hermes import SCHEMA
 
 PLAN_RISK = """# 1. Демо-план конвейера
@@ -171,7 +171,11 @@ def stand(project: Path, hermes_stub: Path, monkeypatch):
 
 @pytest.fixture()
 def stand_high(project: Path, hermes_stub: Path, monkeypatch):
-    """Тот же стенд, но шаг S1 помечен «Риск: high»."""
+    """Тот же стенд, но шаг S1 помечен «Риск: high» и риск-гейт в режиме `hold`.
+
+    Лимит кругов правок постановки проверяется в `hold`: в умолчании `spec` (8-S2B)
+    до разбора вердикта вмешивается требование спеки, и проверялся бы не бюджет.
+    """
     return _stand(project, hermes_stub, monkeypatch, risk="high")
 
 
@@ -181,6 +185,8 @@ def _stand(project: Path, hermes_stub: Path, monkeypatch, *, risk: str):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PIPELINE_REPO", str(project))
     write_risk_plan(project, risk)
+    if risk == "high":
+        set_risk_gate(project, "hold")
     cfg = config_mod.load(project)
     return project, gate.resolve_paths(cfg, "1"), hermes_stub
 

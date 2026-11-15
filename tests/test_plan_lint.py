@@ -47,6 +47,61 @@ def _line(text: str, needle: str) -> int:
     raise AssertionError(f"в тексте нет строки с {needle!r}")
 
 
+RISK_PROSE_PLAN = """# 2. План с прозой в риске
+
+## Шаги
+
+### S1. Доки и конфиг (1 дн)
+
+- Файл: `app/x.py`
+- Тесты/гейты: `python -m pytest tests/test_x.py -q` → 1 passed
+- Риск: доки описывают ключи, которых нет в конфиге — сверка примеров
+- Готово = примеры конфигурации сверены с разбором
+
+### S2. Метка из словаря (1 дн)
+
+- Файл: `app/y.py`
+- Тесты/гейты: `python -m pytest tests/test_y.py -q` → 1 passed
+- Риск: high — данные и деньги
+- Готово = метка прочитана как класс
+
+### S3. Опечатка метки (1 дн)
+
+- Файл: `app/z.py`
+- Тесты/гейты: `python -m pytest tests/test_z.py -q` → 1 passed
+- Риск: высокий
+- Готово = опечатка прочитана как high
+
+## Журнал выполнения
+
+| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |
+|---|---|---|---|---|
+| — | S1 | — | — | открыт |
+| — | S2 | — | — | открыт |
+| — | S3 | — | — | открыт |
+"""
+
+
+def test_risk_prose_is_a_warning_not_a_problem(project: Path):
+    """Л22 (8-S2B): проза в «Риск:» — предупреждение о шаге, а не отказ утверждения.
+
+    Проза значит «класс риска не задан»: движок читает такой шаг как `normal`, и владелец
+    должен видеть это до запуска. Метка из словаря и однословная опечатка — не проза
+    (опечатку движок по-прежнему считает `high`).
+    """
+    path = project / "docs" / "plans" / "2-risks.md"
+    path.write_text(RISK_PROSE_PLAN, encoding="utf-8")
+    settings = plan_lint.settings(project)
+
+    assert plan_lint.lint_file(path, project, settings) == []
+    prose = [item for item in plan_lint.lint_warnings(path, project, settings)
+             if "прозой" in item.text]
+    assert len(prose) == 1, [str(item) for item in prose]
+    assert prose[0].step == "S1"
+    assert prose[0].line == _line(RISK_PROSE_PLAN, "### S1.")
+    assert "low/normal/high" in prose[0].text
+
+
 def test_plan_with_stale_line_address_is_a_problem(project: Path):
     """Адрес `файл.py:строки` за концом файла — находка линтера, а не ревью.
 
@@ -511,19 +566,26 @@ def test_repo_plans_lint_clean():
 
 
 def test_repo_plans_warn_only_legacy():
-    """Планы 1-4 (legacy) и план 5 (действующего формата) — линтер существующие не ломает.
+    """Существующие планы репозитория: `problems` пусто, предупреждения — не отказ.
 
-    `problems` пусто у всех; предупреждение Л20 — о каждом legacy-плане, у плана 5 его нет:
-    конституционная строка есть, и предупреждать не о чем.
+    Л20 (нет строки «Конституция:») — у четырёх legacy-планов, у плана 5 и новее её нет:
+    конституционная строка есть, и предупреждать не о чем. С 8-S2B добавляется Л22 —
+    проза в пункте «Риск:»: планы 12 и 13 писали риски описанием, и линтер называет это
+    предупреждением. Подгонять проверку под «ровно 4 предупреждения» нельзя: число
+    следует из текста планов, а не из правила, и правка планов ради счётчика — запрет
+    шага. Здесь фиксируется смысл: ошибок нет, четыре legacy-предупреждения на месте,
+    у Л22 есть шаг.
     """
     result = plan_lint.lint_project(helpers.REPO)
 
     assert result.problems == []
     assert len(result.files) >= 5
-    assert len(result.warnings) == 4
-    names = sorted(Path(warning.file).name for warning in result.warnings)
+    legacy = [warning for warning in result.warnings if "Конституция" in warning.text]
+    names = sorted(Path(warning.file).name for warning in legacy)
     assert names == ["1-stabilnost.md", "2-upravlenie.md", "3-panel.md", "4-planner.md"]
-    assert all("Конституция" in warning.text for warning in result.warnings)
+    prose = [warning for warning in result.warnings if "прозой" in warning.text]
+    assert prose, "план 12 писал риски прозой — Л22 обязан сработать"
+    assert all(warning.step for warning in prose), [str(item) for item in prose]
 
 
 RESEARCH_STEP = "### S1. Разведка рынка (1 дн)"

@@ -129,3 +129,88 @@ def test_too_many_questions_warns():
     text = GOOD.replace("Нет вопросов: решения записаны в блоке 4.",
                         "Что делать? Как? Почему? Когда? Где?")
     assert codes(text)["W1"] == "WARN"
+
+
+# ───────────────── спека высокорискового шага: C7 (8-S2B) ─────────────────
+
+SPEC_BODY = """### Замысел
+
+Шаг закрывает расхождение между примерами конфигурации и разбором: сейчас примеры
+описывают ключи, которых разбор не знает, и потребитель узнаёт об этом на запуске.
+Нужно, чтобы набор ключей примера и набора ключей разбора совпадал, а расхождение
+показывал гейт.
+
+### Границы
+
+Входит: сверка ключей примеров с разбором и тест на расхождение. Не входит: чистка
+самих примеров от устаревших значений и правка разбора под новые ключи.
+
+### Критерии готовности
+
+`python -m pytest tests/test_config_example.py -q` → 3 passed; в тесте есть случай
+«ключ есть в примере, нет в разборе» и обратный; `git diff` не трогает gate.py.
+
+### Риски
+
+Расхождение может оказаться намеренным (ключ читается из окружения): тогда тест
+фиксирует исключение списком, а не ослабляется до «проверять нечего».
+"""
+
+
+def with_spec(text: str, body: str = SPEC_BODY) -> str:
+    """Промт с блоком «Спека» прямо перед «3. Границы и запреты»."""
+    return text.replace("## 3. Границы и запреты",
+                        f"## Спека (у шага с «Риск: high»)\n\n{body}\n\n## 3. Границы и запреты")
+
+
+def test_spec_not_required_for_normal_risk():
+    """Без `Риск: high` спека не требуется: постановка проходит как раньше."""
+    assert ctk.spec_problems(GOOD) != []          # спеки в GOOD нет
+    assert codes(GOOD)["C7"] == "PASS"
+    assert codes(GOOD, risk="normal")["C7"] == "PASS"
+    assert codes(GOOD, risk="low")["C7"] == "PASS"
+
+
+def test_spec_missing_fails_c7_at_high_risk():
+    results = {code: (level, msg) for level, code, msg in
+               ctk.check_prompt(GOOD, "reviewer", "", risk="high")}
+    level, msg = results["C7"]
+    assert level == "FAIL", results
+    assert "Спека" in msg
+    # Строк результата столько же, сколько было: C7 совмещает ревью и спеку (D1).
+    assert len(ctk.check_prompt(GOOD, "reviewer", "", risk="high")) == 8
+
+
+def test_full_spec_passes_c7():
+    text = with_spec(GOOD)
+    assert ctk.spec_problems(text) == []
+    assert codes(text, risk="high")["C7"] == "PASS"
+
+
+def test_short_spec_fails_c7():
+    short = with_spec(GOOD, "### Замысел\n\nКоротко.\n\n### Границы\n\nНет.\n"
+                            "\n### Критерии готовности\n\nНе проверяются.\n"
+                            "\n### Риски\n\nПочти нет.\n")
+    problems = ctk.spec_problems(short)
+    assert any("символов из" in item for item in problems), problems
+
+
+def test_spec_without_subsections_fails_c7():
+    body = "Одна вода без подразделов. " * 40
+    problems = ctk.spec_problems(with_spec(GOOD, body))
+    assert any("Критерии готовности" in item for item in problems), problems
+
+
+def test_spec_not_required_in_hold_mode():
+    """`risk_gate: hold`: high-шаг держит ручной допуск, спека не спрашивается."""
+    assert codes(GOOD, risk="high", risk_gate="hold")["C7"] == "PASS"
+
+
+def test_spec_checked_by_cli_flag(tmp_path, capsys):
+    """CLI: `--risk high` включает проверку спеки и говорит об этом кодом 1."""
+    path = tmp_path / "prompt.md"
+    path.write_text(GOOD, encoding="utf-8")
+    assert ctk.main([str(path)]) == 0
+    assert ctk.main([str(path), "--risk", "high"]) == 1
+    out = capsys.readouterr().out
+    assert "C7" in out and "Спека" in out

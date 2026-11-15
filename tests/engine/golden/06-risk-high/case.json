@@ -1,5 +1,6 @@
 {
-  "note": "Шаг с Риск: high: карточки нет, ручной допуск владельца",
+  "note": "Шаг с Риск: high в режиме risk_gate: hold: карточки нет, ручной допуск владельца",
   "approved": true,
-  "ticks": 1
+  "ticks": 1,
+  "config": {"risk_gate": "hold"}
 }

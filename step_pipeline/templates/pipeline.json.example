@@ -38,6 +38,7 @@
   "require_prompt": true,
   "prefetch_prompt": true,
   "prompt_review": "auto",
+  "risk_gate": "spec",
   "max_fix_rounds": 2,
   "max_fix_rounds_high": 6,
   "max_stale_rebuilds": 2,

@@ -101,6 +101,7 @@ import config as config_mod  # noqa: E402 - модуль рядом
 import registry  # noqa: E402 - реестр планов
 import plan_cycle  # noqa: E402 - гейт корректировки плана по разведке (план 5, S4)
 import next_step  # noqa: E402 - шаги плана: проверка номера в ручном допуске
+import check_task_prompt  # noqa: E402 - форма постановки: спека high-шага (8-S2B)
 import state_io  # noqa: E402 - атомарная запись состояния и блокировка тика
 
 # ──────────────────── целостность движка ────────────────────
@@ -817,6 +818,29 @@ def prompt_fresh(p: Paths, recon: str | None) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0
+
+
+def prompt_spec_problems(p: Paths, step: dict) -> list[str]:
+    """Пункты спеки постановки high-шага (C7): пусто — спека не требуется или полная.
+
+    Требование предъявляет режим: `risk_gate: hold` спеки не ждёт (шаг держит ручной
+    допуск), `spec` — ждёт у каждого шага с «Риск: high». Нет постановки — пусто: её
+    ещё никто не писал, и отказ «нет спеки» говорил бы о файле, которого нет; заказ
+    постановки делает обычная ветка. Чтение файла — здесь, потому что `decide` получает
+    только `ctx` (D4) и файлов не читает.
+    """
+    if str((step or {}).get("risk") or "normal").lower() != "high":
+        return []
+    if str(getattr(p.cfg, "risk_gate", "spec") or "spec").strip().lower() != "spec":
+        return []
+    rel = prompt_rel(p, step["id"])
+    if not rel:
+        return []
+    try:
+        text = (Path(p.repo) / rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return check_task_prompt.spec_problems(text)
 
 
 # ───────────────── D6: сверка версии ревью постановки по тексту ─────────────────
@@ -1579,10 +1603,31 @@ def prompt_order_body(p: Paths, step: dict) -> str:
         "4. Раздел «Состояние на момент постановки»: что уже сделано, чего не хватает до «Готово =».",
         "5. Гейт: `python .pipeline/check_task_prompt.py <файл>` → `ИТОГ: PASS`.",
         "6. Коммит и пуш ТОЛЬКО файла постановки, затем kanban_complete: путь, результат гейта, sha.",
+        *_spec_request_block(step),
         "",
         "ЗАПРЕТЫ: не править код приложения, не запускать тесты и сборки, не менять план,",
         "не коммитить чужие файлы (`git add` перечислением, не `-A`).",
     ])
+
+
+def _spec_request_block(step: dict) -> list[str]:
+    """Требование спеки для карточки заказа постановки high-шага (8-S2B).
+
+    Одно место правды о форме: исполнитель видит требование до того, как напишет файл,
+    а не узнаёт из отказа стража после. У шага без пометки `high` блок пуст — карточка
+    прежняя дословно.
+    """
+    if str(step.get("risk") or "").lower() != "high":
+        return []
+    return [
+        "",
+        "У ШАГА ПОМЕТКА «Риск: high» — В ПОСТАНОВКЕ НУЖЕН БЛОК «СПЕКА»:",
+        "- подразделы «Замысел», «Границы», «Критерии готовности», «Риски»;",
+        "- тело блока не короче 600 символов (проверка C7, детерминированная);",
+        "- блок «Контекст» ссылается на разделы спеки, «Вопросы» её не переспрашивают;",
+        "- гейт: `python .pipeline/check_task_prompt.py <файл> --risk high` → `ИТОГ: PASS`.",
+        "Без спеки шаг не начнётся: страж вернёт круг правок постановки вместо карточки.",
+    ]
 
 
 def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
@@ -1598,6 +1643,12 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
             "- Выполненное СВЕРХ постановки — находка (расширение объёма), а не плюс;",
             "  расхождение постановки с планом/кодом — отдельная находка с указанием, что верно.",
         ]
+        if str(step.get("risk") or "").lower() == "high":
+            prompt_block += [
+                "- У шага пометка «Риск: high»: сверить сделанное с блоком «Спека» постановки.",
+                "  Расхождение со спекой (сделано не то или не всё) — блокирующая находка;",
+                "  стилистические замечания по-прежнему не блокируют.",
+            ]
     else:
         prompt_block = [
             "СВЕРКА С ПОСТАНОВКОЙ (обязательный раздел отчёта)",
@@ -1741,9 +1792,33 @@ def _prompt_fix_verdict_line(findings: list[str] | None, report_verdict: str,
     return f"Ревью постановки вернуло REQUEST_CHANGES. Отчёт: `{report_rel}`."
 
 
+def _prompt_spec_section(spec: list[str], limit: int, round_no: int) -> list[str]:
+    """Блок «спека не готова» для карточки правок high-шага (8-S2B).
+
+    Спека — часть роли постановщика (D7): здесь названы недостатки формы (C7) и что в них
+    дописать, чтобы исполнитель правил постановку, а не выяснял гейт заново.
+    """
+    round_text = f"круг {round_no} из {limit}" if limit else f"круг {round_no}"
+    return [
+        "",
+        f"СПЕКА НЕ ГОТОВА ({round_text}) — у шага пометка «Риск: high» "
+        f"и режим `risk_gate: spec`:",
+        *[f"- {item}" for item in spec],
+        "Дописать в блок «Спека» (шаблон — `.pipeline/task-prompt.md`):",
+        "- «Замысел» — что появляется в репозитории и что мешает это получить сейчас;",
+        "- «Границы» — что входит и что не входит в шаг;",
+        "- «Критерии готовности» — проверяемые пункты «команда → значение»;",
+        "- «Риски» — что может сломаться и на что смотреть в диффе.",
+        "- Тело блока — не меньше 600 символов; подразделы ищутся по смыслу названия.",
+        "- Гейт: `python .pipeline/check_task_prompt.py <файл постановки> --risk high` → "
+        "`ИТОГ: PASS`.",
+    ]
+
+
 def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
                          findings: list[str] | None = None,
-                         max_rounds: int = 0, report_verdict: str = "") -> str:
+                         max_rounds: int = 0, report_verdict: str = "",
+                         spec: list[str] | None = None) -> str:
     """Тело карточки «переписать постановку»: закрыть находки ревью, код не трогать.
 
     *findings* — открытые ID реестра находок постановки (шаг 12-S2): реестр говорит, что
@@ -1752,7 +1827,9 @@ def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
     исполнитель видит, сколько попыток осталось («круг N из M»), а не «круг N» в каждой
     карточке. Умолчание `0` сохраняет прежний вид строки. *report_verdict* — вердикт отчёта
     ревью: по нему первая строка карточки говорит правду и при отчёте `APPROVE`, где
-    постановку держит открытая находка реестра.
+    постановку держит открытая находка реестра. *spec* — пункты C7 «спека не готова»
+    (8-S2B): с ними круг открыт риск-гейтом, а не ревью, поэтому вместо находок ревью
+    карточка несёт раздел «СПЕКА НЕ ГОТОВА» и что дописать в блок «Спека».
     """
     sid = step["id"]
     plan_id = p.plan_id
@@ -1761,11 +1838,17 @@ def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
     head = head_commit(p) or "—"
     recon = prompt_recon(Path(p.repo) / prompt_path) if prompt_path else None
     limit = f" из {max_rounds}" if max_rounds else ""
+    spec_items = [str(item) for item in (spec or []) if str(item)]
+    head_line = (f"ПОСТАНОВКУ ШАГА {sid} плана {plan_id} ПЕРЕПИСАТЬ — {step['title']} "
+                 f"(круг {round_no}{limit})")
+    if spec_items:
+        head_line += " — спека high-шага"
     lines = [
-        f"ПОСТАНОВКУ ШАГА {sid} плана {plan_id} ПЕРЕПИСАТЬ — {step['title']} "
-        f"(круг {round_no}{limit})",
+        head_line,
         "",
-        _prompt_fix_verdict_line(findings, report_verdict, report_rel),
+        (f"Спека high-шага не готова (замечаний: {len(spec_items)}). "
+         f"Отчёт ревью постановки, если он есть: `{report_rel}`."
+         if spec_items else _prompt_fix_verdict_line(findings, report_verdict, report_rel)),
         f"Постановка: `{prompt_path}` (recon_commit `{recon or '—'}`, текущий HEAD `{head}`).",
         f"Контракт шага — `{plan_rel}` §{sid}.",
         "",
@@ -1794,6 +1877,15 @@ def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
         "- Не расширять объём шага и не смягчать гейты.",
         "",
     ]
+    if spec_items:
+        # Круг открыт риск-гейтом: находки ревью в нём ни при чём (их может не быть вовсе),
+        # а «править каждую блокирующую» отправило бы исполнителя в пустой отчёт.
+        return "\n".join(lines + _prompt_spec_section(spec_items, max_rounds or 0, round_no)
+                         + ["", "ЗАВЕРШЕНИЕ",
+                            "kanban_complete: что дописано в спеку (по замечаниям), "
+                            "вывод проверки постановки, sha коммита.",
+                            "Следующий круг ревью постановки ставит страж — "
+                            "ревью сам не заказывай."])
     blocking = _blocking_findings(Path(p.repo) / report_rel, FINDINGS_LIMIT)
     if blocking:
         lines.append("БЛОКИРУЮЩИЕ НАХОДКИ — закрыть полностью, ответить на каждую:")
@@ -2014,6 +2106,9 @@ def build_ctx(p: Paths) -> dict:
     # Режимы плана 2 (S6) — в ctx, чтобы `decide` оставалась чистой функцией.
     ctx["prefetch"] = bool(p.cfg.prefetch_prompt)
     ctx["prompt_review"] = str(p.cfg.prompt_review)
+    # Режим риск-гейта (8-S2B): `hold` держит high-шаг ручным допуском, `spec` требует
+    # спеку в постановке. В ctx — потому что `decide` видит только его (D4).
+    ctx["risk_gate"] = str(getattr(p.cfg, "risk_gate", "spec") or "spec")
     ctx["require_prompt"] = bool(p.cfg.require_prompt)
     # Лимит автоматических кругов правок по ревью: решение чистым остаётся, но правило
     # живёт в конфигурации проекта, а не в коде.
@@ -2045,6 +2140,9 @@ def build_ctx(p: Paths) -> dict:
                    # не считаем, иначе решение пропустило бы обязательное ревью.
                    steps=[], prompt=None, prompt_recon=None, prompt_fresh=False,
                    prompt_report=None, prompt_verdict=None, next_step=None,
+                   # 8-S2B: без шагов спеки не видно — пустой список, а не отсутствие
+                   # ключа: решение получает только `ctx` и падать не имеет права.
+                   prompt_spec=[],
                    # План 12, S2: без шагов реестр постановки не читается, но ключи обязаны
                    # быть — решение получает только `ctx` и на сбое сборщика падать не имеет
                    # права. База правки тоже пустая: сравнивать не с чем.
@@ -2100,6 +2198,9 @@ def build_ctx(p: Paths) -> dict:
     ctx["prompt"] = prompt
     ctx["prompt_recon"] = recon
     ctx["prompt_fresh"] = prompt_fresh(p, recon) if prompt else False
+    # Спека high-шага (8-S2B): считается до решения о ветке — страж пускает шаг по факту
+    # полной спеки, а не по наличию файла постановки.
+    ctx["prompt_spec"] = prompt_spec_problems(p, step) if step else []
     ctx["prompt_report"] = prompt_review_rel(p, step["id"]) if step else None
     ctx["prompt_verdict"] = prompt_verdict(p, step["id"]) if step else None
     # Реестр находок постановки (план 12, S2): источник действующего вердикта. Читается
@@ -2386,14 +2487,19 @@ def _decide_base(ctx: dict) -> dict:
             # Решение, а не отказ ветки создания: иначе тик снимал бы инцидент и ставил
             # его заново, уведомляя владельца каждые 10 минут.
             return {"action": "stop", "step": sid, "reason": ctx["assignee_error"]}
-        # Рискованный шаг не получает НИ ОДНОЙ карточки (включая заказ постановки),
-        # пока владелец не допустил: проверка стоит внутри «карточки шага ещё нет»,
-        # иначе уже начатый шаг застрял бы на hold и не дошёл до ревью (D5).
+        # Рискованный шаг в режиме `hold` не получает НИ ОДНОЙ карточки (включая заказ
+        # постановки), пока владелец не допустил: проверка стоит внутри «карточки шага ещё
+        # нет», иначе уже начатый шаг застрял бы на hold и не дошёл до ревью (D5).
+        # В режиме `spec` (умолчание, 8-S2B) hold не ставится: шаг идёт обычной веткой —
+        # заказ постановки → проверка спеки → круг правок постановки или карточка шага.
+        # Ручной `--hold` держит шаг в обоих режимах: он проверяется выше и режиму не подчинён.
         risk = str(step.get("risk") or "normal").lower()
+        risk_gate = str(ctx.get("risk_gate") or "spec").strip().lower()
         held = {str(h).upper() for h in (ctx.get("hold") or [])}
         released = {str(r).upper() for r in (ctx.get("released") or [])}
         # ANCHOR:hold_risk_decision — стабильная ссылка для спеки и ревью
-        if risk == "high" and sid.upper() not in held and sid.upper() not in released:
+        if (risk == "high" and risk_gate == "hold" and sid.upper() not in held
+                and sid.upper() not in released):
             where = ctx.get("plan_file") or f"план {ctx.get('plan_id') or '?'}"
             return {"action": "hold_risk", "step": sid, "data": step, "risk": risk,
                     "reason": (f"шаг {sid} помечен «Риск: high» — нужен допуск владельца; "
@@ -3332,8 +3438,12 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
     fixes = _prompt_fix_cards(ctx, sid)
     stales = _prompt_stale_cards(ctx, sid)
     mode = str(ctx.get("prompt_review") or "auto").strip().lower()
-    if mode == "never" and not fixes and not stales:
-        return None                        # владелец выключил ревью постановок
+    # Номер круга ревью: и круг правок, и пересборка сдвигают его на единицу. Без пересборок
+    # в счёте повторное ревью взяло бы закрытую карточку круга 1 и прочитало вердикт прошлой
+    # редакции — пересборка пошла бы по кругу до лимита. Считается до проверок режима: от
+    # `fixes`/`stales` зависит, а от режима нет — и нужен ветке спеки, которая стоит выше
+    # стража `never` (8-S2B, D5).
+    round_no = len(fixes) + len(stales) + 1
     # «Идёт / упала» смотрит на самую свежую карточку объединённой серии: и правка, и
     # пересборка работают по той же постановке, вторая карточка поверх первой не нужна.
     latest = _prompt_latest_card(fixes, stales)
@@ -3347,10 +3457,25 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
             detail = (last_card.get("error") or last_card.get("result") or "")[:300]
             return {"action": "stop", "step": sid,
                     "reason": f"{noun} постановки {sid} упало ({last_card['status']}): {detail}"}
-    # Номер круга ревью: и круг правок, и пересборка сдвигают его на единицу. Без пересборок
-    # в счёте повторное ревью взяло бы закрытую карточку круга 1 и прочитало вердикт прошлой
-    # редакции — пересборка пошла бы по кругу до лимита.
-    round_no = len(fixes) + len(stales) + 1
+
+    # Спека высокорискового шага (8-S2B): выше стража `never` и выше разбора вердикта (D5).
+    # Выключатель ревью постановок не выключает риск-гейт, а `APPROVE` без спеки шаг не
+    # пускает: спеки нет — отказ постановки, а не ручной допуск и не карточка шага. Стоит
+    # ниже блока «идёт / упала», иначе второй тик заказал бы вторую карточку правок.
+    spec = [str(item) for item in (ctx.get("prompt_spec") or []) if str(item)]
+    if spec:
+        limit = step_fix_limit(ctx, step)
+        if len(fixes) >= limit:
+            return {"action": "stop", "step": sid, "kind": "owner",
+                    "reason": (f"спека шага {sid} не готова, круги правок постановки "
+                               f"исчерпаны ({len(fixes)} из {limit}) — решает владелец: "
+                               + "; ".join(spec))}
+        return {"action": "create_prompt_fix", "step": sid, "data": step,
+                "round": round_no, "spec": spec,
+                "reason": (f"спека шага {sid} не готова (C7): постановку переписываю "
+                           f"автоматически (круг {round_no}): " + "; ".join(spec))}
+    if mode == "never" and not fixes and not stales:
+        return None                        # владелец выключил ревью постановок
 
     def _stale(reason_code: str, changed: dict | None = None) -> dict:
         """Оба признака устаревания: пересборка, а после лимита — стоп владельцу."""
@@ -5347,18 +5472,26 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         else:
             key = f"planloop:{plan_id}:{step['id']}:promptfix:{round_no}"
             title = f"[переписать постановку {plan_id} {step['id']}] {step['title']}"
+            # Пункты C7 «спека не готова» (8-S2B): круг открыт риск-гейтом, а не ревью.
+            spec_items = [str(item) for item in (decision.get("spec") or []) if str(item)]
+            if spec_items:
+                title = f"[дописать спеку постановки {plan_id} {step['id']}] {step['title']}"
             # Открытые ID реестра — в тело карточки (12-S2): реестр решает вердикт, и правка
             # обязана закрыть именно его строки. Предел кругов — по риску шага (12-S3).
             body = prompt_fix_card_body(p, step, round_no, report_rel,
                                         findings=open_prompt_findings_lines(ctx),
                                         max_rounds=step_fix_limit(ctx, step),
-                                        report_verdict=str(decision.get("report") or ""))
+                                        report_verdict=str(decision.get("report") or ""),
+                                        spec=spec_items)
         cid = create_card(p, title, body, p.cfg.prompter, key, p.cfg.prompt_skills,
                           max_runtime=p.cfg.prompt_runtime)
         result.update(applied=bool(cid), detail=f"карточка переписывания постановки: {cid}")
-        if cid and not stale:
+        if cid and not stale and not decision.get("spec"):
             # База правила «0 закрытых» (12-S2): что было открыто до правки. Пишется только
             # круг правок — пересборка по свежести находок не закрывает и правило не вооружает.
+            # Круг спеки (8-S2B) тоже не пишет: он открыт формой постановки, а не реестром,
+            # и закрытые находки прошлого круга не должны читаться как «правка ничего не
+            # закрыла».
             state["prompt_fix_baseline"] = {
                 "step": step["id"],
                 "round": round_no,
@@ -5380,6 +5513,9 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 say(f"план {plan_id}: постановка шага {step['id']} протухла — "
                     f"пересобираю автоматически ({decision.get('rebuild')} из "
                     f"{decision.get('limit')}, карточка {cid})")
+            elif decision.get("spec"):
+                say(f"план {plan_id}: спека шага {step['id']} не готова (C7) — "
+                    f"переписываю постановку автоматически, круг {round_no} (карточка {cid})")
             else:
                 say(f"план {plan_id}: реестр постановки шага {step['id']} держит "
                     f"{int(decision.get('open_count') or 0)} открытых находок (отчёт: "

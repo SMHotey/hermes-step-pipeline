@@ -124,6 +124,21 @@ def make_project(root: Path, board: str = "testboard", approved: bool = True,
     return root
 
 
+def set_risk_gate(root: Path, mode: str = "hold") -> Path:
+    """Переключить риск-гейт в `pipeline.json` проекта (8-S2B) и вернуть путь.
+
+    Два режима: `spec` (умолчание шаблона — спека в постановке вместо допуска) и `hold`
+    (прежнее поведение: high-шаг ждёт `--unhold`). Отдельная запись, а не `overrides`
+    у `make_project`: часть стендов переписывает `pipeline.json` уже после установки
+    (например, планировщик пауз), и режим надо уметь вернуть на место.
+    """
+    path = Path(root) / "pipeline.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["risk_gate"] = mode
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def cards(db: Path) -> list[dict]:
     """Все карточки из поддельной борды (для проверок)."""
     con = sqlite3.connect(db)

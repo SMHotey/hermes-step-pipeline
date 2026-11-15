@@ -72,6 +72,11 @@ DEFAULTS: dict = {
     # 12-S2 считается по реестру находок (`prompt-N-ШАГ-findings.md`), а строка отчёта
     # остаётся разбором: отчёт APPROVE при открытой находке шаг не открывает.
     "prompt_review": "auto",
+    # Риск-гейт высокорискового шага (8-S2B). `spec` (умолчание) — до кода шаг получает
+    # спецификацию в постановке (блок «Спека»): спеки нет — страж заказывает круг правок
+    # постановки, а не держит шаг. `hold` — прежнее поведение целиком: шаг ждёт ручного
+    # `--unhold` владельца. Неизвестное значение — `ConfigError`, а не молчаливое `spec`.
+    "risk_gate": "spec",
     # Сколько автоматических кругов правок делает страж (шаг и план), прежде чем
     # остановиться. 1 — стоп на первом же отказе после круга; 2 — ещё один круг до решения
     # владельца. Останавливает лимит, а не первый отказ: у ревью плана каждый
@@ -147,6 +152,11 @@ ENGINE_FILES = ("__init__.py", "analyze.py", "approval.py", "check_task_prompt.p
 # Режимы ревью постановки: иное значение в pipeline.json — ошибка конфигурации, а не
 # молчаливое «auto»: владелец должен узнать, что его настройка не подействовала.
 PROMPT_REVIEW_MODES = ("auto", "always", "never")
+
+# Режимы риск-гейта высокорискового шага (8-S2B): `spec` — спецификация в постановке,
+# `hold` — прежний ручной допуск. Мусор — `ConfigError`, а не молчаливое умолчание:
+# владелец должен узнать, что его настройка не подействовала.
+RISK_GATE_MODES = ("spec", "hold")
 
 # Предметки, которые движок знает по имени (план 5, S7). Их не надо объявлять в конфиге:
 # маршрут лишь говорит, какому профилю предметка соответствует. Предметки без записи в
@@ -422,6 +432,7 @@ class Config:
     require_prompt: bool
     prefetch_prompt: bool
     prompt_review: str
+    risk_gate: str
     max_fix_rounds: int
     max_fix_rounds_high: int
     max_stale_rebuilds: int
@@ -599,6 +610,11 @@ def load(repo: Path | str | None = None) -> Config:
         raise ConfigError(f"prompt_review: неизвестный режим {prompt_review!r}; допустимо: "
                           f"auto | always | never")
 
+    risk_gate = str(raw.get("risk_gate") or DEFAULTS["risk_gate"]).strip().lower()
+    if risk_gate not in RISK_GATE_MODES:
+        raise ConfigError(f"risk_gate: неизвестный режим {risk_gate!r}; допустимо: "
+                          f"spec | hold")
+
     cfg = Config(
         repo=root,
         project=str(raw.get("project") or root.name),
@@ -621,6 +637,7 @@ def load(repo: Path | str | None = None) -> Config:
         require_prompt=bool(raw.get("require_prompt", True)),
         prefetch_prompt=bool(raw.get("prefetch_prompt", True)),
         prompt_review=prompt_review,
+        risk_gate=risk_gate,
         max_fix_rounds=_fix_rounds(raw.get("max_fix_rounds")),
         max_fix_rounds_high=_fix_rounds_high(raw.get("max_fix_rounds_high")),
         max_stale_rebuilds=_stale_rebuilds(raw.get("max_stale_rebuilds")),

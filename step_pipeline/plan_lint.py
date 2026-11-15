@@ -503,6 +503,65 @@ def _ref_warnings(shown: str, lines: list[str], project: Path) -> list[Problem]:
     return out
 
 
+# ─────────────────────── проза в пункте «Риск:» (Л22) ───────────────────────
+
+#: Пункт шага, который задаёт класс риска (`next_step._step_from_section`).
+_RISK_LABEL = "риск"
+#: Словарь классов риска — тот же, что в `next_step._risk_of`.
+_RISK_WORDS = ("low", "normal", "high")
+_RISK_PROSE_WARNING = ("пункт «Риск:» описан прозой — класс не задан, поставь "
+                       "low/normal/high отдельной пометкой")
+
+
+def _risk_is_prose(text: str) -> bool:
+    """Пункт «Риск:» — описание, а не метка: та же копия правила, что в `_risk_of`.
+
+    Копия осознанная (D5 докстринга модуля): плагин не импортирует движок как модуль.
+    Метка из словаря — что бы ни шло дальше — не проза; ровно одно слово вне словаря —
+    опечатка (движок оставит `high`), тоже не проза; два слова и больше, первое вне
+    словаря, — описание риска, и класс шага при таком разборе не задан.
+    """
+    tokens = _norm(text).split()
+    if not tokens:
+        return False
+    token = tokens[0].lower().strip(".,;:()«»\"'")
+    if token in _RISK_WORDS:
+        return False
+    return len(tokens) > 1
+
+
+def _risk_warnings(shown: str, lines: list[str], found: list[tuple[int, int, str]],
+                   settings: Settings) -> list[Problem]:
+    """Л22: проза в пункте «Риск:» шага — предупреждение, а не ошибка.
+
+    Класс риска меняет решения стража (ручной допуск, предел кругов), поэтому описание
+    риска прозой не должно выдавать себя за метку: автор это описал, а не решил. План
+    утверждается как раньше — чинить пометку владелец может и после запуска.
+    """
+    step_regex = settings.step_regex
+    if step_regex is None:  # pragma: no cover - отсекается в lint_project
+        return []
+    span = _steps_span(lines, found, settings)
+    if span is None:
+        return []
+    start, end = span
+    inside = [item for item in found if start < item[0] < end]
+    out: list[Problem] = []
+    for pos, (idx, _level, title) in enumerate(inside):
+        m = step_regex.match(title)
+        if not m:
+            continue
+        sid = m.group("id").upper()
+        body_end = _span_end(inside, pos, end)
+        for label, text, _full in _section_blocks(lines[idx + 1:body_end]):
+            if not label.startswith(_RISK_LABEL):
+                continue
+            if _risk_is_prose(text):
+                out.append(Problem(shown, idx + 1, f"шаг {sid}: {_RISK_PROSE_WARNING}", sid))
+            break
+    return out
+
+
 def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
     """Все проверки одного файла плана; строки — 1-based, «весь файл» — 0."""
     path = Path(path)
@@ -582,19 +641,24 @@ def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
 
 # ───────────────────────────── точка входа ─────────────────────────────
 
-# Л20 — единственная находка, которая не попадает в `problems`, а идёт в `warnings`:
-# план без строки `Конституция:` в шапке — legacy, а планы 1-4 заведены до конституции
-# (решение D1 шага S1: старые планы не ломаются и утверждение не блокируют).
+# Канал warnings: находки, которые не блокируют утверждение (Л20 конституции, Л21 адресов,
+# Л22 прозы риска).
 _CONSTITUTION_WARNING = ("нет строки «Конституция: docs/CONSTITUTION.md» в шапке "
                          "плана — план не сослался на конституцию проекта")
 
 
 def lint_warnings(path: Path, project: Path, settings: Settings) -> list[Problem]:
-    """Предупреждения файла плана: не блокируют, но видны человеку (Л20).
+    """Предупреждения файла плана — не блокируют, но видны человеку: Л20, Л21, Л22.
+
+    Л20 — нет строки `Конституция:` в шапке (legacy-план). Л21 — ссылка плана на код
+    уехала или анкор пропал (`_ref_warnings`). Л22 — пункт «Риск:» описан прозой, класс
+    не задан (`_risk_warnings`); у такой пометки шаг читается `normal`, и владелец должен
+    видеть, что метку он не ставил.
 
     Файл не читается — предупреждения нет: это уже ошибка Л2, второй находки об одном
-    и том же не нужно. Строка находки — заголовок плана (`# …`, 1-based); заголовка
-    уровня 1 нет — строка 1. `step` пустой: находка уровня файла, как у Л18.
+    и том же не нужно. Строка находки Л20 — заголовок плана (`# …`, 1-based); заголовка
+    уровня 1 нет — строка 1. `step` пустой у находок уровня файла (как у Л18), у Л22 —
+    идентификатор шага: панель даёт по нему переход.
     """
     try:
         text = Path(path).read_text(encoding="utf-8", errors="replace")
@@ -611,6 +675,9 @@ def lint_warnings(path: Path, project: Path, settings: Settings) -> list[Problem
     # а не ошибка: блокировать утверждение адресом нельзя — владельцу нужен один способ
     # снять стоп, и это не «починить номер строки».
     out.extend(_ref_warnings(_shown(Path(path), project), lines, project))
+    # Проза в «Риск:» (Л22): класс риска не задан — сказать об этом до запуска, а не
+    # после того, как шаг получил не тот предел кругов.
+    out.extend(_risk_warnings(_shown(Path(path), project), lines, found, settings))
     return out
 
 

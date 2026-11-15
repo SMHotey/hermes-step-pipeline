@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 import config as config_mod
-from engine_kit import cards, make_project, write_approval
+from engine_kit import cards, make_project, set_risk_gate, write_approval
 from stub_hermes import SCHEMA
 
 import gate
@@ -262,6 +262,7 @@ def test_risk_hold_is_not_swallowed_by_multi_action_tick(project: Path, hermes_s
     plan = project / "docs" / "plans" / "1-demo.md"
     plan.write_text(RISK_PLAN, encoding="utf-8")
     write_approval(project, plan)          # план изменён: sha256 в записи утверждения
+    set_risk_gate(project, "hold")         # проверяется hold: в `spec` шаг пошёл бы на спеку
     cfg = config_mod.load(project)
 
     res = gate.tick(cfg, max_actions=2)
