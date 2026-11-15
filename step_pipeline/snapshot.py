@@ -1537,6 +1537,16 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         out["quiet_hours"] = decision.get("pause") or {}
     except Exception as exc:                                    # noqa: BLE001
         out["errors"].append(f"решение: {exc}")
+    if not out.get("quiet_hours"):
+        # Запасной путь: `--status` не отдал паузу (нет ни одного плана с журналом или в
+        # копии движка паузы ещё нет). Лишний процесс здесь стоит только в этом случае —
+        # без него панель проекта без планов не сказала бы, почему тики спят.
+        try:
+            out["quiet_hours"] = proj.engine_json(root, "gate.py", "--pause",
+                                                  engine_dir=engine_dir,
+                                                  extra_env=extra_env) or {}
+        except Exception as exc:                                # noqa: BLE001 - панель не падает
+            proj.debug_note("snapshot.pause", exc)
     try:
         pkg = proj.engine_json(root, "next_step.py", *args,
                                engine_dir=engine_dir, extra_env=extra_env) or {}
