@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 import config as config_mod
+import check_task_prompt as ctk
 import gate
 from engine_kit import cards, complete, write_approval
 
@@ -223,12 +224,18 @@ def test_prompt_review_verdict_controls_start(stand):
 
 
 def test_prompt_fix_rounds_exhausted_stops(stand):
-    """Третий REQUEST_CHANGES постановки — стоп: круги автопереписывания исчерпаны."""
+    """Третий REQUEST_CHANGES постановки — стоп: круги автопереписывания исчерпаны.
+
+    Отчёт пишется ПОСЛЕ карточки ревью, как это делает ревьюер: страж сверяет, что отчёт
+    переписан в этом круге (`_report_written_after`, допуск 1 с). Отчёт, записанный до
+    создания карточки, на медленной машине валит тик стопом «вердикт может быть от прошлого
+    круга», и тест краснел не по существу.
+    """
     root, p, db = stand
     write_plan(root, plan_body(3))
     write_prompt(root, "S1", recon="1111111")
+    gate.run_gate(p, execute=True, notify_fn=quiet)     # карточка ревью круга 1
     write_report(root, "REQUEST_CHANGES")
-    gate.run_gate(p, execute=True, notify_fn=quiet)     # ревью круга 1
     complete(db, ":promptreview")
 
     gate.run_gate(p, execute=True, notify_fn=quiet)     # круг 1: переписать
@@ -285,3 +292,134 @@ def test_prompt_review_modes(stand):
     with pytest.raises(config_mod.ConfigError) as exc:
         config_mod.load(root)
     assert "prompt_review" in str(exc.value)
+
+
+# --- Адрес факта в постановке: символ и команда вместо `файл:строка` (план 8, §S2A) ---
+
+STEP = {"id": "S1", "epoch": "", "title": "таблица счетов", "days": 1.0, "owner": "",
+        "goal": "таблица счетов", "files": ["app/s1.py"],
+        "gates": ["python -m pytest tests/test_s1.py -q"], "dod": "сделано",
+        "read": [], "notes": ""}
+
+PROMPT_REL = "docs/prompts/2026-11-04_1-S1_prompt.md"
+REPORT_REL = "docs/reviews/1-S1-prompt.md"
+
+
+def prompt_cards(root: Path, p) -> dict[str, str]:
+    """Тела трёх карточек постановки: ревью, переписывание, пересборка протухшей."""
+    (root / "docs" / "reviews").mkdir(parents=True, exist_ok=True)
+    (root / REPORT_REL).write_text(
+        "Находки\n\n- [блокирующая] раздел 4 — символ `Invoice.total` не находится в коде\n",
+        encoding="utf-8")
+    decision = {"rebuild": 1, "limit": 2, "prev_recon": "1111111", "review_round": 2,
+                "reason": "постановка протухла: вход изменился после ревью"}
+    return {
+        "ревью постановки": gate.prompt_review_card_body(p, STEP, REPORT_REL, PROMPT_REL),
+        "переписывание": gate.prompt_fix_card_body(p, STEP, 1, REPORT_REL),
+        "пересборка": gate.prompt_stale_card_body(p, STEP, decision, REPORT_REL),
+    }
+
+
+def test_prompt_review_card_drops_line_addresses(stand):
+    """Ни одна карточка постановки не учит паре «файл и номер строки»."""
+    root, p, _db = stand
+    write_plan(root, plan_body(3))
+    write_prompt(root, "S1", recon="1111111")
+    for name, body in prompt_cards(root, p).items():
+        assert "path:line" not in body, f"карточка «{name}» всё ещё требует path:line:\n{body}"
+
+
+def test_symbols_block_but_line_shift_does_not(stand):
+    """Символ проверяется и блокирует, сдвиг строки — нет: оба правила в «ЧТО ПРОВЕРИТЬ».
+
+    Место правила важно: пункт, уехавший в хвост карточки, ревьюер прочтёт после вердикта.
+    Там же проверяется реестр: фактом закрытия служит адрес-символ, а не пара
+    «файл и номер строки».
+    """
+    root, p, _db = stand
+    write_plan(root, plan_body(3))
+    write_prompt(root, "S1", recon="1111111")
+    body = prompt_cards(root, p)["ревью постановки"]
+
+    head = "ЧТО ПРОВЕРИТЬ"
+    tail = "РЕЕСТР НАХОДОК ПОСТАНОВКИ (обязательно)"
+    assert head in body and tail in body, body
+    checks = " ".join(body.split(head, 1)[1].split(tail, 1)[0].split())
+    assert "Несуществующий символ" in checks, "символ не назван блокирующей находкой"
+    assert "блокирующая находка" in checks, checks
+    assert "сдвиг строки находкой не считается" in checks, "сдвиг строки не исключён из находок"
+
+    registry = " ".join(body.split(tail, 1)[1].split("РЕЕСТР СЕЙЧАС", 1)[0].split())
+    assert "`файл.py::символ`" in registry, "реестр не называет адрес-символ"
+    assert "файл:строка" not in registry, "реестр всё ещё требует пару «файл и номер строки»"
+
+
+PROMPT_SYMBOLS = """# Промт: 1 / S1 — таблица счетов
+
+## 1. Роль и цель
+
+Ты — бэкенд-разработчик. Результат: модель Invoice с полем total и её миграция.
+
+## 2. Контекст (факты)
+
+- Репозиторий: `demo`, ветка `main`, HEAD `abc1234`.
+- Сумма счёта — `app/invoice.py::Invoice.total`; найти: `grep -n 'def total' app/invoice.py`.
+- Ключ конфига — `app/config.py::Settings.currency`; найти: `grep -n 'currency' app/config.py`.
+- План: `docs/plans/1-demo.md` → раздел S1. Журнал шага: не начат.
+
+## 3. Границы и запреты
+
+Можно менять: `app/invoice.py`, `tests/test_invoice.py`.
+Запрещено: трогать существующие модели, править данные приложения.
+Не входит в задачу: API-эндпоинт и сериализаторы.
+
+## 4. Что сделать
+
+1. `app/invoice.py::Invoice` — добавить поле `total` → в таблице есть колонка.
+2. `app/invoice.py::Invoice.total` — проверка неотрицательности → минус отвергается.
+3. Тесты: `tests/test_invoice.py::test_total` — happy path, граница (ноль), отрицательное.
+
+Решения, принятые за тебя (не переигрывать): сумма хранится в копейках целым числом.
+
+## 5. Как проверить (гейты)
+
+```
+python -m pytest tests/test_invoice.py -m "not slow"   # ожидается: 3 passed, EXIT=0
+```
+
+Вывод писать в файл, код возврата смотреть у pytest.
+
+## 6. Стоп-сигналы
+
+- нужна миграция с NOT NULL или drop;
+- факт в коде расходится с этим промтом;
+- гейт красный по посторонней причине.
+
+## 7. Формат отчёта
+
+`diff stat` → диффы → решения → строки гейтов (команда + число + EXIT) → вопросы.
+
+## 8. Вопросы
+
+Нет вопросов: решения записаны в блоке 4.
+
+## 9. Ревью (обязательно)
+
+Шаг закрывает роль `reviewer` по плану и коду; вердикт APPROVE или REQUEST_CHANGES.
+"""
+
+
+def test_prompt_without_line_numbers_passes_form_gate():
+    """Гейт формы нейтрален к виду адреса: обе редакции дают пустой список FAIL.
+
+    Правило «символ, а не строка» держится скиллом и ревью, а не формой постановки; тест
+    фиксирует эту нейтральность, а не маскирует её. Адреса в обеих редакциях литеральные:
+    запись в угловых скобках уронила бы текст по C3 (`PLACEHOLDER_ANGLE`) и проверяла бы не то.
+    """
+    with_line = PROMPT_SYMBOLS.replace("`app/invoice.py::Invoice.total`",
+                                       "`app/models/invoice.py:42`")
+    assert "app/models/invoice.py:42" in with_line, "подмена адреса не сработала"
+    for text in (PROMPT_SYMBOLS, with_line):
+        failed = [(code, msg) for level, code, msg in ctk.check_prompt(text)
+                  if level == "FAIL"]
+        assert not failed, failed
