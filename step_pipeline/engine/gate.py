@@ -1904,9 +1904,8 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
     round_label = f"(круг {round_no} из {max_rounds})" if max_rounds else f"(круг {round_no})"
     if max_rounds and round_no >= max_rounds:
         tail = [
-            "ВАЖНО: это последний автоматический круг правок. Второй REQUEST_CHANGES "
-            "останавливает",
-            "конвейер и уходит владельцу — доведи находки до конца.",
+            "ВАЖНО: это последний автоматический круг правок. Следующий REQUEST_CHANGES",
+            "останавливает конвейер и уходит владельцу — доведи находки до конца.",
         ]
     elif max_rounds:
         tail = [
@@ -1916,9 +1915,8 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
         ]
     else:
         tail = [
-            "ВАЖНО: это последний автоматический круг правок. Второй REQUEST_CHANGES "
-            "останавливает",
-            "конвейер и уходит владельцу — доведи находки до конца.",
+            "ВАЖНО: это последний автоматический круг правок. Следующий REQUEST_CHANGES",
+            "останавливает конвейер и уходит владельцу — доведи находки до конца.",
         ]
     return "\n".join([
         f"ПРАВКИ ПО РЕВЬЮ шага {step['id']} плана {p.plan_id} — {step['title']} {round_label}",

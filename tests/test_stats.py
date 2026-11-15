@@ -247,8 +247,8 @@ def test_metrics_tiles_and_empty_project(tmp_path: Path) -> None:
     tiles = stats.cycle_tiles(data)
     assert len(tiles) == 5
     assert all(tile["label"] and tile["value"] for tile in tiles)
-    # Планов нет — кругов правок считать не на что: значение плитки «—», не «0.00».
-    assert tiles[4]["label"] == "кругов правок на план"
+    # Планов и кругов нет — считать круги на шаг не на что: значение плитки «—».
+    assert tiles[4]["label"] == "кругов правок на шаг"
     assert tiles[4]["value"] == "—"
 
     root = make_project(
@@ -264,15 +264,15 @@ def test_metrics_tiles_and_empty_project(tmp_path: Path) -> None:
     assert [tile["label"] for tile in tiles] == [
         "планов с разведкой", "вердиктов без готового решения",
         "правок по разведке на план", "ревью плана с первого раза",
-        "кругов правок на план"]
-    # Планы есть, кругов правок нет — «0.00», а не «—» (D10 шага 12-S3).
-    assert tiles[4]["value"] == "0.00"
+        "кругов правок на шаг"]
+    # Планы есть, кругов правок нет — считать не на что: «—», а не «0».
+    assert tiles[4]["value"] == "—"
     line = stats.render_cycle(data)
     assert "\n" not in line
     assert line.startswith("Цикл:")
     assert "с разведкой 1" in line
     assert "из 3" in line
-    assert "кругов правок" in line
+    assert line.endswith("кругов на шаг — (правок 0, пересборок 0, закрыто находок 0)")
 
 
 def test_metrics_counts_unreferenced_review(tmp_path: Path) -> None:
@@ -288,62 +288,80 @@ def test_metrics_counts_unreferenced_review(tmp_path: Path) -> None:
     assert data["plan_reviews"] == 0
 
 
-def test_metrics_counts_step_fix_rounds(tmp_path: Path) -> None:
-    """История: правки, пересборки и повторные ревью считаются по классам (R10)."""
+def registry_text(statuses: list[str]) -> str:
+    """Реестр находок постановки: шапка `PROMPT_FINDINGS_HEADER`, строка на находку.
+
+    Статус — последняя ячейка: так его читает и движок (`gate.parse_findings`), и
+    статистика (R11). ID вида `F-N` обязателен только движку, здесь он держится ради
+    правдоподобия фикстуры.
+    """
+    rows = ["# Реестр находок постановки", "",
+            "| ID | Класс | Находка | Что сделать | Статус |",
+            "|---|---|---|---|---|"]
+    rows += [f"| F-{number} | замысел | находка {number} | что-то | {status} |"
+             for number, status in enumerate(statuses, start=1)]
+    return "\n".join(rows) + "\n"
+
+
+def test_metrics_counts_fix_rounds_and_zero_close_share(tmp_path: Path) -> None:
+    """Круги по паре «план + шаг» и находки из реестров постановок (R10, R11, §5.4)."""
     root = make_project(
         tmp_path / "project",
         {"1-plan.md": plan_text("1. План 1"), "2-plan.md": plan_text("2. План 2")},
         history=[
             {"action": "create_fix", "plan": 1, "step": "S1", "detail": "карточка правок: t1"},
             {"action": "create_fix", "plan": 1, "step": "S1", "detail": "карточка правок: t2"},
-            {"action": "create_fix", "plan": 1, "step": "S1", "detail": "карточка правок: t3"},
-            {"action": "create_prompt_fix", "plan": 1, "step": "S1", "stale": True,
-             "detail": "пересборка протухшей постановки: t4"},
-            {"action": "create_prompt_fix", "plan": 1, "step": "S1", "stale": True,
+            {"action": "create_prompt_fix", "plan": 1, "step": "S1",
+             "detail": "переписать постановку: t3"},
+            {"action": "create_prompt_fix", "plan": 1, "step": "S2",
+             "detail": "переписать постановку: t4"},
+            {"action": "create_prompt_fix", "plan": 1, "step": "S3", "stale": True,
              "detail": "пересборка протухшей постановки: t5"},
+            {"action": "create_fix", "plan": 2, "step": "S1", "detail": "карточка правок: t6"},
+            # Повтор ревью и стоп — не круги правок: ни бюджет, ни «0 закрытых» не двигают.
             {"action": "create_rereview", "plan": 1, "step": "S1", "detail": "повторное ревью"},
-            {"action": "create_prompt_fix", "plan": 2, "step": "S1",
-             "detail": "переписать постановку: t6"},
+            {"action": "stop", "plan": 1, "step": "S2",
+             "detail": "правка постановки не закрыла ни одной находки (круг 2: F-2 — открыты)"},
         ],
     )
+    reviews = root / "docs" / "reviews"
+    (reviews / "prompt-1-S1-findings.md").write_text(
+        registry_text(["закрыто", "закрыто", "закрыто", "открыто"]), encoding="utf-8")
+    (reviews / "prompt-1-S2-findings.md").write_text(
+        registry_text(["открыто", "не блокирует"]), encoding="utf-8")
+    # Реестр без шапки таблицы — строка в errors, шаг «нет данных», а не «ноль закрытых».
+    (reviews / "prompt-1-S3-findings.md").write_text("# Реестр\n\nбез таблицы\n", encoding="utf-8")
 
     data = metrics(root)
 
-    plan1 = {item["plan"]: item for item in data["by_plan"]}["1"]
-    assert plan1["fix_rounds"] == 3
-    assert plan1["stale_rebuilds"] == 2
-    assert plan1["rereview"] == 1
-    # Переписывание постановки без `stale` — тоже круг правок шага (R10).
-    assert data["fix_rounds_total"] == 4
-    assert data["stale_rebuilds_total"] == 2
-    assert data["rereview_total"] == 1
-    assert data["fix_rounds_per_plan"] == 2.0
-    assert data["zero_fix_rounds"] == 0
-    assert data["zero_fix_share"] == 0.0       # ни один круг не сообщил «закрыто 0»
+    assert data["fix_rounds"] == 3                 # 2 правки S1 плана 1 + 1 правка плана 2
+    assert data["prompt_fix_rounds"] == 2          # переписывания S1 и S2, пересборка S3 — нет
+    assert data["stale_rebuilds"] == 1
+    assert data["steps_with_rounds"] == 3          # (1,S1), (1,S2), (2,S1)
+    assert data["rounds_per_step"] == 1.7          # 5 кругов на 3 шага
+    assert data["findings_total"] == 6
+    assert data["findings_closed"] == 3
+    assert data["closed_per_round"] == 0.6         # 3 закрытых на 5 кругов
+    assert data["zero_close_steps"] == 1           # S2 плана 1: реестр есть, закрытых ноль
+    assert data["zero_close_base"] == 2            # (1,S1) и (1,S2); у (2,S1) реестра нет
+    assert data["zero_close_share"] == 0.5
+    assert any("prompt-1-S3-findings.md" in line for line in data["errors"])
 
+    plans = {item["plan"]: item for item in data["by_plan"]}
+    assert plans["1"]["fix_rounds"] == 2           # только `create_fix`, как ключ §5.4
+    assert plans["1"]["stale_rebuilds"] == 1
+    assert plans["1"]["findings_closed"] == 3
+    assert plans["2"]["fix_rounds"] == 1
+    assert plans["2"]["stale_rebuilds"] == 0
+    assert plans["2"]["findings_closed"] == 0
+    assert "rereview" not in plans["1"]
 
-def test_metrics_counts_zero_finding_rounds(tmp_path: Path) -> None:
-    """Доля кругов, закрывших 0 находок, считается парой с числом кругов (R11)."""
-    root = make_project(
-        tmp_path / "project",
-        {"1-plan.md": plan_text("1. План 1")},
-        history=[
-            {"action": "create_fix", "plan": 1, "step": "S1",
-             "detail": "карточка правок: t1, закрыто 0 находок"},
-            {"action": "create_fix", "plan": 1, "step": "S1", "detail": "карточка правок: t2"},
-            {"action": "stop", "plan": 1, "step": "S1",
-             "detail": "правка постановки не закрыла ни одной находки (круг 2: F-1 — открыты)"},
-        ],
-    )
-
-    data = metrics(root)
-
-    assert data["fix_rounds_total"] == 2
-    assert data["zero_fix_rounds"] == 2
-    assert data["zero_fix_share"] == 1.0
     tiles = stats.cycle_tiles(data)
-    assert tiles[4]["value"] == "2.00"        # 2 круга на 1 план
-    assert "2 из 2" in tiles[4]["hint"]
+    assert tiles[4]["label"] == "кругов правок на шаг"
+    assert tiles[4]["value"] == "1.7"
+    assert tiles[4]["hint"] == ("правок 3, пересборок 1; закрыто находок 3 (по 0.6 за круг); "
+                                "ноль закрытых за круг у 1 из 2 шагов")
     line = stats.render_cycle(data)
-    assert "кругов правок 2" in line
-    assert "с 0 находок 1" in line
+    assert line.startswith("Цикл:")
+    # §5.7: числа про круги дописаны в конец строки, прежние части — на своих местах.
+    assert line.endswith("кругов на шаг 1.7 (правок 3, пересборок 1, закрыто находок 3)")

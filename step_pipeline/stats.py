@@ -37,20 +37,21 @@ R7. Круги ревью плана — записи `create_plan_review` из 
 R8. Нечитаемый файл попадает строкой в `errors`, его числа считаются нулём;
     отсутствие каталогов — не ошибка (механизм ещё не работал).
 R9. `by_plan` — по записи на план, по возрастанию номера.
-R10. Круги правок шагов — записи истории `create_fix` (правка кода шага) и
-    `create_prompt_fix` без `stale` (переписывание постановки): обе серии —
-    круг правок шага и обе берут лимит по риску (`gate.step_fix_limit`).
-    `create_prompt_fix` с `stale: true` — пересборка протухшей постановки, она
-    идёт своим лимитом `max_stale_rebuilds` и в круги правок не входит (6-S8A
-    израсходовал два круга из шести на сдвиг HEAD). `create_rereview` — повтор
-    прогона ревью, не правка. Источник классификации: `gate.rounds_classification`.
-R11. Круг, закрывший 0 находок, — запись истории, в `detail` которой стоит либо
-    «закрыто 0» (карточка правок сообщает, сколько находок закрыла), либо стоп
-    стража «правка постановки не закрыла ни одной находки» (`gate._prompt_zero_fix`).
-    Доля считается по всем кругам правок (R10): круг без находок — работа без
-    результата, и она видна только в паре с числом кругов.
-R12. Пустая история — не ошибка (R8): план без записей получает нули, а доля
-    кругов без находок при нуле кругов — `None` (не «0 %»: делить не на что).
+R10. Круги правок шага — записи истории `create_fix` (правка кода шага) и
+    `create_prompt_fix` без `stale` (переписывание постановки): обе серии — круг
+    правок шага, обе берут лимит по риску (`gate.step_fix_limit`), счёт идёт по паре
+    «план + шаг». `create_prompt_fix` с `stale: true` — пересборка протухшей
+    постановки, она идёт своим лимитом `max_stale_rebuilds` и в круги правок не
+    входит (6-S8A израсходовал два круга из шести на сдвиг HEAD). `create_rereview` —
+    повтор прогона ревью, не правка, и ни один бюджет не двигает. Источник
+    классификации: `gate.rounds_classification`, `gate.remember_action`.
+R11. Реестр находок постановки — файл `prompt-<план>-<шаг>-findings.md` в каталоге
+    отчётов; статус находки — последняя ячейка строки таблицы, `закрыто` — закрытая
+    находка. Из него берутся число находок, число закрытых и шаги, где круг правок
+    не закрыл ни одной находки: `detail` истории для этого не годится — движок
+    пишет в него только id карточки. Источник: `gate.prompt_findings_path`,
+    `gate.load_findings` с шапкой `gate.PROMPT_FINDINGS_HEADER`. Нечитаемый реестр —
+    строка в `errors`, шаг с ним считается «нет данных».
 """
 from __future__ import annotations
 
@@ -90,15 +91,20 @@ DEFAULT_PATHS = {"plans": "docs/plans", "reviews": "docs/reviews",
 DEFAULT_JOURNAL_MARKER = "журнал"
 #: Действие истории, считающее круг ревью плана.
 PLAN_REVIEW_ACTION = "create_plan_review"
-#: Действия истории для кругов правок шага (R10): правка кода, переписывание постановки
-#: (пересборка отличается полем `stale`), повторное ревью.
+#: Действия истории для кругов правок шага (R10): правка кода и переписывание постановки.
+#: Пересборка протухшей постановки — та же запись `create_prompt_fix`, отличается полем
+#: `stale`; `create_rereview` бюджетов не тратит и счётчиком не считается (`gate.py`,
+#: якорь `ANCHOR:rounds_classification`).
 FIX_ACTION = "create_fix"
 PROMPT_FIX_ACTION = "create_prompt_fix"
-REREVIEW_ACTION = "create_rereview"
-#: Признак круга, закрывшего 0 находок (R11): `detail` истории — «закрыто 0» из карточки
-#: правок либо стоп стража «не закрыла ни одной находки».
-ZERO_FINDINGS_RE = re.compile(r"закрыт\w*\s+0\b|не\s+закрыла\s+ни\s+одной\s+находки",
-                              re.IGNORECASE)
+#: Шапка таблицы реестра находок постановки — дословно `gate.PROMPT_FINDINGS_HEADER`:
+#: без колонки «Шаг», постановка принадлежит одному шагу. Порядок ячеек важен: статус —
+#: последняя (`gate.FINDING_STATUSES`), закрытая находка — `закрыто`.
+PROMPT_FINDINGS_HEADER = ("ID", "Класс", "Находка", "Что сделать", "Статус")
+CLOSED_STATUS = "закрыто"
+#: Имя реестра находок постановки (`gate.prompt_findings_path`): `prompt-12-S3-findings.md`.
+#: Группа 1 — номер плана, группа 2 — шаг; пара «план + шаг» — ключ метрик (R10, R11).
+PROMPT_FINDINGS_FILE_RE = re.compile(r"^prompt-(\d{1,2})-(.+)-findings\.md$")
 
 _HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>\S.*?)\s*$")
 _MAX_HASHES = 6
@@ -394,35 +400,87 @@ def _rounds(records: list[dict]) -> dict[str, int]:
     return rounds
 
 
-def _step_rounds(records: list[dict]) -> dict[str, dict]:
-    """Круги правок, пересборки, повторные ревью и круги без находок (R10–R12).
+def _step_rounds(records: list[dict]) -> dict[tuple[str, str], dict]:
+    """Круги правок и пересборки по паре «план + шаг» (R10).
 
-    Возвращает номер плана → `{"fix", "stale", "rereview", "zero"}`. Поле `stale`
+    Возвращает `(номер плана, шаг)` → `{"fix", "promptfix", "stale"}`. Поле `stale`
     различает две серии одной записи `create_prompt_fix`: пересборка протухшей
     постановки (`stale: true`) бюджет правок не тратит, переписывание постановки
-    тратит. Круг без находок ищется по тексту `detail` любой записи: стоп стража
-    «не закрыла ни одной находки» — тоже событие круга (R11).
+    тратит. `create_rereview` не считается: это повтор ревью, а не правка.
     """
-    data: dict[str, dict] = {}
+    data: dict[tuple[str, str], dict] = {}
 
-    def row(plan: str) -> dict:
-        return data.setdefault(plan, {"fix": 0, "stale": 0, "rereview": 0, "zero": 0})
+    def row(plan: str, step: str) -> dict:
+        return data.setdefault((plan, step), {"fix": 0, "promptfix": 0, "stale": 0})
 
     for record in records:
         action = str(record.get("action") or "")
-        plan = str(record.get("plan"))
-        if action in (FIX_ACTION, PROMPT_FIX_ACTION, REREVIEW_ACTION):
-            item = row(plan)
-            if action == FIX_ACTION:
-                item["fix"] += 1
-            elif action == REREVIEW_ACTION:
-                item["rereview"] += 1
-            elif record.get("stale"):
-                item["stale"] += 1
-            else:
-                item["fix"] += 1
-        if ZERO_FINDINGS_RE.search(str(record.get("detail") or "")):
-            row(plan)["zero"] += 1
+        if action not in (FIX_ACTION, PROMPT_FIX_ACTION):
+            continue
+        item = row(str(record.get("plan")), str(record.get("step") or ""))
+        if action == FIX_ACTION:
+            item["fix"] += 1
+        elif record.get("stale"):
+            item["stale"] += 1
+        else:
+            item["promptfix"] += 1
+    return data
+
+
+def _registry_counts(text: str) -> tuple[int, int] | None:
+    """Число находок реестра постановки и число закрытых (R11); нет шапки — `None`.
+
+    Разбор повторяет `gate.parse_findings`: строки таблицы — только после шапки
+    `PROMPT_FINDINGS_HEADER`, разделитель `|---|` пропускается, статус — последняя
+    ячейка. Строка с другим числом ячеек в таблицу не попадает (движок на ней
+    остановился бы), но и находкой не считается: файл читается, числа — по факту.
+    """
+    lines = str(text).splitlines()
+    header = tuple(PROMPT_FINDINGS_HEADER)
+    start = None
+    for index, line in enumerate(lines):
+        if tuple(_cells(line)) == header:
+            start = index + 1
+            break
+    if start is None:
+        return None
+    rows = closed = 0
+    for line in lines[start:]:
+        if not line.strip().startswith("|"):
+            continue
+        cells = _cells(line)
+        if _is_separator(cells) or len(cells) != len(header):
+            continue
+        rows += 1
+        if cells[-1].strip().lower() == CLOSED_STATUS:
+            closed += 1
+    return rows, closed
+
+
+def _prompt_registries(reviews_dir: Path, errors: list[str]) -> dict[tuple[str, str], dict]:
+    """Реестры находок постановок (R11): пара «план + шаг» → `{"rows", "closed"}`.
+
+    Имя файла `prompt-<план>-<шаг>-findings.md` даёт ключ; файлов нет — пустой словарь
+    (механизм ещё не работал, как у отсутствующих каталогов). Нечитаемый файл и файл
+    без шапки таблицы — строка в `errors`: шаг остаётся «нет данных», а не «ноль
+    закрытых» — иначе нечитанный реестр выглядел бы кругом без результата.
+    """
+    data: dict[tuple[str, str], dict] = {}
+    if not reviews_dir.is_dir():
+        return data
+    for path in sorted(reviews_dir.glob("prompt-*-findings.md")):
+        match = PROMPT_FINDINGS_FILE_RE.match(path.name)
+        if not match:
+            continue
+        text = _read(path, errors, "реестр находок постановки")
+        if text is None:
+            continue
+        counts = _registry_counts(text)
+        if counts is None:
+            errors.append(f"реестр находок постановки {path.name}: нет шапки таблицы")
+            continue
+        data[(str(int(match.group(1))), match.group(2))] = {"rows": counts[0],
+                                                           "closed": counts[1]}
     return data
 
 
@@ -469,6 +527,7 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
     records = _history(state_dir, errors)
     rounds = _rounds(records)
     step_rounds = _step_rounds(records)
+    registries = _prompt_registries(reviews_dir, errors)
     artifacts: dict[Path, dict[str, int]] = {}
     by_plan: list[dict] = []
     plans_with_research = 0
@@ -502,7 +561,10 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
         if edits is not None:
             edits_total += edits
             edits_plans += 1
-        step_data = step_rounds.get(plan_id) or {}
+        # Круги и находки плана — сумма по его парам «план + шаг» (R10, R11).
+        plan_pairs = [item for key, item in step_rounds.items() if key[0] == plan_id]
+        plan_closed = sum(item["closed"] for key, item in registries.items()
+                          if key[0] == plan_id)
         by_plan.append({
             "plan": plan_id,
             "research": research,
@@ -512,18 +574,25 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
             "edits": edits,
             "review": _review_state(text, plan["file"], reviews_dir / f"plan-{plan_id}.md"),
             "rounds": rounds.get(plan_id, 0),
-            "fix_rounds": int(step_data.get("fix") or 0),
-            "stale_rebuilds": int(step_data.get("stale") or 0),
-            "rereview": int(step_data.get("rereview") or 0),
-            "zero_fix_rounds": int(step_data.get("zero") or 0),
+            "fix_rounds": sum(item["fix"] for item in plan_pairs),
+            "stale_rebuilds": sum(item["stale"] for item in plan_pairs),
+            "findings_closed": plan_closed,
         })
 
     states = [item["review"] for item in by_plan]
-    fix_total = sum(item["fix_rounds"] for item in by_plan)
-    stale_total = sum(item["stale_rebuilds"] for item in by_plan)
-    rereview_total = sum(item["rereview"] for item in by_plan)
-    zero_total = sum(item["zero_fix_rounds"] for item in by_plan)
-    rounds_plans = sum(1 for item in by_plan if item["fix_rounds"])
+    fix_rounds = sum(item["fix"] for item in step_rounds.values())
+    prompt_fix_rounds = sum(item["promptfix"] for item in step_rounds.values())
+    stale_rebuilds = sum(item["stale"] for item in step_rounds.values())
+    rounds_total = fix_rounds + prompt_fix_rounds
+    steps_with_rounds = sum(1 for item in step_rounds.values()
+                            if item["fix"] or item["promptfix"])
+    findings_total = sum(item["rows"] for item in registries.values())
+    findings_closed = sum(item["closed"] for item in registries.values())
+    # «Ноль закрытых за круг» — по паре «план + шаг» (D9): снимков находок на каждый
+    # круг история не хранит, поэтому круг без результата виден только на шаге целиком.
+    zero_base = [key for key, item in step_rounds.items()
+                 if (item["fix"] or item["promptfix"]) and key in registries]
+    zero_steps = sum(1 for key in zero_base if registries[key]["closed"] == 0)
     return {
         "plans_total": len(by_plan),
         "plans_with_research": plans_with_research,
@@ -535,13 +604,18 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
         "edits_total": edits_total,
         "edits_plans": edits_plans,
         "edits_per_plan": round(edits_total / edits_plans, 1) if edits_plans else None,
-        "fix_rounds_total": fix_total,
-        "fix_rounds_plans": rounds_plans,
-        "fix_rounds_per_plan": round(fix_total / len(by_plan), 2) if by_plan else None,
-        "stale_rebuilds_total": stale_total,
-        "rereview_total": rereview_total,
-        "zero_fix_rounds": zero_total,
-        "zero_fix_share": round(zero_total / fix_total, 2) if fix_total else None,
+        "fix_rounds": fix_rounds,
+        "prompt_fix_rounds": prompt_fix_rounds,
+        "stale_rebuilds": stale_rebuilds,
+        "steps_with_rounds": steps_with_rounds,
+        "rounds_per_step": (round(rounds_total / steps_with_rounds, 1)
+                            if steps_with_rounds else None),
+        "findings_total": findings_total,
+        "findings_closed": findings_closed,
+        "closed_per_round": round(findings_closed / rounds_total, 1) if rounds_total else None,
+        "zero_close_steps": zero_steps,
+        "zero_close_base": len(zero_base),
+        "zero_close_share": round(zero_steps / len(zero_base), 1) if zero_base else None,
         "plan_reviews": states.count("fresh"),
         "plan_reviews_stale": states.count("stale"),
         "plan_reviews_unbound": states.count("unbound"),
@@ -563,7 +637,7 @@ def _num(value) -> str:
 
 
 def cycle_tiles(metrics: dict) -> list[dict]:
-    """Четыре плитки панели по числам цикла; значения — уже готовые строки."""
+    """Пять плиток панели по числам цикла; значения — уже готовые строки."""
     total = int(metrics.get("plans_total") or 0)
     with_research = int(metrics.get("plans_with_research") or 0)
     gap = [str(item) for item in metrics.get("research_gap") or []]
@@ -591,18 +665,17 @@ def cycle_tiles(metrics: dict) -> list[dict]:
     skipped = int(metrics.get("plan_reviews_skipped") or 0)
     fresh = int(metrics.get("plan_reviews") or 0)
 
-    # Круги правок шагов (12-S3): значение — доля на план в два знака; у проекта без
-    # планов считать не на что («—»), у проекта с планами и без кругов — «0.00».
-    per_step = metrics.get("fix_rounds_per_plan")
-    if per_step is None:
-        rounds_value = "0.00" if total else "—"
-    else:
-        rounds_value = f"{float(per_step):.2f}"
-    fix_total = int(metrics.get("fix_rounds_total") or 0)
-    zero_share = metrics.get("zero_fix_share")
-    zero_text = ("—" if zero_share is None
-                 else f"{int(metrics.get('zero_fix_rounds') or 0)} из {fix_total} "
-                      f"({float(zero_share):.2f})")
+    # Круги правок шагов (12-S3): значение — кругов на шаг (обе серии, R10); у проекта
+    # без кругов считать не на что — «—», как и у проекта без планов.
+    per_step = metrics.get("rounds_per_step")
+    rounds_value = "—" if per_step is None else _num(per_step)
+    fix_rounds = int(metrics.get("fix_rounds") or 0)
+    stale = int(metrics.get("stale_rebuilds") or 0)
+    closed = int(metrics.get("findings_closed") or 0)
+    per_round = metrics.get("closed_per_round")
+    per_round_text = "—" if per_round is None else _num(per_round)
+    zero_steps = int(metrics.get("zero_close_steps") or 0)
+    zero_base = int(metrics.get("zero_close_base") or 0)
 
     return [
         {"label": "планов с разведкой",
@@ -620,11 +693,11 @@ def cycle_tiles(metrics: dict) -> list[dict]:
          "hint": (f"свежих вердиктов {fresh}, непригодных {stale + unbound + unreferenced} "
                   f"(не привязано к версии {stale + unbound}, без ссылки на конституцию "
                   f"{unreferenced}), ждут {pending}, без ревью {skipped}")},
-        {"label": "кругов правок на план",
+        {"label": "кругов правок на шаг",
          "value": rounds_value,
-         "hint": (f"правок {fix_total}, пересборок "
-                  f"{int(metrics.get('stale_rebuilds_total') or 0)}, повторных ревью "
-                  f"{int(metrics.get('rereview_total') or 0)}; кругов с 0 находок: {zero_text}")},
+         "hint": (f"правок {fix_rounds}, пересборок {stale}; закрыто находок {closed} "
+                  f"(по {per_round_text} за круг); ноль закрытых за круг у "
+                  f"{zero_steps} из {zero_base} шагов")},
     ]
 
 
@@ -637,17 +710,16 @@ def render_cycle(metrics: dict) -> str:
         metrics.get("candidates_unknown") or 0)
     per_plan = metrics.get("edits_per_plan")
     edits = "—" if per_plan is None else _num(per_plan)
-    per_step = metrics.get("fix_rounds_per_plan")
+    per_step = metrics.get("rounds_per_step")
     rounds = "—" if per_step is None else _num(per_step)
-    zero_share = metrics.get("zero_fix_share")
-    zero = "—" if zero_share is None else _num(zero_share)
     return (f"Цикл: планов {total}, с разведкой {int(metrics.get('plans_with_research') or 0)}, "
             f"кандидатов {candidates} (готовых {ready}, без готового {without}), "
             f"правок по разведке {edits}, "
-            f"кругов правок {rounds} (с 0 находок {zero}, пересборок "
-            f"{int(metrics.get('stale_rebuilds_total') or 0)}), "
             f"ревью плана {int(metrics.get('plan_reviews') or 0)} из {total} "
-            f"(с первого раза {int(metrics.get('plan_reviews_first') or 0)})")
+            f"(с первого раза {int(metrics.get('plan_reviews_first') or 0)}), "
+            f"кругов на шаг {rounds} (правок {int(metrics.get('fix_rounds') or 0)}, "
+            f"пересборок {int(metrics.get('stale_rebuilds') or 0)}, "
+            f"закрыто находок {int(metrics.get('findings_closed') or 0)})")
 
 
 if __name__ == "__main__":  # ручная проба владельца: `python -m step_pipeline.stats [путь]`

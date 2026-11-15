@@ -17,7 +17,7 @@ import pytest
 
 import config as config_mod
 import gate
-from engine_kit import write_approval
+from engine_kit import cards, write_approval
 from stub_hermes import SCHEMA
 
 PLAN_RISK = """# 1. Демо-план конвейера
@@ -103,6 +103,52 @@ def fix_state(root: Path, db: Path, rounds: int, *, step: str = "S1") -> None:
     report.write_text(FINDINGS, encoding="utf-8")
 
 
+def keys_in_board(db: Path) -> set[str]:
+    """Ключи идемпотентности всех карточек поддельной борды."""
+    return {card["key"] for card in cards(db)}
+
+
+PROMPT_REPORT = """recon_commit: 1111111
+
+## ВЕРДИКТ: REQUEST_CHANGES
+
+постановка требует правок
+"""
+
+
+def prompt_state(p, root: Path, db: Path, fixes: int, *, rereview: bool = False) -> None:
+    """Состояние «ревью постановки вернуло REQUEST_CHANGES после `fixes` кругов».
+
+    Карточки ревью кладутся на все круги `1..fixes+1`, переписывания — на `1..fixes`:
+    страж видит закрытое ревью текущего круга и считает бюджет `:promptfix:` по числу
+    карточек. Отметка `recon_commit` в отчёте и в постановке одна — вердикт относится к
+    этой редакции, иначе страж ушёл бы в пересборку по свежести. Допуск владельца
+    записывается в состояние: `high`-шаг без него получил бы `hold_risk` вместо решения
+    по постановке (`ANCHOR:hold_risk_decision`).
+    """
+    state = gate.load_state(p)
+    state["hold_released"] = sorted({str(item).upper()
+                                     for item in state.get("hold_released") or []} | {"S1"})
+    gate.save_state(p, state)
+    folder = Path(root) / "docs" / "prompts"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "2026-11-15_1-S1_prompt.md").write_text(
+        "# Постановка S1\n\nrecon_commit: 1111111\n\n## Ревью\n\nроль `reviewer`.\n",
+        encoding="utf-8")
+    for number in range(1, fixes + 2):
+        suffix = "" if number == 1 else f":{number}"
+        insert_card(db, f"t_prev_{number}", f"planloop:1:S1:promptreview{suffix}",
+                    created_at=number)
+    for number in range(1, fixes + 1):
+        insert_card(db, f"t_pfix_{number}", f"planloop:1:S1:promptfix:{number}",
+                    created_at=100 + number)
+    if rereview:
+        insert_card(db, "t_rerev_prompt", "planloop:1:S1:rereview:1", created_at=200)
+    report = Path(root) / "docs" / "reviews" / "1-S1-prompt.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(PROMPT_REPORT, encoding="utf-8")
+
+
 def captured_create(created: list[tuple[str, str]]):
     """Подпись `_create_card`, которая запоминает ключ и тело карточки."""
 
@@ -151,11 +197,13 @@ def test_defaults_ladder_in_config(stand):
 
     path = Path(_root) / "pipeline.json"
     raw = json.loads(path.read_text(encoding="utf-8"))
-    for bad in ("три", 0, True):
+    for bad in ("три", 0, -1, True):
         raw["max_fix_rounds_high"] = bad
         path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
-        with pytest.raises(config_mod.ConfigError):
+        with pytest.raises(config_mod.ConfigError) as exc:
             config_mod.load(_root)
+        # Владельцу нужен ключ, а не номер строки: имя — часть текста ошибки (§1.2).
+        assert "max_fix_rounds_high" in str(exc.value)
 
 
 def test_limit_by_risk():
@@ -208,6 +256,8 @@ def test_high_step_stops_at_six_and_names_class(stand_high):
     assert "(6)" in decision["reason"]
     assert "класс риска: high" in decision["reason"]
     assert "повышение не предусмотрено" in decision.get("details", "")
+    # Седьмой круг не открывается: стоп — не только текст причины, но и борда.
+    assert "planloop:1:S1:fix:7" not in keys_in_board(db)
 
 
 def test_stale_rebuild_does_not_eat_fix_budget(stand):
@@ -233,6 +283,43 @@ def test_rereview_does_not_move_budgets(stand):
 
     assert res["decision"]["action"] == "stop", res["decision"]
     assert "(2)" in res["decision"]["reason"]
+
+
+def test_rereview_does_not_move_prompt_budget(stand):
+    """`:rereview:` не двигает и бюджет постановки: после круга 1 круг 2, а не 3."""
+    root, p, db = stand
+    prompt_state(p, root, db, 1, rereview=True)
+
+    created: list[tuple[str, str]] = []
+    res = gate.run_gate(p, execute=True, create_card=captured_create(created),
+                        notify_fn=quiet)
+
+    assert res["decision"]["action"] == "create_prompt_fix", res["decision"]
+    assert res["decision"]["round"] == 2          # 1 круг правок + повтор ревью + 1
+    assert created and created[-1][0].endswith(":promptfix:2")
+
+
+def test_prompt_fix_budget_follows_risk(stand_high):
+    """`:promptfix:` на `high`-шаге идёт до шестого круга; седьмой — стоп с цифрой 6."""
+    root, p, db = stand_high
+    prompt_state(p, root, db, 5)
+
+    created: list[tuple[str, str]] = []
+    res = gate.run_gate(p, execute=True, create_card=captured_create(created),
+                        notify_fn=quiet)
+    assert res["decision"]["action"] == "create_prompt_fix", res["decision"]
+    assert res["decision"]["round"] == 6
+    assert created and created[-1][0].endswith(":promptfix:6")
+    assert "(круг 6 из 6)" in created[-1][1]      # предел — ступень риска, а не база 2
+
+    insert_card(db, "t_pfix_6", "planloop:1:S1:promptfix:6", created_at=300)
+    insert_card(db, "t_prev_7", "planloop:1:S1:promptreview:7", created_at=301)
+    res = gate.run_gate(p, execute=True, create_card=captured_create([]), notify_fn=quiet)
+    decision = res["decision"]
+    assert decision["action"] == "stop", decision
+    assert "исчерпаны (6" in decision["reason"]
+    assert "класс риска: high" in decision["reason"]
+    assert "planloop:1:S1:promptfix:7" not in keys_in_board(db)
 
 
 # ─────────────────────────── тексты карточек и история ───────────────────────────
