@@ -184,13 +184,14 @@ Markdown-заголовок первого уровня разделом не с
   годятся `low`, `normal`, `high` (`step_pipeline/engine/next_step.py:75-83,189-190`).
   Любое другое значение — пусто, опечатка, русское слово — считается `high`: ошибка в
   плане не должна делать опасный шаг безопасным. «Риск по умолчанию normal» относится
-  только к отсутствию пункта. `high` — единственное значение, которое меняет решения
-  стража: шаг не получает карточку, а ставится в ручной допуск с уведомлением владельца
-  (`gate.py#ANCHOR:hold_risk_decision`, исполнение — `gate.py#ANCHOR:hold_risk_action`); `low` и `normal`
-  ведут шаг обычным порядком. Класс риска выбирает и предел кругов правок шага: `low` и
-  `normal` получают `max_fix_rounds`, `high` — `max_fix_rounds_high` (функция `step_fix_limit`,
-  §7). Опечатка в пометке уже сведена к `high` при разборе, поэтому предела «выше high» нет:
-  четвёртое значение читалось бы как `high` и лестницу не меняло.
+  только к отсутствию пункта. Класс риска меняет два решения стража и только их: шаг с
+  `high` не получает карточку сразу, а ставится в ручной допуск с уведомлением владельца
+  (`gate.py#ANCHOR:hold_risk_decision`, исполнение — `gate.py#ANCHOR:hold_risk_action`), и
+  по нему же выбирается предел автоматических кругов правок — `low` и `normal` получают
+  `max_fix_rounds`, `high` — `max_fix_rounds_high` (функция `step_fix_limit`, §7). Поэтому
+  `low` и `normal` отличаются от `high`, но не друг от друга: словарь остаётся
+  `low`/`normal`/`high`. Опечатка в пометке уже сведена к `high` при разборе, поэтому
+  предела «выше high» нет: четвёртое значение читалось бы как `high` и лестницу не меняло.
 - Метка «авто…» даёт `auto` шага: правдой считаются `да`, `yes`, `true`, `1`
   (`step_pipeline/engine/next_step.py:86-89,191-192`). Это запись договорённости в
   контракте шага, а не отмена ожидания: в решении стража она не участвует, и `high` ею
@@ -489,7 +490,8 @@ Markdown-заголовок первого уровня разделом не с
 | П24 | параметры грамматики из `pipeline.json`: маркеры, `step_id_regex` с «^» и группой `id`, `paths.plans` | §7 | `step_pipeline/engine/config.py:46-55,318-325` | `tests/engine/test_next_step.py:214,306,314` |
 | П25 | риск шага: пункт «Риск:» → `low`/`normal`/`high`, нераспознанное значение → `high`, отсутствие пункта → `normal`; `high` без допуска владельца даёт `hold_risk` вместо карточки | §5 | `step_pipeline/engine/next_step.py:75-83,189-190`; `step_pipeline/engine/gate.py#ANCHOR:hold_risk_decision`, `gate.py#ANCHOR:hold_risk_action` | `tests/engine/test_risk.py:90,105,150` |
 | П26 | «Авто:» → `auto` (`да`/`yes`/`true`/`1`); в решении стража не участвует и риск `high` не отменяет | §5 | `step_pipeline/engine/next_step.py:86-89,191-192` | `tests/engine/test_risk.py:90,150` |
-| П27 | предел кругов правок шага по риску: `low`/`normal` → `max_fix_rounds` (2), `high` → `max_fix_rounds_high` (6); серии `:fix:` и `:promptfix:` берут этот предел, `:promptfix-stale:` (свой `max_stale_rebuilds`) и `:rereview:` — нет | §5, §7 | `step_pipeline/engine/gate.py#ANCHOR:rounds_classification` (функция `step_fix_limit`); `step_pipeline/engine/config.py:78-90` | `tests/engine/test_fix_rounds_risk.py:190,209,302` |
+| П27 | реестр находок постановки `prompt-НОМЕР-ШАГ-findings.md` в каталоге отчётов ревью; блокирует только статус `открыто`; реестр сильнее отчёта — открытая находка делает действующим `REQUEST_CHANGES` и при `APPROVE` в отчёте, расхождение называется `discrepancy`, а не сглаживается; реестра нет — вердикт берётся из отчёта; порядок решения — свежесть → реестр → бюджет | §5 | `step_pipeline/engine/gate.py::prompt_findings_path`, `::effective_prompt_verdict`, `::_prompt_review_decision`, `::_prompt_zero_fix` | `tests/engine/test_prompt_findings.py::test_registry_path_and_title`, `::test_effective_verdict_by_registry`, `::test_zero_fix_stops_once_then_owner`, `::test_budget_counts_effective_verdict` |
+| П28 | предел кругов правок шага по риску: `low`/`normal` → `max_fix_rounds` (2), `high` → `max_fix_rounds_high` (6); серии `:fix:` и `:promptfix:` берут этот предел, `:promptfix-stale:` (свой `max_stale_rebuilds`) и `:rereview:` — нет | §5, §7 | `step_pipeline/engine/gate.py#ANCHOR:rounds_classification` (функция `step_fix_limit`), ключи — `step_pipeline/engine/config.py::DEFAULTS` | `tests/engine/test_fix_rounds_risk.py::test_limit_by_risk`, `::test_stale_rebuild_does_not_eat_fix_budget`, `::test_prompt_fix_budget_follows_risk` |
 
 ### 11.3 Проверки анализатора
 
