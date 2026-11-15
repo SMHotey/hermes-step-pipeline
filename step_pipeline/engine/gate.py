@@ -957,6 +957,25 @@ def findings_table(findings: list[dict], header: tuple = FINDINGS_HEADER,
     return rows
 
 
+def read_findings_text(path) -> str:
+    """Прочитать текст реестра терпимо. Файла нет — `""`; ошибка чтения — `GateError`.
+
+    Чтение отделено от разбора (план 12, S2, ревью): тик берёт текст один раз и считает по
+    нему и `exists`, и строки. Два чтения одного файла давали окно, в котором реестр,
+    переписанный ревьюером между ними, выглядел как «файл есть, открытых нет» — то есть
+    APPROVE по неизвестному реестру.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        # ValueError — это UnicodeDecodeError: реестр, записанный не в UTF-8 (cp1251 — штатная
+        # кодировка консоли на Windows), обязан дать GateError с путём, а не сырое исключение.
+        raise GateError(f"реестр находок не читается: {path}: {exc}") from exc
+
+
 def load_findings(path, header: tuple = FINDINGS_HEADER,
                   keys: tuple = FINDINGS_KEYS) -> list[dict]:
     """Прочитать реестр находок. Файла нет — `[]` (норма, как у `load_state`).
@@ -969,15 +988,17 @@ def load_findings(path, header: tuple = FINDINGS_HEADER,
     не блокирует: он выбирает маршрут находки (S3).
     """
     path = Path(path)
-    if not path.is_file():
-        return []
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, ValueError) as exc:
-        # ValueError — это UnicodeDecodeError: реестр, записанный не в UTF-8 (cp1251 — штатная
-        # кодировка консоли на Windows), обязан дать GateError с путём, а не сырое исключение.
-        raise GateError(f"реестр находок не читается: {path}: {exc}") from exc
-    lines = text.splitlines()
+    return parse_findings(read_findings_text(path), path, header, keys)
+
+
+def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
+                   keys: tuple = FINDINGS_KEYS) -> list[dict]:
+    """Разобрать текст реестра; `path` — только для сообщений об ошибке.
+
+    Правила те же, что были у чтения: пустой текст — `[]`, нет шапки — `GateError`.
+    """
+    path = Path(path)
+    lines = str(text).splitlines()
     start = None
     for index, line in enumerate(lines):
         if tuple(_finding_cells(line)) == tuple(header):
@@ -1677,16 +1698,34 @@ def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
     ])
 
 
+def _prompt_fix_verdict_line(findings: list[str] | None, report_verdict: str,
+                             report_rel: str) -> str:
+    """Первая строка карточки правок: почему круг открыт — по действующему вердикту.
+
+    С шага 12-S2 круг правок открывает не только отчёт `REQUEST_CHANGES`: реестр с открытой
+    находкой держит постановку и при отчёте `APPROVE`. Текст «ревью вернуло REQUEST_CHANGES»
+    в этом случае врал исполнителю — он видел в отчёте `APPROVE`, решал, что карточка от
+    прошлого круга, и не правил ничего (правило «0 закрытых» давало owner-стоп). Без
+    действующего вердикта (прямой вызов) строка прежняя.
+    """
+    if report_verdict in ("APPROVE", "REQUEST_CHANGES"):
+        return (f"Реестр находок постановки держит {len(findings or [])} открытых находок "
+                f"(отчёт: {report_verdict}). Отчёт: `{report_rel}`.")
+    return f"Ревью постановки вернуло REQUEST_CHANGES. Отчёт: `{report_rel}`."
+
+
 def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
                          findings: list[str] | None = None,
-                         max_rounds: int = 0) -> str:
+                         max_rounds: int = 0, report_verdict: str = "") -> str:
     """Тело карточки «переписать постановку»: закрыть находки ревью, код не трогать.
 
     *findings* — открытые ID реестра находок постановки (шаг 12-S2): реестр говорит, что
     осталось, отчёт — что не так, поэтому блокирующие пункты отчёта не заменяются, а
     дополняются списком реестра. *max_rounds* — предел кругов правок проекта: по нему
     исполнитель видит, сколько попыток осталось («круг N из M»), а не «круг N» в каждой
-    карточке. Умолчание `0` сохраняет прежний вид строки.
+    карточке. Умолчание `0` сохраняет прежний вид строки. *report_verdict* — вердикт отчёта
+    ревью: по нему первая строка карточки говорит правду и при отчёте `APPROVE`, где
+    постановку держит открытая находка реестра.
     """
     sid = step["id"]
     plan_id = p.plan_id
@@ -1699,7 +1738,7 @@ def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
         f"ПОСТАНОВКУ ШАГА {sid} плана {plan_id} ПЕРЕПИСАТЬ — {step['title']} "
         f"(круг {round_no}{limit})",
         "",
-        f"Ревью постановки вернуло REQUEST_CHANGES. Отчёт: `{report_rel}`.",
+        _prompt_fix_verdict_line(findings, report_verdict, report_rel),
         f"Постановка: `{prompt_path}` (recon_commit `{recon or '—'}`, текущий HEAD `{head}`).",
         f"Контракт шага — `{plan_rel}` §{sid}.",
         "",
@@ -2021,11 +2060,15 @@ def build_ctx(p: Paths) -> dict:
     ctx["prompt_findings_error"] = ""
     if prompt_findings_file is not None:
         try:
-            ctx["prompt_findings"] = load_findings(prompt_findings_file, PROMPT_FINDINGS_HEADER,
+            # Одно чтение на тик (12-S2, ревью): текст берётся один раз, и `exists`, и строки
+            # считаются по нему. Два чтения давали окно, в котором переписанный между ними
+            # реестр выглядел как «файл есть, открытых нет» — то есть APPROVE по отчёту
+            # REQUEST_CHANGES и «правка закрыла всё» у правила «0 закрытых».
+            findings_text = read_findings_text(prompt_findings_file)
+            ctx["prompt_findings"] = parse_findings(findings_text, prompt_findings_file,
+                                                   PROMPT_FINDINGS_HEADER,
                                                    PROMPT_FINDINGS_KEYS)
-            ctx["prompt_findings_exists"] = bool(
-                prompt_findings_file.is_file()
-                and prompt_findings_file.read_text(encoding="utf-8").strip())
+            ctx["prompt_findings_exists"] = bool(findings_text.strip())
         except (GateError, OSError, ValueError) as exc:
             ctx["prompt_findings"] = []
             ctx["prompt_findings_error"] = str(exc)
@@ -3312,7 +3355,10 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
     stop = _prompt_findings_stop(ctx, sid)
     if stop is not None:
         return stop
-    active = str((effective_prompt_verdict(ctx) or {}).get("verdict") or "")
+    active_view = effective_prompt_verdict(ctx) or {}
+    active = str(active_view.get("verdict") or "")
+    open_count = len(active_view.get("open") or [])
+    report_verdict = str(active_view.get("report") or "")
     if active != "APPROVE":
         # Бюджет считает действующий вердикт: отчёт APPROVE при открытой находке круги
         # расходует так же, как REQUEST_CHANGES. Текст и число стопа прежние — они
@@ -3329,7 +3375,9 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
         if zero is not None:
             return zero
         return {"action": "create_prompt_fix", "step": sid, "data": step, "round": round_no,
-                "reason": (f"ревью постановки {sid} вернуло REQUEST_CHANGES — постановку "
+                "open_count": open_count, "report": report_verdict,
+                "reason": (f"реестр находок постановки {sid} держит {open_count} открытых "
+                           f"находок (отчёт: {report_verdict or '—'}) — постановку "
                            f"переписываю автоматически (круг {round_no}): "
                            f"{Path(verdict['path']).name}")}
     return None                            # действующий APPROVE — шаг стартует
@@ -5217,7 +5265,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             body = prompt_fix_card_body(p, step, round_no, report_rel,
                                         findings=open_prompt_findings_lines(ctx),
                                         max_rounds=int(ctx.get("max_fix_rounds")
-                                                       or DEFAULT_FIX_ROUNDS))
+                                                       or DEFAULT_FIX_ROUNDS),
+                                        report_verdict=str(decision.get("report") or ""))
         cid = create_card(p, title, body, p.cfg.prompter, key, p.cfg.prompt_skills,
                           max_runtime=p.cfg.prompt_runtime)
         result.update(applied=bool(cid), detail=f"карточка переписывания постановки: {cid}")
@@ -5246,9 +5295,10 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                     f"пересобираю автоматически ({decision.get('rebuild')} из "
                     f"{decision.get('limit')}, карточка {cid})")
             else:
-                say(f"план {plan_id}: ревью постановки шага {step['id']} вернуло "
-                    f"REQUEST_CHANGES — переписываю постановку автоматически, круг {round_no} "
-                    f"(карточка {cid})")
+                say(f"план {plan_id}: реестр постановки шага {step['id']} держит "
+                    f"{int(decision.get('open_count') or 0)} открытых находок (отчёт: "
+                    f"{decision.get('report') or '—'}) — переписываю постановку автоматически, "
+                    f"круг {round_no} (карточка {cid})")
         else:
             say(f"план {plan_id}: не смог поставить переписывание постановки шага {step['id']}")
         return result

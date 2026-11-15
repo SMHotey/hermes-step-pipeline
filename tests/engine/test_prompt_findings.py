@@ -522,3 +522,118 @@ def test_fix_card_names_open_ids_and_limit(project):
     with_ids = gate.prompt_fix_card_body(p, STEP, 2, REPORT_REL,
                                          findings=["F7: нет входа — добавить вход"])
     assert "F7: нет входа — добавить вход" in with_ids, with_ids
+
+
+# ───────────────── реестр в теле карточки ревью постановки (12-S2, ревью) ─────────────────
+
+def test_review_card_prints_registry(project):
+    """Тело карточки ревью несёт реестр: путь, «реестра ещё нет», строки и поломку.
+
+    Без таблицы перед глазами ревьюер закрывал находки по памяти отчёта, а вердикт страж
+    ставит по реестру — находка оставалась открытой и стоила круга правок.
+    """
+    p = paths(project)
+    write_prompt(project, "S1", recon="1111111")
+    report_rel = gate.prompt_review_rel(p, "S1")
+    prompt = gate.prompt_rel(p, "S1")
+
+    empty = gate.prompt_review_card_body(p, STEP, report_rel, prompt)
+    assert "РЕЕСТР НАХОДОК ПОСТАНОВКИ (обязательно)" in empty
+    assert FINDINGS_REL in empty, "путь реестра не назван"
+    assert HEADER in empty, "шапка таблицы не напечатана"
+    assert "реестра ещё нет" in empty
+
+    write_findings(project, [open_row(1)])
+    filled = gate.prompt_review_card_body(p, STEP, report_rel, prompt)
+    assert "реестра ещё нет" not in filled
+    assert "F1" in filled and "тест 3 не изолирует профиль" in filled, filled
+
+    # Битый реестр тело не роняет: причина печатается строкой, стоп ставит решение.
+    (Path(project) / FINDINGS_REL).write_text("# Реестр\n\nмусор без таблицы\n", encoding="utf-8")
+    broken = gate.prompt_review_card_body(p, STEP, report_rel, prompt)
+    assert "не читается" in broken, broken
+
+
+def test_fix_card_speaks_registry_verdict(stand, monkeypatch):
+    """Отчёт APPROVE + открытая находка: карточка и причина говорят про реестр, не про отчёт.
+
+    Раньше карточка утверждала «ревью вернуло REQUEST_CHANGES» при отчёте APPROVE:
+    исполнитель видел в отчёте согласие, решал, что карточка от прошлого круга, и не правил
+    ничего — правило «0 закрытых» тут же давало owner-стоп.
+    """
+    root, p, db = stand
+    seen, spy = spy_cards(monkeypatch)
+    write_plan(root, plan_body(3))
+    write_prompt(root, "S1", recon="1111111")
+    write_findings(root, [open_row(1)])
+    gate.run_gate(p, execute=True, notify_fn=quiet, create_card=spy)
+    complete(db, ":promptreview")
+    write_report(root, "APPROVE")
+
+    res = gate.run_gate(p, execute=True, notify_fn=quiet, create_card=spy)
+    assert res["decision"]["action"] == "create_prompt_fix", res["decision"]
+    reason = res["decision"]["reason"]
+    assert "вернуло REQUEST_CHANGES" not in reason, reason
+    assert "1 открытых находок (отчёт: APPROVE)" in reason, reason
+
+    title, body = [item for item in seen if "переписать постановку" in item[0]][-1]
+    assert "вернуло REQUEST_CHANGES" not in body, body
+    assert "1 открытых находок (отчёт: APPROVE)" in body, body
+    assert "F1: тест 3 не изолирует профиль" in body, body
+
+
+# ─────────────────────── ветви правила «0 закрытых» и битого реестра ───────────────────────
+
+def test_zero_fix_empty_baseline_opens_round(stand):
+    """Круг правок без открытых находок в базе: правило «0 закрытых» не вооружается.
+
+    База, записанная при пустом реестре, — это «правке нечего было закрывать», а не «правка
+    ничего не закрыла». Иначе находка, появившаяся в реестре позже, упиралась бы в owner-стоп
+    вместо второго круга.
+    """
+    root, p, db = stand
+    write_plan(root, plan_body(3))
+    write_prompt(root, "S1", recon="1111111")
+    res = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert res["decision"]["action"] == "create_prompt_review", res["decision"]
+    complete(db, ":promptreview")
+    write_report(root, "REQUEST_CHANGES")
+
+    res = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert res["decision"]["action"] == "create_prompt_fix", res["decision"]
+    state = json.loads(Path(p.state_file).read_text(encoding="utf-8"))
+    assert state["prompt_fix_baseline"]["open_ids"] == [], state
+    complete(db, ":promptfix:1")
+
+    res = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert res["decision"]["action"] == "create_prompt_review", res["decision"]
+    assert res["decision"]["round"] == 2, res["decision"]
+    complete(db, ":promptreview:2")
+    write_findings(root, [open_row(1)])              # реестр появился уже после правки
+    write_report(root, "REQUEST_CHANGES")
+
+    res = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert res["decision"]["action"] == "create_prompt_fix", res["decision"]
+    assert not res["decision"].get("zero_fix"), res["decision"]
+    assert gate.load_stop(p) is None, "пустая база — не повод для owner-стопа"
+    assert "planloop:1:S1:promptfix:2" in keys_of(db)
+
+
+def test_broken_registry_blocks_review_card(stand):
+    """Битый реестр на первом тике: стоп-инцидент вместо карточки ревью.
+
+    Тело карточки печатает таблицу реестра, поэтому стоп ставится до её заказа: ревьюер
+    иначе получил бы «не читается» вместо реестра и закрывал бы находки наугад.
+    """
+    root, p, db = stand
+    write_plan(root, plan_body(3))
+    write_prompt(root, "S1", recon="1111111")
+    (Path(root) / FINDINGS_REL).parent.mkdir(parents=True, exist_ok=True)
+    (Path(root) / FINDINGS_REL).write_text("# Реестр\n\nмусор без таблицы\n", encoding="utf-8")
+
+    res = gate.run_gate(p, execute=True, notify_fn=quiet)
+    assert res["decision"]["action"] == "stop", res["decision"]
+    assert "не читается" in res["decision"]["reason"], res["decision"]
+    board = Path(db)                                  # борда ещё не создана: карточек не было
+    assert not board.exists() or not any(":promptreview" in key for key in keys_of(board))
+    assert gate.load_stop(p) is not None
