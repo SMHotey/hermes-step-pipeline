@@ -248,6 +248,12 @@ FINDING_KINDS = ("замысел", "двусмысленность", "форма
 FINDING_STATUSES = ("открыто", "закрыто", "не блокирует")
 FINDINGS_HEADER = ("ID", "Шаг", "Класс", "Находка", "Что сделать", "Статус")
 FINDING_ID_RE = re.compile(r"F(\d+)")
+# Реестр находок постановки (план 12, S2): та же таблица без колонки «Шаг» — постановка
+# принадлежит одному шагу. Порядок ключей идёт за шапкой: разбор ячеек и запись строки
+# живут на одном списке ключей, иначе шапка и данные разошлись бы молча.
+FINDINGS_KEYS = ("id", "step", "kind", "text", "action", "status")
+PROMPT_FINDINGS_HEADER = ("ID", "Класс", "Находка", "Что сделать", "Статус")
+PROMPT_FINDINGS_KEYS = ("id", "kind", "text", "action", "status")
 # Постановка следующего шага и ревью постановки (план 2, S6): отметка свежести recon
 # и что считать расхождением постановки с кодом.
 RECON_RE = re.compile(r"recon_commit\s*[:=]\s*`?([0-9a-f]{7,40})", re.IGNORECASE)
@@ -871,6 +877,21 @@ def prompt_review_rel(p: Paths, step_id: str) -> str:
     return p.cfg.rel(prompt_review_path(p, step_id))
 
 
+def prompt_findings_path(p: Paths, step_id: str) -> Path:
+    """Реестр находок постановки: `prompt-<номер плана>-<шаг>-findings.md` (план 12, S2).
+
+    Имя берётся из плана буквально (§S2, строка 114) и строится от `review_dir` и
+    `review_prefix`, а не через `with_name(stem + "-findings.md")`: тот дал бы
+    `12-S2-prompt-findings.md` и разошёлся бы с форматом плана.
+    """
+    return Path(p.review_dir) / f"prompt-{p.review_prefix}-{step_id}-findings.md"
+
+
+def prompt_findings_rel(p: Paths, step_id: str) -> str:
+    """Путь реестра постановки для текстов карточек: относительный, не абсолютный."""
+    return p.cfg.rel(prompt_findings_path(p, step_id))
+
+
 def plan_review_path(p: Paths) -> Path:
     """Отчёт ревью плана: `docs/reviews/plan-<N>.md` (D4) — один файл на план.
 
@@ -904,31 +925,41 @@ def _finding_cells(line: str) -> list[str]:
     return [cell.strip() for cell in str(line).strip().strip("|").split("|")]
 
 
-def _findings_title(path: Path) -> str:
-    """Первая строка реестра: номер плана из имени `plan-N-findings.md`, иначе имя файла."""
+def _findings_title(path: Path, kind: str = "плана", prefix: str = "plan-") -> str:
+    """Первая строка реестра: номер из имени `<prefix><номер>-findings.md`, иначе имя файла.
+
+    Обобщено на реестр постановки (план 12, S2): у него префикс `prompt-`, а номер в имени
+    — «12-S2». Второй сборщик заголовка разошёлся бы с первым так же, как разошёлся бы
+    второй сборщик шапки таблицы.
+    """
     stem = Path(path).stem
-    if stem.startswith("plan-") and stem.endswith("-findings"):
-        return f"# Реестр находок плана {stem[len('plan-'):-len('-findings')]}"
-    return f"# Реестр находок плана {stem}"
+    suffix = "-findings"
+    if stem.startswith(prefix) and stem.endswith(suffix):
+        return f"# Реестр находок {kind} {stem[len(prefix):-len(suffix)]}"
+    return f"# Реестр находок {kind} {stem}"
 
 
-def findings_table(findings: list[dict]) -> list[str]:
+def findings_table(findings: list[dict], header: tuple = FINDINGS_HEADER,
+                   keys: tuple = FINDINGS_KEYS) -> list[str]:
     """Строки markdown-таблицы реестра: шапка, разделитель, находки в переданном порядке.
 
     Один построитель для записи файла и для тела карточки: второй шаблон шапки разошёлся бы
-    с первым, и `load_findings` перестал бы находить таблицу.
+    с первым, и `load_findings` перестал бы находить таблицу. Шапка и ключи — параметры
+    (план 12, S2): у реестра постановки нет колонки «Шаг», и копия цикла разъехалась бы
+    с этим построителем.
     """
-    rows = ["| " + " | ".join(FINDINGS_HEADER) + " |",
-            "|" + "|".join("---" for _ in FINDINGS_HEADER) + "|"]
+    rows = ["| " + " | ".join(header) + " |",
+            "|" + "|".join("---" for _ in header) + "|"]
     for item in findings:
-        cells = [item.get(key) or "" for key in ("id", "step", "kind", "text", "action", "status")]
+        cells = [item.get(key) or "" for key in keys]
         rows.append("| " + " | ".join(str(c).replace("|", "/").replace("\n", " ").strip()
                                       for c in cells) + " |")
     return rows
 
 
-def load_findings(path) -> list[dict]:
-    """Прочитать реестр находок плана. Файла нет — `[]` (норма, как у `load_state`).
+def load_findings(path, header: tuple = FINDINGS_HEADER,
+                  keys: tuple = FINDINGS_KEYS) -> list[dict]:
+    """Прочитать реестр находок. Файла нет — `[]` (норма, как у `load_state`).
 
     Битый файл — `GateError`, а не пустой список: молча вернуть `[]` значило бы «открытых
     находок нет» и открыть дорогу APPROVE по неизвестному реестру.
@@ -949,14 +980,14 @@ def load_findings(path) -> list[dict]:
     lines = text.splitlines()
     start = None
     for index, line in enumerate(lines):
-        if tuple(_finding_cells(line)) == FINDINGS_HEADER:
+        if tuple(_finding_cells(line)) == tuple(header):
             start = index + 1
             break
     if start is None:
         if not text.strip():
             return []
         raise GateError("в реестре находок нет шапки таблицы "
-                        f"`| {' | '.join(FINDINGS_HEADER)} |`: {path}")
+                        f"`| {' | '.join(header)} |`: {path}")
     found: list[dict] = []
     seen: set[str] = set()
     for number, line in enumerate(lines[start:], start=start + 1):
@@ -965,10 +996,10 @@ def load_findings(path) -> list[dict]:
         cells = _finding_cells(line)
         if all(cell and set(cell) <= set("-: ") for cell in cells):
             continue                                   # строка-разделитель
-        if len(cells) != len(FINDINGS_HEADER):
+        if len(cells) != len(header):
             raise GateError(f"реестр находок, строка {number}: ячеек {len(cells)}, "
-                            f"нужно {len(FINDINGS_HEADER)}: {path}")
-        item = dict(zip(("id", "step", "kind", "text", "action", "status"), cells))
+                            f"нужно {len(header)}: {path}")
+        item = dict(zip(keys, cells))
         if not FINDING_ID_RE.fullmatch(item["id"]):
             raise GateError(f"реестр находок, строка {number}: идентификатор не вида F-N: "
                             f"{item['id']!r}: {path}")
@@ -985,7 +1016,9 @@ def load_findings(path) -> list[dict]:
     return found
 
 
-def write_findings(path, findings: list[dict]) -> Path:
+def write_findings(path, findings: list[dict], header: tuple = FINDINGS_HEADER,
+                   keys: tuple = FINDINGS_KEYS, title_kind: str = "плана",
+                   title_prefix: str = "plan-") -> Path:
     """Записать реестр целиком: порядок находок сохраняется, дубль ID — ошибка.
 
     Запись атомарная (`state_io.atomic_write_text`): kill посреди записи оставляет прежний
@@ -1006,34 +1039,34 @@ def write_findings(path, findings: list[dict]) -> Path:
         if item.get("status") not in FINDING_STATUSES:
             raise GateError(f"реестр находок: статус {item.get('status')!r} вне словаря "
                             f"({' | '.join(FINDING_STATUSES)}): {path}")
-    state_io.atomic_write_text(path, "\n".join([_findings_title(path), ""]
-                                               + findings_table(rows)) + "\n")
+    state_io.atomic_write_text(path, "\n".join([_findings_title(path, title_kind, title_prefix), ""]
+                                               + findings_table(rows, header, keys)) + "\n")
     return path
 
 
-def add_findings(path, items: list[dict]) -> list[dict]:
-    """Добавить находки: ID присваивает функция — следующий свободный F-N по плану.
+def add_findings(path, items: list[dict], header: tuple = FINDINGS_HEADER,
+                 keys: tuple = FINDINGS_KEYS, title_kind: str = "плана",
+                 title_prefix: str = "plan-") -> list[dict]:
+    """Добавить находки: ID присваивает функция — следующий свободный F-N по реестру.
 
     `status` по умолчанию `открыто`. Поле `id` во входных словарях игнорируется: иначе после
     ручной правки файла в реестре появятся дубли, а ведущий реестра — не тот, кто считает.
     """
     path = Path(path)
-    current = load_findings(path)
+    current = load_findings(path, header, keys)
     numbers = [int(FINDING_ID_RE.fullmatch(item["id"]).group(1)) for item in current]
     next_number = max(numbers, default=0) + 1
     added: list[dict] = []
     for raw in items or []:
-        added.append({
-            "id": f"F{next_number}",
-            "step": str(raw.get("step") or "").strip(),
-            "kind": str(raw.get("kind") or "").strip(),
-            "text": str(raw.get("text") or "").strip(),
-            "action": str(raw.get("action") or "").strip(),
-            "status": str(raw.get("status") or "открыто").strip(),
-        })
+        item = {"id": f"F{next_number}"}
+        for key in keys:
+            if key != "id":
+                item[key] = str(raw.get(key) or "").strip()
+        item["status"] = str(raw.get("status") or "открыто").strip()
+        added.append(item)
         next_number += 1
     result = current + added
-    write_findings(path, result)
+    write_findings(path, result, header, keys, title_kind, title_prefix)
     return result
 
 
@@ -1560,12 +1593,28 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
 
 def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
                             prompt: str | None, round_no: int = 1) -> str:
-    """Тело карточки ревью постановки: постановка против текущего HEAD (правило 3)."""
+    """Тело карточки ревью постановки: постановка против текущего HEAD (правило 3).
+
+    С шага 12-S2 тело несёт реестр находок постановки (`prompt_findings_rel`) целиком —
+    путь, правило блокирования и таблицу: закрыть все открытые ID можно, только если они
+    перед глазами. Файл читается терпимо: битый реестр печатается строкой с причиной, а не
+    роняет сборку тела (живой стоп на нём ставит решение).
+    """
     plan_id = p.plan_id
     plan_rel = p.cfg.rel(Path(p.plan_file))
     prompt_line = f"`{prompt}`" if prompt else "— (файл постановки не найден)"
     recon = prompt_recon(Path(p.repo) / prompt) if prompt else None
     head = head_commit(p) or "—"
+    findings_path = prompt_findings_path(p, step["id"])
+    try:
+        rows = findings_table(load_findings(findings_path, PROMPT_FINDINGS_HEADER,
+                                            PROMPT_FINDINGS_KEYS),
+                              PROMPT_FINDINGS_HEADER, PROMPT_FINDINGS_KEYS)
+        # Файл с одной шапкой значит «находок пока нет», а не «реестра ещё нет».
+        registry_lines = rows if findings_path.is_file() else [
+            "- реестра ещё нет: первая находка создаёт файл с шапкой выше."]
+    except (GateError, OSError, ValueError) as exc:
+        registry_lines = [f"- реестр находок постановки не читается: {exc}"]
     return "\n".join([
         f"РЕВЬЮ ПОСТАНОВКИ ШАГА {step['id']} плана {plan_id} — {step['title']}",
         "",
@@ -1593,12 +1642,33 @@ def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
         "- Блок «Ревью» требует вердикта роли `reviewer`, а не самопроверки исполнителя.",
         "- Расхождение постановки с планом или кодом — находка с указанием, что верно.",
         "",
+        "РЕЕСТР НАХОДОК ПОСТАНОВКИ (обязательно)",
+        f"- Файл: `{prompt_findings_rel(p, step['id'])}`; шапка таблицы — "
+        f"`{findings_table([], PROMPT_FINDINGS_HEADER, PROMPT_FINDINGS_KEYS)[0]}`.",
+        "- Блокирует вердикт только статус `открыто`: `закрыто` и `не блокирует` старт шага",
+        "  не держат. Класс (`замысел`, `двусмысленность`, `формат-стража`, `гейт-исполнение`,",
+        "  `стиль`) выбирает маршрут находки, а не вердикт.",
+        "- Открытые ID закрыть фактом или подтвердить статус, новые находки добавлять строками",
+        "  с новым F-N. Закрытые повторно не поднимаются.",
+        "- `закрыто` — только с фактом: адрес `файл:строка` в действующей редакции постановки",
+        "  либо sha коммита круга правок. Запись `закрыто` без факта — дефект ревьюера.",
+        "- Реестр переживает переписывание постановки: статусы `закрыто`/`не блокирует` остаются,",
+        "  новая находка встаёт со следующим ID, нумерация F-N сквозная по шагу.",
+        "- Отсутствие в отчёте строки `recon_commit:` — находка `не блокирует` (шаг стартует),",
+        "  а не повод остановить конвейер.",
+        "",
+        "РЕЕСТР СЕЙЧАС",
+        *registry_lines,
+        "",
         "ОБЯЗАТЕЛЬНЫЙ ФОРМАТ ОТЧЁТА",
         f"- Файл `{report_rel}` содержит РОВНО ОДНУ строку вердикта (заголовок допустим):",
         "  `## ВЕРДИКТ: APPROVE` либо `## ВЕРДИКТ: REQUEST_CHANGES`.",
         "  Две строки вердикта или цитата чужого вердикта = страж остановит конвейер (AMBIGUOUS).",
+        "- В ревью постановки вердикт ставится по реестру находок: отчёт остаётся разбором и",
+        "  перечнем находок, а старт шага решает закрытый реестр.",
         f"- Первая строка отчёта — отметка версии: `recon_commit: {recon or '<sha постановки>'}`;",
-        "  тот же sha, что в шапке постановки. Другой sha — страж не примет ревью за эту версию.",
+        "  тот же sha, что в шапке постановки. Другой sha — страж закажет пересборку постановки",
+        "  и повторное ревью.",
         "",
         "ЗАПРЕТЫ: не править постановку и код, не коммитить, не пушить, не запускать тесты.",
         f"Постановку после REQUEST_CHANGES переписывает роль `{p.cfg.prompter}`, не ревьюер.",
@@ -1607,16 +1677,27 @@ def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
     ])
 
 
-def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -> str:
-    """Тело карточки «переписать постановку»: закрыть находки ревью, код не трогать."""
+def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
+                         findings: list[str] | None = None,
+                         max_rounds: int = 0) -> str:
+    """Тело карточки «переписать постановку»: закрыть находки ревью, код не трогать.
+
+    *findings* — открытые ID реестра находок постановки (шаг 12-S2): реестр говорит, что
+    осталось, отчёт — что не так, поэтому блокирующие пункты отчёта не заменяются, а
+    дополняются списком реестра. *max_rounds* — предел кругов правок проекта: по нему
+    исполнитель видит, сколько попыток осталось («круг N из M»), а не «круг N» в каждой
+    карточке. Умолчание `0` сохраняет прежний вид строки.
+    """
     sid = step["id"]
     plan_id = p.plan_id
     plan_rel = p.cfg.rel(Path(p.plan_file))
     prompt_path = prompt_rel(p, sid) or ""
     head = head_commit(p) or "—"
     recon = prompt_recon(Path(p.repo) / prompt_path) if prompt_path else None
+    limit = f" из {max_rounds}" if max_rounds else ""
     lines = [
-        f"ПОСТАНОВКУ ШАГА {sid} плана {plan_id} ПЕРЕПИСАТЬ — {step['title']} (круг {round_no})",
+        f"ПОСТАНОВКУ ШАГА {sid} плана {plan_id} ПЕРЕПИСАТЬ — {step['title']} "
+        f"(круг {round_no}{limit})",
         "",
         f"Ревью постановки вернуло REQUEST_CHANGES. Отчёт: `{report_rel}`.",
         f"Постановка: `{prompt_path}` (recon_commit `{recon or '—'}`, текущий HEAD `{head}`).",
@@ -1655,6 +1736,12 @@ def prompt_fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str) -
         others = _review_findings(Path(p.repo) / report_rel, 5)
         lines.append("Блокирующих пометок в отчёте нет — замечания ревьюера:")
         lines += [f"{num}. {finding}" for num, finding in enumerate(others, 1)] or ["- (отчёт пуст)"]
+    registry = list(findings or [])
+    if registry:
+        # Реестр — источник вердикта (12-S2): без его открытых ID правка закроет только то,
+        # что назвал отчёт, и реестр останется открытым на новый круг.
+        lines += ["", "ОТКРЫТЫЕ НАХОДКИ РЕЕСТРА — закрыть полностью, ответить на каждую:",
+                  *[f"- {item}" for item in registry]]
     lines += [
         "",
         "ЗАВЕРШЕНИЕ",
@@ -1865,6 +1952,11 @@ def build_ctx(p: Paths) -> dict:
                    # не считаем, иначе решение пропустило бы обязательное ревью.
                    steps=[], prompt=None, prompt_recon=None, prompt_fresh=False,
                    prompt_report=None, prompt_verdict=None, next_step=None,
+                   # План 12, S2: без шагов реестр постановки не читается, но ключи обязаны
+                   # быть — решение получает только `ctx` и на сбое сборщика падать не имеет
+                   # права. База правки тоже пустая: сравнивать не с чем.
+                   prompt_findings_rel="", prompt_findings=[], prompt_findings_exists=False,
+                   prompt_findings_error="", prompt_fix_baseline={},
                    # D6: расхождение отметок проверять не на чем — обе сверки `False`,
                    # и решение по ревью постановки остаётся стопом, а не падением.
                    prompt_marker_text_same=False, prompt_marker_same_commit=False,
@@ -1917,6 +2009,26 @@ def build_ctx(p: Paths) -> dict:
     ctx["prompt_fresh"] = prompt_fresh(p, recon) if prompt else False
     ctx["prompt_report"] = prompt_review_rel(p, step["id"]) if step else None
     ctx["prompt_verdict"] = prompt_verdict(p, step["id"]) if step else None
+    # Реестр находок постановки (план 12, S2): источник действующего вердикта. Читается
+    # терпимо, как реестр плана: битый файл уходит в `ctx` строкой, а стоп по нему ставит
+    # решение (`_prompt_findings_stop`) — `decide` получает только `ctx` и файлов не читает.
+    # Реестром считается файл с непустым текстом: `load_findings` отдаёт `[]` и для
+    # отсутствующего, и для пробельного файла, а вердикт по ним был бы выдуман.
+    prompt_findings_file = prompt_findings_path(p, step["id"]) if step else None
+    ctx["prompt_findings_rel"] = prompt_findings_rel(p, step["id"]) if step else ""
+    ctx["prompt_findings"] = []
+    ctx["prompt_findings_exists"] = False
+    ctx["prompt_findings_error"] = ""
+    if prompt_findings_file is not None:
+        try:
+            ctx["prompt_findings"] = load_findings(prompt_findings_file, PROMPT_FINDINGS_HEADER,
+                                                   PROMPT_FINDINGS_KEYS)
+            ctx["prompt_findings_exists"] = bool(
+                prompt_findings_file.is_file()
+                and prompt_findings_file.read_text(encoding="utf-8").strip())
+        except (GateError, OSError, ValueError) as exc:
+            ctx["prompt_findings"] = []
+            ctx["prompt_findings_error"] = str(exc)
     # Второй признак устаревания постановки (план 12, S1): пофайловый отпечаток входов и
     # опора, снятая в момент заказа ревью. Только чтение файлов — тик по-прежнему делает
     # один `git diff`, стоимость не растёт.
@@ -1924,6 +2036,10 @@ def build_ctx(p: Paths) -> dict:
     ctx["prompt_input_fp"] = prompt_input_fp(ctx["prompt_input_parts"])
     saved_input = (state.get("prompt_input") or {}).get(step["id"]) if step else None
     ctx["prompt_input_baseline"] = dict(saved_input) if isinstance(saved_input, dict) else {}
+    # База правки постановки (12-S2): какие ID были открыты в реестре на момент заказа
+    # круга правок. По ней видно, закрыла ли правка хоть одну находку (правило «0 закрытых»).
+    saved_fix = state.get("prompt_fix_baseline")
+    ctx["prompt_fix_baseline"] = dict(saved_fix) if isinstance(saved_fix, dict) else {}
     # `getattr`: старый кэш конфига в тестах и в чужом коде не обязан знать новый ключ.
     ctx["max_stale_rebuilds"] = int(getattr(p.cfg, "max_stale_rebuilds", 0) or 0)
     # D6: отметка версии в отчёте и `recon_commit` постановки сверяются не как строки.
@@ -2458,6 +2574,44 @@ def open_findings_lines(ctx: dict) -> list[str]:
             if str(item.get("status") or "") == "открыто"]
 
 
+def effective_prompt_verdict(ctx: dict) -> dict | None:
+    """Действующий вердикт ревью постановки: реестр находок сильнее отчёта (план 12, S2).
+
+    Отчёта нет — вердикта нет: реестр его не выдумывает (`None`). Реестр переопределяет
+    только распознанный вердикт (`APPROVE`/`REQUEST_CHANGES`), а файла реестра нет —
+    переопределять нечего, и действующий вердикт равен отчётному (у плана это условие
+    `registry and known`). `NONE`/`AMBIGUOUS` не лечатся: иначе нечитаемый отчёт
+    «вылечивался» бы чистым реестром.
+
+    Ключи: `verdict` — действующий, `report` — из отчёта, `open` — ID со статусом
+    `открыто` в порядке файла, `total` — строк в реестре, `registry` — файл реестра есть,
+    `discrepancy` — действующий вердикт расходится с отчётом, `error` — реестр не читается.
+    """
+    report = str((ctx.get("prompt_verdict") or {}).get("verdict") or "")
+    if not report:
+        return None
+    rows = ctx.get("prompt_findings") or []
+    open_ids = [str(item.get("id") or "") for item in rows
+                if str(item.get("status") or "") == "открыто"]
+    registry = bool(ctx.get("prompt_findings_exists"))
+    known = report in ("APPROVE", "REQUEST_CHANGES")
+    verdict = ("REQUEST_CHANGES" if open_ids else "APPROVE") if (registry and known) else report
+    return {"verdict": verdict, "report": report, "open": open_ids, "total": len(rows),
+            "registry": registry, "discrepancy": bool(registry and known and verdict != report),
+            "error": str(ctx.get("prompt_findings_error") or "")}
+
+
+def open_prompt_findings_lines(ctx: dict) -> list[str]:
+    """Открытые находки реестра постановки строками для карточки правок: ID, что не так.
+
+    Колонки «Шаг» у реестра постановки нет — постановка принадлежит одному шагу, и
+    повторять его в каждой строке незачем.
+    """
+    return [f"{item.get('id')}: {item.get('text')} — {item.get('action')}"
+            for item in (ctx.get("prompt_findings") or [])
+            if str(item.get("status") or "") == "открыто"]
+
+
 def verdict_discrepancy_text(ctx: dict) -> str:
     """Строка о расхождении вердикта отчёта с реестром; пустая строка — расхождения нет.
 
@@ -2942,6 +3096,59 @@ def _prompt_stale_cards(ctx: dict, sid: str) -> list[dict]:
     return sorted(cards, key=_round_of_key)
 
 
+def _prompt_findings_stop(ctx: dict, sid: str) -> dict | None:
+    """Битый реестр постановки — стоп-инцидент; `None` — реестр читается или его нет.
+
+    `kind` не задаётся: инцидент страж снимает сам, как только файл починили. Вызывается
+    ровно там, где реестр читается: перед заказом карточки (её тело печатает таблицу) и
+    перед действующим вердиктом. Пока ревью идёт, реестр никто не читает, и стоп по нему
+    был бы шумом.
+    """
+    error = str(ctx.get("prompt_findings_error") or "")
+    if not error:
+        return None
+    return {"action": "stop", "step": sid,
+            "reason": f"реестр находок постановки {sid} не читается: {error}"}
+
+
+def _prompt_zero_fix(ctx: dict, sid: str, fixes: list[dict]) -> dict | None:
+    """Правило «0 закрытых»: правка, не закрывшая ни одной находки, новый круг не открывает.
+
+    Проверяется в ветке бюджета, когда ревью новой редакции уже закрыто отчётом: только там
+    видно, закрыла ли правка хоть что-нибудь. База (`prompt_fix_baseline`) пишется при
+    заказе круга `:promptfix:N`; сравнивается номер последней карточки правок, а не
+    `len(fixes)`: номер круга считает и пересборки по свежести.
+
+    Стоп owner и один раз (`reported_round`): иначе он повторялся бы каждый тик и после
+    `--resume`. Пропавший реестр — инцидент, а не «0 закрытых»: `load_findings` на
+    отсутствующем файле даёт `[]`, и владелец искал бы правку, которой не было.
+    """
+    baseline = ctx.get("prompt_fix_baseline") or {}
+    if not isinstance(baseline, dict) or not baseline or not fixes:
+        return None
+    if str(baseline.get("step") or "") != sid:
+        return None
+    round_no = _round_of_key(fixes[-1])
+    if int(baseline.get("round") or 0) != round_no:
+        return None
+    if int(baseline.get("reported_round") or 0) == round_no:
+        return None
+    open_ids = [str(item) for item in (baseline.get("open_ids") or []) if str(item)]
+    if not open_ids:
+        return None                        # правка и не должна была ничего закрывать
+    if not ctx.get("prompt_findings_exists"):
+        return {"action": "stop", "step": sid,
+                "reason": (f"реестр находок постановки {sid} исчез: база круга {round_no} "
+                           f"не с чем сверить")}
+    status = {str(item.get("id") or ""): str(item.get("status") or "")
+              for item in (ctx.get("prompt_findings") or [])}
+    if any(status.get(item) in ("закрыто", "не блокирует") for item in open_ids):
+        return None
+    return {"action": "stop", "step": sid, "kind": "owner", "zero_fix": round_no,
+            "reason": (f"правка постановки не закрыла ни одной находки "
+                       f"(круг {round_no}: {', '.join(open_ids)} — открыты)")}
+
+
 def _prompt_latest_card(fixes: list[dict], stales: list[dict]) -> tuple[dict, str, str] | None:
     """Самая свежая карточка двух серий, её глагол и существительное для причины.
 
@@ -2987,8 +3194,11 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
     (`:promptfix:{N}`), после каждого круга ревью повторяется. Протухшая постановка (отчёт
     снят по другой версии или вход изменился после ревью) конвейер тоже не останавливает:
     страж заказывает пересборку (`:promptfix-stale:{N}`, свой лимит `max_stale_rebuilds`,
-    не входящий в `max_fix_rounds`) и повторное ревью. Стоп — когда исчерпаны
-    соответствующие круги, упала карточка или вердикт не распознан.
+    не входящий в `max_fix_rounds`) и повторное ревью. С шага 12-S2 вердикт ставится по
+    реестру находок постановки, и порядок ветвей жёсткий: свежесть → реестр → бюджет, иначе
+    пересборка съедала бы круг правок, а закрытый реестр не смог бы открыть шаг. Стоп —
+    когда исчерпаны соответствующие круги, упала карточка, вердикт не распознан, реестр
+    находок постановки не читается или исчез, либо круг правок не закрыл ни одной находки.
     """
     sid = step["id"]
     if not ctx.get("prompt"):
@@ -3047,6 +3257,12 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
     if card is None:
         if not need:
             return None
+        # Битый реестр останавливает до заказа: тело карточки печатает таблицу, и
+        # `GateError` из `run_gate` вышел бы сырым исключением вместо решения `stop`.
+        # Правила «0 закрытых» здесь нет: статусы реестра в этот момент менять некому.
+        stop = _prompt_findings_stop(ctx, sid)
+        if stop is not None:
+            return stop
         return {"action": "create_prompt_review", "step": sid, "data": step, "round": round_no,
                 "reason": (f"постановка {sid} требует ревью (круг {round_no}, "
                            f"recon_commit: {ctx.get('prompt_recon') or '—'}), отчёт {report_rel}")}
@@ -3070,41 +3286,53 @@ def _prompt_review_decision(ctx: dict, step: dict) -> dict | None:
         return {"action": "stop", "step": sid,
                 "reason": (f"ревью постановки {sid} закрыто, но отчёт {report_rel} не обновлён "
                            f"после карточки {card['id']} — вердикт может быть от прошлого круга")}
-    if verdict["verdict"] != "APPROVE":
+    # Свежесть (план 12, S1) — выше реестра и бюджета: протухшая постановка делала вердикт
+    # о другом тексте, и её пересбор не должен тратить круг правок (6-S8A, допущение 6).
+    # Сравнение только при непустой отметке: пустая строка сравнилась бы с sha постановки
+    # и дала бы ложную пересборку на каждом тике.
+    if verdict.get("recon") and verdict["recon"] != (ctx.get("prompt_recon") or ""):
+        # Формальная путаница отметок конвейер не роняет (D6, инцидент 09.11.2026): если
+        # текст постановки на sha из отчёта тот же, что в файле сейчас, или обе отметки —
+        # один коммит (короткий sha против полного), вердикт относится к этой редакции.
+        # Дальше — к реестру, а не на старт: иначе открытая находка прошла бы мимо вердикта.
+        if not (ctx.get("prompt_marker_text_same") or ctx.get("prompt_marker_same_commit")):
+            # Расхождение отметок — не стоп, а протухшая постановка: пересобираем её от
+            # текущего HEAD и ревьюим заново. Стоп остаётся только на исчерпанном лимите
+            # пересборок внутри `_stale`.
+            return _stale("stale-recon")
+    # Отметка совпала (или её нет) — второй признак устаревания: вход постановки (файлы шага
+    # и её файл) изменился после того, как эта редакция ушла ревьюеру. Правка мимо git не
+    # двигает `recon_commit`, поэтому без отпечатка она прошла бы незамеченной.
+    changed = prompt_input_changed(ctx)
+    if changed:
+        return _stale("stale-input", changed)
+    # Реестр находок постановки (план 12, S2): действующий вердикт считается по нему, а не по
+    # строке отчёта. Третьей проверки здесь нет: расхождение реестра с отчётом («закрыто» без
+    # правки в коммите круга) разбирает ревьюер, а не страж (D11).
+    stop = _prompt_findings_stop(ctx, sid)
+    if stop is not None:
+        return stop
+    active = str((effective_prompt_verdict(ctx) or {}).get("verdict") or "")
+    if active != "APPROVE":
+        # Бюджет считает действующий вердикт: отчёт APPROVE при открытой находке круги
+        # расходует так же, как REQUEST_CHANGES. Текст и число стопа прежние — они
+        # закреплены тестом `test_prompt_fix_rounds_exhausted_stops`.
         max_rounds = int(ctx.get("max_fix_rounds") or DEFAULT_FIX_ROUNDS)
         if len(fixes) >= max_rounds:
             return {"action": "stop", "step": sid,
                     "reason": (f"ревью постановки {sid} вернуло REQUEST_CHANGES, круги "
                                f"автопереписывания исчерпаны ({len(fixes)}) — решает владелец: "
                                f"{Path(verdict['path']).name}")}
+        # Правило приёмки — только когда следующий круг ещё можно открыть: круг правок,
+        # закрывший 0 находок, нового круга не открывает, а уходит владельцу.
+        zero = _prompt_zero_fix(ctx, sid, fixes)
+        if zero is not None:
+            return zero
         return {"action": "create_prompt_fix", "step": sid, "data": step, "round": round_no,
                 "reason": (f"ревью постановки {sid} вернуло REQUEST_CHANGES — постановку "
                            f"переписываю автоматически (круг {round_no}): "
                            f"{Path(verdict['path']).name}")}
-    # D6: без строки `recon_commit:` в отчёте сверять нечего — не принимаем, даже если
-    # и в постановке отметки нет: так ловится APPROVE, написанный до переписывания постановки.
-    if not verdict.get("recon"):
-        return {"action": "stop", "step": sid,
-                "reason": (f"ревью постановки {sid} не про эту версию: в отчёте "
-                           f"{Path(verdict['path']).name} нет строки recon_commit, "
-                           f"в постановке {ctx.get('prompt_recon') or 'отметки нет'}")}
-    if verdict["recon"] != (ctx.get("prompt_recon") or ""):
-        # Формальная путаница отметок конвейер не роняет (D6, инцидент 09.11.2026): если
-        # текст постановки на sha из отчёта тот же, что в файле сейчас, или обе отметки —
-        # один коммит (короткий sha против полного), вердикт относится к этой редакции.
-        if ctx.get("prompt_marker_text_same") or ctx.get("prompt_marker_same_commit"):
-            return None
-        # Расхождение отметок — не стоп, а протухшая постановка: пересобираем её от текущего
-        # HEAD и ревьюим заново (план 12, S1). Стоп остаётся только на исчерпанном лимите
-        # пересборок внутри `_stale`.
-        return _stale("stale-recon")
-    # Отметка совпала — второй признак устаревания: вход постановки (файлы шага и её файл)
-    # изменился после того, как эта редакция ушла ревьюеру. Правка мимо git не двигает
-    # `recon_commit`, поэтому без отпечатка она прошла бы незамеченной.
-    changed = prompt_input_changed(ctx)
-    if changed:
-        return _stale("stale-input", changed)
-    return None                            # APPROVE по той же версии — шаг стартует
+    return None                            # действующий APPROVE — шаг стартует
 
 
 def prompt_review_rel_of(ctx: dict, step_id: str) -> str:
@@ -4984,10 +5212,26 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         else:
             key = f"planloop:{plan_id}:{step['id']}:promptfix:{round_no}"
             title = f"[переписать постановку {plan_id} {step['id']}] {step['title']}"
-            body = prompt_fix_card_body(p, step, round_no, report_rel)
+            # Открытые ID реестра — в тело карточки (12-S2): реестр решает вердикт, и правка
+            # обязана закрыть именно его строки. Предел кругов — из конфигурации проекта.
+            body = prompt_fix_card_body(p, step, round_no, report_rel,
+                                        findings=open_prompt_findings_lines(ctx),
+                                        max_rounds=int(ctx.get("max_fix_rounds")
+                                                       or DEFAULT_FIX_ROUNDS))
         cid = create_card(p, title, body, p.cfg.prompter, key, p.cfg.prompt_skills,
                           max_runtime=p.cfg.prompt_runtime)
         result.update(applied=bool(cid), detail=f"карточка переписывания постановки: {cid}")
+        if cid and not stale:
+            # База правила «0 закрытых» (12-S2): что было открыто до правки. Пишется только
+            # круг правок — пересборка по свежести находок не закрывает и правило не вооружает.
+            state["prompt_fix_baseline"] = {
+                "step": step["id"],
+                "round": round_no,
+                "open_ids": [str(item.get("id") or "")
+                             for item in (ctx.get("prompt_findings") or [])
+                             if str(item.get("status") or "") == "открыто"],
+                "at": time.strftime("%d.%m.%Y %H:%M:%S"),
+            }
         if cid and stale:
             # Зеркало счётчика в состоянии плана: источник истины — карточки, но цифра должна
             # читаться в `--status` даже без борды.
@@ -5140,6 +5384,14 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 # и число закрытых находок — иначе «доложено» не диагностируется по цифрам.
                 baseline["reported_growth"] = dict(growth)
                 baseline["reported_at"] = state["plan_growth_report"]["at"]
+        # Отметка «доложено» у правила «0 закрытых» (12-S2): owner-стоп ставится один раз,
+        # иначе он повторялся бы каждый тик и после `--resume`. Касается только решения с
+        # `zero_fix`: прочие стопы базу правки не трогают и правило не гасят.
+        zero_fix = decision.get("zero_fix")
+        if zero_fix:
+            fix_baseline = state.get("prompt_fix_baseline")
+            if isinstance(fix_baseline, dict) and fix_baseline:
+                fix_baseline["reported_round"] = int(zero_fix)
         previous = (ctx.get("stop") or {}).get("reason")
         # `kind` из решения: эскалация владельцу (`owner`) не должна сниматься тиком сама (D6).
         write_stop(p, reason, "gate", kind=decision.get("kind") or "incident")

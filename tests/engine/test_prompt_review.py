@@ -173,7 +173,8 @@ def test_prompt_review_verdict_controls_start(stand):
 
     Автоматика (правило 3, дополнение): постановку переписывает роль prompter карточкой
     `:promptfix:{N}`, после правки ревью ставится заново (`:promptreview:{N}`). Стоп —
-    только когда вердикт не про эту версию.
+    только на исчерпанном бюджете кругов правок (у пересборок свой лимит
+    `max_stale_rebuilds`).
     """
     root, p, db = stand
     write_plan(root, plan_body(3))
@@ -254,8 +255,7 @@ def test_prompt_review_modes(stand):
 
     Режимы проверяются так, чтобы каждый отличался от `auto`: `always` — на свежей
     постановке (её `auto` ревью не требует), `never` — на устаревшей (`recon_commit:
-    1111111`, §4.7 п.10: без ветки `never` тут остался бы `auto` с ревью). Между ними —
-    D6: постановка без отметки не принимает APPROVE без строки `recon_commit:`.
+    1111111`, §4.7 п.10: без ветки `never` тут остался бы `auto` с ревью).
     """
     root, p, db = stand
     write_plan(root, plan_body(3))
@@ -266,17 +266,6 @@ def test_prompt_review_modes(stand):
     always = gate.run_gate(paths(root), execute=True, notify_fn=quiet)
     assert always["decision"]["action"] == "create_prompt_review", always["decision"]
     assert sum(1 for c in cards(db) if c["key"] == "planloop:1:S1:promptreview") == 1
-
-    # D6: в постановке отметки нет, отчёт APPROVE без строки `recon_commit:` — сверять
-    # нечего, шаг не стартует (раньше две пустоты считались совпадением версий).
-    write_prompt(root, "S1")                            # без recon_commit, как старые постановки
-    complete(db, ":promptreview")
-    write_report(root, "APPROVE", recon=None)           # без строки recon_commit
-    unmarked = gate.run_gate(paths(root), execute=True, notify_fn=quiet)
-    assert unmarked["decision"]["action"] == "stop", unmarked["decision"]
-    assert "не про эту версию" in unmarked["detail"]
-    assert "planloop:1:S1:step" not in keys_of(db)
-    Path(p.stop_file).unlink()                          # снять инцидент перед следующим тиком
 
     set_config(root, prompt_review="never")
     write_prompt(root, "S1", recon="1111111")           # устаревшая (§4.7 п.10)
