@@ -365,3 +365,37 @@ def test_metrics_counts_fix_rounds_and_zero_close_share(tmp_path: Path) -> None:
     assert line.startswith("Цикл:")
     # §5.7: числа про круги дописаны в конец строки, прежние части — на своих местах.
     assert line.endswith("кругов на шаг 1.7 (правок 3, пересборок 1, закрыто находок 3)")
+
+
+def test_tiles_hint_reads_plan_review_stale_not_rebuilds(tmp_path: Path) -> None:
+    """Подсказка четвёртой плитки считает вердикты ревью плана (R6), а не пересборки (R10).
+
+    Числа различаются намеренно: `plan_reviews_stale` 1, `plan_reviews_unbound` 1,
+    `stale_rebuilds` 5 — подмена класса переменной внутри `cycle_tiles` видна в подсказке,
+    а при совпадающих числах прошла бы зелёной.
+    """
+    root = make_project(
+        tmp_path / "project",
+        {"1-stale.md": plan_text("1. План 1"), "2-unbound.md": plan_text("2. План 2")},
+        history=[{"action": "create_prompt_fix", "plan": 1, "step": f"S{number}", "stale": True}
+                 for number in range(1, 6)],
+    )
+    reviews = root / "docs" / "reviews"
+    # 1 — вердикт привязан к чужой версии плана (stale), 2 — строки привязки нет (unbound).
+    (reviews / "plan-1.md").write_text(report_text("APPROVE", sha="0" * 64), encoding="utf-8")
+    (reviews / "plan-2.md").write_text(report_text("APPROVE"), encoding="utf-8")
+
+    data = metrics(root)
+
+    assert data["plan_reviews_stale"] == 1
+    assert data["plan_reviews_unbound"] == 1
+    assert data["plan_reviews_unreferenced"] == 0
+    assert data["plan_reviews_first"] == 0
+    assert data["stale_rebuilds"] == 5
+
+    tiles = stats.cycle_tiles(data)
+    assert tiles[3]["label"] == "ревью плана с первого раза"
+    assert tiles[3]["hint"] == ("свежих вердиктов 0, непригодных 2 (не привязано к версии 2, "
+                                "без ссылки на конституцию 0), ждут 0, без ревью 0")
+    # Пересборки — число пятой плитки («кругов правок на шаг»), не подсказки ревью плана.
+    assert tiles[4]["hint"].startswith("правок 0, пересборок 5; ")

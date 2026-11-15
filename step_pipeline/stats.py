@@ -670,7 +670,7 @@ def cycle_tiles(metrics: dict) -> list[dict]:
     per_step = metrics.get("rounds_per_step")
     rounds_value = "—" if per_step is None else _num(per_step)
     fix_rounds = int(metrics.get("fix_rounds") or 0)
-    stale = int(metrics.get("stale_rebuilds") or 0)
+    rebuilds = int(metrics.get("stale_rebuilds") or 0)
     closed = int(metrics.get("findings_closed") or 0)
     per_round = metrics.get("closed_per_round")
     per_round_text = "—" if per_round is None else _num(per_round)
@@ -695,7 +695,7 @@ def cycle_tiles(metrics: dict) -> list[dict]:
                   f"{unreferenced}), ждут {pending}, без ревью {skipped}")},
         {"label": "кругов правок на шаг",
          "value": rounds_value,
-         "hint": (f"правок {fix_rounds}, пересборок {stale}; закрыто находок {closed} "
+         "hint": (f"правок {fix_rounds}, пересборок {rebuilds}; закрыто находок {closed} "
                   f"(по {per_round_text} за круг); ноль закрытых за круг у "
                   f"{zero_steps} из {zero_base} шагов")},
     ]
