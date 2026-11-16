@@ -52,31 +52,45 @@ def test_review_approve_closes_step():
     assert d["action"] == "close_step"
 
 
-def test_review_request_changes_creates_fix():
+def write_report(tmp_path, findings: list[str]) -> Path:
+    """Отчёт ревью с разделом «Находки»: без него вердикт не сверить с классами (13-S1).
+
+    Пункты идут с меткой класса в квадратных скобках — страж считает блокирующие по ней,
+    и круг правок открывает только блокирующая находка.
+    """
+    report = tmp_path / "2-S1.md"
+    report.write_text(chr(10).join(["## ВЕРДИКТ: REQUEST_CHANGES", "",
+                                    "## Находки", ""] + findings) + chr(10), encoding="utf-8")
+    return report
+
+
+def test_review_request_changes_creates_fix(tmp_path):
+    report = write_report(tmp_path, ["- [блокирующая] `app/sql.py:14` — индекс не создан"])
     cards = [card("step", "done"), card("review", "done", n="1")]
-    d = gate.decide(ctx(cards=cards, verdict={"verdict": "REQUEST_CHANGES", "path": "x"}))
+    d = gate.decide(ctx(cards=cards, verdict={"verdict": "REQUEST_CHANGES",
+                                              "path": str(report)}))
     assert d["action"] == "create_fix"
     assert d["round"] == 1
 
 
-def test_second_request_changes_creates_second_fix_round():
+def test_second_request_changes_creates_second_fix_round(tmp_path):
     """Правило 4: после первого круга правок даётся ещё один, а не стоп."""
+    report = write_report(tmp_path, ["- [блокирующая] `app/sql.py:14` — индекс не создан"])
     cards = [card("step", "done", short="1"),
              card("review", "done", n="1", short="2"),
              card("fix", "done", n="1", short="3"),
              card("review", "done", n="2", short="4")]
-    d = gate.decide(ctx(cards=cards, verdict={"verdict": "REQUEST_CHANGES", "path": "x"}))
+    d = gate.decide(ctx(cards=cards, verdict={"verdict": "REQUEST_CHANGES",
+                                              "path": str(report)}))
     assert d["action"] == "create_fix"
     assert d["round"] == 2
     assert d["parent"] == "t_4"
 
 
 def test_second_request_changes_stops_with_findings(tmp_path):
-    lines = ["VERDICT: REQUEST_CHANGES", "", "## Замечания", "",
-             "- риск шага не проверяется при ручном допуске",
-             "- вывод статуса врёт про hold"]
-    report = tmp_path / "2-S1.md"
-    report.write_text(chr(10).join(lines) + chr(10), encoding="utf-8")
+    report = write_report(tmp_path, [
+        "- [блокирующая] риск шага не проверяется при ручном допуске",
+        "- [блокирующая] вывод статуса врёт про hold"])
     cards = [card("step", "done", short="1"),
              card("review", "done", n="1", short="2"),
              card("fix", "done", n="1", short="3"),
@@ -96,8 +110,7 @@ def test_second_request_changes_stops_with_findings(tmp_path):
 
 def test_fix_rounds_limit_one_restores_stop(tmp_path):
     """max_fix_rounds=1 — прежнее поведение: стоп после первого круга правок."""
-    report = tmp_path / "2-S1.md"
-    report.write_text("## ВЕРДИКТ: REQUEST_CHANGES\n", encoding="utf-8")
+    report = write_report(tmp_path, ["- [блокирующая] `app/sql.py:14` — индекс не создан"])
     cards = [card("step", "done", short="1"),
              card("review", "done", n="1", short="2"),
              card("fix", "done", n="1", short="3"),
@@ -105,11 +118,12 @@ def test_fix_rounds_limit_one_restores_stop(tmp_path):
     d = gate.decide(ctx(cards=cards, max_fix_rounds=1,
                         verdict={"verdict": "REQUEST_CHANGES", "path": str(report)}))
     assert d["action"] == "stop"
+    assert "лимит" in d["reason"]
 
 
 def test_details_prefer_reviewer_recommendations(tmp_path):
     lines = ["## ВЕРДИКТ: REQUEST_CHANGES", "", "## Находки", "",
-             "- правка файла из списка Запрещено", "",
+             "- [блокирующая] правка файла из списка Запрещено", "",
              "## Рекомендации владельцу", "",
              "- откатить строку ACTION_LABELS в snapshot.py",
              "- поправить адрес в §11.2 на gate.py:1402-1418"]

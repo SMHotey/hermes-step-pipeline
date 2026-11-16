@@ -277,6 +277,21 @@ FINDING_ID_RE = re.compile(r"F(\d+)")
 FINDINGS_KEYS = ("id", "step", "kind", "text", "action", "status")
 PROMPT_FINDINGS_HEADER = ("ID", "Класс", "Находка", "Что сделать", "Статус")
 PROMPT_FINDINGS_KEYS = ("id", "kind", "text", "action", "status")
+# Классы находок в отчёте ревью шага (план 13, S1): метка в квадратных скобках в пункте
+# раздела «Находки». Сверка вердикта с классами решает, откроется ли круг правок, поэтому
+# разбор один: `report_finding_classes` считает, `_decide_base` решает.
+FINDING_CLASS_STEMS = (("блокирующ", "блокирующая"),
+                       ("значим", "значимая"),
+                       ("стилистическ", "стилистическая"))
+FINDING_SECTION_WORD = "наход"
+FINDING_CLOSED_WORD = "закрыт"
+FINDING_LABEL_RE = re.compile(r"^\[([^\[\]]{1,120})\]")
+FINDING_SUBLABEL_SEP = "/"
+# Текст строки реестра плана для замечания, принятого при закрытии шага (§4.3): класс
+# ревью остаётся в тексте меткой, класс строки — из словаря реестра, статус — не держит.
+REMARK_KIND = "стиль"
+REMARK_STATUS = "не блокирует"
+REMARK_ACTION = "принято при закрытии шага, шаг принят; закрывает ревьюер плана фактом"
 # Вопросы шага (план 8, S5): своя таблица того же механизма, что реестр находок, и своей
 # шапки. Файл — `docs/reviews/plan-<N>-questions.md`; ID вида `Q-N`, статусы из двух слов.
 # Вопрос закрывает владелец (ответ, `/answer`, окно панели или автовыбор рекомендации),
@@ -1165,6 +1180,28 @@ def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
     return found
 
 
+def _findings_preamble(path: Path, header: tuple) -> list[str]:
+    """Строки файла до шапки таблицы — то, что запись обязана сохранить (13-S1, §4.3).
+
+    Реестр плана несёт привязку к версии плана (`plan_sha256:` первой строкой). Пока
+    `write_findings` писала «заголовок + таблица» с нуля, первая же строка, дописанная
+    стражем при закрытии шага, стирала эту привязку, и реестр молча переставал
+    соответствовать плану. Файла нет или шапки в нём нет — преамбулы нет.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if tuple(_finding_cells(line)) == tuple(header):
+            preamble = lines[:index]
+            if preamble and preamble[-1].strip():
+                preamble = preamble + [""]
+            return preamble
+    return []
+
+
 def write_findings(path, findings: list[dict], header: tuple = FINDINGS_HEADER,
                    keys: tuple = FINDINGS_KEYS, title_kind: str = "плана",
                    title_prefix: str = "plan-", *, title: str = "",
@@ -1202,8 +1239,9 @@ def write_findings(path, findings: list[dict], header: tuple = FINDINGS_HEADER,
             raise GateError(f"{what}: статус {item.get('status')!r} вне словаря "
                             f"({' | '.join(statuses)}): {path}")
     heading = title or _findings_title(path, title_kind, title_prefix)
-    state_io.atomic_write_text(path, "\n".join([heading, ""]
-                                               + findings_table(rows, header, keys)) + "\n")
+    preamble = _findings_preamble(path, header) or [heading, ""]
+    state_io.atomic_write_text(path, "\n".join(preamble + findings_table(rows, header, keys))
+                               + "\n")
     return path
 
 
@@ -2226,8 +2264,16 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
         "  Две строки вердикта или цитата чужого вердикта = страж остановит конвейер (AMBIGUOUS).",
         "- Первая строка блока «Объект ревью» — коммит шага в обратных кавычках:",
         "  Объект ревью: коммит `<sha>`. Без него стражу нечего сверять.",
-        "- Разбор каждого пункта «Готово =» с file:line, свои прогоны с цифрами, находки по",
-        "  классам (блокирующая/значимая/стилистическая).",
+        "- Разбор каждого пункта «Готово =» с file:line и свои прогоны с цифрами.",
+        "- Раздел «Находки»: каждый пункт начинается меткой класса в квадратных скобках —",
+        "  [блокирующая], [значимая], [стилистическая]. У блокирующей допустима подметка",
+        "  через дробь: [блокирующая/тест-недетерминирован].",
+        "- Блок «Классы находок» со счётом по трём классам (блокирующих N, значимых N,",
+        "  стилистических N): без счёта стражу не с чем сверять вердикт.",
+        "- Вердикт обязан совпадать с классами: есть блокирующая — REQUEST_CHANGES, нет —",
+        "  APPROVE. REQUEST_CHANGES без блокирующих закрывает шаг с замечаниями (они уходят",
+        "  в реестр находок плана), а отчёт без меток классов — ошибка формата: круг правок",
+        "  не заказывается, шаг остаётся открытым.",
         "",
         "ЗАПРЕТЫ: не править код, не коммитить, не пушить, не запускать полный набор тестов,",
         "не трогать данные приложения. Ревьюер выносит суждение — исправляет исполнитель.",
@@ -3023,6 +3069,23 @@ def _question_hold_decision(ctx: dict, step: dict) -> dict | None:
             "reason": question_hold_reason(sid, item, tail)}
 
 
+def _classes_stop(sid: str, reason: str, what: str) -> dict:
+    """Инцидентный стоп сверки вердикта с классами: причина и три пункта «что сделать».
+
+    Вид стопа — инцидентный (умолчание `run_gate`): причина живёт в отчёте, и как только
+    отчёт поправлен, страж снимает стоп сам. Владелец не должен остаться с ручным стопом
+    из-за опечатки в отчёте ревьюера.
+    """
+    return {"action": "stop", "step": sid, "reason": reason, "details": "\n".join([
+        "Вердикт сверяется с классами находок отчёта ревью:",
+        f"  - {what};",
+        "  - либо переписать вердикт под классы: есть блокирующая — REQUEST_CHANGES, "
+        "нет — APPROVE;",
+        "  - стоп инцидентный: снимется сам после правки отчёта, вручную — "
+        "`python .pipeline/gate.py --resume`.",
+    ])}
+
+
 def _decide_base(ctx: dict) -> dict:
     """Решение без учёта стоп-флага."""
     step = ctx.get("next")
@@ -3189,6 +3252,17 @@ def _decide_base(ctx: dict) -> dict:
         return {"action": "stop", "step": sid,
                 "reason": f"вердикт {sid} не распознан ({what}): {Path(verdict['path']).name}"}
     if verdict["verdict"] == "APPROVE":
+        # Обратное расхождение (13-S1): в отчёте есть блокирующая, а вердикт APPROVE.
+        # Это видимая ошибка ревьюера, а не прощение: иначе блокирующая находка закрыла бы
+        # шаг молча. Отчёт нечитаем — блокирующих ноль, закрытие идёт как раньше.
+        classes = report_finding_classes_at(verdict["path"])
+        if classes["blocking"] > 0:
+            return _classes_stop(
+                sid,
+                f"вердикт APPROVE расходится с классами: блокирующих находок "
+                f"{classes['blocking']} — вердикт обязан совпадать с классами "
+                f"(есть блокирующая — REQUEST_CHANGES): {Path(verdict['path']).name}",
+                "в отчёте есть блокирующая находка, а вердикт APPROVE")
         nxt = ctx.get("next_step")
         # Правило 1: шаг не считается выполненным, пока нет постановки N+1. Гейт живёт
         # в решении, а не в отказе `apply` (D10): иначе каждый тик давал бы повторный
@@ -3203,6 +3277,33 @@ def _decide_base(ctx: dict) -> dict:
             return {"action": "create_prompt", "step": nxt["id"], "data": nxt,
                     "after_close": True, "reason": reason}
         return {"action": "close_step", "step": sid, "data": step, "verdict": verdict,
+                "journal_closed": ctx.get("journal_closed")}
+    # Сверка вердикта с классами находок (13-S1, §4.2). Порядок обязателен: ошибки формата —
+    # стопы, а не круги, и проверяются ДО бюджета кругов; бюджет не меняется.
+    classes = report_finding_classes_at(verdict["path"])
+    report_name = Path(verdict["path"]).name
+    if not classes["read"]:
+        return _classes_stop(
+            sid, f"отчёт ревью не читается: вердикт не сверить с классами — {report_name}",
+            "отчёт не прочитан (файл удалён, права или кодировка)")
+    if not classes["section"]:
+        return _classes_stop(
+            sid,
+            f"ошибка формата отчёта: нет раздела «Находки» — находки идут разделом с метками "
+            f"класса; вердикт не сверить с классами — {report_name}",
+            "в отчёте нет раздела «Находки» с пунктами и метками классов")
+    if classes["labeled"] == 0:
+        return _classes_stop(
+            sid,
+            f"ошибка формата отчёта: ни одной метки класса (блокирующая, значимая, "
+            f"стилистическая) — вердикт не сверить с классами; поправь отчёт — {report_name}",
+            "ни один пункт раздела не начинается с метки класса в квадратных скобках")
+    if classes["blocking"] == 0:
+        # Круга нет: замечания без блокирующего класса шаг не держат. Шаг принимается, а
+        # замечания не теряются — `run_gate` дописывает их в реестр находок плана (§4.3).
+        return {"action": "close_step", "step": sid, "data": step, "verdict": verdict,
+                "remarks": classes["significant"] + classes["style"],
+                "unlabeled": classes["unlabeled"],
                 "journal_closed": ctx.get("journal_closed")}
     max_fix_rounds = step_fix_limit(ctx, step)
     if len(fixes) < max_fix_rounds:
@@ -4260,6 +4361,167 @@ def _report_items(text: str) -> list[tuple[str, bool]]:
             if len(item) >= 12:
                 items.append((item, under_blocking))
     return items
+
+
+def _finding_class(word: str) -> str:
+    """Класс находки по основе слова: «блокирующ» → «блокирующая»; иначе пусто.
+
+    Сравнение по основе, а не по целому слову: в отчётах пишут «блокирующая», «блокирующих»
+    и «Блокирующие» (заголовок подраздела) — падеж и число класс не меняют.
+    """
+    stem = str(word or "").strip().lower()
+    for prefix, name in FINDING_CLASS_STEMS:
+        if stem.startswith(prefix):
+            return name
+    return ""
+
+
+def _finding_label(label: str) -> tuple[str, str]:
+    """Класс и подметка метки: `[блокирующая/тест-недетерминирован]` → (блокирующая, тест-…).
+
+    Класс — первое слово до запятой или дроби: `[значимая, вне объёма шага]` — значимая.
+    Метка вне словаря (`[закрыта]` — это статус, `[вне объёма]` — не класс) даёт пустой
+    класс, и пункт считается неразмеченным: выдумывать класс из незнакомой метки нельзя.
+    Незнакомая подметка после дроби ошибкой не является — её читает тот, кому она нужна.
+    """
+    head, _, tail = str(label).partition(FINDING_SUBLABEL_SEP)
+    return _finding_class(head.split(",")[0].strip()), tail.strip()
+
+
+def _finding_item_text(line: str) -> str:
+    """Текст пункта списка без маркера и разметки; пусто — строка пунктом не является.
+
+    Правила те же, что у `_report_items` (`,` `* `, `1. `, `1) `, не короче 12 символов после
+    снятия `**`, `__` и бэктиков): пункт отчёта один, и второй шаблон пункта разошёлся бы
+    с первым на живых отчётах.
+    """
+    stripped = str(line).strip()
+    if stripped[:2] in ("- ", "* "):
+        text = stripped[2:]
+    elif stripped[:1].isdigit() and stripped[1:3] in (". ", ") "):
+        text = stripped[3:]
+    else:
+        return ""
+    text = text.replace("`", "").replace("**", "").replace("__", "").strip(" .;")
+    return text if len(text) >= 12 else ""
+
+
+def scan_report_findings(text) -> tuple[bool, list[dict]]:
+    """Раздел находок отчёта: найден ли он и что в нём за пункты (план 13, S1, §4.1).
+
+    Правила:
+
+    - область — раздел, в заголовке которого есть «наход» и нет «закрыт» (регистр не важен);
+      заголовок-класс («Блокирующие», «Значимые», «Стилистические») внутри области задаёт
+      класс пунктам без своей метки;
+    - отчёт в стиле подразделов-классов БЕЗ родительского заголовка «Находки» тоже считается
+      областью: это живая форма (её держит фикстура `tests/engine/test_comments.py`, отбор
+      блокирующих из которой закреплён контрактом комментария карточки правок). Иначе
+      правило останавливало бы отчёты, уже размеченные по классам, и решение расходилось бы
+      с отбором блокирующих;
+    - пункты — правила `_report_items`, но только внутри области;
+    - метка — фрагмент в квадратных скобках в начале пункта; класс — до запятой или дроби по
+      основе слова, подметка после дроби — отдельным полем.
+
+    Возврат `(найден, пункты)`, пункт — `{"text", "class", "sublabel", "label"}`: значение, а
+    не «есть строка». Второй шаблон пункта рядом с `_report_items` намеренный — та функция
+    держит отбор блокирующих для комментария карточки правок (S2 плана 2), и переписывать её
+    под счёт классов значило бы менять поведение комментария.
+    """
+    items: list[dict] = []
+    section = False
+    inside = False
+    level = 0
+    group = ""
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            depth = len(line) - len(line.lstrip("#"))
+            low = line.lstrip("#").strip().lower()
+            if FINDING_SECTION_WORD in low and FINDING_CLOSED_WORD not in low:
+                section = inside = True
+                level, group = depth, ""
+                continue
+            cls = _finding_class(low)
+            if cls:
+                # Подразделы-классы и есть область, даже если родительского заголовка нет.
+                if not inside:
+                    section = inside = True
+                    level = depth - 1
+                group = cls
+                continue
+            if inside and depth <= level:
+                inside, group = False, ""
+            continue
+        if not inside:
+            continue
+        item_text = _finding_item_text(line)
+        if not item_text:
+            continue
+        match = FINDING_LABEL_RE.match(item_text)
+        cls, sublabel = _finding_label(match.group(1)) if match else ("", "")
+        body = item_text[match.end():].strip(" —-;:") if match else item_text
+        items.append({"text": item_text, "body": body, "class": cls or group,
+                      "sublabel": sublabel, "label": match.group(1) if match else ""})
+    return section, items
+
+
+def report_finding_classes(text) -> dict:
+    """Счёт находок отчёта по классам — единственный источник сверки вердикта (13-S1).
+
+    Ключи: `blocking`, `significant`, `style` — счёт по трём классам; `labeled` — их сумма;
+    `unlabeled` — пункты без метки словаря (в том числе с меткой статуса `[закрыта]`);
+    `sublabels` — счёт подметок после дроби; `section` — найден ли раздел находок; `read` —
+    удалось ли прочитать отчёт.
+
+    `text=None` — отчёт не прочитан: счёт пуст, `read` ложно. Функция не бросает и не читает
+    путей: чтение — на вызывающей стороне (`report_finding_classes_at`), как у реестра.
+    """
+    empty = {"blocking": 0, "significant": 0, "style": 0, "labeled": 0, "unlabeled": 0,
+             "sublabels": {}, "section": False, "read": False}
+    if text is None:
+        return empty
+    section, items = scan_report_findings(text)
+    counts = {name: 0 for _stem, name in FINDING_CLASS_STEMS}
+    unlabeled = 0
+    sublabels: dict[str, int] = {}
+    for item in items:
+        cls = item["class"]
+        if cls not in counts:
+            unlabeled += 1
+            continue
+        counts[cls] += 1
+        sublabel = item["sublabel"]
+        if sublabel:
+            sublabels[sublabel] = sublabels.get(sublabel, 0) + 1
+    return {"blocking": counts["блокирующая"], "significant": counts["значимая"],
+            "style": counts["стилистическая"], "labeled": sum(counts.values()),
+            "unlabeled": unlabeled, "sublabels": sublabels,
+            "section": section, "read": True}
+
+
+def report_finding_classes_at(path) -> dict:
+    """Счёт классов по файлу отчёта: нечитаемый файл — `read` ложно, без исключения."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        text = None
+    return report_finding_classes(text)
+
+
+def report_remarks(text) -> list[dict]:
+    """Замечания отчёта вне блокирующих — строки реестра плана при закрытии шага (§4.3).
+
+    Замечание — пункт класса «значимая» или «стилистическая»: блокирующая держит шаг и
+    в реестр закрытия не попадает, неразмеченный пункт класса не имеет (его считает
+    `unlabeled`, и в реестр он идёт только если у него есть класс).
+    """
+    if text is None:
+        return []
+    _section, items = scan_report_findings(text)
+    return [item for item in items if item["class"] in ("значимая", "стилистическая")]
 
 
 def _review_findings(path: Path, limit: int = 5) -> list[str]:
@@ -5727,11 +5989,44 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
     return result
 
 
-def _evidence(p: Paths, verdict: dict) -> str:
+def _evidence(p: Paths, verdict: dict, remarks: int = 0) -> str:
+    """Четвёртая колонка журнала: чем шаг доказан.
+
+    `remarks` > 0 — шаг принят с замечаниями (13-S1): вердикт `REQUEST_CHANGES`, блокирующих
+    находок ноль. Строка APPROVE остаётся дословной: её держит golden-эталон
+    `04-review-approve`, и менять эталон закрытия APPROVE нельзя.
+    """
     commit = f"коммит `{verdict['commit']}`" if verdict.get("commit") else "коммит не указан"
     report = p.cfg.rel(Path(verdict["path"]))
+    if remarks:
+        return (f"ревью `{p.cfg.reviewer}` — принято с замечаниями, находок вне блокирующих: "
+                f"{remarks} (`{report}`, {commit}); замечания — в реестре находок плана")
     return (f"ревью `{p.cfg.reviewer}` — APPROVE (`{report}`, {commit}); "
             f"гейты шага прогнаны ревьюером самостоятельно")
+
+
+def _register_remarks(p: Paths, step: dict, verdict: dict) -> int:
+    """Дописать замечания закрытого шага в реестр находок плана (§4.3). Число строк.
+
+    Статус `не блокирует`: находка шаг не держит, она — память о том, что ревью заметило.
+    Класс строки — `стиль` из словаря реестра (классов ревью в словаре нет: расширять
+    формат реестра — зона S6), а класс ревью остаётся меткой в тексте находки, и ревьюер
+    плана вправе уточнить его своим проходом. ID присваивает `add_findings` — следующий
+    свободный по файлу. `GateError`/`OSError` не глотаются: решение закрывать шаг молча
+    по неизвестному реестру не принимается (вызывающая сторона ставит стоп).
+    """
+    try:
+        text = Path(verdict["path"]).read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        text = None
+    rows = [{"step": step["id"], "kind": REMARK_KIND,
+             "text": f"[{item['class']}] {item['body']}",
+             "action": REMARK_ACTION, "status": REMARK_STATUS}
+            for item in report_remarks(text)]
+    if not rows:
+        return 0
+    add_findings(plan_findings_path(p), rows)
+    return len(rows)
 
 
 def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
@@ -6291,21 +6586,47 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 touch("stop:bad_commit")
                 say("⛔ " + reason)
                 return result
-        added = append_journal_row(p, step["id"], step["title"], commit, _evidence(p, verdict))
+        remarks = int(decision.get("remarks") or 0)
+        added = append_journal_row(p, step["id"], step["title"], commit,
+                                   _evidence(p, verdict, remarks))
+        if added and remarks:
+            # Замечания не теряются (13-S1, §4.3): строки реестра — ПОСЛЕ журнала (он —
+            # единственное доказательство закрытия) и ДО коммита (реестр входит в тот же
+            # коммит). Повторный тик не дописывает: `append_journal_row` вернула False.
+            try:
+                _register_remarks(p, step, verdict)
+            except (GateError, OSError, ValueError) as exc:
+                reason = (f"замечания ревью {step['id']} не попали в реестр находок плана "
+                          f"({plan_findings_rel(p)}): {exc} — шаг не закрыт коммитом")
+                write_stop(p, reason, "gate")
+                result.update(applied=True, detail=reason)
+                touch("stop:findings")
+                say("⛔ " + reason)
+                return result
         files = [p.cfg.rel(Path(p.plan_file)), _report_rel(p, step["id"])]
-        ok, detail = commit_fn(
-            p, files, f"docs(plan): закрыт шаг {step['id']} плана {plan_id} (ревью APPROVE)")
+        if remarks and plan_findings_path(p).is_file():
+            files.append(plan_findings_rel(p))
+        subject = (f"docs(plan): закрыт шаг {step['id']} плана {plan_id} "
+                   f"(принято с замечаниями, находок вне блокирующих: {remarks})"
+                   if remarks else
+                   f"docs(plan): закрыт шаг {step['id']} плана {plan_id} (ревью APPROVE)")
+        ok, detail = commit_fn(p, files, subject)
+        tail = (f"; принято с замечаниями, находок вне блокирующих: {remarks}"
+                if remarks else "")
         result.update(applied=ok, detail=f"журнал: {'добавлена строка' if added else 'уже был'}; "
-                                         f"коммит/пуш: {'ok ' + detail if ok else detail}")
+                                         f"коммит/пуш: {'ok ' + detail if ok else detail}{tail}")
         # sha коммита для истории: свой коммит стража из detail, иначе — коммит из ревью (D5).
         match = re.match(r"^([0-9a-f]{7,40})(?:\s|$)", detail.strip())
         result["commit"] = match.group(1) if match else commit
         touch(f"close_step:{step['id']}")
         if ok:
-            say(f"✅ план {plan_id}, шаг {step['id']} закрыт (ревью APPROVE, коммит {detail}). "
+            closing = (f"принято с замечаниями, находок вне блокирующих: {remarks}"
+                       if remarks else f"ревью APPROVE, коммит {detail}")
+            say(f"✅ план {plan_id}, шаг {step['id']} закрыт ({closing}). "
                 f"Следующий шаг стартует автоматически")
         else:
-            state["pending_commit"] = {"files": files, "step": step["id"], "reason": detail}
+            state["pending_commit"] = {"files": files, "step": step["id"], "reason": detail,
+                                       "message": subject}
             save_state(p, state)
             say(f"шаг {step['id']} принят ревью, но коммит/пуш не выполнен: {detail}. "
                 f"Повторю сам, как только дерево освободится")
@@ -6392,14 +6713,19 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
 
 
 def retry_pending(p: Paths, notify_fn=None) -> dict | None:
-    """Повторить отложенный коммит/пуш (дерево было занято чужой сессией)."""
+    """Повторить отложенный коммит/пуш (дерево было занято чужой сессией).
+
+    Тема берётся из записи (`message`), а не собирается заново: шаг, принятый с замечаниями,
+    обязан получить тему про замечания, а не «ревью APPROVE». Прежняя тема — только
+    умолчание для старых записей состояния, где поля `message` ещё нет.
+    """
     state = load_state(p)
     pending = state.get("pending_commit")
     if not pending:
         return None
-    ok, detail = commit_and_push(
-        p, pending["files"],
-        f"docs(plan): закрыт шаг {pending['step']} плана {p.plan_id} (ревью APPROVE)")
+    message = str(pending.get("message") or
+                  f"docs(plan): закрыт шаг {pending['step']} плана {p.plan_id} (ревью APPROVE)")
+    ok, detail = commit_and_push(p, pending["files"], message)
     if ok:
         state.pop("pending_commit", None)
         save_state(p, state)
