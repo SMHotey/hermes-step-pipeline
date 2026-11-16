@@ -310,6 +310,9 @@
   <span class="badge mono" id="board">—</span>
   <span class="badge mono" id="ui-ver" title="версия плагина">—</span>
   <span class="badge" id="mode">…</span>
+  <!-- Расписание паузы (0.28.5): видно и вне окна, иначе настроенную паузу не отличить
+       от «ничего не задано» — бейдж mode показывает только текущее состояние. -->
+  <span class="badge" id="quiet" hidden></span>
   <span class="badge" id="telegram">telegram</span>
   <!-- Бейдж критичных проблем (план 3 S5, §4.5): виден с любой вкладки, клик ведёт в «Проверки». -->
   <span class="badge stop" id="checks-badge" hidden></span>
@@ -2435,6 +2438,25 @@ function render(data) {
     mode.title = paused ? (quietHours.reason || "пауза по расписанию") : "";
     // Кнопки возвращаются в строй только здесь: предпросмотр и «не установлен» их гасят.
     $("btn-stop").disabled = $("btn-resume").disabled = panelBusy;
+  }
+  // Плашка расписания: показывается, когда пауза настроена, — и вне окна тоже. В окне
+  // говорит «до ЧЧ:ММ», вне окна — сами интервалы; без настроенных окон плашки нет,
+  // чтобы шапка не обещала паузу, которой нет.
+  const quietBadge = $("quiet");
+  const quietWindows = (quietHours.windows || [])
+    .filter((pair) => pair && pair.from && pair.to)
+    .map((pair) => pair.from + "\u2013" + pair.to);
+  if (quietHours.enabled && quietWindows.length) {
+    quietBadge.hidden = false;
+    quietBadge.textContent = paused
+      ? ("пауза до " + (quietHours.until || "…"))
+      : ("пауза " + quietWindows.join(", "));
+    quietBadge.className = "badge" + (paused ? " stop" : "");
+    quietBadge.title = paused
+      ? (quietHours.reason || "пауза по расписанию")
+      : ("по расписанию: " + quietWindows.join(", ") + " — сейчас не окно, тики идут");
+  } else {
+    quietBadge.hidden = true;
   }
   const tg = data.telegram || {};
   const tgEl = $("telegram");
