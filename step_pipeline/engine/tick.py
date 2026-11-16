@@ -15,6 +15,11 @@ import runpy
 import sys
 from pathlib import Path
 
+#: Префикс переменных канала уведомлений конвейера (как `NOTIFY_ENV_PREFIX` в `project.py`).
+NOTIFY_ENV_PREFIX = "STEP_PIPELINE_TELEGRAM_"
+#: Общие переменные Bot API: прокси/база тоже принадлежат каналу, а не процессу-родителю.
+NOTIFY_SHARED_ENVS = ("TELEGRAM_API_BASE_URL", "TELEGRAM_API_BASE_FILE_URL")
+
 
 def _setup_stdio() -> None:
     """UTF-8 в stdout/stderr: cron-лог на Windows пишется в cp1251 и падает."""
@@ -28,14 +33,31 @@ def _setup_stdio() -> None:
             pass
 
 
+def drop_inherited_notify_env() -> None:
+    """Убрать чужой канал уведомлений, унаследованный от процесса-родителя.
+
+    cron-джоба живёт в процессе шлюза, а шлюз держит в своём окружении `.env` того профиля,
+    чей Telegram-адаптер поднялся первым. Дальше `STEP_PIPELINE_TELEGRAM_BOT_TOKEN` в джобе
+    оказывается токеном чужого бота, и уведомления проекта уходят от чужого имени (проверено
+    16.11.2026: отчёт проекта `pipeline` приходил ботом профиля `writer`). Свой канал
+    берётся только из `.env` своего профиля — `load_profile_env`.
+    """
+    for key in [k for k in os.environ
+                if k.startswith(NOTIFY_ENV_PREFIX) or k in NOTIFY_SHARED_ENVS]:
+        del os.environ[key]
+
+
 def load_profile_env() -> None:
     """Дочитать `.env` профиля Hermes и `PIPELINE_ENV`, если задан.
 
     Зачем: cron шлюза запускает скрипт с `HERMES_HOME` профиля, но переменные из
     `profiles/<профиль>/.env` в окружение не попадают (проверено 01.11.2026: переменные
     уведомлений есть в CLI и отсутствуют в джобе). Без этого уведомления движка молчат.
-    Существующие значения не перетираются.
+    Унаследованный чужой канал уведомлений снимается до чтения файлов, поэтому токен бота
+    берётся из `.env` своего профиля, а не из окружения шлюза. Прочие существующие значения
+    не перетираются.
     """
+    drop_inherited_notify_env()
     candidates = []
     explicit = os.environ.get("PIPELINE_ENV")
     if explicit:

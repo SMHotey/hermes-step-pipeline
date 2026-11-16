@@ -69,6 +69,35 @@ def test_existing_values_are_not_overwritten(profile_script: Path, monkeypatch):
     assert os.environ["STEP_TEST_TOKEN"] == "from_env"
 
 
+def test_inherited_foreign_bot_is_replaced_by_profile_env(profile_script: Path, monkeypatch):
+    """cron-джоба в шлюзе наследует `.env` чужого профиля — свой канал обязан победить.
+
+    Проверено на живом шлюзе 16.11.2026: в окружении процесса лежал токен бота профиля
+    `writer`, поэтому отчёт проекта `pipeline` уходил от чужого имени.
+    """
+    (profile_script.parents[1] / ".env").write_text(
+        "STEP_PIPELINE_TELEGRAM_BOT_TOKEN=111:own\nSTEP_PIPELINE_TELEGRAM_CHAT_ID=42\n",
+        encoding="utf-8")
+    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_BOT_TOKEN", "999:foreign")
+    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_CHAT_ID", "999")
+    monkeypatch.setenv("TELEGRAM_API_BASE_URL", "https://proxy.example/bot")
+
+    load_tick(profile_script).load_profile_env()
+
+    assert os.environ["STEP_PIPELINE_TELEGRAM_BOT_TOKEN"] == "111:own"
+    assert os.environ["STEP_PIPELINE_TELEGRAM_CHAT_ID"] == "42"
+    assert "TELEGRAM_API_BASE_URL" not in os.environ
+
+
+def test_inherited_foreign_bot_is_dropped_without_own_env(profile_script: Path, monkeypatch):
+    """Профиль без своего токена молчит, а не пишет чужому боту."""
+    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_BOT_TOKEN", "999:foreign")
+
+    load_tick(profile_script).load_profile_env()
+
+    assert "STEP_PIPELINE_TELEGRAM_BOT_TOKEN" not in os.environ
+
+
 def test_pipeline_env_overrides_profile_file(profile_script: Path, tmp_path: Path, monkeypatch):
     (profile_script.parents[1] / ".env").write_text("STEP_TEST_TOKEN=profile\n", encoding="utf-8")
     custom = tmp_path / "custom.env"

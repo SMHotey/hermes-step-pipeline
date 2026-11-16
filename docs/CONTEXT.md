@@ -244,6 +244,15 @@ hermes pipeline doctor  --project <путь>
   хотя `hermes pipeline notify-test` из CLI работает. Поэтому тик-скрипт сам дочитывает
   `profiles/<профиль>/.env` (см. 1-S17); проверять канал надо не CLI-командой, а пробой
   в контексте джобы.
+- **Унаследованный канал уведомлений — чужой бот (0.30.1).** Обратная сторона того же:
+  шлюз один на все профили и держит в своём окружении `.env` профиля, чей Telegram-адаптер
+  поднялся первым. Джоба наследует его `STEP_PIPELINE_TELEGRAM_BOT_TOKEN`, а
+  `os.environ.setdefault` в тике оставлял чужое значение — 16.11.2026 отчёт проекта
+  `pipeline` приходил ботом профиля `writer` (проверено чтением блока окружения процесса
+  шлюза: там лежал токен `writer`). Правило: скрипты cron сначала снимают
+  `STEP_PIPELINE_TELEGRAM_*`, `TELEGRAM_API_BASE_URL`/`_FILE_URL` и только потом читают
+  `.env` своего профиля (как `project.engine_env` у панели). Тест-сторож:
+  `tests/engine/test_tick.py::test_inherited_foreign_bot_is_replaced_by_profile_env`.
 - **`skills trust` нужен каждой роли, а не только драйверу** (1-S15): иначе воркер падает
   `Unknown skill(s): pipeline-prompter`, карточка уходит в `blocked` по `failure_limit`.
 - **Ключ провайдера должен быть сохранён в профиле, а не в переменной окружения** (1-S16):

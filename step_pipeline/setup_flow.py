@@ -120,6 +120,11 @@ import runpy
 import sys
 from pathlib import Path
 
+#: Префикс переменных канала уведомлений конвейера (как `NOTIFY_ENV_PREFIX` в `project.py`).
+NOTIFY_ENV_PREFIX = "STEP_PIPELINE_TELEGRAM_"
+#: Общие переменные Bot API: прокси/база тоже принадлежат каналу, а не процессу-родителю.
+NOTIFY_SHARED_ENVS = ("TELEGRAM_API_BASE_URL", "TELEGRAM_API_BASE_FILE_URL")
+
 
 def _setup_stdio():
     for stream in (sys.stdout, sys.stderr):
@@ -132,7 +137,20 @@ def _setup_stdio():
             pass
 
 
+def drop_inherited_notify_env():
+    """Убрать чужой канал уведомлений, унаследованный от процесса-родителя.
+
+    cron-джоба живёт в процессе шлюза, а шлюз держит в своём окружении `.env` того профиля,
+    чей Telegram-адаптер поднялся первым: без этого команды читал бы чужой бот. Свой канал
+    берётся только из `.env` своего профиля — `load_profile_env`.
+    """
+    for key in [k for k in os.environ
+                if k.startswith(NOTIFY_ENV_PREFIX) or k in NOTIFY_SHARED_ENVS]:
+        del os.environ[key]
+
+
 def load_profile_env():
+    drop_inherited_notify_env()
     paths = []
     explicit = os.environ.get("PIPELINE_ENV")
     if explicit:

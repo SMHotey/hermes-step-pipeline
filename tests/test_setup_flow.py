@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sqlite3
@@ -1157,3 +1158,26 @@ def test_plugin_cli_reads_output_as_utf8_with_replacement(monkeypatch):
         assert kwargs["text"] is True, f"вызов {num}: text=True не запрошен"
         assert kwargs["encoding"] == "utf-8", f"вызов {num}: encoding != utf-8"
         assert kwargs["errors"] == "replace", f"вызов {num}: errors != replace"
+
+
+def test_commands_script_takes_bot_from_its_own_profile(tmp_path: Path, monkeypatch):
+    """Скрипт команд читает свой `.env`, а не унаследованный канал чужого профиля.
+
+    cron-джоба живёт в процессе шлюза, где лежит `.env` профиля, чей Telegram-адаптер
+    поднялся первым: без снятия унаследованных `STEP_PIPELINE_TELEGRAM_*` команды проекта
+    читал бы чужой бот (проверено 16.11.2026 на профиле `pipeline` / `writer`).
+    """
+    scripts = tmp_path / "profiles" / "demo" / "scripts"
+    scripts.mkdir(parents=True)
+    target = scripts / "pipeline_commands.py"
+    target.write_text(setup_flow.COMMANDS_SCRIPT, encoding="utf-8")
+    (scripts.parent / ".env").write_text(
+        "STEP_PIPELINE_TELEGRAM_BOT_TOKEN=111:own\n", encoding="utf-8")
+    monkeypatch.setenv("STEP_PIPELINE_TELEGRAM_BOT_TOKEN", "999:foreign")
+
+    spec = importlib.util.spec_from_file_location("pipeline_commands_demo", target)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.load_profile_env()
+
+    assert os.environ["STEP_PIPELINE_TELEGRAM_BOT_TOKEN"] == "111:own"
