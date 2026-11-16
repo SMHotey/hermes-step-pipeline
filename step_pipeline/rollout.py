@@ -50,6 +50,22 @@ STATUS_SKIPPED = "skipped"
 STATUS_FAILED = "failed"
 STATUS_WAITING = "waiting"
 
+#: Подписи статусов — одна таблица на весь пакет: слова плана, других формулировок нет (D5).
+STATUS_LABELS: dict[str, str] = {STATUS_UPDATED: "обновлено", STATUS_SKIPPED: "пропущено",
+                                 STATUS_FAILED: "ошибка", STATUS_WAITING: "ждёт"}
+#: Порядок счёта и подписи — как в плане; второго порядка не заводится.
+STATUS_ORDER: tuple[str, ...] = (STATUS_UPDATED, STATUS_SKIPPED, STATUS_FAILED, STATUS_WAITING)
+#: Ключи строки статуса проекта — ровно эти и в этом порядке (сверяет тест шага).
+PROJECT_ROW_KEYS: tuple[str, ...] = ("id", "name", "root", "status", "status_label", "from", "to",
+                                     "reason", "error", "at")
+
+#: Статус «раскатки не было»: отсутствие записи, а не нули, выставленные заранее (D1).
+NO_ROLLOUT_TEXT = "раскатка движка не запускалась"
+#: Причина строки проекта, до которого раскатка не дошла.
+WAITING_QUEUE_REASON = "ждёт очереди"
+#: Пояснение к статусу, когда запись говорит «идёт», а живого процесса уже нет (D3).
+STALE_NOTE = "раскатка прервана: запись говорит «идёт», живого процесса нет"
+
 #: Блокировка от второго жеста: одна установка за раз на профиль (D5).
 _LOCK = threading.Lock()
 
@@ -85,6 +101,18 @@ def read_engine() -> dict:
     return _read_record(ENGINE_KEY)
 
 
+def _projection(entry: dict) -> dict:
+    """Плоские ключи контейнера `rollout` из записи шага `engine`.
+
+    Это проекция, а не второе состояние (D1): их пишет тот же `_put_record` и в том же
+    атомарном сохранении, поэтому расхождению негде появиться. Владелец читает статус,
+    не зная формы записи, а код по-прежнему читает запись шага (`read_engine`).
+    """
+    return {"running": bool(entry.get("running")),
+            "at": str(entry.get("at") or ""),
+            "projects": list(entry.get("projects") or [])}
+
+
 def _put_record(key: str, entry: dict) -> None:
     """Записать итог шага раскатки в реестр профиля, сохранив чужие ключи контейнера.
 
@@ -99,6 +127,10 @@ def _put_record(key: str, entry: dict) -> None:
     # `rollout` в контейнере есть, но не словарь — это `TypeError` на присваивании:
     # портить чужую запись догадкой нельзя, отказ уходит наверх (D3).
     box[RECORD_KEY][key] = entry
+    if key == ENGINE_KEY:
+        # Плоские ключи контейнера — проекция записи шага `engine` (D1): владелец читает
+        # статус, не зная формы записи, а источник истины остаётся один.
+        box[RECORD_KEY].update(_projection(entry))
     proj._write_registry(box, entries)
 
 
@@ -115,6 +147,136 @@ def write_engine(entry: dict) -> None:
 def busy() -> bool:
     """Идёт ли установка прямо сейчас (для панели и второго жеста)."""
     return _LOCK.locked()
+
+
+# ───────────────────────── статус раскатки для панели (S8B) ─────────────────────────
+
+def _summary(rows: list[dict]) -> dict:
+    """Счёт строк по статусам: ключи и порядок — `STATUS_ORDER`, нули на месте (D6)."""
+    counts = {status: 0 for status in STATUS_ORDER}
+    for row in rows:
+        status = str(row.get("status") or "")
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def _summary_text(summary: dict) -> str:
+    """«обновлено: 1, пропущено: 0, ошибка: 0, ждёт: 2» — русские подписи из одной таблицы."""
+    return ", ".join(f"{STATUS_LABELS[status]}: {int(summary.get(status) or 0)}"
+                     for status in STATUS_ORDER)
+
+
+def _status_text(running: bool, stale: bool, ok: bool | None, at: str, finished: str,
+                 summary: dict, note: str) -> str:
+    """Готовая строка статуса: страница печатает её как есть и ничего не досчитывает (D6).
+
+    `finished` может быть пустым (запись сделана не `run_engine`) — тогда берётся `at`;
+    подставлять пустоту в текст нельзя, поэтому путь «закончена» требует хоть одной метки.
+    """
+    text = _summary_text(summary)
+    if ok is None and not at:
+        # Записи нет: «не запускалась» — это факт, а не нули, выставленные заранее (D1).
+        return note or NO_ROLLOUT_TEXT
+    if running:
+        return f"идёт раскатка с {at}: {text}"
+    if stale:
+        return f"раскатка прервана, запись от {at}: {text}"
+    when = finished or at
+    if ok is False and summary.get(STATUS_FAILED):
+        return f"раскатка закончена {when} с ошибками: {text}"
+    return f"раскатка закончена {when}: {text}"
+
+
+def _status_row(entry: dict | None, registry_row: dict) -> dict:
+    """Строка статуса одного проекта: исход из записи шага, иначе — `waiting`.
+
+    Порядок и набор ключей — `PROJECT_ROW_KEYS`; проект реестра без строки в записи
+    показан `waiting` с причиной «ждёт очереди»: раскатка до него не дошла, и это видно.
+    """
+    root = str(registry_row.get("root") or "")
+    if not entry:
+        return {"id": str(registry_row.get("id") or ""),
+                "name": str(registry_row.get("name") or ""),
+                "root": root,
+                "status": STATUS_WAITING,
+                "status_label": STATUS_LABELS[STATUS_WAITING],
+                "from": "", "to": "",
+                "reason": WAITING_QUEUE_REASON,
+                "error": "",
+                "at": ""}
+    status = str(entry.get("status") or "")
+    return {"id": str(entry.get("id") or ""),
+            "name": str(entry.get("name") or ""),
+            "root": str(entry.get("root") or root),
+            "status": status,
+            "status_label": STATUS_LABELS.get(status, status),
+            "from": str(entry.get("from") or ""),
+            "to": str(entry.get("to") or ""),
+            "reason": str(entry.get("reason") or ""),
+            "error": str(entry.get("error") or ""),
+            "at": str(entry.get("at") or "")}
+
+
+def status() -> dict:
+    """Статус раскатки движка: жив ли процесс, чем закончилось и строка на каждый проект.
+
+    Источник строк — реестр профиля (`proj.read_projects`), исходов — запись
+    `rollout.engine`; слияние по `id` (D4). Порядок строк — порядок реестра, а записи,
+    чьего проекта в реестре уже нет, идут в хвосте: история не теряется.
+
+    `running` — живой процесс раскатки (`busy()`) при записи «идёт»: запись `running: true`
+    без процесса (панель перезапустили) — не раскатка, а `stale` с пояснением (D3).
+    """
+    registry = proj.read_projects()
+    note = ""
+    try:
+        engine = read_engine()
+    except ValueError as exc:
+        # Битый реестр статус не отменяет: владелец видит причину, а не отказ панели.
+        # `read_projects` такой файл переживает сам и отдаёт пустой список: выдуманных
+        # строк в статусе не будет.
+        engine = {}
+        note = f"реестр профиля не разбирается: {exc}"
+    outcomes: dict[str, dict] = {}
+    for item in engine.get("projects") or []:
+        if isinstance(item, dict):
+            key = str(item.get("id") or "")
+            if key and key not in outcomes:
+                outcomes[key] = item
+    rows = [_status_row(outcomes.get(str(row.get("id") or "")), row) for row in registry]
+    seen = {str(row.get("id") or "") for row in registry}
+    for item in engine.get("projects") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(_status_row(item, item))
+    summary = _summary(rows)
+    process = busy()
+    # «Идёт» — это живой процесс, а не само поле записи: панель перезапустили посреди
+    # раскатки, запись осталась `running: true`, а раскатки уже нет (D3). Живой процесс
+    # без записи «идёт» — не раскатка движка, а другая установка, и кнопку она не держит.
+    running = process and bool(engine.get("running"))
+    stale = bool(engine.get("running")) and not process
+    at = str(engine.get("at") or "")
+    finished = str(engine.get("finished") or "")
+    if not engine:
+        ok = None
+    elif stale:
+        ok = False
+    else:
+        # `ok` пишет каждый итог; запись без него (владелец собрал руками) — не провал.
+        ok = bool(engine["ok"]) if "ok" in engine else None
+    if stale:
+        note = STALE_NOTE
+    return {"running": running, "stale": stale, "at": at, "finished": finished, "ok": ok,
+            "note": note, "summary": summary, "summary_text": _summary_text(summary),
+            "status_text": _status_text(running=running, stale=stale, ok=ok, at=at,
+                                        finished=finished, summary=summary, note=note),
+            "projects": rows}
 
 
 def _failure(before: str, exc: BaseException) -> dict:

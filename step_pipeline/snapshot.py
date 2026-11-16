@@ -18,6 +18,9 @@
 прогресс закрыто/всего по файлам планов. Ради этого движок НЕ запускается: число шагов
 разбирается по заголовкам файла плана, иначе сборка снимка подорожала бы на запуск на план
 (критерий шага 3-S1 — не больше 20 запусков движка в минуту).
+
+Ключ `rollout` — статус раскатки движка по реестру профиля (`rollout.status`): панель
+рисует его готовыми строками и сама правила статуса не повторяет.
 """
 from __future__ import annotations
 
@@ -321,9 +324,10 @@ def fingerprint(root: Path, plan: str | None = None, preview: bool = False,
                 board: str | None = None) -> tuple:
     """Отпечаток источников снимка: только `stat`, без чтения содержимого.
 
-    Входят `pipeline.json`, `*.md` планов, отчёты ревью, файлы каталога состояния и файл
-    борды и сам ключ кэша (проект, план, предпросмотр, борда) — чтобы отпечатки разных
-    планов одного проекта не совпали. Результат отсортирован: порядок обхода не влияет.
+    Входят `pipeline.json`, `*.md` планов, отчёты ревью, файлы каталога состояния, файл
+    борды, файл реестра профиля (в нём живёт статус раскатки) и сам ключ кэша (проект,
+    план, предпросмотр, борда) — чтобы отпечатки разных планов одного проекта не совпали.
+    Результат отсортирован: порядок обхода не влияет.
     """
     root = Path(root)
     cfg = proj.read_config(root)
@@ -353,6 +357,9 @@ def fingerprint(root: Path, plan: str | None = None, preview: bool = False,
         review_files = []
     entries.extend(_stat_entry("review:" + path.name, path) for path in review_files)
     entries.append(_stat_entry("board", proj.board_db(root, board)))
+    # Статус раскатки движка (S8B) читается из реестра профиля, поэтому его `stat` входит
+    # в отпечаток: иначе панель отдала бы статус прошлого жеста до истечения CACHE_TTL.
+    entries.append(_stat_entry("registry", proj.projects_file()))
     entries.extend([
         ("key:root", str(root), 0),
         ("key:plan", str(plan or ""), 0),
@@ -1480,6 +1487,20 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
             "limit": cap}
 
 
+def _rollout_status() -> dict:
+    """Статус раскатки движка из реестра профиля — ключ `rollout` снимка.
+
+    Импорт внутри функции: `rollout` тянет `panel_pause`, а тот — `snapshot`
+    (в `panel_pause.py` строка `from . import snapshot as snap`); модульный импорт дал бы
+    цикл. Приём в пакете уже есть: `cmd_ui` в `cli.py` импортирует `ui_server` внутри тела.
+    """
+    try:
+        from . import rollout as rollout_mod
+    except ImportError:  # pragma: no cover - ручная проверка файлом
+        import rollout as rollout_mod  # type: ignore[no-redef]
+    return rollout_mod.status()
+
+
 def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | None) -> dict:
     """Собрать снимок с нуля: три запуска движка, борда и хвост журнала."""
     cfg = proj.read_config(root)
@@ -1604,6 +1625,9 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
     cycle = stats.cycle_metrics(root, cfg)
     cycle["tiles"] = stats.cycle_tiles(cycle)
     out["cycle"] = cycle
+    # Статус раскатки движка (S8B): реестр профиля, а не проект. Без этого ключа панель
+    # не показала бы ни строки статуса, ни блокировки кнопки во время раскатки.
+    out["rollout"] = _rollout_status()
     # Лента действий — отдельным чтением history.jsonl: движок ради неё не запускается (D2).
     out["events"] = events(root, cfg)
     return out

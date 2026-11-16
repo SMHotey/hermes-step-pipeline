@@ -365,6 +365,14 @@
       <!-- Глобальная пауза (0.25.0): подпись кнопки и ожидание закрытия шагов. -->
       <div id="pause-banner" class="pause-banner" hidden></div>
       <div id="projects-table"><span class="muted">реестр не загружен</span></div>
+      <!-- Статус раскатки движка (S8B): данные приходят ключом rollout из /api/snapshot. Кнопка одна на весь реестр: она поднимает POST /api/rollout/engine. -->
+      <div class="row">
+        <div><div class="ov-head" id="rollout-status">раскатка движка не запускалась</div></div>
+        <div style="flex:0 0 auto">
+          <button id="rollout-btn" type="button" aria-label="Обновить движок во всех проектах реестра">Обновить во всех</button>
+        </div>
+      </div>
+      <div class="plans" id="rollout-rows"></div>
       <!-- Подключение проекта из панели (S8, D2): путь проверяет сервер, каталог не трогаем. -->
       <div class="project-add">
         <label for="new-project-path">Путь к каталогу проекта</label>
@@ -1430,6 +1438,23 @@ async function removeProject(id) {
   await loadProjects();
 }
 
+// Раскатка движка по реестру (S8B): запуск в фоне, итог приходит снимком. Кнопка
+// «Обновить во всех» поднимает тот же маршрут, что S8A, — второго пути раскатки нет.
+async function rolloutEngine() {
+  if (window.__preview) { toast("предпросмотр только читает", true); return; }
+  let data;
+  try {
+    data = await api("/api/rollout/engine", {method: "POST", headers: PANEL_HEADERS});
+  } catch (err) {
+    toast(String(err), true);
+    return;
+  }
+  toast(data.running ? "раскатка движка запущена" : (data.error || "раскатка не запущена"),
+        !data.running);
+  etag = null;
+  await refresh();
+}
+
 async function loadProjects() {
   let data;
   try {
@@ -1861,6 +1886,43 @@ function renderCycle(data) {
   grid.innerHTML = tiles.map((tile) => `
     <div class="ov-item"><span>${esc(tile.label)}</span>
       <b class="mono" title="${esc(tile.hint || "")}">${esc(tile.value)}</b></div>`).join("");
+}
+
+function renderRollout(data) {
+  // Статус раскатки движка (S8B): строку статуса и строки проектов считает сервер
+  // (`rollout.status` в снимке), страница ничего не досчитывает (D6). Кнопка блокируется,
+  // пока раскатка идёт, и не показывается в предпросмотре: действий там нет (D9).
+  const r = (data && data.rollout) || {};
+  const text = $("rollout-status");
+  if (text) {
+    text.textContent = r.status_text || "нет данных раскатки";
+    text.title = r.note || "";
+  }
+  const button = $("rollout-btn");
+  if (button) {
+    button.disabled = Boolean(r.running);
+    button.title = r.note || "";
+    button.style.display = data && data.preview ? "none" : "";
+  }
+  const body = $("rollout-rows");
+  if (!body) return;
+  const rows = r.projects || [];
+  if (!rows.length) {
+    body.innerHTML = '<span class="muted">проектов в реестре нет</span>';
+    return;
+  }
+  const head = '<tr><th scope="col">Проект</th><th scope="col">Статус</th>' +
+    '<th scope="col">Было → Стало</th><th scope="col">Причина</th></tr>';
+  body.innerHTML = `<table><thead>${head}</thead><tbody>` + rows.map((row) => {
+    const versions = row.from || row.to
+      ? `${esc(row.from || "—")} → ${esc(row.to || "—")}` : "—";
+    return `<tr data-project="${esc(row.id)}" data-status="${esc(row.status)}">
+      <td>${esc(row.name || row.id || "—")}</td>
+      <td><span class="pill">${esc(row.status_label || row.status)}</span></td>
+      <td class="mono">${versions}</td>
+      <td>${esc(row.error || row.reason || "—")}</td>
+    </tr>`;
+  }).join("") + '</tbody></table>';
 }
 
 // ── экран «Шаг» (план 3 S3): контракт, постановка, отчёт ревью, коммит ──
@@ -2582,6 +2644,7 @@ function render(data) {
 
   renderOverview(data);
   renderCycle(data);
+  renderRollout(data);
   renderEvents(data);
   renderDrafts(data);
   collectNotify(data.notify);
@@ -3166,6 +3229,7 @@ $("ui-ver").onclick = () => {
     .finally(() => setBusy(false));
 };
 $("add-project").onclick = () => addProject();
+$("rollout-btn").onclick = () => rolloutEngine();
 $("new-project-path").addEventListener("keydown", (event) => {
   if (event.key === "Enter") { event.preventDefault(); addProject(); }
 });
