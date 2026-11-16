@@ -570,22 +570,28 @@ def test_repo_plans_warn_only_legacy():
 
     Л20 (нет строки «Конституция:») — у четырёх legacy-планов, у плана 5 и новее её нет:
     конституционная строка есть, и предупреждать не о чем. С 8-S2B добавляется Л22 —
-    проза в пункте «Риск:»: планы 12 и 13 писали риски описанием, и линтер называет это
-    предупреждением. Подгонять проверку под «ровно 4 предупреждения» нельзя: число
-    следует из текста планов, а не из правила, и правка планов ради счётчика — запрет
-    шага. Здесь фиксируется смысл: ошибок нет, четыре legacy-предупреждения на месте,
-    у Л22 есть шаг.
+    проза в пункте «Риск:»: план 12 писал риски описанием, и линтер называет это
+    предупреждением по каждому из пяти шагов (S0…S4). У плана 13 риск написан меткой
+    `- Риск: high`, поэтому Л22 у него нет. Число следует из текста планов, поэтому оно
+    фиксируется вместе с составом (4 legacy плюс пять шагов плана 12): молчаливая правка
+    плана или пропажа правила сдвинет счётчик и уронит тест. Иных предупреждений нет —
+    это отдельный assert, а не следствие суммы.
     """
     result = plan_lint.lint_project(helpers.REPO)
 
     assert result.problems == []
     assert len(result.files) >= 5
+    assert len(result.warnings) == 9, [str(item) for item in result.warnings]
     legacy = [warning for warning in result.warnings if "Конституция" in warning.text]
     names = sorted(Path(warning.file).name for warning in legacy)
     assert names == ["1-stabilnost.md", "2-upravlenie.md", "3-panel.md", "4-planner.md"]
     prose = [warning for warning in result.warnings if "прозой" in warning.text]
-    assert prose, "план 12 писал риски прозой — Л22 обязан сработать"
-    assert all(warning.step for warning in prose), [str(item) for item in prose]
+    assert [(Path(item.file).name, item.step) for item in prose] == [
+        ("12-cikl-postanovki.md", "S0"), ("12-cikl-postanovki.md", "S1"),
+        ("12-cikl-postanovki.md", "S2"), ("12-cikl-postanovki.md", "S3"),
+        ("12-cikl-postanovki.md", "S4"),
+    ], [str(item) for item in prose]
+    assert len(legacy) + len(prose) == len(result.warnings), "иных предупреждений быть не должно"
 
 
 RESEARCH_STEP = "### S1. Разведка рынка (1 дн)"

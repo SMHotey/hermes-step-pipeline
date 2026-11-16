@@ -447,6 +447,11 @@ def test_spec_card_body_lists_c7_findings(project: Path):
     assert "СПЕКА НЕ ГОТОВА (круг 1 из 6)" in body
     assert "нет блока «Спека»" in body
     assert "«Критерии готовности»" in body          # что именно дописать
+    # Гейт круга спеки спрашивает спеку, и команда в карточке ровно одна: вторая, без
+    # `--risk high`, давала «PASS 8/8» постановке без блока «Спека» (правки по ревью 8-S2B).
+    assert body.count("check_task_prompt.py") == 1, body
+    gate_lines = [line for line in body.splitlines() if "check_task_prompt.py" in line]
+    assert " --risk high` → PASS 8/8" in gate_lines[0], gate_lines
     # Раздел находок ревью не печатается: круг открыт формой постановки, а не отчётом.
     assert "БЛОКИРУЮЩИЕ НАХОДКИ" not in body
     assert "ОТКРЫТЫЕ НАХОДКИ РЕЕСТРА" not in body
