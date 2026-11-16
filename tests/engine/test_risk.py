@@ -604,7 +604,10 @@ def test_spec_card_puts_spec_section_before_forbids(project: Path):
     step = next_step.build_package(cfg, "1")["next"]
     body = gate.prompt_fix_card_body(p, step, 1, "docs/reviews/1-S1-prompt.md",
                                      spec=["нет блока «Спека»"], max_rounds=6)
-    assert body.index("СПЕКА НЕ ГОТОВА") < body.index("ЗАПРЕТЫ"), body
+    # Анкер — заголовок раздела, а не фраза «СПЕКА НЕ ГОТОВА» вообще: та же фраза стоит
+    # в первом действии («по разделу «СПЕКА НЕ ГОТОВА» ниже»), поэтому прежний анкер был
+    # зелёным и при разделе, уехавшем под «ЗАПРЕТЫ» (F9 ревью 8-S2B).
+    assert body.index("СПЕКА НЕ ГОТОВА (круг") < body.index("ЗАПРЕТЫ"), body
     first_action = body.split("ЧТО ДЕЛАТЬ", 1)[1].splitlines()[1]
     assert "«Спека»" in first_action, first_action
     assert "закрыть КАЖДУЮ блокирующую" not in body
