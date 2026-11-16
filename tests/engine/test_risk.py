@@ -548,3 +548,85 @@ def spec_env(monkeypatch, project: Path) -> None:
     monkeypatch.setenv("PIPELINE_REPO", str(project))
     for name in ("PIPELINE_CONFIG", "PIPELINE_PLANS", "PIPELINE_STATE_DIR", "PIPELINE_BOARD"):
         monkeypatch.delenv(name, raising=False)
+
+
+STALE_DECISION = {"stale": True, "stale_reason": "stale-input", "rebuild": 1, "limit": 2,
+                  "fp": "ab" * 32, "prev_recon": None, "review_round": 2, "changed": {},
+                  "reason": "постановка S1 протухла: вход изменился после ревью"}
+
+
+def prompt_gate_line(body: str) -> str:
+    """Единственная строка гейта формы постановки в теле карточки.
+
+    Команд должно быть ровно одна: вторая, без флага, давала «PASS 8/8» постановке без
+    блока «Спека» (правки по ревью 8-S2B, круг 1).
+    """
+    lines = [line for line in body.splitlines() if "check_task_prompt.py" in line]
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+def test_gate_line_carries_risk_flag_by_step_risk(project: Path, monkeypatch):
+    """Флаг `--risk high` — по пометке шага и режиму, а не по непустому `spec` (F6 8-S2B).
+
+    Обычный круг правок постановки (замечания C7 в карточке не собраны) и карточка
+    пересборки протухшей постановки переписывают постановку с нуля так же, как круг
+    спеки: команда без флага пропускала постановку без блока «Спека», и страж тут же
+    заказывал новый круг — при пересборке ещё и сжигая `max_stale_rebuilds`.
+    """
+    write_high_stand(project)
+    spec_env(monkeypatch, project)
+    cfg = config_mod.load(project)
+    p = gate.resolve_paths(cfg, "1")
+    step = next_step.build_package(cfg, "1")["next"]
+    assert step["risk"] == "high", step
+    report = "docs/reviews/1-S1-prompt.md"
+
+    ordinary = gate.prompt_fix_card_body(p, step, 3, report)
+    assert "СПЕКА НЕ ГОТОВА" not in ordinary          # круг открыт не спекой
+    assert prompt_gate_line(ordinary).endswith("--risk high` → PASS 8/8."), ordinary
+
+    stale = gate.prompt_stale_card_body(p, step, STALE_DECISION, report)
+    assert prompt_gate_line(stale).endswith("--risk high` → `ИТОГ: PASS`.")
+    assert "«Спека»" in stale, "пересборка молчит о блоке, который обязан написать"
+
+
+def test_spec_card_puts_spec_section_before_forbids(project: Path):
+    """Стилистическая находка круга 2: «СПЕКА НЕ ГОТОВА» — выше «ЗАПРЕТОВ».
+
+    Круг открыт формой постановки, а не отчётом: первым действием карточка велит дописать
+    спеку, а не «прочитать отчёт и закрыть каждую блокирующую находку» — отчёта может не
+    быть вовсе, и исполнитель шёл в пустой документ.
+    """
+    write_high_stand(project)
+    cfg = config_mod.load(project)
+    p = gate.resolve_paths(cfg, "1")
+    step = next_step.build_package(cfg, "1")["next"]
+    body = gate.prompt_fix_card_body(p, step, 1, "docs/reviews/1-S1-prompt.md",
+                                     spec=["нет блока «Спека»"], max_rounds=6)
+    assert body.index("СПЕКА НЕ ГОТОВА") < body.index("ЗАПРЕТЫ"), body
+    first_action = body.split("ЧТО ДЕЛАТЬ", 1)[1].splitlines()[1]
+    assert "«Спека»" in first_action, first_action
+    assert "закрыть КАЖДУЮ блокирующую" not in body
+
+
+def test_gate_line_has_no_risk_flag_where_spec_is_not_required(project: Path, monkeypatch):
+    """`normal`-шаг и режим `hold`: флага нет — иначе C7 дал бы ложный FAIL спеки."""
+    write_high_stand(project)
+    spec_env(monkeypatch, project)
+    cfg = config_mod.load(project)
+    p = gate.resolve_paths(cfg, "1")
+    high = next_step.build_package(cfg, "1")["next"]
+    report = "docs/reviews/1-S1-prompt.md"
+
+    normal = dict(high, risk="normal")
+    for body in (gate.prompt_fix_card_body(p, normal, 2, report),
+                 gate.prompt_stale_card_body(p, normal, STALE_DECISION, report)):
+        assert "--risk high" not in prompt_gate_line(body), body
+
+    set_risk_gate(project, "hold")
+    p_hold = gate.resolve_paths(config_mod.load(project), "1")
+    for body in (gate.prompt_fix_card_body(p_hold, high, 2, report),
+                 gate.prompt_stale_card_body(p_hold, high, STALE_DECISION, report)):
+        assert "--risk high" not in prompt_gate_line(body), body
+    assert "«Спека»" not in gate.prompt_stale_card_body(p_hold, high, STALE_DECISION, report)
