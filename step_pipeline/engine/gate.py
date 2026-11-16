@@ -1095,9 +1095,19 @@ def load_findings(path, header: tuple = FINDINGS_HEADER,
     return parse_findings(read_findings_text(path), path, header, keys, **rules)
 
 
+def _id_hint(id_prefix: str, id_sep: str) -> str:
+    """Подсказка вида идентификатора для сообщений об ошибке (план 8, S5, §4.2).
+
+    Собирается из тех же `id_prefix`/`id_sep`, которыми функция присваивает ID: у вопросов
+    («Q» + «-») это `Q-N`, у находок («F» + «») — `F<число>`: писать `FN` было бы неправдой,
+    настоящие ID находок — `F1`, `F2`.
+    """
+    return f"{id_prefix}{id_sep}N" if id_sep else f"{id_prefix}<число>"
+
+
 def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
                    keys: tuple = FINDINGS_KEYS, *,
-                   id_re: re.Pattern = FINDING_ID_RE, id_hint: str = "F-N",
+                   id_re: re.Pattern = FINDING_ID_RE, id_prefix: str = "F", id_sep: str = "",
                    statuses: tuple = FINDING_STATUSES, kinds: tuple | None = FINDING_KINDS,
                    what: str = "реестр находок",
                    what_at: str = "реестре находок") -> list[dict]:
@@ -1107,9 +1117,14 @@ def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
 
     Шапка, ключи, вид идентификатора и словари — параметры (план 8, S5): файл вопросов
     разбирается ЭТИМ разбором, а не вторым, иначе два разбора одной таблицы разошлись бы
-    молча. `kinds=None` — таблица без классов (у вопросов класса нет).
+    молча. `kinds=None` — таблица без классов (у вопросов класса нет). Проверка идёт только
+    по тем колонкам, которые есть в `keys`: у таблицы без колонки «Статус» проверять нечего.
+
+    Идентификатор собирается из `id_prefix` и `id_sep` («F» + «» и «Q» + «-»), подсказка
+    в ошибке — из них же: `Q-N` у вопросов, `F<число>` у находок.
     """
     path = Path(path)
+    id_hint = _id_hint(id_prefix, id_sep)
     lines = str(text).splitlines()
     start = None
     for index, line in enumerate(lines):
@@ -1133,18 +1148,19 @@ def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
             raise GateError(f"{what}, строка {number}: ячеек {len(cells)}, "
                             f"нужно {len(header)}: {path}")
         item = dict(zip(keys, cells))
-        if not id_re.fullmatch(item["id"]):
-            raise GateError(f"{what}, строка {number}: идентификатор не вида {id_hint}: "
-                            f"{item['id']!r}: {path}")
-        if item["id"] in seen:
-            raise GateError(f"{what}: идентификатор {item['id']} повторяется: {path}")
+        if "id" in keys:
+            if not id_re.fullmatch(item["id"]):
+                raise GateError(f"{what}, строка {number}: идентификатор не вида {id_hint}: "
+                                f"{item['id']!r}: {path}")
+            if item["id"] in seen:
+                raise GateError(f"{what}: идентификатор {item['id']} повторяется: {path}")
+            seen.add(item["id"])
         if kinds and "kind" in item and item["kind"] not in kinds:
             raise GateError(f"{what}: класс {item['kind']!r} вне словаря "
                             f"({' | '.join(kinds)}): {path}")
-        if item["status"] not in statuses:
+        if "status" in keys and item["status"] not in statuses:
             raise GateError(f"{what}: статус {item['status']!r} вне словаря "
                             f"({' | '.join(statuses)}): {path}")
-        seen.add(item["id"])
         found.append(item)
     return found
 
@@ -1152,7 +1168,7 @@ def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
 def write_findings(path, findings: list[dict], header: tuple = FINDINGS_HEADER,
                    keys: tuple = FINDINGS_KEYS, title_kind: str = "плана",
                    title_prefix: str = "plan-", *, title: str = "",
-                   id_re: re.Pattern = FINDING_ID_RE, id_hint: str = "F-N",
+                   id_re: re.Pattern = FINDING_ID_RE, id_prefix: str = "F", id_sep: str = "",
                    statuses: tuple = FINDING_STATUSES,
                    kinds: tuple | None = FINDING_KINDS,
                    what: str = "реестр находок") -> Path:
@@ -1163,20 +1179,26 @@ def write_findings(path, findings: list[dict], header: tuple = FINDINGS_HEADER,
 
     `title` заменяет вычисленный заголовок: у файла вопросов он свой, а сборщик заголовка
     («Реестр находок …») в нём читался бы как второй вид файла.
+
+    Проверка идентификатора идёт только при колонке `id` в `keys`, статус — только при
+    колонке `status` (план 8, S5, §4.2): таблица без такой колонки не обязана их иметь.
     """
     path = Path(path)
+    id_hint = _id_hint(id_prefix, id_sep)
     rows = list(findings or [])
-    ids = [str(item.get("id") or "") for item in rows]
-    repeat = sorted({item for item in ids if ids.count(item) > 1})
-    if repeat:
-        raise GateError(f"{what}: идентификаторы повторяются: {', '.join(repeat)}: {path}")
-    for item, item_id in zip(rows, ids):
-        if not id_re.fullmatch(item_id):
-            raise GateError(f"{what}: идентификатор не вида {id_hint}: {item_id!r}: {path}")
-        if kinds and item.get("kind") not in kinds:
+    if "id" in keys:
+        ids = [str(item.get("id") or "") for item in rows]
+        repeat = sorted({item for item in ids if ids.count(item) > 1})
+        if repeat:
+            raise GateError(f"{what}: идентификаторы повторяются: {', '.join(repeat)}: {path}")
+        for item_id in ids:
+            if not id_re.fullmatch(item_id):
+                raise GateError(f"{what}: идентификатор не вида {id_hint}: {item_id!r}: {path}")
+    for item in rows:
+        if kinds and "kind" in item and item.get("kind") not in kinds:
             raise GateError(f"{what}: класс {item.get('kind')!r} вне словаря "
                             f"({' | '.join(kinds)}): {path}")
-        if item.get("status") not in statuses:
+        if "status" in keys and item.get("status") not in statuses:
             raise GateError(f"{what}: статус {item.get('status')!r} вне словаря "
                             f"({' | '.join(statuses)}): {path}")
     heading = title or _findings_title(path, title_kind, title_prefix)
@@ -1187,27 +1209,43 @@ def write_findings(path, findings: list[dict], header: tuple = FINDINGS_HEADER,
 
 def add_findings(path, items: list[dict], header: tuple = FINDINGS_HEADER,
                  keys: tuple = FINDINGS_KEYS, title_kind: str = "плана",
-                 title_prefix: str = "plan-") -> list[dict]:
-    """Добавить находки: ID присваивает функция — следующий свободный F-N по реестру.
+                 title_prefix: str = "plan-", *, title: str = "",
+                 id_re: re.Pattern = FINDING_ID_RE, id_prefix: str = "F", id_sep: str = "",
+                 statuses: tuple = FINDING_STATUSES, kinds: tuple | None = FINDING_KINDS,
+                 what: str = "реестр находок", what_at: str = "") -> list[dict]:
+    """Добавить строки реестра: ID присваивает функция — следующий свободный номер таблицы.
 
-    `status` по умолчанию `открыто`. Поле `id` во входных словарях игнорируется: иначе после
-    ручной правки файла в реестре появятся дубли, а ведущий реестра — не тот, кто считает.
+    У находок это `F<N>`, у вопросов шага (`id_prefix="Q"`, `id_sep="-"`) — `Q-N`; вид ID
+    ведёт тот же параметр, что у разбора, а не автор отчёта. Нумерация в отчётах сквозная
+    только внутри отчёта: автор каждой постановки пишет `Q1`, поэтому его номер — не ID
+    реестра (план 8, S5, ревью шага: вопрос второго шага терялся).
+
+    `status` по умолчанию — первый статус словаря (`открыто` у находок, `открыт` у
+    вопросов). Поле `id` во входных словарях игнорируется: иначе после ручной правки файла
+    в реестре появятся дубли, а ведущий реестра — не тот, кто считает.
     """
     path = Path(path)
-    current = load_findings(path, header, keys)
-    numbers = [int(FINDING_ID_RE.fullmatch(item["id"]).group(1)) for item in current]
+    rules = {"id_re": id_re, "id_prefix": id_prefix, "id_sep": id_sep,
+             "statuses": statuses, "kinds": kinds, "what": what}
+    if what_at:
+        rules["what_at"] = what_at
+    current = load_findings(path, header, keys, **rules)
+    numbers = [int(id_re.fullmatch(item["id"]).group(1)) for item in current if item.get("id")]
     next_number = max(numbers, default=0) + 1
+    default_status = str(statuses[0]) if statuses else "открыто"
     added: list[dict] = []
     for raw in items or []:
-        item = {"id": f"F{next_number}"}
+        item = {"id": f"{id_prefix}{id_sep}{next_number}"}
         for key in keys:
             if key != "id":
                 item[key] = str(raw.get(key) or "").strip()
-        item["status"] = str(raw.get("status") or "открыто").strip()
+        item["status"] = str(raw.get("status") or default_status).strip()
         added.append(item)
         next_number += 1
     result = current + added
-    write_findings(path, result, header, keys, title_kind, title_prefix)
+    write_findings(path, result, header, keys, title_kind, title_prefix, title=title,
+                   id_re=id_re, id_prefix=id_prefix, id_sep=id_sep, statuses=statuses,
+                   kinds=kinds, what=what)
     return result
 
 
@@ -1231,9 +1269,11 @@ def _question_rules() -> dict:
     """Правила разбора файла вопросов: тот же разбор, что у реестра находок (S5, п.1).
 
     Второго парсера таблицы нет: шапка, словарь статусов и вид идентификатора — параметры
-    `parse_findings`. Класса у вопроса нет, поэтому `kinds=None`.
+    `parse_findings`/`add_findings`. ID собирается из `id_prefix="Q"` и `id_sep="-"` —
+    теми же параметрами, что у находок («F» + «»); класса у вопроса нет, поэтому `kinds=None`.
     """
-    return {"id_re": QUESTION_ID_RE, "id_hint": "Q-N", "statuses": QUESTION_STATUSES,
+    return {"id_re": QUESTION_ID_RE, "id_prefix": "Q", "id_sep": "-",
+            "statuses": QUESTION_STATUSES,
             "kinds": None, "what": "файл вопросов", "what_at": "файле вопросов"}
 
 
@@ -1343,7 +1383,9 @@ def question_view(item: dict, asked_at=None, timeout: float = 0) -> dict:
             "recommend": recommend,
             "status": item.get("status") or "",
             "asked_at": _local_stamp(float(asked)) if asked is not None else "",
-            "deadline_at": _local_stamp(deadline) if deadline else ""}
+            # Нет рекомендации или таймаут выключен — ключ `null`, как в §4.8: панель читает
+            # его как `row.deadline_at || ""`, и «пусто» должно быть одним значением, а не двумя.
+            "deadline_at": _local_stamp(deadline) if deadline else None}
 
 
 def questions_view(ctx: dict) -> list[dict]:
@@ -1398,6 +1440,10 @@ def step_report_texts(p: Paths, step: dict, cards=()) -> list[str]:
     Источники — постановка, отчёт ревью постановки, отчёт ревью шага и результат каждой
     карточки шага. Чтение терпимое: нет файла или он не читается — вопроса из него просто
     нет, а тик не встаёт из-за отсутствия необязательного файла.
+
+    Карточки фильтруются по шагу: ключ `planloop:<план>:<шаг>:<вид>` (S5, ревью шага).
+    Результат карточки чужого шага — чужой отчёт, и вопрос из него завёл бы ложное ожидание
+    текущему шагу. Карточка без ключа источником не считается: у неё нет адреса шага.
     """
     texts: list[str] = []
     sid = step.get("id") or ""
@@ -1409,7 +1455,10 @@ def step_report_texts(p: Paths, step: dict, cards=()) -> list[str]:
             texts.append(Path(path).read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
+    prefix = f"planloop:{p.plan_id}:{sid}:"
     for card in cards or ():
+        if not str(card.get("key") or "").startswith(prefix):
+            continue
         texts.append(f"{card.get('result') or ''}\n{card.get('error') or ''}")
     return texts
 
@@ -1417,9 +1466,12 @@ def step_report_texts(p: Paths, step: dict, cards=()) -> list[str]:
 def register_questions(p: Paths, ctx: dict, state: dict | None = None) -> list[dict]:
     """Перенести строки вопросов из отчётов шага в файл вопросов (S5, п.2).
 
-    Идемпотентно: ID ведёт автор отчёта, страж только заводит недостающие строки со статусом
-    «открыт» и пишет время вопроса в состояние плана. Дубликат — пара «шаг + текст»: автор
-    мог повторить вопрос в двух отчётах или повторить тик. Битый файл вопросов — причина в
+    Идемпотентно: страж только заводит недостающие строки со статусом «открыт» и пишет
+    время вопроса в состояние плана. Дубликат — ровно пара «шаг + текст»: автор мог
+    повторить вопрос в двух отчётах или повторить тик. ID присваивает `add_findings`
+    (следующий свободный `Q-N` по файлу): нумерация в отчёте своя у каждого автора — каждая
+    постановка пишет `Q1`, — поэтому номер автора ID реестра не задаёт (ревью шага S5:
+    вопрос второго и следующих шагов молча терялся). Битый файл вопросов — причина в
     `ctx["step_questions_error"]`, второй файл молча не заводится.
     """
     step = ctx.get("next")
@@ -1428,21 +1480,23 @@ def register_questions(p: Paths, ctx: dict, state: dict | None = None) -> list[d
     sid = step.get("id") or ""
     path = plan_questions_path(p)
     current = load_questions(path)
-    known = {item["id"] for item in current}
     pairs = {(_question_pair_key(item)) for item in current}
-    added: list[dict] = []
+    fresh: list[dict] = []
     for text in step_report_texts(p, step, ctx.get("cards") or []):
         for parsed in parse_question_lines(text):
             item = dict(parsed, step=sid, status=QUESTION_OPEN, answer="")
             pair = _question_pair_key(item)
-            if parsed["id"] in known or pair in pairs:
+            if pair in pairs:
                 continue
-            known.add(parsed["id"])
             pairs.add(pair)
-            added.append({key: item.get(key) or "" for key in QUESTIONS_KEYS})
-    if not added:
+            fresh.append(item)
+    if not fresh:
         return []
-    write_questions(path, current + added, p.plan_id)
+    rules = _question_rules()
+    number = str(p.plan_id or "").strip()
+    title = f"# Вопросы плана {number}" if number else "# Вопросы шага"
+    rows = add_findings(path, fresh, QUESTIONS_HEADER, QUESTIONS_KEYS, title=title, **rules)
+    added = rows[len(current):]
     if not isinstance(state, dict):
         state = ctx.get("state") if isinstance(ctx.get("state"), dict) else load_state(p)
     stamps = state.get("questions")
@@ -1520,8 +1574,10 @@ def answer_question(cfg: config_mod.Config, plan_id, question_id, value, *,
     qid = question_id_of(question_id)
     if not qid:
         return {"ok": False, "message": f"номер вопроса не вида Q-N: {question_id!r}"}
-    value = " ".join(str(value or "").split())
-    if not value:
+    # Ответ пишется дословно (§4.4): нормализация схлопывала бы авторский текст, а ячейку
+    # от `|` и перевода строки защищает `findings_table`. Пустой ответ по-прежнему не ответ.
+    value = str(value or "")
+    if not value.strip():
         return {"ok": False, "message": f"нужен ответ: /answer {qid} <вариант>"}
     try:
         p = resolve_paths(cfg, str(plan_id) if plan_id else None)

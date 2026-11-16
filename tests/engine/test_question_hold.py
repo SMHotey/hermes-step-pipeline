@@ -130,6 +130,76 @@ def test_question_line_registers_once(project: Path, hermes_stub: Path, stand):
     assert len(rows_of(project)) == 1
 
 
+def test_second_step_question_gets_free_id(project: Path, hermes_stub: Path, stand):
+    """S5 п.2/ревью: номер `Q1` второй постановки не совпадает с ID — берётся новый ID.
+
+    Нумерация в отчётах своя у каждого автора: каждая постановка пишет `Q1`. Дубликат
+    считается парой (шаг, текст), поэтому вопрос шага S2 при уже закрытом `Q-1` шага S1
+    получает свободный номер и держит свой шаг.
+    """
+    cfg, p = stand
+    gate.write_questions(questions_file(project),
+                         [{"id": "Q-1", "step": "S1", "text": "какой лимит карточек",
+                           "options": "", "recommend": "", "status": "закрыт", "answer": "A"}],
+                         "1")
+    state = gate.load_state(p)
+    write_prompt(project, f"# Постановка S1\n\n{QUESTION_LINE}\n")
+    prompt = project / "docs" / "prompts" / "2026-11-16_1-S2_prompt.md"
+    prompt.write_text("# Постановка S2\n\nQ1: поднимать ли версию плагина — "
+                      "A) да, минор / B) нет (цена: релиз ждёт) — рекомендация A\n",
+                      encoding="utf-8")
+    ctx = {"next": {"id": "S2"}, "state": state, "cards": []}
+    added = gate.register_questions(p, ctx, state)
+
+    assert [(row["step"], row["text"], row["status"]) for row in added] == [
+        ("S2", "поднимать ли версию плагина", "открыт")]
+    rows = rows_of(project)
+    assert [(row["id"], row["step"], row["status"]) for row in rows] == [
+        ("Q-1", "S1", "закрыт"), ("Q-2", "S2", "открыт")]
+    assert rows[1]["recommend"] == "A"
+    # Решение того же тика видит новый вопрос: файл перечитан, а не «запомнен».
+    assert [item["id"] for item in ctx["step_questions"]] == ["Q-2"]
+    assert "Q-2" in (state.get("questions") or {})
+
+
+def test_foreign_step_card_question_not_registered(project: Path, hermes_stub: Path, stand):
+    """S5 п.2/ревью: вопрос из карточки чужого шага текущему шагу не заводится."""
+    cfg, p = stand
+    state = gate.load_state(p)
+    ctx = {"next": {"id": "S1"}, "state": state, "cards": [
+        {"key": "planloop:1:S2:step",
+         "result": "Q7: старый вопрос шага S2 — A) да / B) нет — рекомендация A"},
+        {"key": "planloop:1:S1:step",
+         "result": "Q8: вопрос текущего шага — A) да / B) нет — рекомендация A"},
+    ]}
+    added = gate.register_questions(p, ctx, state)
+
+    assert [(row["step"], row["text"]) for row in added] == [("S1", "вопрос текущего шага")]
+    assert [(row["id"], row["step"]) for row in rows_of(project)] == [("Q-1", "S1")]
+
+
+def test_registry_skips_columns_absent_in_keys(tmp_path: Path):
+    """S5 §4.2: проверки `id`/`status` идут только по колонкам, которые есть в `keys`.
+
+    Третья таблица того же разбора может не иметь статуса вовсе — это «проверки нет»,
+    а не `KeyError` и не отказ записи.
+    """
+    path = tmp_path / "registry.md"
+    header, keys = ("ID", "Текст"), ("id", "text")
+    gate.write_findings(path, [{"id": "F1", "text": "что-то"}], header, keys,
+                        title="# Реестр без статуса")
+    assert gate.load_findings(path, header, keys) == [{"id": "F1", "text": "что-то"}]
+    # Присвоение ID идёт теми же параметрами, что разбор: у вопросов это `Q-N`.
+    gate.write_questions(path, [{"id": "Q-1", "step": "S1", "text": "т", "status": "закрыт",
+                                 "options": "", "recommend": "", "answer": ""}], "7")
+    added = gate.add_findings(path, [{"step": "S2", "text": "второй"}],
+                              gate.QUESTIONS_HEADER, gate.QUESTIONS_KEYS,
+                              title="# Вопросы плана 7",
+                              **gate._question_rules())
+    assert [row["id"] for row in added] == ["Q-1", "Q-2"]
+    assert added[1]["status"] == "открыт"
+
+
 def test_open_question_holds_step(project: Path, hermes_stub: Path, stand):
     """S5 п.3: ожидание с номером вопроса в причине, `hold_steps` пуст."""
     cfg, p = stand
@@ -367,15 +437,17 @@ def test_notice_not_oftener_than_hour(project: Path, hermes_stub: Path, stand, m
 def test_free_text_answer_and_empty_variants(project: Path, hermes_stub: Path, stand):
     """S5 п.2/4: вопрос без вариантов валиден, ответ приходит свободным текстом."""
     cfg, p = stand
-    write_prompt(project, "# Постановка S1\n\nQ3: как оформляем отчёт — рекомендации нет\n")
+    # Авторский номер в отчёт — не ID реестра (ID присваивает страж), поэтому `Q1` в постановке
+    # и `Q-1` в файле: строка проверяет вопрос без вариантов и свободный ответ.
+    write_prompt(project, "# Постановка S1\n\nQ1: как оформляем отчёт — рекомендации нет\n")
     res = tick(p)
     row = rows_of(project)[0]
-    assert row["id"] == "Q-3" and row["options"] == "" and row["recommend"] == ""
+    assert row["id"] == "Q-1" and row["options"] == "" and row["recommend"] == ""
     assert "рекомендации нет" in res["decision"]["reason"]
     # Автовыбора у такого вопроса не будет, поэтому и дедлайна в панели нет (S5, п.4.8).
-    assert res["questions"][0]["asked_at"] and res["questions"][0]["deadline_at"] == ""
+    assert res["questions"][0]["asked_at"] and res["questions"][0]["deadline_at"] is None
 
-    answer = gate.handle_command(cfg, "/answer Q-3 делаем по-своему")
+    answer = gate.handle_command(cfg, "/answer Q-1 делаем по-своему")
     assert "закрыт" in answer
     assert rows_of(project)[0]["status"] == "закрыт"
     assert rows_of(project)[0]["answer"] == "делаем по-своему"
