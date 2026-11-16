@@ -56,7 +56,9 @@ ACTION_LABELS = {"create_step": "шаг", "create_prompt": "постановка
                  "create_fix": "правки", "create_rereview": "ревью", "close_step": "журнал",
                  "idle": "ждёт", "stop": "стоп", "retry_pending": "довыкладка",
                  "hold_risk": "ручной допуск", "create_prompt_review": "ревью постановки",
-                 "create_prompt_fix": "переписывание постановки", "tg_dialog": "диалог в Telegram"}
+                 "create_prompt_fix": "переписывание постановки", "tg_dialog": "диалог в Telegram",
+                 # Вопросы шага (8-S5): ожидание и автовыбор рекомендации по таймауту.
+                 "question": "ждёт ответа", "question_auto": "автоответ по таймауту"}
 
 # ─── лента действий (план 3 S9): история тиков из `state/history.jsonl` ───
 HISTORY_FILE = "history.jsonl"      # файл истории пишет страж, панель только читает
@@ -1503,6 +1505,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         "decision": None,
         "status": "",
         "metrics": {},
+        "questions": [],
         "cycle": {},
         "events": {"rows": [], "total": 0, "bad": 0, "limit": EVENTS_LIMIT, "note": ""},
         "progress": {},
@@ -1531,6 +1534,9 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         out["decision"] = decision.get("decision") or {}
         out["status"] = decision.get("status") or ""
         out["metrics"] = decision.get("metrics") or {}
+        # Открытые вопросы шага (8-S5) приходят тем же ответом `--status`: окно с кнопками
+        # в панели и дедлайн автовыбора считает движок, а не страница.
+        out["questions"] = decision.get("questions") or []
         # Пауза по расписанию (0.28.2) приходит тем же ответом `--status`: своего запуска
         # движка у неё нет. Ключ называется `quiet_hours`, а не `pause`: `pause` в снимке —
         # глобальная пауза панели (projects.json), это другая вещь.

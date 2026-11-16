@@ -231,6 +231,72 @@ def test_hold_without_step_is_error(server):
     assert status == 400 and not data["ok"]
 
 
+def write_questions(root: Path, rows: list[str]) -> Path:
+    """Файл вопросов плана 1 в проекте панели: шапка нормативна (план 8, S5)."""
+    path = root / "docs" / "reviews" / "plan-1-questions.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# Вопросы плана 1\n\n"
+                    "| ID | Шаг | Вопрос | Варианты | Рекомендация | Статус | Ответ |\n"
+                    "|---|---|---|---|---|---|---|\n" + "\n".join(rows) + "\n", encoding="utf-8")
+    return path
+
+
+def test_answer_action_closes_question(server):
+    """Действие `answer` панели (8-S5): ответ пишется тем же путём, что у `/answer`."""
+    root = server["root"]
+    write_questions(root, ["| Q-1 | S1 | какой лимит карточек | A) две / B) три | A | открыт |  |"])
+    status, data = post(server["url"], {"action": "answer", "plan": "1",
+                                        "question": "Q-1", "value": "B"})
+    assert status == 200 and data["ok"], data
+    assert "вопрос Q-1 закрыт" in data["stdout"]
+    text = (root / "docs" / "reviews" / "plan-1-questions.md").read_text(encoding="utf-8")
+    assert "| закрыт |" in text and "B" in text
+
+
+def test_answer_action_needs_question_and_value(server):
+    """Действие `answer` без номера или без варианта — ошибка панели, файл не тронут."""
+    status, data = post(server["url"], {"action": "answer", "plan": "1", "question": "Q-1"})
+    assert status == 400 and not data["ok"]
+    assert data["error"] == "нужен вопрос и вариант"
+    assert not (server["root"] / "docs" / "reviews" / "plan-1-questions.md").exists()
+
+
+def test_snapshot_carries_questions_with_deadline(server):
+    """Снимок несёт `questions` (8-S5): варианты, рекомендация и дедлайн автовыбора.
+
+    Дедлайн считает движок из `asked_at` в состоянии плана: времени вопроса в файле
+    вопросов нет, поэтому одно другого не подменяет.
+    """
+    root = server["root"]
+    write_questions(root, ["| Q-1 | S1 | какой лимит карточек | A) две / B) три | A | открыт |  |"])
+    asked = 1_700_000_000
+    state_path = root / ".pipeline" / "state" / "plan_1_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
+    state["questions"] = {"Q-1": {"asked_at": asked}}
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    status, data = get(server["url"] + "/api/snapshot?plan=1")
+    assert status == 200 and data["ok"], data
+    rows = data["questions"]
+    assert [row["id"] for row in rows] == ["Q-1"] and rows[0]["step"] == "S1"
+    assert [option["letter"] for option in rows[0]["options"]] == ["A", "B"]
+    assert rows[0]["recommend"] == "A" and rows[0]["status"] == "открыт"
+    assert rows[0]["asked_at"] and rows[0]["deadline_at"]
+
+
+def test_answer_in_preview_is_refused(tmp_path: Path, hermes_stub: Path):
+    """Предпросмотр: окно вопроса действие `answer` не проводит, файл вопросов цел (8-S5)."""
+    root = install_project(tmp_path / "ui-preview-answer", board="uiboard")
+    path = write_questions(root, ["| Q-1 | S1 | какой лимит карточек | A) две / B) три | A | "
+                                  "открыт |  |"])
+    before = path.read_bytes()
+    with running(root, preview=True) as (url, _httpd):
+        status, data = post(url, {"action": "answer", "plan": "1", "question": "Q-1", "value": "B"})
+    assert status == 400 and "предпросмотр" in data["error"], data
+    assert path.read_bytes() == before
+
+
 def test_save_config(server):
     status, data = post(server["url"], {"action": "save_config", "config": {
         "board": "newboard", "driven_plans": "1,2", "require_prompt": False,

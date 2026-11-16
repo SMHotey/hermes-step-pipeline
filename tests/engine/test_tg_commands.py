@@ -60,6 +60,14 @@ def update(text: str, chat: str = CHAT, uid: int = 1, user: int | None = None) -
 def test_help_lists_commands(cfg):
     answer = gate.handle_command(cfg, "/help")
     assert "/status" in answer and "/stop" in answer and "/resume" in answer
+    assert "/answer" in answer
+
+
+def test_answer_without_arguments_shows_form(cfg):
+    """`/answer` без варианта объясняет форму, а не падает (S5, п.4)."""
+    answer = gate.handle_command(cfg, "/answer")
+    assert "/answer Q-1" in answer
+    assert "/answer Q-1" in gate.TG_HELP
 
 
 def test_bot_suffix_in_command_is_stripped(cfg):

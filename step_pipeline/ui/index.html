@@ -170,6 +170,14 @@
       border: 1px solid var(--line); background: var(--bg); color: var(--text); font-size: 13px; }
   /* Правка конфигурации (S7): дифф перед сохранением, заметки и отказ валидации. */
   .config-preview { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+  /* Вопрос шага (8-S5): окно с вариантами ответа; в предпросмотре кнопки неактивны. */
+  .question { border-top: 1px solid var(--line); padding: 10px 0; }
+  .question .row1 { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .question-text { margin: 6px 0; }
+  .question-options { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  .question-free { display: flex; gap: 8px; align-items: center; }
+  .question-free input { flex: 1; }
+  #questions-hint { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
   .config-preview-head { display: flex; justify-content: space-between; gap: 10px;
                          font-size: 12px; color: var(--muted); margin-bottom: 6px; }
   #config-diff { background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
@@ -809,6 +817,16 @@
   <button type="button" id="close-hotkeys">Закрыть</button>
 </dialog>
 
+<!-- Вопрос шага (8-S5): окно выбора. Ответ уходит POST /api/action `answer` — тем же путём,
+     что `/answer` в чате и адресная команда движка; в предпросмотре кнопки неактивны. -->
+<dialog id="question-dialog" aria-label="Вопрос по шагу плана">
+  <h2 style="margin-top:0">Нужен ответ по шагу</h2>
+  <div id="questions-hint">Вопрос держит шаг до ответа. Если не ответить, будет принята
+    рекомендация — как `/answer` в чате.</div>
+  <div id="question-dialog-body"></div>
+  <form method="dialog"><button type="submit">Позже</button></form>
+</dialog>
+
 <script>
 const $ = (id) => document.getElementById(id);
 // Метка панели уходит на оба POST-маршрута: тумблер требует её сегодня, действия — когда её
@@ -870,6 +888,7 @@ function act(action, payload = {}) {
 function actionLabel(action) {
   return {tick: "Тик", stop: "Стоп", resume: "Продолжить",
           hold: "Допуск", unhold: "Снят допуск", update: "Обновление",
+          answer: "Ответ на вопрос",
           plan_fix: "Круг правок плана",
           pause_all: "Остановка после шага", resume_all: "Запуск всех",
           autostart: "Автозагрузка",
@@ -2380,6 +2399,91 @@ function gotoSighting(plan, step) {
   refresh();
 }
 
+// ── вопросы шага (8-S5): окно с вариантами, ответ — POST /api/action `answer` ──
+// Окно открывается из refresh() на новый набор вопросов: закрытое владельцем не всплывает
+// на каждом обновлении, но новый вопрос (или новый дедлайн) открывает его снова.
+// В предпросмотре окно не открывается вовсе: действия там запрещены.
+let questionsShown = "";
+
+function questionMinutes(row) {
+  // «осталось N мин» — от дедлайна автовыбора; без рекомендации дедлайна нет.
+  const until = Date.parse(row.deadline_at || "");
+  if (!until) return "";
+  const left = Math.round((until - Date.now()) / 60000);
+  return left > 0 ? `осталось ${left} мин` : "дедлайн автовыбора прошёл";
+}
+
+function answerQuestion(qid, value) {
+  if (window.__preview) { toast("предпросмотр только читает", true); return; }
+  const answer = String(value || "").trim();
+  if (!answer) { toast("нужен вариант или свой ответ", true); return; }
+  const dialog = $("question-dialog");
+  act("answer", {question: qid, value: answer, plan: planIdOf()})
+    .then(() => { questionsShown = ""; if (dialog && dialog.open) dialog.close(); });
+}
+
+function renderQuestions(rows) {
+  const box = $("question-dialog-body");
+  const dialog = $("question-dialog");
+  if (!box || !dialog) return;
+  if (!rows.length) {
+    box.innerHTML = "";
+    if (dialog.open) dialog.close();
+    return;
+  }
+  const preview = Boolean(window.__preview);
+  box.innerHTML = rows.map((q) => {
+    const options = (q.options || []).map((opt) => `
+      <button type="button" data-answer="${esc(q.id)}"
+              data-value="${esc(opt.letter || opt.text)}" ${preview ? "disabled" : ""}
+              title="${esc(opt.text)}">${esc((opt.letter ? opt.letter + ") " : "") + opt.text)}</button>`
+    ).join(" ");
+    const rec = q.recommend
+      ? `рекомендация: ${esc(q.recommend)}`
+      : "рекомендации нет — автовыбора не будет";
+    const left = questionMinutes(q);
+    return `
+      <div class="question" data-question="${esc(q.id)}">
+        <div class="row1"><span class="pill wait">${esc(q.id)}</span>
+          <span>· шаг ${esc(q.step)}</span>
+          ${left ? `<span class="muted">· ${esc(left)}</span>` : ""}</div>
+        <div class="question-text">${esc(q.text)}</div>
+        ${q.options_text ? `<div class="muted mono">${esc(q.options_text)}</div>` : ""}
+        <div class="question-options">${options}</div>
+        <div class="question-free">
+          <input type="text" data-answer-input="${esc(q.id)}" placeholder="свой ответ"
+                 ${preview ? "disabled" : ""}>
+          <button type="button" data-answer-send="${esc(q.id)}"
+                  ${preview ? "disabled" : ""}>Ответить</button>
+        </div>
+        <div class="muted">${rec}</div>
+      </div>`;
+  }).join("");
+  box.querySelectorAll("[data-answer]").forEach((btn) => {
+    btn.onclick = () => answerQuestion(btn.dataset.answer, btn.dataset.value);
+  });
+  box.querySelectorAll("[data-answer-send]").forEach((btn) => {
+    btn.onclick = () => {
+      const input = box.querySelector(`[data-answer-input="${btn.dataset.answerSend}"]`);
+      answerQuestion(btn.dataset.answerSend, input ? input.value : "");
+    };
+  });
+}
+
+// Окно открывается один раз на набор «вопрос + дедлайн»: закрытое владельцем не всплывает
+// на каждом обновлении, а новый вопрос или новый дедлайн открывает его снова.
+// В предпросмотре окно не открывается вовсе — действия там запрещены.
+function showQuestionDialog(rows) {
+  const dialog = $("question-dialog");
+  if (!dialog) return;
+  if (window.__preview || !rows.length) return;
+  const key = rows.map((q) => q.id + ":" + (q.deadline_at || "")).join("|");
+  if (key === questionsShown) return;
+  questionsShown = key;
+  renderQuestions(rows);
+  if (!dialog.open) dialog.showModal();
+}
+
 function render(data) {
   $("project").textContent = data.project || "—";
   $("board").textContent = "борда: " + (data.board || "—");
@@ -2624,6 +2728,7 @@ async function refresh() {
   if (!data.ok) { toast(data.error || "не удалось получить состояние", true); return; }
   etag = res.headers.get("ETag") || etag;
   render(data);
+  showQuestionDialog(data.questions || []);
   if (!data.errors || !data.errors.length) {
     // форма настроек заполняется один раз — не перетираем ввод пользователя
     if (!window.__configLoaded) {

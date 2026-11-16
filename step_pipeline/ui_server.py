@@ -22,7 +22,7 @@
     POST /api/setup        один шаг мастера: {"step": ..., "values": {...}},
                            заголовок X-Pipeline-Panel; токен уходит в .env профиля
                            и обратно в браузер не возвращается
-    POST /api/action       действия: tick, stop, resume, hold, unhold,
+    POST /api/action       действия: tick, stop, resume, hold, unhold, answer,
                            pause_all, resume_all, autostart,
                            preview_config, save_config, revert_config,
                            save_telegram, test_telegram
@@ -373,6 +373,21 @@ def act_unhold(state: State, payload: dict) -> dict:
     plan = str(payload.get("plan") or "").strip()
     extra = ["--plan", plan] if plan else []
     return _run_engine(state, "--unhold", step, *extra)
+
+
+def act_answer(state: State, payload: dict) -> dict:
+    """Ответ на вопрос шага из окна панели (8-S5): тот же путь, что `/answer` и CLI.
+
+    Движок зовётся адресно (`--plan`): окно может быть открыто по соседнему плану, а
+    ответ без номера записался бы плану по умолчанию — второй путь к тому же состоянию.
+    """
+    question = str(payload.get("question") or "").strip()
+    value = str(payload.get("value") or "").strip()
+    if not question or not value:
+        return {"ok": False, "error": "нужен вопрос и вариант"}
+    plan = str(payload.get("plan") or "").strip()
+    extra = ["--plan", plan] if plan else []
+    return _run_engine(state, "--answer", question, value, *extra)
 
 
 # ── глобальная пауза и автозагрузка: жесты на всю панель, а не на проект ──
@@ -1062,6 +1077,7 @@ ACTIONS = {
     "resume": act_resume,
     "hold": act_hold,
     "unhold": act_unhold,
+    "answer": act_answer,
     "plan_fix": act_plan_fix,
     "pause_all": act_pause_all,
     "resume_all": act_resume_all,

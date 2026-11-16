@@ -277,6 +277,37 @@ FINDING_ID_RE = re.compile(r"F(\d+)")
 FINDINGS_KEYS = ("id", "step", "kind", "text", "action", "status")
 PROMPT_FINDINGS_HEADER = ("ID", "Класс", "Находка", "Что сделать", "Статус")
 PROMPT_FINDINGS_KEYS = ("id", "kind", "text", "action", "status")
+# Вопросы шага (план 8, S5): своя таблица того же механизма, что реестр находок, и своей
+# шапки. Файл — `docs/reviews/plan-<N>-questions.md`; ID вида `Q-N`, статусы из двух слов.
+# Вопрос закрывает владелец (ответ, `/answer`, окно панели или автовыбор рекомендации),
+# поэтому реестр находок и файл вопросов не смешиваются: вердикт ревью плана считается по
+# находкам, а вопрос вердикт не двигает.
+QUESTIONS_HEADER = ("ID", "Шаг", "Вопрос", "Варианты", "Рекомендация", "Статус", "Ответ")
+QUESTIONS_KEYS = ("id", "step", "text", "options", "recommend", "status", "answer")
+QUESTION_STATUSES = ("открыт", "закрыт")
+QUESTION_OPEN, QUESTION_CLOSED = "открыт", "закрыт"
+QUESTION_ID_RE = re.compile(r"Q-(\d+)")
+# Строка вопроса в отчёте карточки (постановка, ревью, исполнение):
+#   `Q1: <вопрос> — A) <вариант> (цена) / B) <вариант> (цена) — рекомендация A`
+# Маркер списка перед `Q` допускается: отчёт — markdown, автор пишет пунктом.
+QUESTION_LINE_RE = re.compile(r"^\s*(?:[-*+]\s*)?Q-?\s*(\d+)\s*:\s*(?P<body>\S.*)$")
+# Разделитель «вопрос — варианты»: длинное тире, короткое и дефис. Автор пишет по-разному,
+# а строка вопроса — не место для спора об оформлении.
+QUESTION_DASH_RE = re.compile(r"\s+[—–-]{1,2}\s+")
+# Вариант с ценой: буква, скобка, текст. Буквы латинские и кириллические (`А)`, `Б)`),
+# но только буквы вариантов: иначе «и.т.д.» в тексте варианта стало бы вариантом.
+QUESTION_OPTION_RE = re.compile(r"(?<![А-Яа-яA-Za-z])([ABCDАБВГ])\s*[)\.]\s*")
+# Рекомендация — буква варианта; «рекомендации нет» — явный отказ от автовыбора.
+QUESTION_RECOMMEND_RE = re.compile(r"рекомендац\w*\s*:?\s*([А-Яа-яA-Za-z])(?![А-Яа-яA-Za-z])")
+QUESTION_NO_RECOMMEND_RE = re.compile(r"рекомендац\w*\s*(?:нет|отсутствует|—|-|:?\s*$)", re.I)
+# Автовыбор рекомендации по таймауту (план 8, S5 п.5): секунды, 0 — выключить. Время вопроса
+# живёт в состоянии плана (`questions: {"Q-1": {"asked_at", "notified_at"}}`), а не в
+# таблице: шапка файла остаётся нормативной.
+ANSWER_TIMEOUT_DEFAULT = 300
+AUTO_ANSWER_NOTE = "авто: рекомендация по таймауту"
+# Напоминание о вопросе — не чаще раза в час: тот же порядок, что у тревог и сторожа.
+QUESTION_NOTICE_GAP = 3600
+
 # Постановка следующего шага и ревью постановки (план 2, S6): отметка свежести recon
 # и что считать расхождением постановки с кодом.
 RECON_RE = re.compile(r"recon_commit\s*[:=]\s*`?([0-9a-f]{7,40})", re.IGNORECASE)
@@ -1047,7 +1078,7 @@ def read_findings_text(path) -> str:
 
 
 def load_findings(path, header: tuple = FINDINGS_HEADER,
-                  keys: tuple = FINDINGS_KEYS) -> list[dict]:
+                  keys: tuple = FINDINGS_KEYS, **rules) -> list[dict]:
     """Прочитать реестр находок. Файла нет — `[]` (норма, как у `load_state`).
 
     Битый файл — `GateError`, а не пустой список: молча вернуть `[]` значило бы «открытых
@@ -1056,16 +1087,27 @@ def load_findings(path, header: tuple = FINDINGS_HEADER,
     Единственное правило блокирования, общее для S2 и S3: блокирует только статус — находка
     со статусом `открыто` блокирует вердикт, `закрыто` и `не блокирует` — нет. Класс ничего
     не блокирует: он выбирает маршрут находки (S3).
+
+    `**rules` уходит в `parse_findings`: файл вопросов (план 8, S5) разбирается этим же
+    разбором с другой шапкой, другими словарями и своим видом идентификатора.
     """
     path = Path(path)
-    return parse_findings(read_findings_text(path), path, header, keys)
+    return parse_findings(read_findings_text(path), path, header, keys, **rules)
 
 
 def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
-                   keys: tuple = FINDINGS_KEYS) -> list[dict]:
+                   keys: tuple = FINDINGS_KEYS, *,
+                   id_re: re.Pattern = FINDING_ID_RE, id_hint: str = "F-N",
+                   statuses: tuple = FINDING_STATUSES, kinds: tuple | None = FINDING_KINDS,
+                   what: str = "реестр находок",
+                   what_at: str = "реестре находок") -> list[dict]:
     """Разобрать текст реестра; `path` — только для сообщений об ошибке.
 
     Правила те же, что были у чтения: пустой текст — `[]`, нет шапки — `GateError`.
+
+    Шапка, ключи, вид идентификатора и словари — параметры (план 8, S5): файл вопросов
+    разбирается ЭТИМ разбором, а не вторым, иначе два разбора одной таблицы разошлись бы
+    молча. `kinds=None` — таблица без классов (у вопросов класса нет).
     """
     path = Path(path)
     lines = str(text).splitlines()
@@ -1077,7 +1119,7 @@ def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
     if start is None:
         if not text.strip():
             return []
-        raise GateError("в реестре находок нет шапки таблицы "
+        raise GateError(f"в {what_at} нет шапки таблицы "
                         f"`| {' | '.join(header)} |`: {path}")
     found: list[dict] = []
     seen: set[str] = set()
@@ -1088,20 +1130,20 @@ def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
         if all(cell and set(cell) <= set("-: ") for cell in cells):
             continue                                   # строка-разделитель
         if len(cells) != len(header):
-            raise GateError(f"реестр находок, строка {number}: ячеек {len(cells)}, "
+            raise GateError(f"{what}, строка {number}: ячеек {len(cells)}, "
                             f"нужно {len(header)}: {path}")
         item = dict(zip(keys, cells))
-        if not FINDING_ID_RE.fullmatch(item["id"]):
-            raise GateError(f"реестр находок, строка {number}: идентификатор не вида F-N: "
+        if not id_re.fullmatch(item["id"]):
+            raise GateError(f"{what}, строка {number}: идентификатор не вида {id_hint}: "
                             f"{item['id']!r}: {path}")
         if item["id"] in seen:
-            raise GateError(f"реестр находок: идентификатор {item['id']} повторяется: {path}")
-        if item["kind"] not in FINDING_KINDS:
-            raise GateError(f"реестр находок: класс {item['kind']!r} вне словаря "
-                            f"({' | '.join(FINDING_KINDS)}): {path}")
-        if item["status"] not in FINDING_STATUSES:
-            raise GateError(f"реестр находок: статус {item['status']!r} вне словаря "
-                            f"({' | '.join(FINDING_STATUSES)}): {path}")
+            raise GateError(f"{what}: идентификатор {item['id']} повторяется: {path}")
+        if kinds and "kind" in item and item["kind"] not in kinds:
+            raise GateError(f"{what}: класс {item['kind']!r} вне словаря "
+                            f"({' | '.join(kinds)}): {path}")
+        if item["status"] not in statuses:
+            raise GateError(f"{what}: статус {item['status']!r} вне словаря "
+                            f"({' | '.join(statuses)}): {path}")
         seen.add(item["id"])
         found.append(item)
     return found
@@ -1109,28 +1151,36 @@ def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
 
 def write_findings(path, findings: list[dict], header: tuple = FINDINGS_HEADER,
                    keys: tuple = FINDINGS_KEYS, title_kind: str = "плана",
-                   title_prefix: str = "plan-") -> Path:
+                   title_prefix: str = "plan-", *, title: str = "",
+                   id_re: re.Pattern = FINDING_ID_RE, id_hint: str = "F-N",
+                   statuses: tuple = FINDING_STATUSES,
+                   kinds: tuple | None = FINDING_KINDS,
+                   what: str = "реестр находок") -> Path:
     """Записать реестр целиком: порядок находок сохраняется, дубль ID — ошибка.
 
     Запись атомарная (`state_io.atomic_write_text`): kill посреди записи оставляет прежний
     реестр целым, а не обрезанным на середине таблицы.
+
+    `title` заменяет вычисленный заголовок: у файла вопросов он свой, а сборщик заголовка
+    («Реестр находок …») в нём читался бы как второй вид файла.
     """
     path = Path(path)
     rows = list(findings or [])
     ids = [str(item.get("id") or "") for item in rows]
     repeat = sorted({item for item in ids if ids.count(item) > 1})
     if repeat:
-        raise GateError(f"реестр находок: идентификаторы повторяются: {', '.join(repeat)}: {path}")
+        raise GateError(f"{what}: идентификаторы повторяются: {', '.join(repeat)}: {path}")
     for item, item_id in zip(rows, ids):
-        if not FINDING_ID_RE.fullmatch(item_id):
-            raise GateError(f"реестр находок: идентификатор не вида F-N: {item_id!r}: {path}")
-        if item.get("kind") not in FINDING_KINDS:
-            raise GateError(f"реестр находок: класс {item.get('kind')!r} вне словаря "
-                            f"({' | '.join(FINDING_KINDS)}): {path}")
-        if item.get("status") not in FINDING_STATUSES:
-            raise GateError(f"реестр находок: статус {item.get('status')!r} вне словаря "
-                            f"({' | '.join(FINDING_STATUSES)}): {path}")
-    state_io.atomic_write_text(path, "\n".join([_findings_title(path, title_kind, title_prefix), ""]
+        if not id_re.fullmatch(item_id):
+            raise GateError(f"{what}: идентификатор не вида {id_hint}: {item_id!r}: {path}")
+        if kinds and item.get("kind") not in kinds:
+            raise GateError(f"{what}: класс {item.get('kind')!r} вне словаря "
+                            f"({' | '.join(kinds)}): {path}")
+        if item.get("status") not in statuses:
+            raise GateError(f"{what}: статус {item.get('status')!r} вне словаря "
+                            f"({' | '.join(statuses)}): {path}")
+    heading = title or _findings_title(path, title_kind, title_prefix)
+    state_io.atomic_write_text(path, "\n".join([heading, ""]
                                                + findings_table(rows, header, keys)) + "\n")
     return path
 
@@ -1159,6 +1209,446 @@ def add_findings(path, items: list[dict], header: tuple = FINDINGS_HEADER,
     result = current + added
     write_findings(path, result, header, keys, title_kind, title_prefix)
     return result
+
+
+# ───────────────────── вопросы шага (план 8, S5) ─────────────────────
+# Вопрос шага — повод ожидания, который читается из файла, а не из `hold_steps` (допущение 6):
+# ручной допуск владелец ставит жестом, а вопрос задаёт автор отчёта (постановка, ревью,
+# исполнение). Ответ закрывает вопрос, и повод исчезает; `hold_released` не пополняется.
+
+def plan_questions_path(p: Paths) -> Path:
+    """Файл вопросов шага: рядом с отчётом ревью плана, `plan-N-questions.md` (допущение 4)."""
+    report = plan_review_path(p)
+    return report.with_name(f"{report.stem}-questions.md")
+
+
+def plan_questions_rel(p: Paths) -> str:
+    """Путь файла вопросов для текстов карточек и уведомлений: относительный, не полный."""
+    return p.cfg.rel(plan_questions_path(p))
+
+
+def _question_rules() -> dict:
+    """Правила разбора файла вопросов: тот же разбор, что у реестра находок (S5, п.1).
+
+    Второго парсера таблицы нет: шапка, словарь статусов и вид идентификатора — параметры
+    `parse_findings`. Класса у вопроса нет, поэтому `kinds=None`.
+    """
+    return {"id_re": QUESTION_ID_RE, "id_hint": "Q-N", "statuses": QUESTION_STATUSES,
+            "kinds": None, "what": "файл вопросов", "what_at": "файле вопросов"}
+
+
+def load_questions(path) -> list[dict]:
+    """Прочитать файл вопросов. Файла нет — `[]` (норма); битый — `GateError`."""
+    return load_findings(path, QUESTIONS_HEADER, QUESTIONS_KEYS, **_question_rules())
+
+
+def write_questions(path, rows: list[dict], plan_id: str = "") -> Path:
+    """Записать файл вопросов целиком: шапка нормативна, время вопроса — в состоянии плана."""
+    rules = _question_rules()
+    rules.pop("what_at", None)
+    number = str(plan_id or "").strip()
+    title = f"# Вопросы плана {number}" if number else "# Вопросы шага"
+    return write_findings(path, rows, QUESTIONS_HEADER, QUESTIONS_KEYS, title=title, **rules)
+
+
+def question_id_of(value) -> str:
+    """Идентификатор вопроса из записи автора или команды: «Q1», «q-2» → `Q-1`, `Q-2`."""
+    text = str(value or "").strip().upper().replace(" ", "")
+    match = QUESTION_ID_RE.fullmatch(text) or re.fullmatch(r"Q(\d+)", text)
+    return f"Q-{int(match.group(1))}" if match else ""
+
+
+def question_options(options) -> list[dict]:
+    """Варианты вопроса списком: `[{"letter": "A", "text": "…"}]` — для кнопок панели.
+
+    Оформление автора («A) … / B) …») разбирается здесь, а не в разметке: у панели и у
+    текста уведомления один источник вариантов. Вариантов может не быть вовсе — тогда и
+    кнопок нет, ответ приходит свободным текстом.
+    """
+    text = str(options or "").strip()
+    if not text:
+        return []
+    marks = list(QUESTION_OPTION_RE.finditer(text))
+    if not marks:
+        return [{"letter": "", "text": part.strip()}
+                for part in re.split(r"\s*/\s*", text) if part.strip()]
+    rows: list[dict] = []
+    for pos, mark in enumerate(marks):
+        end = marks[pos + 1].start() if pos + 1 < len(marks) else len(text)
+        chunk = text[mark.end():end].strip(" /;,").strip("—–-").strip()
+        rows.append({"letter": mark.group(1).upper(), "text": chunk})
+    return rows
+
+
+def parse_question_line(line: str) -> dict | None:
+    """Строка вопроса из отчёта карточки (S5, п.2); `None` — строка вопросом не является.
+
+    Форма: `Q<N>: <вопрос> — A) <вариант> (цена) / B) <вариант> (цена) — рекомендация <буква>`.
+    Разбор терпим к автору: вариантов может не быть (вопрос со свободным ответом), а
+    «рекомендации нет» даёт пустую рекомендацию — автовыбора по такому вопросу не будет.
+    """
+    match = QUESTION_LINE_RE.match(str(line or ""))
+    if not match:
+        return None
+    body = match.group("body").replace("`", "").strip()
+    head, recommend = body, ""
+    mark = re.search(r"рекомендаци\w*", body, re.IGNORECASE)
+    if mark:
+        tail = body[mark.start():]
+        head = body[:mark.start()].strip().strip("—–-").strip()
+        if not QUESTION_NO_RECOMMEND_RE.search(tail):
+            letter = QUESTION_RECOMMEND_RE.search(tail)
+            recommend = letter.group(1).upper() if letter else ""
+    parts = [part.strip() for part in QUESTION_DASH_RE.split(head) if part.strip()]
+    text = (parts[0] if parts else head).strip()
+    options = " — ".join(parts[1:]) if len(parts) > 1 else ""
+    if not text:
+        return None
+    return {"id": f"Q-{int(match.group(1))}", "text": text, "options": options,
+            "recommend": recommend}
+
+
+def parse_question_lines(text) -> list[dict]:
+    """Все строки вопросов отчёта: по одной записи на строку формы `Q<N>:` (S5, п.2)."""
+    found: list[dict] = []
+    for line in str(text or "").splitlines():
+        parsed = parse_question_line(line)
+        if parsed:
+            found.append(parsed)
+    return found
+
+
+def step_questions(path, step_id: str = "") -> list[dict]:
+    """Открытые вопросы шага (или все открытые, если шаг не задан). Порядок — как в файле."""
+    want = str(step_id or "").strip().upper()
+    return [item for item in load_questions(path)
+            if item.get("status") == QUESTION_OPEN
+            and (not want or str(item.get("step") or "").strip().upper() == want)]
+
+
+def question_view(item: dict, asked_at=None, timeout: float = 0) -> dict:
+    """Вопрос для панели: ID, шаг, текст, варианты с ценой, рекомендация, момент и дедлайн.
+
+    Дедлайн — момент автовыбора, поэтому он есть только там, где автовыбор возможен:
+    рекомендация названа автором и таймаут не выключен. Иначе `deadline_at` пуст, и панель
+    не обещает владельцу «осталось N мин» у вопроса, который будет ждать человека.
+    """
+    asked = asked_at if isinstance(asked_at, (int, float)) else None
+    recommend = str(item.get("recommend") or "").strip()
+    deadline = (float(asked) + timeout) if (asked is not None and timeout > 0 and recommend) else None
+    return {"id": item.get("id") or "", "step": item.get("step") or "",
+            "text": item.get("text") or "",
+            "options": question_options(item.get("options")),
+            "options_text": item.get("options") or "",
+            "recommend": recommend,
+            "status": item.get("status") or "",
+            "asked_at": _local_stamp(float(asked)) if asked is not None else "",
+            "deadline_at": _local_stamp(deadline) if deadline else ""}
+
+
+def questions_view(ctx: dict) -> list[dict]:
+    """Открытые вопросы шага для панели: момент и дедлайн берутся из состояния плана."""
+    opened = ctx.get("step_questions") or []
+    if not opened:
+        return []
+    state = ctx.get("state") if isinstance(ctx.get("state"), dict) else {}
+    stamps = state.get("questions") if isinstance(state.get("questions"), dict) else {}
+    timeout = float(ctx.get("answer_timeout") or 0)
+    rows: list[dict] = []
+    for item in opened:
+        asked = (stamps.get(item["id"]) or {}).get("asked_at")
+        rows.append(question_view(item, asked, timeout))
+    return rows
+
+
+def _question_minutes(seconds: float) -> int:
+    """Минуты для пометки «авто»: не меньше одной, иначе «0 мин» читалось бы как «сразу»."""
+    return max(1, int(round(float(seconds) / 60)))
+
+
+def question_notice_text(p: Paths, item: dict) -> str:
+    """Уведомление о вопросе одной строкой (S5, п.4б): текст, варианты, рекомендация, ответ."""
+    parts = [f"❓ {item.get('id')} (план {p.plan_id}, шаг {item.get('step')}): "
+             f"{' '.join(str(item.get('text') or '').split())}"]
+    if item.get("options"):
+        parts.append(f"варианты: {item['options']}")
+    recommend = str(item.get("recommend") or "").strip()
+    parts.append(f"рекомендация: {recommend}" if recommend else "рекомендация: нет")
+    parts.append(f"ответить: /answer {item.get('id')} {recommend or '<вариант>'} "
+                 f"или окно в панели")
+    return "; ".join(parts)
+
+
+def question_hold_reason(step_id: str, item: dict, tail: str = "") -> str:
+    """Причина ожидания по вопросу: номер, текст, варианты, рекомендация, способ ответить."""
+    recommend = str(item.get("recommend") or "").strip()
+    parts = [f"шаг {step_id} ждёт ответа на вопрос {item.get('id')}: "
+             f"{' '.join(str(item.get('text') or '').split())}"]
+    if item.get("options"):
+        parts.append(f"варианты: {item['options']}")
+    parts.append(f"рекомендация {recommend}" if recommend else "рекомендации нет")
+    parts.append(f"ответ: /answer {item.get('id')} {recommend or '<вариант>'} "
+                 f"или окно в панели{tail}")
+    return "; ".join(parts)
+
+
+def step_report_texts(p: Paths, step: dict, cards=()) -> list[str]:
+    """Тексты отчётов шага, где автор мог выписать вопрос (S5, п.2).
+
+    Источники — постановка, отчёт ревью постановки, отчёт ревью шага и результат каждой
+    карточки шага. Чтение терпимое: нет файла или он не читается — вопроса из него просто
+    нет, а тик не встаёт из-за отсутствия необязательного файла.
+    """
+    texts: list[str] = []
+    sid = step.get("id") or ""
+    rel = prompt_rel(p, sid)
+    paths = [Path(p.repo) / rel] if rel else []
+    paths += [prompt_review_path(p, sid), review_path(p, sid)]
+    for path in paths:
+        try:
+            texts.append(Path(path).read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    for card in cards or ():
+        texts.append(f"{card.get('result') or ''}\n{card.get('error') or ''}")
+    return texts
+
+
+def register_questions(p: Paths, ctx: dict, state: dict | None = None) -> list[dict]:
+    """Перенести строки вопросов из отчётов шага в файл вопросов (S5, п.2).
+
+    Идемпотентно: ID ведёт автор отчёта, страж только заводит недостающие строки со статусом
+    «открыт» и пишет время вопроса в состояние плана. Дубликат — пара «шаг + текст»: автор
+    мог повторить вопрос в двух отчётах или повторить тик. Битый файл вопросов — причина в
+    `ctx["step_questions_error"]`, второй файл молча не заводится.
+    """
+    step = ctx.get("next")
+    if not step or ctx.get("step_questions_error"):
+        return []
+    sid = step.get("id") or ""
+    path = plan_questions_path(p)
+    current = load_questions(path)
+    known = {item["id"] for item in current}
+    pairs = {(_question_pair_key(item)) for item in current}
+    added: list[dict] = []
+    for text in step_report_texts(p, step, ctx.get("cards") or []):
+        for parsed in parse_question_lines(text):
+            item = dict(parsed, step=sid, status=QUESTION_OPEN, answer="")
+            pair = _question_pair_key(item)
+            if parsed["id"] in known or pair in pairs:
+                continue
+            known.add(parsed["id"])
+            pairs.add(pair)
+            added.append({key: item.get(key) or "" for key in QUESTIONS_KEYS})
+    if not added:
+        return []
+    write_questions(path, current + added, p.plan_id)
+    if not isinstance(state, dict):
+        state = ctx.get("state") if isinstance(ctx.get("state"), dict) else load_state(p)
+    stamps = state.get("questions")
+    stamps = dict(stamps) if isinstance(stamps, dict) else {}
+    now = _now()
+    for item in added:
+        stamps[item["id"]] = dict(stamps.get(item["id"]) or {}, asked_at=now)
+    state["questions"] = stamps
+    ctx["state"] = state
+    save_state(p, state)
+    # Решение этого же тика обязано видеть новый вопрос: файл перечитан, а не «запомнен».
+    ctx["step_questions"] = step_questions(path, sid)
+    ctx["step_questions_rel"] = plan_questions_rel(p)
+    return added
+
+
+def _question_pair_key(item: dict) -> tuple[str, str]:
+    """Ключ дубликата вопроса: шаг и текст, без регистра и лишних пробелов."""
+    return (str(item.get("step") or "").strip().upper(),
+            " ".join(str(item.get("text") or "").split()).lower())
+
+
+def answer_timeout_seconds(cfg: config_mod.Config) -> int:
+    """Секунды до автовыбора рекомендации: `notify.answer_timeout`, 0 — выключено (S5, п.5).
+
+    Ноль берётся как есть (`_positive` здесь не годится: она съела бы ноль и вернула
+    умолчание), нечисловое значение — умолчание `ANSWER_TIMEOUT_DEFAULT`.
+    """
+    notify = cfg.notify if isinstance(getattr(cfg, "notify", None), dict) else {}
+    raw = notify.get("answer_timeout", ANSWER_TIMEOUT_DEFAULT)
+    if isinstance(raw, bool):
+        return ANSWER_TIMEOUT_DEFAULT
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return ANSWER_TIMEOUT_DEFAULT
+    return value if value > 0 else 0
+
+
+def _open_questions_text(rows: list[dict]) -> str:
+    """Перечень открытых вопросов для отказа: `Q-1 · шаг S5: текст` (S5, п.4)."""
+    return "; ".join(f"{item.get('id')} · шаг {item.get('step') or '—'}: {item.get('text') or ''}"
+                     for item in rows)
+
+
+def find_question_plan(cfg: config_mod.Config, qid: str) -> dict:
+    """План, которому принадлежит открытый вопрос: ответ из чата адресуется сам (S5, п.4)."""
+    found: list = []
+    for spec in plans_of(cfg):
+        try:
+            p = resolve_paths(cfg, spec.id)
+            rows = step_questions(plan_questions_path(p))
+        except (GateError, OSError, ValueError, config_mod.ConfigError):
+            continue
+        if any(item["id"] == qid for item in rows):
+            found.append(p)
+    if len(found) == 1:
+        return {"plan": found[0], "plans": found, "error": ""}
+    if not found:
+        return {"plan": None, "plans": [], "error": f"нет открытого вопроса {qid}"}
+    numbers = ", ".join(str(item.plan_id) for item in found)
+    return {"plan": None, "plans": found,
+            "error": f"вопрос {qid} открыт в нескольких планах ({numbers}): укажи --plan"}
+
+
+def answer_question(cfg: config_mod.Config, plan_id, question_id, value, *,
+                    auto: bool = False) -> dict:
+    """Ответить на вопрос шага — единственный путь записи ответа (S5, п.4).
+
+    Панель, `/answer`, CLI и автовыбор по таймауту зовут эту функцию, поэтому файл вопросов
+    руками не правится: два пути к одному состоянию разошлись бы. Проверки — номер вопроса,
+    шаг вопроса (шага нет в плане — ответ не принимается) и статус «открыт». Отказ не
+    исключение: и чат, и панель показывают его владельцу строкой.
+    """
+    qid = question_id_of(question_id)
+    if not qid:
+        return {"ok": False, "message": f"номер вопроса не вида Q-N: {question_id!r}"}
+    value = " ".join(str(value or "").split())
+    if not value:
+        return {"ok": False, "message": f"нужен ответ: /answer {qid} <вариант>"}
+    try:
+        p = resolve_paths(cfg, str(plan_id) if plan_id else None)
+    except config_mod.ConfigError as exc:
+        return {"ok": False, "message": str(exc)}
+    path = plan_questions_path(p)
+    try:
+        rows = load_questions(path)
+    except (GateError, OSError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
+    opened = _open_questions_text([item for item in rows
+                                   if item.get("status") == QUESTION_OPEN])
+    target = next((item for item in rows if item["id"] == qid), None)
+    if target is None:
+        return {"ok": False, "message": f"нет вопроса {qid} в плане {p.plan_id}: "
+                                        f"открытые — {opened or '—'}"}
+    if target.get("status") != QUESTION_OPEN:
+        return {"ok": False, "message": f"вопрос {qid} уже закрыт: "
+                                        f"{target.get('answer') or '—'}; открытые — "
+                                        f"{opened or '—'}"}
+    step = str(target.get("step") or "").strip().upper()
+    declared = declared_steps(cfg, p)
+    if declared and step not in declared:
+        return {"ok": False,
+                "message": (f"вопрос {qid} относится к шагу {step or '—'}, которого нет в "
+                            f"плане {p.plan_id}: открытые — {opened or '—'}")}
+    answer = value if not auto else (f"{value} — {AUTO_ANSWER_NOTE} "
+                                     f"{_question_minutes(answer_timeout_seconds(cfg))} мин")
+    target["status"] = QUESTION_CLOSED
+    target["answer"] = answer
+    write_questions(path, rows, p.plan_id)
+    state = load_state(p)
+    stamps = state.get("questions") if isinstance(state.get("questions"), dict) else {}
+    if stamps.pop(qid, None) is not None:
+        # Ожидание снимается вместе с поводом: записи в hold_steps/hold_released нет.
+        if stamps:
+            state["questions"] = stamps
+        else:
+            state.pop("questions", None)
+        save_state(p, state)
+    return {"ok": True, "qid": qid, "step": step, "question": dict(target), "answer": answer,
+            "message": f"вопрос {qid} закрыт: {answer}"}
+
+
+def sweep_questions(cfg: config_mod.Config, p: Paths, ctx: dict, state: dict | None = None,
+                    say=None) -> list[dict]:
+    """Принять рекомендацию по таймауту (S5, п.5); запись идёт той же `answer_question`.
+
+    Автовыбор — не молчаливое согласие: он работает только при названной рекомендации,
+    пишет пометку «авто» и уведомляет владельца строкой. Вопрос без рекомендации, без
+    известного времени вопроса и ключ `answer_timeout: 0` ждут человека.
+    """
+    timeout = answer_timeout_seconds(cfg)
+    if timeout <= 0:
+        return []
+    try:
+        rows = load_questions(plan_questions_path(p))
+    except (GateError, OSError, ValueError):
+        return []                      # причина уже в ctx: по ней решение даёт стоп
+    if not isinstance(state, dict):
+        state = ctx.get("state") if isinstance(ctx.get("state"), dict) else load_state(p)
+    stamps = state.get("questions") if isinstance(state.get("questions"), dict) else {}
+    stamps = dict(stamps)
+    now = _now()
+    done: list[dict] = []
+    for item in rows:
+        if item.get("status") != QUESTION_OPEN:
+            continue
+        recommend = str(item.get("recommend") or "").strip()
+        asked = (stamps.get(item["id"]) or {}).get("asked_at")
+        if not recommend or not isinstance(asked, (int, float)):
+            continue
+        if now - float(asked) < timeout:
+            continue
+        result = answer_question(cfg, p.plan_id, item["id"], recommend, auto=True)
+        if not result.get("ok"):
+            continue
+        stamps.pop(item["id"], None)
+        done.append(result)
+        (say or (lambda text: notify(cfg, text)))(
+            f"⏱ {item['id']} принят автоматически: {recommend} (рекомендация) — "
+            f"прошло {_question_minutes(timeout)} мин")
+    if done:
+        closed = {item["qid"] for item in done}
+        if stamps:
+            state["questions"] = stamps
+        else:
+            state.pop("questions", None)
+        ctx["state"] = state
+        save_state(p, state)
+        ctx["step_questions"] = [item for item in (ctx.get("step_questions") or [])
+                                 if item["id"] not in closed]
+    return done
+
+
+def announce_questions(cfg: config_mod.Config, p: Paths, state: dict | None = None,
+                       say=None) -> list[dict]:
+    """Уведомить владельца об открытых вопросах: на вопрос — одно, повтор не чаще часа.
+
+    Открытые вопросы читаются из файла, а не из `ctx`: функция не зависит от того, успел ли
+    тик собрать контекст. `notified_at` живёт в состоянии плана, как у тревог.
+    """
+    opened = step_questions(plan_questions_path(p))
+    if not opened:
+        return []
+    if not isinstance(state, dict):
+        state = load_state(p)
+    stamps = state.get("questions") if isinstance(state.get("questions"), dict) else {}
+    stamps = dict(stamps)
+    now = _now()
+    sent: list[dict] = []
+    for item in opened:
+        entry = stamps.get(item["id"])
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        last = entry.get("notified_at")
+        if isinstance(last, (int, float)) and now - float(last) < QUESTION_NOTICE_GAP:
+            continue
+        if not isinstance(entry.get("asked_at"), (int, float)):
+            entry["asked_at"] = now
+        entry["notified_at"] = now
+        stamps[item["id"]] = entry
+        sent.append(item)
+        (say or (lambda text: notify(cfg, text)))(question_notice_text(p, item))
+    if sent:
+        state["questions"] = stamps
+        save_state(p, state)
+    return sent
 
 
 def prompt_verdict(p: Paths, step_id: str) -> dict | None:
@@ -2198,7 +2688,9 @@ def build_ctx(p: Paths) -> dict:
                    # Исход идеи, вопросы и ретроспектива (план 5, S10): те же ключи, что в
                    # нормальной ветке, — решение обязано не падать `NameError` на сбое сборщика.
                    plan_decision="", plan_decision_note="", questions_rel="",
-                   questions_open=None, retro_rel="", retro_missing=False)
+                   questions_open=None, step_questions_rel="", step_questions=[],
+                   step_questions_error="", answer_timeout=0,
+                   retro_rel="", retro_missing=False)
         return ctx
     step = pkg.get("next")
     ctx["next"] = step
@@ -2317,6 +2809,20 @@ def build_ctx(p: Paths) -> dict:
     questions = scout_research_dir(p.cfg) / f"{p.plan_id}-questions.md"
     ctx["questions_rel"] = p.cfg.rel(questions)
     ctx["questions_open"] = analyze.open_questions(questions)
+    # Вопросы шага (план 8, S5): повод ожидания, который читается из файла вопросов, а не из
+    # `hold_steps`. Читается терпимо, как реестр находок: битый файл уходит строкой в `ctx`,
+    # а стоп по нему ставит решение — `decide` получает только `ctx` и файлов не читает.
+    ctx["step_questions_rel"] = plan_questions_rel(p)
+    ctx["step_questions"] = []
+    ctx["step_questions_error"] = ""
+    ctx["answer_timeout"] = answer_timeout_seconds(p.cfg)
+    try:
+        # Шага может не быть вовсе (план закрыт) — тогда открытых вопросов не ищем.
+        ctx["step_questions"] = step_questions(plan_questions_path(p),
+                                               (step or {}).get("id") or "")
+    except (GateError, OSError, ValueError) as exc:
+        ctx["step_questions"] = []
+        ctx["step_questions_error"] = str(exc)
     # Ретроспектива после закрытия плана (D8): признак «файла ещё нет» — единственное, что
     # решает, писать ли черновик; идемпотентность держится на существовании файла.
     retro = Path(p.cfg.reviews_dir) / f"retro-{p.plan_id}.md"
@@ -2392,7 +2898,8 @@ def decide(ctx: dict) -> dict:
     # решение только что отложило.
     if (base["action"] == "idle" and not base.get("approval_blocked")
             and not base.get("incident") and not base.get("plan_done")
-            and not base.get("close_blocked") and not base.get("plan_clarify")):
+            and not base.get("close_blocked") and not base.get("plan_clarify")
+            and not base.get("question")):
         prefetch = _prefetch_decision(ctx)
         if prefetch:
             return prefetch
@@ -2418,6 +2925,46 @@ def step_fix_limit(ctx: dict, step: dict | None) -> int:
     else:
         limit = int(ctx.get("max_fix_rounds") or DEFAULT_FIX_ROUNDS)
     return max(limit, 1)
+
+
+def _risk_hold_pending(ctx: dict, step: dict) -> bool:
+    """Ждёт ли шаг ещё и ручного допуска: `risk_gate: hold`, риск `high`, допуска не было.
+
+    Условие то же, что у ветки `hold_risk` (`ANCHOR:hold_risk_decision`), только без
+    побочного эффекта: причина ожидания по вопросу обязана назвать второй повод (S5, S2B).
+    """
+    if str(step.get("risk") or "normal").lower() != "high":
+        return False
+    if str(ctx.get("risk_gate") or "spec").strip().lower() != "hold":
+        return False
+    sid = str(step.get("id") or "").upper()
+    held = {str(item).upper() for item in (ctx.get("hold") or [])}
+    released = {str(item).upper() for item in (ctx.get("released") or [])}
+    return sid not in held and sid not in released
+
+
+def _question_hold_decision(ctx: dict, step: dict) -> dict | None:
+    """Открытый вопрос шага — повод ожидания, а не стоп и не запись в `hold_steps` (S5, п.3).
+
+    Стоит выше всех карточек: пока вопрос открыт, шаг не получает ни заказа постановки,
+    ни карточки шага, ни карточки правок, ни ревью. Причина называет номер вопроса, текст,
+    рекомендацию и способ ответить — по ней владелец отвечает из чата или из панели.
+    """
+    error = str(ctx.get("step_questions_error") or "")
+    if error:
+        return {"action": "stop", "step": step.get("id"),
+                "reason": f"файл вопросов шага не читается: {error}"}
+    opened = ctx.get("step_questions") or []
+    if not opened:
+        return None
+    item = opened[0]
+    sid = step.get("id")
+    tail = ""
+    if _risk_hold_pending(ctx, step):
+        tail = (f"; второй повод ожидания — ручной допуск (риск `high`): "
+                f"`python .pipeline/gate.py --unhold {sid}`")
+    return {"action": "idle", "step": sid, "question": item["id"],
+            "reason": question_hold_reason(sid, item, tail)}
 
 
 def _decide_base(ctx: dict) -> dict:
@@ -2505,6 +3052,12 @@ def _decide_base(ctx: dict) -> dict:
                           f"({Path(prev_verdict['path']).name}) — нужно решение владельца"}
     if sid.upper() in {str(h).upper() for h in (ctx.get("hold") or [])}:
         return {"action": "idle", "reason": f"шаг {sid} в списке ручного допуска владельца"}
+    # Открытый вопрос шага (8-S5): ожидание, а не стоп, и без записи в `hold_steps` —
+    # повод живёт в файле вопросов и исчезает вместе с ответом. Стоит выше всех карточек,
+    # включая заказ постановки и риск-допуск: пока владелец не ответил, шаг не начинается.
+    question = _question_hold_decision(ctx, step)
+    if question:
+        return question
 
     cards = ctx.get("cards") or []
     steps = card_of(cards, "step")
@@ -4396,6 +4949,7 @@ TG_HELP = (
     "/resume — снять стоп-флаг\n"
     "/hold S3 — шаг требует ручного допуска\n"
     "/unhold S3 — снять ручной допуск\n"
+    "/answer Q-1 A — ответ на вопрос шага (без ответа рекомендация берётся по таймауту)\n"
     "/reset — начать диалог с агентом заново\n"
     "Свободный текст без «/» уходит агенту: он ответит в этот же чат.\n"
     "Слишком частые сообщения не обрабатываются (защита от флуда).\n"
@@ -4826,6 +5380,25 @@ def _hold_change(cfg: config_mod.Config, step: str, add: bool) -> str:
     return result["message"] if result["ok"] else result["error"]
 
 
+def _answer_change(cfg: config_mod.Config, arg: str) -> str:
+    """Ответ из чата: `/answer Q-1 A` — тот же путь записи, что у панели (S5, п.4б).
+
+    План ищется по вопросу: номер `Q-N` уникален в момент ответа, поэтому `--plan` из чата
+    не нужен. Вопрос открыт в двух планах — отказ с их номерами и подсказкой `--plan`.
+    """
+    parts = (arg or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return "форма: /answer Q-1 A — номер вопроса и вариант"
+    qid = question_id_of(parts[0])
+    if not qid:
+        return f"номер вопроса не вида Q-N: {parts[0]!r}"
+    found = find_question_plan(cfg, qid)
+    if found["plan"] is None:
+        return found["error"]
+    result = answer_question(cfg, found["plan"].plan_id, qid, parts[1])
+    return result["message"]
+
+
 def handle_command(cfg: config_mod.Config, text: str, chat: str | None = None) -> str:
     """Разобрать одну команду владельца и вернуть текст ответа.
 
@@ -4850,6 +5423,8 @@ def handle_command(cfg: config_mod.Config, text: str, chat: str | None = None) -
         return "▶️ стоп снят, конвейер продолжит" if clear_stop(p) else "стоп-флага не было"
     if cmd in ("/hold", "/unhold"):
         return _hold_change(cfg, arg, add=cmd == "/hold")
+    if cmd == "/answer":
+        return _answer_change(cfg, arg)
     if cmd == "/reset":
         target = str(chat or _only_dialog_chat(cfg))
         if not target:
@@ -5109,10 +5684,15 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
     ctx = ctx if ctx is not None else build_ctx(p)
     say_raw = notify_fn or (lambda text: notify(p.cfg, text))
     plan_id = p.plan_id
+    closed: list[dict] = []
     # Наследование ДО решения: иначе идущий план навсегда получил бы «не утверждён».
     # Только исполняющий проход — `--status` на диск не пишет.
     if execute:
         ensure_approval(p, ctx)
+        # Вопросы шага (8-S5): строки вопросов из отчётов переносятся в файл ДО решения,
+        # чтобы новый вопрос держал шаг уже на этом тике; затем автовыбор рекомендации.
+        register_questions(p, ctx)
+        closed = sweep_questions(p.cfg, p, ctx, ctx.get("state"), say_raw)
     decision = decide(ctx)
     cleared = ""
     if execute and decision.get("clear_incident"):
@@ -5120,15 +5700,33 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         cleared = decision.get("reason", "")
         clear_stop(p)
         decision = decide(ctx)
-    result = {"plan_id": plan_id, "decision": decision, "applied": bool(cleared),
-              "detail": cleared, "incident_cleared": bool(cleared),
-              "status": status_text(ctx, decision)}
+    detail = closed[-1]["message"] if closed else ""
+    if closed:
+        # Автовыбор закрыл вопрос: тик на этом заканчивается, карточка шага — следующим
+        # тиком (требование плана, п. 5). Один тик — одно действие.
+        decision = {"action": "question_auto", "step": closed[-1]["step"],
+                    "question": closed[-1]["qid"],
+                    "reason": f"{closed[-1]['qid']} принят автоматически: "
+                              f"{closed[-1]['answer']} — карточка шага следующим тиком"}
+        detail = decision["reason"]
+    result = {"plan_id": plan_id, "decision": decision,
+              "applied": bool(cleared) or bool(closed), "detail": detail,
+              "incident_cleared": bool(cleared), "status": status_text(ctx, decision)}
     # Пауза по расписанию едет в ответе `--status`: панель берёт её из того же вызова,
     # что и решение, — отдельный запуск движка ради одного ключа не нужен.
     result["pause"] = config_mod.pause_state(p.cfg, _now())
+    # Вопросы шага для панели (8-S5): окно выбора и дедлайн автовыбора берутся из того же
+    # вызова движка, что и решение, — второй разбор файла панели не нужен.
+    result["questions"] = questions_view(ctx)
     if not execute:
         result["metrics"] = history_metrics(p.cfg)
         return result
+    if closed:
+        return result
+
+    # Уведомление владельцу об открытых вопросах — до решения: вопрос уже держит шаг.
+    announce_questions(p.cfg, p, ctx.get("state"), say_raw)
+    result["questions"] = questions_view(ctx)
 
     def say(text: str) -> None:
         say_raw(text)
@@ -6380,6 +6978,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--resume", action="store_true", help="снять стоп-флаг")
     ap.add_argument("--hold", metavar="ШАГ", help="шаг требует ручного допуска владельца")
     ap.add_argument("--unhold", metavar="ШАГ", help="снять ручной допуск")
+    ap.add_argument("--answer", nargs=2, metavar=("ВОПРОС", "ВАРИАНТ"),
+                    help="ответ на вопрос шага: --answer Q-1 A (план — через --plan)")
     ap.add_argument("--commands", action="store_true",
                     help="принять команды владельца из Telegram (getUpdates) и ответить в чат")
     ap.add_argument("--commands-wait", type=int, default=0,
@@ -6504,6 +7104,7 @@ def main(argv: list[str] | None = None) -> int:
 
         owner_cmd = ("stop" if args.stop is not None
                      else "resume" if args.resume
+                     else "answer" if args.answer
                      else "hold" if (args.hold or args.unhold) else "")
         if owner_cmd:
             # Команды владельца меняют состояние и стоп-флаг (read-modify-write), поэтому
@@ -6524,6 +7125,15 @@ def main(argv: list[str] | None = None) -> int:
                     existed = clear_stop(p)
                     notify(cfg, "▶️ стоп снят, конвейер продолжит со следующего шага")
                     print("стоп-флаг снят" if existed else "стоп-флага не было")
+                    return 0
+                if args.answer:
+                    # Ответ владельца на вопрос шага: тот же путь, что у `/answer` и панели.
+                    qid, value = str(args.answer[0]), str(args.answer[1])
+                    result = answer_question(cfg, args.plan, qid, value)
+                    if not result["ok"]:
+                        print(f"ошибка: {result['message']}", file=sys.stderr)
+                        return 2
+                    print(result["message"])
                     return 0
                 result = hold_state_change(cfg, p, args.hold if args.hold is not None
                                            else args.unhold, add=bool(args.hold))

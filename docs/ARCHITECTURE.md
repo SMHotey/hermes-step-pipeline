@@ -532,7 +532,7 @@ no-op), `|` в значениях заменяется на `/`, чтобы та
 | `runtimes` | `step 3h`, `review 150m`, `prompt 45m` (+ `scout`, `plan_review`, `plan_fix`) | лимиты карточек |
 | `kanban.tenant` | `plan` | tenant карточек |
 | `git` | `commit:true, push:true` | коммит и пуш при закрытии |
-| `notify` | `enabled:false` | `token_env`, `chat_env`, `prefix`, `watchdog_hours`, `digest_at`, `commands{enabled,wait}`, `dialog{...}` |
+| `notify` | `enabled:false` | `token_env`, `chat_env`, `prefix`, `watchdog_hours`, `digest_at`, `answer_timeout`, `commands{enabled,wait}`, `dialog{...}` |
 | `ui_port` / `ui.progress` | `8770` / `{learn:true, min_samples:3, weights:{10,55,25,10}}` | только панель |
 
 Принцип разбора: **мусор в ключе — ошибка конфигурации, а не молчаливое умолчание**
