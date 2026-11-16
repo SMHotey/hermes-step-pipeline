@@ -230,3 +230,17 @@ def test_closed_at_request_changes_rerereviews(project: Path):
                         cards=[], prev_cards=[card("step", "done")]))
     assert d["action"] == "create_rereview"
     assert d["step"] == "S1"
+
+
+def test_closed_with_remarks_is_not_rereviewed(project: Path):
+    """Закрытие «с замечаниями» — не расхождение: повторного ревью нет (13-S1).
+
+    Тот же вердикт REQUEST_CHANGES, но журнал закрыл шаг по замечаниям: замечания живут
+    строками реестра плана, второй круг ревью ради того же отчёта не заказывается.
+    """
+    cfg = config_mod.load(project)
+    p = gate.resolve_paths(cfg, "1")
+    prev_verdict = {"verdict": "REQUEST_CHANGES", "path": str(p.review_dir / "1-S1.md")}
+    d = gate.decide(ctx(prev_closed="S1", prev_verdict=prev_verdict, prev_closed_remarks=True,
+                        cards=[], prev_cards=[card("step", "done")]))
+    assert d["action"] == "create_step"

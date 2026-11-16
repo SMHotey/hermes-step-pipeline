@@ -1,7 +1,7 @@
 ---
 name: pipeline-reviewer
 description: "Use when reviewing a completed step of any plan: независимое ревью по контракту плана и коду; вердикт APPROVE/REQUEST_CHANGES."
-version: 1.4.0
+version: 1.5.0
 author: Hermes Agent
 license: MIT
 platforms: [windows, linux, macos]

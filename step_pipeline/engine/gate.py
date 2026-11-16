@@ -17,7 +17,10 @@
     нет постановки шага       → карточка промптеру + инцидентный стоп
     шаг done                  → карточка ревью       (профиль ревьюера)
     вердикт APPROVE           → строка в журнал плана + коммит/пуш
-    вердикт REQUEST_CHANGES   → карточка правок (1-й раз), стоп + уведомление (2-й раз)
+    вердикт REQUEST_CHANGES   → есть блокирующая находка: карточка правок (1-й раз),
+                                стоп + уведомление (2-й раз);
+                                блокирующих нет: шаг закрывается «с замечаниями»,
+                                замечания — строками реестра находок плана
     ревью постановки: REQUEST_CHANGES → карточка промптеру «переписать» + повторное ревью,
                                         стоп только по исчерпании `max_fix_rounds`
     шаг упал/ревью упало      → стоп + уведомление
@@ -292,6 +295,10 @@ FINDING_SUBLABEL_SEP = "/"
 REMARK_KIND = "стиль"
 REMARK_STATUS = "не блокирует"
 REMARK_ACTION = "принято при закрытии шага, шаг принят; закрывает ревьюер плана фактом"
+# Признак закрытия «с замечаниями» — в тексте `_evidence` (четвёртая колонка журнала).
+# Его же читает решение (`journal_closed_with_remarks`): закрытие с замечаниями при
+# REQUEST_CHANGES — штатное состояние, а не расхождение.
+REMARKS_EVIDENCE = "принято с замечаниями"
 # Вопросы шага (план 8, S5): своя таблица того же механизма, что реестр находок, и своей
 # шапки. Файл — `docs/reviews/plan-<N>-questions.md`; ID вида `Q-N`, статусы из двух слов.
 # Вопрос закрывает владелец (ответ, `/answer`, окно панели или автовыбор рекомендации),
@@ -534,6 +541,38 @@ def journal_closed(p: Paths, step_id: str) -> bool:
             continue
         if registry.status_of_row(lines[i]).startswith("ЗАКРЫТ"):
             return True
+    return False
+
+
+def journal_closed_with_remarks(p: Paths, step_id: str) -> bool:
+    """Шаг закрыт строкой «принято с замечаниями» (13-S1).
+
+    Признак берётся из журнала — того же текста `_evidence`, который видит владелец:
+    с 13-S1 «журнал закрыт + отчёт REQUEST_CHANGES» стало штатным состоянием (шаг принят
+    с замечаниями), и ветка повторного ревью не имеет права его задевать. Расхождением
+    остаётся только закрытие НЕ по замечаниям — например, ручное «закрыт» при отчёте
+    «нужны правки».
+
+    Шага в журнале нет, строка не закрыта, колонок меньше четырёх или план не читается —
+    `False`: ветка повторного ревью ведёт себя как прежде.
+    """
+    path = Path(p.plan_file)
+    if not path.is_file():
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    found = registry.journal_section(lines, p.cfg.journal_marker, p.step_re)
+    if not found:
+        return False
+    for i in found[1]:
+        if registry.step_of_row(lines[i], p.step_re) != step_id.upper():
+            continue
+        if not registry.status_of_row(lines[i]).startswith("ЗАКРЫТ"):
+            continue
+        cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+        return len(cells) >= 4 and REMARKS_EVIDENCE in cells[3]
     return False
 
 
@@ -2749,6 +2788,9 @@ def build_ctx(p: Paths) -> dict:
     except SystemExit as exc:
         ctx.update(next=None, collector_error=str(exc), cards=[], verdict=None,
                    journal_closed=False, prev_closed=None, prev_verdict=None,
+                   # 13-S1: без журнала закрытие «с замечаниями» не видно — False
+                   # оставляет ветку повторного ревью прежней.
+                   prev_closed_remarks=False,
                    # Без сборщика шагов ни постановки, ни N+1 не видно; «свежей» постановку
                    # не считаем, иначе решение пропустило бы обязательное ревью.
                    steps=[], prompt=None, prompt_recon=None, prompt_fresh=False,
@@ -2801,6 +2843,11 @@ def build_ctx(p: Paths) -> dict:
     ctx["cards"] = read_cards(p, f"planloop:{p.plan_id}:{step['id']}:") if step else []
     ctx["prev_cards"] = (read_cards(p, f"planloop:{p.plan_id}:{ctx['prev_closed']}:")
                          if ctx.get("prev_closed") else [])
+    # 13-S1: закрытие «с замечаниями» — штатное состояние при вердикте REQUEST_CHANGES.
+    # Решение отличает его от расхождения «журнал закрыл, ревью требует правок» по строке
+    # журнала: закрытие читается из четвёртой колонки, а не из вердикта отчёта.
+    ctx["prev_closed_remarks"] = (journal_closed_with_remarks(p, ctx["prev_closed"])
+                                  if ctx.get("prev_closed") else False)
     # Постановка шага, её свежесть и постановка N+1 (правила 1-3 плана 2 S6). Стоимость:
     # один `git diff` на тик и только когда постановка есть.
     ctx["steps"] = list(pkg.get("steps") or [])
@@ -3135,7 +3182,13 @@ def _decide_base(ctx: dict) -> dict:
     if plan_review:
         return plan_review
     prev, prev_verdict = ctx.get("prev_closed"), ctx.get("prev_verdict")
-    if prev and prev_verdict and prev_verdict["verdict"] == "REQUEST_CHANGES":
+    # 13-S1: признак расхождения — не сам вердикт, а закрытие НЕ по замечаниям. Шаг,
+    # принятый «с замечаниями» (в журнале стоит тот же текст), остаётся закрытым: его
+    # замечания живут строками реестра плана, и повторное ревью здесь было бы вторым
+    # кругом ради того же отчёта. Ветка по-прежнему стережёт ручное «закрыт» при отчёте
+    # «нужны правки».
+    if (prev and prev_verdict and prev_verdict["verdict"] == "REQUEST_CHANGES"
+            and not ctx.get("prev_closed_remarks")):
         # Журнал закрыл шаг, а ревью говорит «нужны правки»: вперёд идти нельзя.
         # Даём ОДИН автоматический повторный круг ревью.
         prev_cards = ctx.get("prev_cards") or []
@@ -5992,7 +6045,7 @@ def _evidence(p: Paths, verdict: dict, remarks: int = 0) -> str:
     commit = f"коммит `{verdict['commit']}`" if verdict.get("commit") else "коммит не указан"
     report = p.cfg.rel(Path(verdict["path"]))
     if remarks:
-        return (f"ревью `{p.cfg.reviewer}` — принято с замечаниями, находок вне блокирующих: "
+        return (f"ревью `{p.cfg.reviewer}` — {REMARKS_EVIDENCE}, находок вне блокирующих: "
                 f"{remarks} (`{report}`, {commit}); замечания — в реестре находок плана")
     return (f"ревью `{p.cfg.reviewer}` — APPROVE (`{report}`, {commit}); "
             f"гейты шага прогнаны ревьюером самостоятельно")

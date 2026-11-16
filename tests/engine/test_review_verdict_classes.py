@@ -20,7 +20,7 @@ from pathlib import Path
 
 import config as config_mod
 import gate
-from engine_kit import make_project
+from engine_kit import cards, make_project
 from stub_hermes import SCHEMA
 
 STEP = {"id": "S1", "epoch": "", "title": "Таблица счетов", "days": 1.0, "owner": "",
@@ -337,6 +337,56 @@ def test_journal_and_tick_message_name_remarks(tmp_path, hermes_stub, monkeypatc
     monkeypatch.setattr(gate, "commit_and_push", fake_retry)
     assert gate.retry_pending(held)["applied"] is True
     assert retried and phrase in retried[0]
+
+
+def test_closed_with_remarks_is_not_rereviewed_next_tick(tmp_path, hermes_stub, monkeypatch):
+    """Закрытый «с замечаниями» шаг не уходит в повторное ревью: следующий шаг идёт (13-S1).
+
+    Находка ревью 13-S1 (блокирующая): после закрытия с замечаниями второй тик видел
+    «журнал закрыт + вердикт REQUEST_CHANGES» и заказывал `:rereview:1`, а за ним — стоп
+    «повторное ревью снова REQUEST_CHANGES». Закрытие по замечаниям — штатное состояние:
+    следующий тик обязан вести S2, а карточки повторного ревью быть не должно.
+    """
+    root = setup_project(tmp_path, hermes_stub)
+    monkeypatch.setenv("PIPELINE_REPO", str(root))
+    p = gate.resolve_paths(config_mod.load(root), "1")
+
+    first = gate.run_gate(p, notify_fn=lambda text: None,
+                          commit_fn=lambda paths, files, message: (True, "abc1234"))
+    assert first["decision"]["action"] == "close_step"
+
+    second = gate.run_gate(p, notify_fn=lambda text: None,
+                           commit_fn=lambda paths, files, message: (True, "abc1234"))
+    assert second["decision"]["action"] == "create_step"
+    assert second["decision"].get("step") == "S2"
+    keys = [str(item["key"]) for item in cards(hermes_stub)]
+    assert not [key for key in keys if ":rereview:" in key], keys
+    assert gate.load_stop(p) is None
+
+
+def test_format_error_names_itself_in_tick_message(tmp_path, hermes_stub, monkeypatch):
+    """Отчёт без меток классов: причина формата видна в сообщении тика, круг не заказан.
+
+    Гейт шага (13-S1, §4.8): остановка читается как «поправь отчёт», а не как «страж
+    отказался». Карточки правок нет — иначе исполнитель начал бы правки по отчёту,
+    классы которого неизвестны.
+    """
+    report = ("## ВЕРДИКТ: REQUEST_CHANGES\n\n## Находки\n\n"
+              "- тест не утверждает значение\n- лог не пишется\n")
+    root = setup_project(tmp_path, hermes_stub, report=report)
+    monkeypatch.setenv("PIPELINE_REPO", str(root))
+    p = gate.resolve_paths(config_mod.load(root), "1")
+    says: list[str] = []
+
+    res = gate.run_gate(p, notify_fn=says.append)
+
+    assert res["decision"]["action"] == "stop"
+    text = "\n".join(says)
+    assert "ни одной метки класса" in text
+    assert "формат" in text
+    keys = [str(item["key"]) for item in cards(hermes_stub)]
+    assert not [key for key in keys if ":fix:" in key], keys
+    assert gate.load_stop(p) is not None
 
 
 def test_review_card_requires_classes_block(project: Path):

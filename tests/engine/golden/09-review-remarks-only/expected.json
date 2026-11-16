@@ -13,6 +13,13 @@
       "max_runtime": "",
       "status": "done",
       "title": "S1. Таблица счетов"
+    },
+    {
+      "assignee": "demo",
+      "key": "planloop:1:S2:step",
+      "max_runtime": "3h",
+      "status": "ready",
+      "title": "[план 1 S2] Эндпоинт списка"
     }
   ],
   "journal": [
@@ -36,6 +43,24 @@
       "applied": true,
       "decision_reason": "",
       "detail": "close_step: журнал: добавлена строка; коммит/пуш: ok <sha>; принято с замечаниями, находок вне блокирующих: 2",
+      "incident_cleared": false,
+      "plan_id": "1",
+      "reason": "предел действий за тик исчерпан (max_actions=1)"
+    },
+    {
+      "action": "create_step",
+      "actions": [
+        {
+          "action": "create_step",
+          "applied": true,
+          "detail": "карточка шага: <card>",
+          "plan": "1",
+          "step": "S2"
+        }
+      ],
+      "applied": true,
+      "decision_reason": "",
+      "detail": "create_step: карточка шага: <card>",
       "incident_cleared": false,
       "plan_id": "1",
       "reason": "предел действий за тик исчерпан (max_actions=1)"

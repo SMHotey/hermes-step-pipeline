@@ -1,7 +1,7 @@
 ---
 name: pipeline-plan-reviewer
 description: "Use when a plan needs review before code: конституция, связность шагов, размер, пересечение файлов, риски, разведка."
-version: 1.1.0
+version: 1.2.0
 author: Hermes Agent
 license: MIT
 platforms: [windows, linux, macos]
