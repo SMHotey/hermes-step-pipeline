@@ -495,7 +495,8 @@ tests/
 Проверки перед коммитом:
 
 ```bash
-python -m pytest                        # все тесты
+python -m pytest                        # все тесты (полный прогон — один раз перед коммитом)
+pytest -m "not slow" <файлы>            # точечно по затронутым: медленные тесты помечены slow
 hermes plugins validate step_pipeline   # манифест, инструменты, security-скан
 ```
 
