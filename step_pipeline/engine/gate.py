@@ -3038,11 +3038,19 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
             "останавливает конвейер и уходит владельцу — доведи находки до конца.",
         ]
     registry = step_findings_block(p, step)
+    # Разбор классов отчёта (13-S3): разбор делает S1, второй не пишем — карточка печатает счёт.
+    classes = report_finding_classes_at(Path(p.repo) / report_rel)
+    classes_line = (f"Классы находок отчёта: блокирующих {classes['blocking']}, "
+                    f"значимых {classes['significant']}, стилистических {classes['style']}")
+    if classes["sublabels"]:
+        classes_line += "; подметки: " + ", ".join(
+            f"{name} ×{count}" for name, count in sorted(classes["sublabels"].items()))
     return "\n".join([
         f"ПРАВКИ ПО РЕВЬЮ шага {step['id']} плана {p.plan_id} — {step['title']} {round_label}",
         "",
         _step_fix_verdict_line(open_step_findings_lines(p, step), report_verdict, report_rel),
         f"Контракт шага — `{plan_rel}` §{step['id']}, критерий: {step.get('dod', '')}",
+        classes_line,
         "",
         *registry,
         "ЧТО ДЕЛАТЬ",
@@ -3057,6 +3065,13 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
         "- Точечный прогон — `pytest -m \"not slow\"` по затронутым тестам: медленные тесты",
         "  помечены `slow` и в него не входят; полный (`python -m pytest`) — один раз перед коммитом.",
         "- `-q` не дублировать, если он уже в `pytest.ini` проекта: второй скрывает итог прогона.",
+        "ДЕТЕРМИНИРОВАННОСТЬ: мигающий тест — дефект теста, а не машины",
+        "- Затронутые тесты прогнать ТРИ раза подряд, три итога — в отчёт.",
+        "- Расхождение прогонов — находка, а не повод повторить.",
+        "- Повторяемость доказывается фиксацией времени, порядка и окружения (`monkeypatch`, `os.replace`).",
+        "- Цикл повторов до успеха запрещён: `pytest.fail` в retry-цикле, `for attempt in range(N)`, `--reruns`.",
+        "- Находка «тест недетерминирован» — блокирующая с подметкой `[блокирующая/тест-недетерминирован]`.",
+        "- Три прогона — только затронутые тесты; полный набор — один раз перед коммитом.",
         "",
         "ЗАВЕРШЕНИЕ",
         "1. Коммит и пуш ТОЛЬКО файлов правок (`git add <файлы>`, НЕ `-A`), сообщение на русском.",
