@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -498,9 +499,41 @@ def _row_line(row: dict) -> str:
     return line + (f" — {tail}" if tail else "")
 
 
+def registries() -> list[Path]:
+    """Реестры, которые видит хост: корневой и по профилям, кто существует.
+
+    Плагин на хосте один (`<hermes>/plugins/step_pipeline`) и общий для всех профилей,
+    поэтому замена пакета обязана обновить движок во всех проектах всех реестров хоста.
+    Иначе `hermes pipeline update` из сессии профиля рапортует «раскатывать нечего» (у
+    профиля свой, обычно пустой `projects.json`), а панель показывает проекты на прежней
+    версии и красного `doctor` — ровно исходный дефект 6-S9. Явный `PIPELINE_PROJECTS_FILE`
+    отменяет поиск: с ним реестр назван, и угадывать нечего.
+    """
+    env = os.environ.get("PIPELINE_PROJECTS_FILE")
+    if env:
+        return [Path(env).expanduser()]
+    home = proj.hermes_home()
+    host = home.parent.parent if home.parent.name == "profiles" else home
+    found = [host / "projects.json"]
+    profiles = host / "profiles"
+    if profiles.is_dir():
+        found += [child / "projects.json" for child in sorted(profiles.iterdir())
+                  if child.is_dir()]
+    unique: list[Path] = []
+    for path in found:
+        if path.is_file() and path.resolve() not in [seen.resolve() for seen in unique]:
+            unique.append(path)
+    return unique
+
+
+def _registry_label(path: Path) -> str:
+    """Имя реестра для строки итога: «хост» или имя профиля, которому он принадлежит."""
+    return path.parent.name if path.parent.parent.name == "profiles" else "хост"
+
+
 def after_update(registry: Path | str | None = None, *, interval: float = ROLLOUT_INTERVAL,
                  limit: float = ROLLOUT_WAIT_LIMIT, sleep=time.sleep) -> dict:
-    """Раскатать движок по реестру сразу после успешной замены плагина.
+    """Раскатать движок по реестрам хоста сразу после успешной замены плагина.
 
     Зачем: копия движка в `<проект>/.pipeline/` берётся из УСТАНОВЛЕННОГО плагина
     (`project.ENGINE_SRC`). Заменили плагин и не раскатали — копии остались от прежнего,
@@ -509,13 +542,25 @@ def after_update(registry: Path | str | None = None, *, interval: float = ROLLOU
     (`run_engine`); отличие одно — `update` ждёт итог, потому что отвечать ему некуда:
     у CLI есть stdout, у cron-скрипта — лог джобы.
 
-    *registry* — файл реестра, по которому раскатывать; умолчание — реестр профиля.
-    Читается и пишется ОДИН файл: строки берутся из него, итог ложится в него же, иначе
-    панель, знающая реестр хоста, не увидела бы раскатки, сделанной джобой профиля.
-    `lines` — готовые к печати строки: строит их пакет, а не вызывающий.
+    *registry* — названный файл реестра (так ходит cron-скрипт: путь записан мастером
+    установки); без него — все реестры хоста (`registries`). Итог пишется в тот же файл,
+    из которого взяты строки: иначе панель, читающая свой реестр, раскатки не увидела бы.
+    Проект, попавший в два реестра, обновляется один раз. `lines` — готовые к печати
+    строки: строит их пакет, а не вызывающий.
     """
-    rows = proj.read_projects(registry)
-    if not rows:
+    groups: list[tuple[Path, list[dict]]] = []
+    seen: set[str] = set()
+    for path in [Path(registry)] if registry else registries():
+        rows = []
+        for row in proj.read_projects(path):
+            key = str(Path(row.get("root") or "").resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+        if rows:
+            groups.append((path, rows))
+    if not groups:
         return {"ok": True, "projects": [], "summary": _summary([]),
                 "lines": [f"{AFTER_UPDATE_HEADER}: {NO_PROJECTS_NOTE}"]}
     if not _LOCK.acquire(blocking=False):
@@ -523,15 +568,28 @@ def after_update(registry: Path | str | None = None, *, interval: float = ROLLOU
         # первого, а панель показала бы чужой итог (D5).
         return {"ok": False, "busy": True, "projects": [], "summary": _summary([]),
                 "lines": [f"{AFTER_UPDATE_HEADER}: {BUSY_NOTE}"]}
+    lines: list[str] = []
+    projects: list[dict] = []
+    entries: list[dict] = []
+    ok = True
     try:
-        entry = run_engine(rows, interval=interval, limit=limit, sleep=sleep,
-                           registry=registry)
+        for path, rows in groups:
+            entry = run_engine(rows, interval=interval, limit=limit, sleep=sleep,
+                               registry=path)
+            done = entry.get("projects") or []
+            ok = ok and bool(entry.get("ok"))
+            entries.append(entry)
+            projects += done
+            head = AFTER_UPDATE_HEADER + (f" ({_registry_label(path)})" if len(groups) > 1 else "")
+            lines.append(f"{head}: {_summary_text(_summary(done))}")
+            lines += [f"  {_row_line(row)}" for row in done]
     finally:
         _LOCK.release()
-    summary = _summary(entry.get("projects") or [])
-    lines = [f"{AFTER_UPDATE_HEADER}: {_summary_text(summary)}"]
-    lines += [f"  {_row_line(row)}" for row in entry.get("projects") or []]
-    return {**entry, "summary": summary, "lines": lines}
+    # Форма ответа — как у `run_engine`: вызывающий (CLI, `--json`) видит те же ключи.
+    first, last = entries[0], entries[-1]
+    return {"step": ENGINE_STEP, "running": False, "at": first.get("at", ""),
+            "finished": last.get("finished", ""), "ok": ok, "error": "",
+            "projects": projects, "summary": _summary(projects), "lines": lines}
 
 
 def _background(rows: list[dict], started: str) -> None:

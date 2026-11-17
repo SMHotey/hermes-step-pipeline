@@ -163,6 +163,42 @@ def test_after_update_reads_and_writes_the_given_registry(project: Path, tmp_pat
     assert "rollout" not in registry()      # реестр профиля остался чистым
 
 
+def test_after_update_covers_registries_of_the_whole_host(tmp_path: Path, monkeypatch):
+    """Плагин на хосте один: раскатка идёт по реестру хоста И по реестрам профилей.
+
+    Так выглядит живая установка: `hermes pipeline update` из сессии профиля видит его
+    (обычно пустой) `projects.json`, а проекты живут в реестре хоста, с которым работает
+    панель. Раскатка только по своему реестру — исходный дефект 6-S9.
+    """
+    calls = upgrade_spy(monkeypatch)
+    fake_hermes(monkeypatch)
+    host = tmp_path / "hermes"
+    (host / "profiles" / "pipeline").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(host))
+    monkeypatch.delenv("PIPELINE_PROJECTS_FILE", raising=False)
+    root_project = helpers.install_project(tmp_path / "rootproj")
+    profile_project = helpers.install_project(tmp_path / "profproj")
+    entries = [{"id": "rootproj", "name": "rootproj", "root": str(root_project)}]
+    (host / "projects.json").write_text(
+        json.dumps({"projects": entries}, ensure_ascii=False), encoding="utf-8")
+    # Второй реестр: свой проект и повтор первого — обновиться каждый обязан один раз.
+    (host / "profiles" / "pipeline" / "projects.json").write_text(
+        json.dumps({"projects": [{"id": "profproj", "name": "profproj",
+                                  "root": str(profile_project)}] + entries},
+                   ensure_ascii=False), encoding="utf-8")
+
+    report = rollout.after_update(interval=0.01, limit=1.0)
+
+    assert report["ok"] is True
+    assert [path.name for path in calls] == ["rootproj", "profproj"]
+    assert report["lines"][0].startswith(f"{rollout.AFTER_UPDATE_HEADER} (хост)")
+    assert any(line.startswith(f"{rollout.AFTER_UPDATE_HEADER} (pipeline)") for line in report["lines"])
+    # Итог записан в оба реестра: каждый читает свой и раскатку в нём видит.
+    for path in (host / "projects.json", host / "profiles" / "pipeline" / "projects.json"):
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["rollout"]["engine"]["projects"][0]["status"] == rollout.STATUS_UPDATED
+
+
 def test_cli_update_rolls_engine_and_prints_it(project: Path, monkeypatch, capsys):
     """`hermes pipeline update`: после установки печатает итог раскатки по проектам."""
     upgrade_spy(monkeypatch)
@@ -251,16 +287,16 @@ def fake_plugin(home: Path, *, rollout_ok: bool = True) -> Path:
         "            'restart': 'перезапусти сессию Hermes'}\n",
         encoding="utf-8")
     (package / "rollout.py").write_text(
-        "def after_update(registry=None):\n"
+        "def after_update(*args, **kwargs):\n"
         f"    return {{'ok': {rollout_ok!r},\n"
         "             'lines': ['раскатка: обновлено: 1',\n"
         "                       '  shop: обновлено 0.31.0 → 0.32.0',\n"
-        "                       '  реестр: ' + str(registry)]}\n",
+        "                       '  аргументы: ' + repr((args, sorted(kwargs)))]}\n",
         encoding="utf-8")
     return package
 
 
-def make_script(tmp_path: Path, monkeypatch, *, rollout_ok: bool = True) -> tuple[Path, Path]:
+def make_script(tmp_path: Path, monkeypatch, *, rollout_ok: bool = True) -> Path:
     """Скрипт автообновления, положенный настоящим `install_update_script`.
 
     Профиль изолирован: `profile_dir` смотрит в tmp, поэтому скрипт и поддельный плагин
@@ -269,12 +305,7 @@ def make_script(tmp_path: Path, monkeypatch, *, rollout_ok: bool = True) -> tupl
     home = tmp_path / "h"
     monkeypatch.setattr(proj, "profile_dir", lambda profile: home / profile)
     fake_plugin(home, rollout_ok=rollout_ok)
-    registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"projects": [{"id": "shop", "name": "shop",
-                                                  "root": str(tmp_path / "shop")}]},
-                                   ensure_ascii=False), encoding="utf-8")
-    script = setup_flow.install_update_script("shop", registry)
-    return script, registry
+    return setup_flow.install_update_script("shop")
 
 
 def run_script(script: Path) -> subprocess.CompletedProcess:
@@ -284,8 +315,8 @@ def run_script(script: Path) -> subprocess.CompletedProcess:
 
 
 def test_cron_script_rolls_engine_after_successful_update(tmp_path: Path, monkeypatch):
-    """Cron автообновления: сначала замена пакета, потом раскатка движка по реестру."""
-    script, registry = make_script(tmp_path, monkeypatch)
+    """Cron автообновления: сначала замена пакета, потом раскатка движка по реестрам."""
+    script = make_script(tmp_path, monkeypatch)
 
     done = run_script(script)
 
@@ -295,13 +326,14 @@ def test_cron_script_rolls_engine_after_successful_update(tmp_path: Path, monkey
     assert "раскатка: обновлено: 1" in out and "shop: обновлено 0.31.0 → 0.32.0" in out
     # Порядок шагов — тот же, что в `rollout.STEPS`: движок после плагина, не до.
     assert out.index("плагин обновлён") < out.index("раскатка: обновлено")
-    # Реестр — тот, что записан при установке: у cron `HERMES_HOME` свой, у панели свой.
-    assert f"реестр: {registry}" in out
+    # Где реестры, решает пакет: у cron свой `HERMES_HOME`, у панели — реестр хоста,
+    # поэтому скрипт не называет файл сам, а зовёт `after_update()` без аргументов.
+    assert "аргументы: ((), [])" in out
 
 
 def test_cron_script_reports_rollout_failure(tmp_path: Path, monkeypatch):
     """Раскатка не удалась — cron-джоба отвечает кодом 1, а не «всё прошло»."""
-    script, _registry = make_script(tmp_path, monkeypatch, rollout_ok=False)
+    script = make_script(tmp_path, monkeypatch, rollout_ok=False)
 
     done = run_script(script)
 
