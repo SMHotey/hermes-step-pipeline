@@ -2476,6 +2476,11 @@ def prompt_order_body(p: Paths, step: dict) -> str:
     ])
 
 
+# Служебная строка «реестр шага не читается»: одна и та же в блоке карточки (13-S2, §4.7)
+# и в строках реестра — второй формулировки причины не вводим.
+STEP_FINDINGS_UNREADABLE = "- реестр находок шага не читается: "
+
+
 def step_registry_lines(p: Paths, step: dict, only_open: bool = False) -> list[str]:
     """Строки реестра шага для тела карточки; битый реестр — строкой с причиной (13-S2).
 
@@ -2489,7 +2494,7 @@ def step_registry_lines(p: Paths, step: dict, only_open: bool = False) -> list[s
         rows = load_findings(path, STEP_FINDINGS_HEADER, STEP_FINDINGS_KEYS,
                              kinds=STEP_FINDING_KINDS)
     except (GateError, OSError, ValueError) as exc:
-        return [f"- реестр находок шага не читается: {exc}"]
+        return [f"{STEP_FINDINGS_UNREADABLE}{exc}"]
     if not path.is_file():
         return ["- реестра ещё нет: первая находка создаёт файл с шапкой выше."]
     if only_open:
@@ -2518,10 +2523,14 @@ def step_findings_block(p: Paths, step: dict) -> list[str]:
 
     Нет реестра или открытых строк нет — пустой список: тело карточки без реестра обязано
     остаться дословно прежним (на этом стоят `test_comments` и `test_prompt_fix_card`).
+    Реестр не читается — блоком идёт одна служебная строка с причиной (§4.7): молча
+    пропущенная ошибка читалась бы исполнителем как «открытых находок нет».
     """
-    open_lines = open_step_findings_lines(p, step)
+    lines = step_registry_lines(p, step, only_open=True)
+    open_lines = [line for line in lines if line.startswith("- F")]
     if not open_lines:
-        return []
+        unreadable = [line for line in lines if line.startswith(STEP_FINDINGS_UNREADABLE)]
+        return [unreadable[0], ""] if unreadable else []
     header = findings_table([], STEP_FINDINGS_HEADER, STEP_FINDINGS_KEYS)[0]
     return [
         "ОТКРЫТЫЕ НАХОДКИ РЕЕСТРА ШАГА (круг закрывает только их)",

@@ -415,6 +415,29 @@ def test_approve_with_significant_finding_closes(tmp_path: Path, hermes_stub: Pa
     assert [r for r in plan_registry_rows(root) if r["step"] == "S1"] == []
 
 
+def test_broken_registry_error_line_reaches_card_and_comment(tmp_path: Path, hermes_stub: Path,
+                                                            monkeypatch):
+    """Битый реестр — в карточке правок и в комментарии строка с причиной (§4.7).
+
+    До решения такой тик не доходит: инцидентный стоп ставится раньше
+    (`test_broken_registry_stops_and_names_path`), поэтому проверяется сам построитель.
+    Молча пропущенный блок исполнитель прочёл бы как «открытых находок нет» и закрыл круг
+    без правки.
+    """
+    _root, p = stand(tmp_path, hermes_stub, monkeypatch, report=REPORT_BLOCKING,
+                     registry="мусор без шапки таблицы\n")
+    body = gate.fix_card_body(p, STEP, 1, REPORT_REL, 6, report_verdict="REQUEST_CHANGES")
+    assert gate.STEP_FINDINGS_UNREADABLE in body, body
+    assert Path(REGISTRY_REL).name in body, body
+    # Строка ошибки не выдаёт себя за открытые находки: заголовка блока нет.
+    assert "ОТКРЫТЫЕ НАХОДКИ РЕЕСТРА ШАГА" not in body
+
+    comment = gate.fix_comment_body(p, STEP, 1, REPORT_REL, "t_rev_s1")
+    assert gate.STEP_FINDINGS_UNREADABLE in comment, comment
+    # Тот же блок первым — до выжимки находок отчёта (как и открытые строки).
+    assert comment.index(gate.STEP_FINDINGS_UNREADABLE) < comment.index("Блокирующие находки")
+
+
 def test_broken_registry_stops_and_names_path(tmp_path: Path, hermes_stub: Path,
                                               monkeypatch):
     """Битый реестр — инцидентный стоп с путём в причине: шаг не закрыть вслепую."""
