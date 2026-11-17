@@ -69,8 +69,7 @@ def test_question_card_puts_the_recommendation_first_and_shows_the_price():
     assert "sort(" in card and "рекомендую" in card
     assert "data-value=\"${esc(opt.letter || opt.text)}\"" in card
     # Дедлайн назван человеческим языком и только когда автовыбор вообще будет.
-    assert "Если не ответить" in card and "приму" in card
-    assert "автовыбора не будет" in card
+    assert "questionDeadlineText(q, rec)" in card
     # Свой ответ — не вместо вариантов, а рядом с ними.
     assert 'data-answer-send=' in card and 'data-answer-input=' in card
 
@@ -126,3 +125,18 @@ def test_settings_carry_the_wait_for_an_answer():
     assert "notify: {answer_timeout:" in patch and "* 60" in patch
     # Секунды из снимка в минуты формы: одна правда о единицах — у движка.
     assert 'Math.round((Number(data.answer_timeout) || 0) / 60)' in html
+
+
+def test_question_deadline_names_three_different_facts():
+    """Пустой дедлайн не читается как «срок вышел» (0.33).
+
+    Карточка обещала автовыбор, которого не будет, когда вопрос взят из файла без времени
+    в состоянии плана: владелец ждёт автовыбора и ждёт напрасно.
+    """
+    src = page()
+    body = block(src, "function questionDeadlineText(", "// Карточка вопроса")
+    assert "Рекомендации нет" in body          # рекомендация не названа — автовыбора нет
+    assert "Срок автовыбора истёк" in body     # время было и прошло
+    assert "Дедлайн не назначен" in body       # времени нет вовсе — и это не «прошло»
+    card = block(src, "function questionCard(", "function renderQuestions(")
+    assert "questionDeadlineText(q, rec)" in card
