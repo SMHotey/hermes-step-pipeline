@@ -2275,6 +2275,27 @@ function renderStepProgress(data) {
   $("step-flow").innerHTML = (pr.tiles || []).map(tileHtml).join("");
 }
 
+function planFindingsHtml(pf) {
+  // Находки реестра плана: ID, шаг, класс, статус, текст и «что сделать».
+  // Пустой реестр ничего не рисует: подпись «находок нет» здесь врала бы — вердикт считает
+  // страж, а он мог закрыть план и без файла реестра.
+  if (!pf || !pf.exists || !(pf.rows || []).length) {
+    return pf && pf.note ? `<div class="muted">${esc(pf.note)}</div>` : "";
+  }
+  const head = `находки реестра: открыто ${Number(pf.open) || 0}`
+    + (pf.total ? ` из ${Number(pf.total)}` : "")
+    + (pf.blocking ? ` · блокирующих ${Number(pf.blocking)}` : "");
+  const rows = (pf.rows || []).map((row) => {
+    const cls = row.open ? "bad" : "muted";
+    const meta = [row.id, row.step, row.cls, row.status].filter(Boolean).join(" · ");
+    const action = row.action
+      ? `<div class="clip">что сделать: ${esc(row.action)}</div>` : "";
+    return `<div class="finding ${cls}"><b>${esc(meta)}</b>${esc(row.text || "")}${action}</div>`;
+  }).join("");
+  const note = pf.note ? `<div class="clip">${esc(pf.note)}</div>` : "";
+  return `<div class="muted">${esc(head)}</div>${rows}${note}`;
+}
+
 function renderPlanReview(data) {
   // Блок «Ревью плана» (S7 плана 6): этап, круг из бюджета, времена по кругам и находки.
   // Числа считает сервер (`plan_review` в снимке и в `/api/step`), страница их не выводит.
@@ -2302,8 +2323,10 @@ function renderPlanReview(data) {
   }).join("");
   const findings = pr.findings || {};
   const found = findings.exists === false || !findings.label ? ""
-    : `<div class="muted">находки: ${esc(findings.label)}</div>`;
-  $("plan-review-findings").innerHTML = (pairs + found)
+    : `<div class="muted">находки отчёта: ${esc(findings.label)}</div>`;
+  // Находки реестра — строками: по нему страж держит вердикт, и счётчик без текста не
+  // объясняет, что править (замечание владельца, 0.34.0).
+  $("plan-review-findings").innerHTML = (pairs + found + planFindingsHtml(data.plan_findings))
     || `<div class="muted">кругов ревью плана нет</div>`;
   // Кнопка активна только при исчерпанном бюджете и неистраченном ручном круге (решение D4),
   // и никогда — в предпросмотре: там действия запрещены.

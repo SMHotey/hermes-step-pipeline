@@ -35,6 +35,7 @@ from typing import Any
 
 try:  # обычный путь — пакет плагина; __main__ — ручная проверка файлом
     from . import plan_accept
+    from . import findings_view
     from . import plan_review_progress
     from . import plan_rounds
     from . import progress
@@ -42,6 +43,7 @@ try:  # обычный путь — пакет плагина; __main__ — ру
     from . import stats
 except ImportError:  # pragma: no cover
     import plan_accept  # type: ignore[no-redef]
+    import findings_view  # type: ignore[no-redef]
     import plan_review_progress  # type: ignore[no-redef]
     import plan_rounds  # type: ignore[no-redef]
     import progress  # type: ignore[no-redef]
@@ -883,6 +885,9 @@ def _plan_progress(root: Path, cfg: dict, plan_row: dict, board: str | None,
         # Имя отчёта ревью плана — `<план>-<шаг>.md` в каталоге отчётов: `plan-6.md`.
         _review(root, cfg, "plan", plan_id, limit=1),
         now if now is not None else time.time())
+    # Находки реестра — строками, а не счётчиком: по нему страж держит вердикт, и без текста
+    # владелец видит «есть замечания» и не видит, какие (замечание владельца, 0.34.0).
+    data["plan_findings"] = _plan_findings(root, cfg, plan_id)
     return data
 
 
@@ -1095,6 +1100,16 @@ def _review(root: Path, cfg: dict, plan_id: str, step_id: str,
     return {"exists": True, "path": rel, "verdict": verdict, "occurrences": len(found),
             "commit": commit.group(1) if commit else "",
             "findings": findings, "findings_note": findings_note, **_clip(text, limit)}
+
+
+def _plan_findings(root: Path, cfg: dict, plan_id: str) -> dict:
+    """Реестр находок плана для показа: путь берётся из того же каталога, что у отчёта.
+
+    `docs/reviews/plan-<N>-findings.md` — файл, по которому страж считает вердикт. Панель
+    только показывает строки (`findings_view`): своего счёта вердикта она не заводит.
+    """
+    rel = f"{((cfg.get('paths') or {}).get('reviews') or 'docs/reviews').rstrip('/')}"
+    return findings_view.load(Path(root) / rel / f"plan-{plan_id}-findings.md")
 
 
 def _git_show(root: Path, sha: str, limit: int = STEP_LINES, timeout: int = 30) -> dict:
@@ -1499,6 +1514,7 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
             "contract": contract, "prompt": prompt, "review": review,
             "commit": _git_show(root, review.get("commit") or "", cap),
             "cards": step_cards, "progress": step_progress, "plan_review": plan_review,
+            "plan_findings": _plan_findings(root, cfg, plan),
             "times": times, "stages": stages,
             "roles": _plan_roles(plan_cards, cfg, plan_runs, now),
             "step_roles": _step_roles(stages),

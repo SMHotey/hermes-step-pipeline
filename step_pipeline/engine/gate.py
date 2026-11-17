@@ -268,6 +268,12 @@ ROUNDS_FILE = "plan_{plan}_rounds.json"
 COMMENT_AUTHOR = "страж"
 COMMENT_MAX_LEN = 4000
 FINDINGS_LIMIT = 5
+# Пределы текста находок в уведомлении о правках плана (0.34.0): находки — в сообщении,
+# а не только счётом. Строка режется с многоточием, общий бюджет оставляет место шапке
+# сообщения и не упирается в лимит Telegram в 4096 символов.
+NOTICE_TEXT_CAP = 260
+NOTICE_ACTION_CAP = 140
+NOTICE_TOTAL_CAP = 3300
 # Реестр находок плана (план 7, S1): закрытые словари классов и статусов, шапка таблицы.
 # Класс выбирает маршрут находки (S3), статус решает вердикт (S2): блокирует только `открыто`.
 FINDING_KINDS = ("замысел", "двусмысленность", "формат-стража", "гейт-исполнение", "стиль")
@@ -2330,6 +2336,47 @@ def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str
         "",
         f"Профиль карточки — `{profile}`; карточка поставлена стражем конвейера.",
     ])
+
+
+def plan_fix_notice(plan_id: str, cid: str, profile: str, round_no: int,
+                    rows: list[dict] | None) -> str:
+    """Сообщение о круге правок плана: прежняя первая строка + открытые находки.
+
+    Зачем. До 0.34.0 владелец получал только «правим план кругом 1, карточка t_…»: он видел
+    счёт находок в панели и не видел ни одной. Открытые находки реестра — это ровно то, за что
+    держится вердикт, поэтому они идут в сообщение строками: ID, шаг, суть, что сделать.
+    Текст режется по-строчно, а не молча: хвост называет число невлезших находок, а полный
+    реестр остаётся файлом.
+    """
+    head = (f"план {plan_id}: ревью вернуло REQUEST_CHANGES — правим план кругом "
+            f"{round_no} (карточка {cid}, профиль {profile}); после правки ревью повторится")
+    opened = [row for row in (rows or [])
+              if str(row.get("status") or "") == "открыто"]
+    if not opened:
+        return head
+    lines = [head, f"открыто находок: {len(opened)} — что править:"]
+    budget = NOTICE_TOTAL_CAP
+    shown = 0
+    for row in opened:
+        text = _notice_part(row.get("text"), NOTICE_TEXT_CAP)
+        action = _notice_part(row.get("action"), NOTICE_ACTION_CAP)
+        line = f"{row.get('id') or '?'} ({row.get('step') or '—'}): {text}"
+        if action:
+            line += f" → {action}"
+        if len(line) + 1 > budget:
+            break
+        budget -= len(line) + 1
+        lines.append(line)
+        shown += 1
+    if shown < len(opened):
+        lines.append(f"…и ещё {len(opened) - shown}: целиком — в реестре находок плана")
+    return "\n".join(lines)
+
+
+def _notice_part(value, cap: int) -> str:
+    """Одна фраза для сообщения: пробелы схлопнуты, длинное обрезано с многоточием."""
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= cap else text[: cap - 1].rstrip() + "…"
 
 
 def plan_fix_card_body(p: Paths, plan_rel: str, report_rel: str,
@@ -6811,9 +6858,10 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                     say("  замечание о расхождении вердикта — комментарием в карточку ревью "
                         f"{review_cards[-1]['id']}")
         if cid:
-            say(f"план {plan_id}: ревью вернуло REQUEST_CHANGES — правим план кругом "
-                f"{key_round} (карточка {cid}, профиль {profile}); после правки ревью "
-                f"повторится")
+            # Находки — в сообщение, не только счётом: владелец должен видеть, что править,
+            # не открывая панель (0.34.0). Порядок строк — как в реестре.
+            say(plan_fix_notice(plan_id, cid, profile, key_round,
+                                ctx.get("plan_findings") or []))
         else:
             say(f"план {plan_id}: не смог поставить правку плана — проверь `hermes kanban ls`")
         return result

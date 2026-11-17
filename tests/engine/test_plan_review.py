@@ -809,3 +809,30 @@ def test_broken_marker_gives_zero_extra_rounds(stand):
     stopped = _to_owner_stop(root, p, db)
     assert "исчерпаны (2 из 2)" in stopped["reason"], stopped
     assert gate.load_stop(p)["kind"] == "owner"
+
+def test_fix_notice_carries_registry_findings(stand):
+    """Сообщение о правках плана несёт открытые находки реестра, а не только счёт (0.34.0).
+
+    Живой случай: план 1 проекта self-analyzer не прошёл ревью, в бот пришло «правим план
+    кругом 1 (карточка t_…)» — и ни одной находки. Чинить владельцу было нечего, он видел
+    только счётчик в панели.
+    """
+    root, p, db = stand
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
+    complete(db, ":planreview")
+    write_report(root, "# Ревью плана 1\n\n- шаг S2 не опирается на S1\n\n"
+                       "## ВЕРДИКТ: REQUEST_CHANGES\n")
+    registry = Path(root) / "docs" / "reviews" / "plan-1-findings.md"
+    registry.write_text(
+        "| ID | Шаг | Класс | Находка | Что сделать | Статус |\n"
+        "|---|---|---|---|---|---|\n"
+        "| F1 | S2 | замысел | В шаге нет стоп-сигнала | Добавить `Риск: high` | открыто |\n"
+        "| F2 | S2 | стиль | Лишняя строка | Убрать | не блокирует |\n",
+        encoding="utf-8")
+    said: list[str] = []
+    result = gate.run_gate(p, notify_fn=said.append)
+    assert result["decision"]["action"] == "create_plan_fix", result["decision"]
+    text = "\n".join(said)
+    assert "F1 (S2): В шаге нет стоп-сигнала" in text, text
+    assert "Добавить `Риск: high`" in text, text
+    assert "F2 (S2)" not in text, text
