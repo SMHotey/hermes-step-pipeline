@@ -14,6 +14,7 @@ for path in (str(TESTS), str(TESTS.parent)):
         sys.path.insert(0, path)
 
 from helpers import install_project  # noqa: E402
+from step_pipeline import project as project_mod  # noqa: E402
 
 
 @pytest.fixture()
@@ -32,6 +33,11 @@ def isolated_hermes_home(tmp_path: Path, monkeypatch) -> Path:
     home = tmp_path / "hermes-home"
     (home / "plugins").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # `profile_dir` читает `LOCALAPPDATA`, а не `HERMES_HOME`: без подмены тесты писали бы
+    # скрипты автообновления в ЖИВЫЕ `profiles/<имя>/scripts/` (найдено 17.11.2026 —
+    # в профилях остались скрипты с путём реестра из pytest-tmp).
+    profiles = tmp_path / "profiles"
+    monkeypatch.setattr(project_mod, "profile_dir", lambda profile: profiles / profile)
     return home
 
 

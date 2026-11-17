@@ -85,7 +85,10 @@
   пакет, а не `HERMES_HOME` джобы (у джобы он указывает на профиль-владельца).
 
 Проверки: `tests/test_rollout_after_update.py` — 11 тестов, среди них два реестра с общим
-проектом; полный `pytest` — 1093 passed, 2 skipped.
+проектом; полный `pytest` — 1093 passed, 2 skipped. Он же вскрыл побочное: `proj.profile_dir()`
+читает `LOCALAPPDATA`, а не `HERMES_HOME`, поэтому тесты писали скрипты автообновления в
+живые `profiles/<имя>/scripts/`. Подмена `profile_dir` переехала в autouse-фикстуру
+`tests/conftest.py`, живые скрипты перезаписаны текущим шаблоном.
 
 ## 0.32.0 — 17.11.2026
 

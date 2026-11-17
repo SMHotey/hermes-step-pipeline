@@ -272,6 +272,11 @@ hermes pipeline doctor  --project <путь>
   пакет на хосте один, значит и движок в проектах всех реестров должен стать один. Ходить
   только по реестру своего профиля нельзя — он на живой установке оказался пустым
   (`{"projects": []}`), и `update` честно рапортовал «раскатывать нечего».
+- **`profile_dir` не слушает `HERMES_HOME`.** `project.profile_dir()` берёт `LOCALAPPDATA`/`~`,
+  поэтому тест, который зовёт `setup --upgrade`/`ensure_update_cron`, писал скрипты
+  автообновления в ЖИВЫЕ `profiles/<имя>/scripts/` (найдено 17.11.2026: в `default` и `demo`
+  лежали скрипты с путём реестра из pytest-tmp). Подмена — в autouse-фикстуре
+  `tests/conftest.py`, не в отдельных тестах.
 - **`hermes` в PATH не гарантирован.** Тесты не должны звать настоящий бинарник:
   подделывать `proj.run_hermes` (иначе CI на ubuntu падает `FileNotFoundError: 'hermes'`).
 - **Windows-консоль cp1251.** Любой русский вывод движка падал `UnicodeEncodeError`,
