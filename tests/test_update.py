@@ -164,7 +164,9 @@ def test_install_rewrites_package_and_keeps_backup(tmp_path: Path):
     assert (package / "engine" / "gate.py").is_file()
     backup = Path(result["backup"])
     assert (backup / "plugin.yaml").read_bytes() == _plugin_yaml("0.1.0")
-    assert "setup --upgrade" in result["restart"]
+    # Раскатку движка больше не оставляют владельцу: её делает `update` (карточка 6-S9).
+    assert "раскатывается следом" in result["restart"]
+    assert "setup --upgrade" not in result["restart"]
 
 
 def test_install_same_version_does_not_touch_files(tmp_path: Path):

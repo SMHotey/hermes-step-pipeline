@@ -13,6 +13,7 @@ try:
     from . import plan_accept
     from . import plan_mode
     from . import project as proj
+    from . import rollout
     from . import setup_flow, snapshot as snap, telegram
     from . import stats
     from . import update
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover - отладка файлом
     import plan_accept  # type: ignore
     import plan_mode  # type: ignore
     import project as proj  # type: ignore
+    import rollout  # type: ignore
     import setup_flow  # type: ignore
     import snapshot as snap  # type: ignore
     import telegram  # type: ignore
@@ -454,12 +456,30 @@ def _print_plan_list(project: Path) -> None:
             print(f"  {number}  {name}")
 
 
+def _rollout_after_update(as_json: bool) -> dict:
+    """Раскатать движок по реестру после замены плагина и напечатать итог по проектам.
+
+    Печать здесь, а не в `rollout`: JSON-режиму нужен только результат, иначе ответ
+    `update --json` перестал бы разбираться. Отказ одного проекта раскатку остальных не
+    отменяет (`run_engine`), а код возврата считает вызывающий.
+    """
+    report = rollout.after_update()
+    if not as_json:
+        for line in report.get("lines") or []:
+            print(line)
+    return report
+
+
 def cmd_update(args) -> int:
     """Проверить GitHub-релиз и обновить плагин.
 
     `--check` — только отчёт (код 0 и когда обновление есть: это не ошибка). Сбой сети
     или архива — код 1 и текст причины: «обновлений нет» при недоступном GitHub было бы
     ложью, из-за которой обновление не приезжало бы никогда.
+
+    Плагин заменён — сразу раскатываем движок по реестру: копии в проектах берутся из
+    установленного плагина, и без этого шага они остаются от прежней версии, а `doctor`
+    краснеет при равной версии.
     """
     timeout = float(getattr(args, "timeout", 0) or 0) or update.DEFAULT_TIMEOUT
     as_json = bool(getattr(args, "json", False))
@@ -489,21 +509,28 @@ def cmd_update(args) -> int:
             print(f"доступно обновление: v{current} → v{latest} ({info['source']})")
             print("поставить: hermes pipeline update")
         return 0
-    print(f"обновляю плагин: v{current} → v{latest}…")
+    if not as_json:
+        print(f"обновляю плагин: v{current} → v{latest}…")
     try:
         result = update.install(tag=info["tag"], timeout=timeout)
     except update.UpdateError as exc:
         print(f"ошибка обновления: {exc}", file=sys.stderr)
         return 1
+    # Раскатка нужна только после настоящей замены пакета: «уже актуально» ничего не
+    # сдвинуло, и раскатывать по реестру нечего.
+    report = _rollout_after_update(as_json) if result.get("updated") else None
     if as_json:
-        print(_dump(result))
-        return 0
+        payload = dict(result)
+        if report is not None:
+            payload["rollout"] = report
+        print(_dump(payload))
+        return 0 if (report or {}).get("ok", True) else 1
     print(result.get("message") or "готово")
     if result.get("backup"):
         print(f"прежняя копия: {result['backup']}")
     if result.get("restart"):
         print(result["restart"])
-    return 0
+    return 0 if (report or {}).get("ok", True) else 1
 
 
 def cmd_plan_mode(args) -> int:

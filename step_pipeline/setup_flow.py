@@ -1118,6 +1118,34 @@ def find_plugin():
     return None
 
 
+def rollout_engine(plugin):
+    """Раздать новый движок по проектам реестра, записанного при установке.
+
+    Плагин ставится копией, а движок в проект — копией из установленного плагина:
+    без этого шага проекты остаются на прежнем движке, и `doctor` краснеет при равной
+    версии. Импорт — пакетом (каталог, содержащий `step_pipeline`, в sys.path): плоский
+    импорт модулей плагина держится на ручных fallback'ах и на первом же модуле без них
+    падает `attempted relative import`.
+
+    Реестр берётся из `REGISTRY`, а не из `HERMES_HOME` этой джобы: cron ходит под
+    профилем-владельцем джобы, а панель на этом хосте работает с реестром хоста. Путь
+    к реестру записан мастером установки — он и был реестром панели в тот момент.
+    """
+    parent = str(plugin.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    try:
+        import importlib
+        module = importlib.import_module(plugin.name + ".rollout")
+    except Exception as exc:                                   # noqa: BLE001
+        print("pipeline_update: раскатка движка не запущена: " + str(exc), file=sys.stderr)
+        return 1
+    report = module.after_update(REGISTRY)
+    for line in report.get("lines") or []:
+        print(line)
+    return 0 if report.get("ok") else 1
+
+
 def main():
     _setup_stdio()
     plugin = find_plugin()
@@ -1130,26 +1158,42 @@ def main():
     if result.get("error"):
         print("pipeline_update: " + str(result["error"]), file=sys.stderr)
         return 1
-    if result.get("updated"):
-        print(result.get("message") or "плагин обновлён")
-        if result.get("restart"):
-            print(result["restart"])
-    return 0
+    if not result.get("updated"):
+        return 0
+    print(result.get("message") or "плагин обновлён")
+    if result.get("restart"):
+        print(result["restart"])
+    return rollout_engine(plugin)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 
 
-def install_update_script(driver: str) -> Path:
-    """Положить скрипт автообновления в `profiles/<профиль>/scripts/` (cron берёт только оттуда)."""
+def install_update_script(driver: str, registry: Path | None = None) -> Path:
+    """Положить скрипт автообновления в `profiles/<профиль>/scripts/` (cron берёт только оттуда).
+
+    *registry* — файл реестра проектов, по которому раскатывать движок. Записывается в
+    скрипт текстом: у cron-джобы `HERMES_HOME` указывает на профиль-владельца, а панель
+    может работать с реестром хоста — тогда «проекты для раскатки» разъехались бы с тем,
+    что видит владелец. Умолчание — `proj.projects_file()`, то есть реестр этого профиля.
+    """
     scripts = proj.profile_dir(driver) / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
+    path_text = str(Path(registry).expanduser() if registry else proj.projects_file())
     header = ('# -*- coding: utf-8 -*-\n'
               '"""Автообновление плагина конвейера из GitHub (`--no-agent`, раз в сутки).\n\n'
               'Плагин ставится копией, поэтому обновление — скачать архив тега и переписать\n'
-              'пакет. Движок в проектах обновляет владелец: `hermes pipeline setup --upgrade`\n'
-              '(плагин не переписывает `.pipeline/` в проектах молча).\n'
+              'пакет. Движок в проектах берётся из установленного плагина, поэтому сразу\n'
+              'после замены пакета скрипт раскатывает его по реестру профиля\n'
+              '(rollout.after_update): без этого шага копии в `.pipeline/` остаются от\n'
+              'прежней версии, а `doctor` краснеет при равной версии.\n'
               '"""\n'
               'import sys\n'
-              'from pathlib import Path\n')
+              'from pathlib import Path\n'
+              '\n'
+              'REGISTRY = Path(r"' + path_text + '")\n')
     target = scripts / "pipeline_update.py"
     target.write_text(header + UPDATE_SCRIPT, encoding="utf-8")
     return target
@@ -1165,7 +1209,7 @@ def ensure_update_cron(driver: str, project: Path, log: Log, *, skip: bool) -> N
     if skip:
         log.warn("автообновление не заведено (--no-cron)")
         return
-    install_update_script(driver)
+    install_update_script(driver, proj.projects_file())
     listing = proj.run_hermes("-p", driver, "cron", "list")
     if UPDATE_JOB in (listing.stdout or ""):
         log.ok("cron-джоба автообновления уже есть (скрипт обновлён)")

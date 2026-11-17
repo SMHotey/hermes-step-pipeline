@@ -145,9 +145,9 @@ def write_engine_spy(monkeypatch) -> list[dict]:
     real = rollout.write_engine
     entries: list[dict] = []
 
-    def spy(entry: dict) -> None:
+    def spy(entry: dict, path=None) -> None:
         entries.append(json.loads(json.dumps(entry, default=str)))
-        real(entry)
+        real(entry, path)
 
     monkeypatch.setattr(rollout, "write_engine", spy)
     return entries

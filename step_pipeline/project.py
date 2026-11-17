@@ -110,15 +110,21 @@ def _displayed_entries(raw: list) -> list[tuple[int, dict[str, Any], str, Path, 
     return out
 
 
-def read_projects() -> list[dict[str, Any]]:
+def read_projects(path: Path | str | None = None) -> list[dict[str, Any]]:
     """Записи реестра: `{"id", "name", "root"}`; битый файл — пустой список.
 
     Запись без `root` пропускается: угадывать, какой проект имелся в виду, нельзя.
     Неуникальные `id` получают суффикс `-2`, `-3` — по ним панель адресует действия.
     Пути не проверяются: каталог без `.pipeline` показывается как «не установлен».
+
+    *path* — читать конкретный файл реестра вместо того, который даёт `projects_file()`.
+    Нужен cron-скрипту автообновления: он запоминает реестр на момент установки
+    (`HERMES_HOME` в джобе указывает на профиль, а панель может работать с реестром хоста),
+    и «проекты для раскатки» обязаны совпадать с тем, что видит панель.
     """
     try:
-        data = json.loads(projects_file().read_text(encoding="utf-8"))
+        source = Path(path).expanduser() if path is not None else projects_file()
+        data = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     raw = data.get("projects") if isinstance(data, dict) else data
@@ -128,14 +134,18 @@ def read_projects() -> list[dict[str, Any]]:
             for _index, _item, project_id, root, name in _displayed_entries(raw)]
 
 
-def _read_registry_raw() -> tuple[dict[str, Any] | None, list]:
+def _read_registry_raw(path: Path | str | None = None) -> tuple[dict[str, Any] | None, list]:
     """Сырой реестр: контейнер (`None` — форма-список) и список записей.
 
     Нет файла — пустой реестр формы-словаря: добавление создаёт файл. Битый JSON —
     `ValueError`: писатель обязан отказать, а не затереть чужие записи (D2).
+
+    *path* — конкретный файл реестра вместо `projects_file()`: раскатка после
+    самообновления читает и пишет тот же реестр, который знает панель.
     """
+    target = Path(path).expanduser() if path is not None else projects_file()
     try:
-        text = projects_file().read_text(encoding="utf-8")
+        text = target.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {"projects": []}, []
     except OSError as exc:
@@ -157,12 +167,14 @@ def raw_projects() -> list[dict[str, Any]]:
     return [item for item in raw if isinstance(item, dict)]
 
 
-def _write_registry(container: dict[str, Any] | None, entries: list) -> None:
+def _write_registry(container: dict[str, Any] | None, entries: list,
+                    path: Path | str | None = None) -> None:
     """Записать реестр атомарно: временный файл рядом, затем `os.replace` (D1).
 
     Чужие ключи контейнера сохраняются: панель правит только список `projects`.
+    *path* — писать в конкретный файл реестра вместо `projects_file()`.
     """
-    path = projects_file()
+    path = Path(path).expanduser() if path is not None else projects_file()
     payload = entries if container is None else {**container, "projects": entries}
     path.parent.mkdir(parents=True, exist_ok=True)
     temp: Path | None = None

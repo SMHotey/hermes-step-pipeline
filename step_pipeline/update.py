@@ -286,8 +286,9 @@ def install(explicit: Path | str | None = None, fetch=None,
     return {"ok": True, "updated": after != current, "from": current, "to": after,
             "latest": new_version, "backup": str(backup), "error": "",
             "message": f"плагин обновлён: v{current} → v{after}",
-            "restart": "перезапусти сессию Hermes; движок проектов — "
-                       "`hermes pipeline setup --upgrade`"}
+            "restart": "перезапусти сессию Hermes; движок в проектах раскатывается следом "
+                       "(`hermes pipeline update` делает это сам, в панели — "
+                       "«Обновить во всех»)"}
 
 
 def auto(explicit: Path | str | None = None, fetch=None,

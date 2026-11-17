@@ -113,14 +113,17 @@ def _projection(entry: dict) -> dict:
             "projects": list(entry.get("projects") or [])}
 
 
-def _put_record(key: str, entry: dict) -> None:
-    """Записать итог шага раскатки в реестр профиля, сохранив чужие ключи контейнера.
+def _put_record(key: str, entry: dict, path: Path | str | None = None) -> None:
+    """Записать итог шага раскатки в реестр, сохранив чужие ключи контейнера.
 
     Форма-список приводится к словарю `{"projects": [...]}`: в список ключ `rollout` не
     положить, а `read_projects` читает обе формы. Запись атомарна и делает её
     `proj._write_registry` — второго писателя `projects.json` в пакете нет (D3).
+
+    *path* — реестр, с которым работал вызывающий (самообновление берёт его из cron-скрипта):
+    итог обязан лечь туда же, откуда взяты строки, иначе панель не увидит раскатки.
     """
-    container, entries = proj._read_registry_raw()
+    container, entries = proj._read_registry_raw(path)
     box: dict = container if isinstance(container, dict) else {"projects": entries}
     if RECORD_KEY not in box:
         box[RECORD_KEY] = {}
@@ -131,7 +134,7 @@ def _put_record(key: str, entry: dict) -> None:
         # Плоские ключи контейнера — проекция записи шага `engine` (D1): владелец читает
         # статус, не зная формы записи, а источник истины остаётся один.
         box[RECORD_KEY].update(_projection(entry))
-    proj._write_registry(box, entries)
+    proj._write_registry(box, entries, path)
 
 
 def write_plugin(entry: dict) -> None:
@@ -139,9 +142,9 @@ def write_plugin(entry: dict) -> None:
     _put_record(PLUGIN_KEY, entry)
 
 
-def write_engine(entry: dict) -> None:
+def write_engine(entry: dict, path: Path | str | None = None) -> None:
     """Записать итог раскатки движка тем же правилом, что и плагин (D14)."""
-    _put_record(ENGINE_KEY, entry)
+    _put_record(ENGINE_KEY, entry, path)
 
 
 def busy() -> bool:
@@ -388,7 +391,7 @@ def _row(row: dict, status: str, *, at: str = "", was: str = "", now: str = "",
 
 
 def _record(rows: list[dict], *, running: bool, ok: bool, begin: str,
-            error: str = "") -> dict:
+            error: str = "", path: Path | str | None = None) -> dict:
     """Собрать запись и записать её; отказ реестра не отменяет сделанную работу (D8).
 
     Следующая запись несёт полный список строк, поэтому потерянная не рвёт раскатку:
@@ -398,7 +401,7 @@ def _record(rows: list[dict], *, running: bool, ok: bool, begin: str,
              "finished": "" if running else _stamp(), "ok": ok, "error": error,
              "projects": list(rows)}
     try:
-        write_engine(entry)
+        write_engine(entry, path)
     except (OSError, ValueError, TypeError) as exc:
         proj.debug_note("rollout.engine", exc)
     return entry
@@ -406,13 +409,14 @@ def _record(rows: list[dict], *, running: bool, ok: bool, begin: str,
 
 def run_engine(rows: list[dict], *, interval: float = ROLLOUT_INTERVAL,
                limit: float = ROLLOUT_WAIT_LIMIT, sleep=time.sleep,
-               started: str = "") -> dict:
+               started: str = "", registry: Path | str | None = None) -> dict:
     """Синхронный проход по проектам: окно → `upgrade` → строка → запись реестра.
 
     Один проект за раз: тяжёлый `upgrade` (копия движка, роли, cron, доверие) не должен
     идти параллельно двум проектам, иначе непонятно, чей отказ в итоге. Ожидание окна
     имеет предел: не дождались — проект `failed` с причиной, раскатка идёт дальше (D5).
     `sleep`, `interval` и `limit` — параметры, чтобы тест не ждал настоящие полчаса.
+    *registry* — файл реестра для записи итога (умолчание — реестр профиля).
     """
     begin = started or _stamp()
     # Нулевой (или отрицательный) интервал не должен крутить цикл ожидания вечно:
@@ -433,7 +437,7 @@ def run_engine(rows: list[dict], *, interval: float = ROLLOUT_INTERVAL,
                     # Первое обнаружение пишется сразу: панель должна видеть, чего ждём.
                     position = len(results)
                     results.append(_row(row, STATUS_WAITING, reason=reason))
-                    _record(results, running=True, ok=False, begin=begin)
+                    _record(results, running=True, ok=False, begin=begin, path=registry)
                     waited = 0.0
                     while reason and waited < limit:
                         sleep(interval)
@@ -464,8 +468,70 @@ def run_engine(rows: list[dict], *, interval: float = ROLLOUT_INTERVAL,
             results[position] = final
         if final["status"] == STATUS_FAILED:
             ok = False
-        _record(results, running=True, ok=False, begin=begin)
-    return _record(results, running=False, ok=ok, begin=begin)
+        _record(results, running=True, ok=False, begin=begin, path=registry)
+    return _record(results, running=False, ok=ok, begin=begin, path=registry)
+
+
+# ─────────────────── раскатка сразу после замены плагина (6-S9) ───────────────────
+
+#: Заголовок итога раскатки после обновления: печатают CLI и cron-скрипт автообновления,
+#: поэтому текст один и живёт здесь, а не в двух вызывающих.
+AFTER_UPDATE_HEADER = "раскатка движка по реестру после обновления плагина"
+#: Реестр пуст — раскатывать некуда. Это факт, который надо назвать, а не ошибка.
+NO_PROJECTS_NOTE = "реестр проектов пуст — раскатывать нечего"
+#: Второй проход поверх идущего не начинается: запись реестра затёрла бы итог первого.
+BUSY_NOTE = "раскатка уже идёт, итог — в реестре профиля и в панели"
+
+
+def _row_line(row: dict) -> str:
+    """Строка итога одного проекта: имя, статус и то, чем проект кончился.
+
+    «→» без «было» остаётся при первом обновлении проекта, где маркера версии ещё нет:
+    выдумывать прежнюю версию нельзя, пустое место честнее выдуманного нуля.
+    """
+    status = str(row.get("status") or "")
+    line = f"{row.get('name') or row.get('root')}: {STATUS_LABELS.get(status, status)}"
+    if status == STATUS_UPDATED:
+        before = str(row.get("from") or "")
+        return line + (f" {before} → {row.get('to')}" if before else f" → {row.get('to')}")
+    tail = str(row.get("error") or row.get("reason") or "")
+    return line + (f" — {tail}" if tail else "")
+
+
+def after_update(registry: Path | str | None = None, *, interval: float = ROLLOUT_INTERVAL,
+                 limit: float = ROLLOUT_WAIT_LIMIT, sleep=time.sleep) -> dict:
+    """Раскатать движок по реестру сразу после успешной замены плагина.
+
+    Зачем: копия движка в `<проект>/.pipeline/` берётся из УСТАНОВЛЕННОГО плагина
+    (`project.ENGINE_SRC`). Заменили плагин и не раскатали — копии остались от прежнего,
+    и `doctor` красный при равной версии (прецедент 17.11.2026, карточка 6-S9). Порядок
+    шагов уже описан `STEPS` (плагин → движок), проход тот же, что у панели
+    (`run_engine`); отличие одно — `update` ждёт итог, потому что отвечать ему некуда:
+    у CLI есть stdout, у cron-скрипта — лог джобы.
+
+    *registry* — файл реестра, по которому раскатывать; умолчание — реестр профиля.
+    Читается и пишется ОДИН файл: строки берутся из него, итог ложится в него же, иначе
+    панель, знающая реестр хоста, не увидела бы раскатки, сделанной джобой профиля.
+    `lines` — готовые к печати строки: строит их пакет, а не вызывающий.
+    """
+    rows = proj.read_projects(registry)
+    if not rows:
+        return {"ok": True, "projects": [], "summary": _summary([]),
+                "lines": [f"{AFTER_UPDATE_HEADER}: {NO_PROJECTS_NOTE}"]}
+    if not _LOCK.acquire(blocking=False):
+        # Занятую раскатку второй раз не начинаем: второй `run_engine` затёр бы запись
+        # первого, а панель показала бы чужой итог (D5).
+        return {"ok": False, "busy": True, "projects": [], "summary": _summary([]),
+                "lines": [f"{AFTER_UPDATE_HEADER}: {BUSY_NOTE}"]}
+    try:
+        entry = run_engine(rows, interval=interval, limit=limit, sleep=sleep,
+                           registry=registry)
+    finally:
+        _LOCK.release()
+    summary = _summary(entry.get("projects") or [])
+    lines = [f"{AFTER_UPDATE_HEADER}: {_summary_text(summary)}"]
+    lines += [f"  {_row_line(row)}" for row in entry.get("projects") or []]
+    return {**entry, "summary": summary, "lines": lines}
 
 
 def _background(rows: list[dict], started: str) -> None:
