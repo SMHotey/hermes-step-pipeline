@@ -1055,6 +1055,36 @@ def prompt_findings_rel(p: Paths, step_id: str) -> str:
     return p.cfg.rel(prompt_findings_path(p, step_id))
 
 
+# ───────────────────── реестр находок шага (план 13, S2) ─────────────────────
+# Реестр шага — память круга правок: одна строка на находку ревью КОДА, живущая от первого
+# `REQUEST_CHANGES` до закрытия шага. Шапка и ключи — псевдонимы реестра постановки (план
+# требует «того же формата»), а словарь классов свой: у реестров плана и постановки `kind`
+# — класс-маршрут (`замысел`, `стиль`), у реестра шага — класс находки. Общий словарь
+# (`FINDING_KINDS`) не расширяется: иначе реестр плана начал бы принимать классы находок.
+STEP_FINDINGS_HEADER = PROMPT_FINDINGS_HEADER
+STEP_FINDINGS_KEYS = PROMPT_FINDINGS_KEYS
+STEP_FINDING_KINDS = ("блокирующая", "значимая", "стилистическая")
+# Статус строки — из класса находки: держит шаг только блокирующая.
+STEP_FINDING_STATUS = {"блокирующая": "открыто", "значимая": "не блокирует",
+                       "стилистическая": "не блокирует"}
+STEP_FINDING_ACTION = ("Закрыть находку правкой и ответить фактом "
+                       "(адрес-символ или sha коммита)")
+
+
+def step_findings_path(p: Paths, step_id: str) -> Path:
+    """Реестр находок шага: `step-<номер плана>-<шаг>-findings.md` (план 13, S2).
+
+    Собирается от `review_dir` и `review_prefix`, как реестр постановки: `with_name` от
+    отчёта ревью дал бы `13-S2-findings.md` и разошёлся бы с форматом плана.
+    """
+    return Path(p.review_dir) / f"step-{p.review_prefix}-{step_id}-findings.md"
+
+
+def step_findings_rel(p: Paths, step_id: str) -> str:
+    """Путь реестра шага для текстов карточек: относительный, не абсолютный."""
+    return p.cfg.rel(step_findings_path(p, step_id))
+
+
 def plan_review_path(p: Paths) -> Path:
     """Отчёт ревью плана: `docs/reviews/plan-<N>.md` (D4) — один файл на план.
 
@@ -1332,6 +1362,79 @@ def add_findings(path, items: list[dict], header: tuple = FINDINGS_HEADER,
                    id_re=id_re, id_prefix=id_prefix, id_sep=id_sep, statuses=statuses,
                    kinds=kinds, what=what)
     return result
+
+
+def _finding_norm(text, limit: int = 120) -> str:
+    """Нормализованный текст находки — ключ сверки строк между кругами (13-S2, §4.4).
+
+    Отчёт круга 2 часто цитирует круг 1 дословно: без сверки по нормализованному тексту
+    каждая цитата давала бы вторую строку реестра, и реестр рос бы вдвое за круг.
+    """
+    raw = str(text or "").replace("`", "").replace("*", "").replace("__", "")
+    return " ".join(raw.split()).lower()[:limit]
+
+
+def step_finding_rows(text) -> list[dict]:
+    """Находки отчёта ревью строками реестра шага: только пункты с непустым классом.
+
+    Разбор отчёта — существующий `scan_report_findings` (D2): второй разбор метки класса
+    разошёлся бы с первым на живых отчётах. Статус строки — из класса находки, текст —
+    поле `body` (без метки), подметка (`[блокирующая/тест-недетерминирован]`) остаётся
+    в тексте в скобках: терять её нельзя, она называет вид блокирующей находки.
+    """
+    _section, items = scan_report_findings(text)
+    rows: list[dict] = []
+    for item in items:
+        kind = str(item.get("class") or "")
+        if kind not in STEP_FINDING_KINDS:
+            continue                       # пункт без класса реестра не заводит (D3)
+        body = str(item.get("body") or "").strip()
+        if not body:
+            continue
+        sublabel = str(item.get("sublabel") or "")
+        if sublabel:
+            body = f"{body} (подметка: {sublabel})"
+        rows.append({"kind": kind, "text": body, "action": STEP_FINDING_ACTION,
+                     "status": STEP_FINDING_STATUS[kind]})
+    return rows
+
+
+def ensure_step_findings(p: Paths, step: dict, report_rel: str) -> list[dict]:
+    """Завести и пополнить реестр находок шага из отчёта ревью (13-S2, §4.4).
+
+    Возвращает ВСЕ строки реестра после записи: по ним строится сообщение тика. Правила:
+
+    - первым проходом страж заводит файл из отчёта (у ревьюера файла ещё нет), дальше файл
+      ведёт ревьюер, а страж только дописывает то, чего в реестре нет;
+    - отчёт без единого пункта с классом файла не создаёт: пустой реестр на отчёте без
+      раздела «Находки» читался бы как «находок нет» и стирал бы память круга;
+    - строка, текст которой уже есть в реестре, не добавляется: цитата прошлого круга —
+      не новая находка;
+    - статусы существующих строк страж не переписывает: их ставит ревьюер фактом.
+
+    Ошибки чтения и разбора реестра наружу не глотаются (`GateError`, `OSError`,
+    `ValueError`): вызывающая ветка ставит по ним инцидентный стоп. Нечитаемый отчёт
+    ошибкой не считается — он не даёт новых строк, а решение по реестру от него не зависит.
+    """
+    path = step_findings_path(p, step["id"])
+    current = load_findings(path, STEP_FINDINGS_HEADER, STEP_FINDINGS_KEYS,
+                            kinds=STEP_FINDING_KINDS)
+    try:
+        text = (Path(p.repo) / report_rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return current
+    fresh: list[dict] = []
+    known = {_finding_norm(item.get("text")) for item in current}
+    for row in step_finding_rows(text):
+        key = _finding_norm(row["text"])
+        if key in known:
+            continue
+        known.add(key)
+        fresh.append(row)
+    if not fresh:
+        return current
+    return add_findings(path, fresh, STEP_FINDINGS_HEADER, STEP_FINDINGS_KEYS, "шага", "step-",
+                        kinds=STEP_FINDING_KINDS)
 
 
 # ───────────────────── вопросы шага (план 8, S5) ─────────────────────
@@ -2373,6 +2476,76 @@ def prompt_order_body(p: Paths, step: dict) -> str:
     ])
 
 
+def step_registry_lines(p: Paths, step: dict, only_open: bool = False) -> list[str]:
+    """Строки реестра шага для тела карточки; битый реестр — строкой с причиной (13-S2).
+
+    Читается терпимо, как блок `registry_lines` в `prompt_review_card_body`: сборка тела
+    карточки из-за реестра не падает (живой стоп на нём ставит решение). Файла нет — одна
+    служебная строка: реестр заводит страж на первом круге правок. `only_open=True` —
+    только статус `открыто`: карточке правок нужны ровно те строки, которые она закрывает.
+    """
+    path = step_findings_path(p, step["id"])
+    try:
+        rows = load_findings(path, STEP_FINDINGS_HEADER, STEP_FINDINGS_KEYS,
+                             kinds=STEP_FINDING_KINDS)
+    except (GateError, OSError, ValueError) as exc:
+        return [f"- реестр находок шага не читается: {exc}"]
+    if not path.is_file():
+        return ["- реестра ещё нет: первая находка создаёт файл с шапкой выше."]
+    if only_open:
+        rows = [item for item in rows if str(item.get("status") or "") == "открыто"]
+    return [f"- {item.get('id')} ({item.get('kind')}): {item.get('text')} → {item.get('action')}"
+            for item in rows]
+
+
+def open_step_findings(ctx: dict) -> list[dict]:
+    """Открытые находки реестра шага: строки со статусом `открыто` в порядке файла.
+
+    Реестра нет — пустой список: решение по несуществующему реестру ничего не держит.
+    """
+    return [item for item in (ctx.get("step_findings") or [])
+            if str(item.get("status") or "") == "открыто"]
+
+
+def open_step_findings_lines(p: Paths, step: dict) -> list[str]:
+    """Только строки находок реестра шага — без служебных («реестра ещё нет», ошибка)."""
+    return [line for line in step_registry_lines(p, step, only_open=True)
+            if line.startswith("- F")]
+
+
+def step_findings_block(p: Paths, step: dict) -> list[str]:
+    """Блок открытых находок реестра шага для карточки правок и комментария (13-S2, §4.7).
+
+    Нет реестра или открытых строк нет — пустой список: тело карточки без реестра обязано
+    остаться дословно прежним (на этом стоят `test_comments` и `test_prompt_fix_card`).
+    """
+    open_lines = open_step_findings_lines(p, step)
+    if not open_lines:
+        return []
+    header = findings_table([], STEP_FINDINGS_HEADER, STEP_FINDINGS_KEYS)[0]
+    return [
+        "ОТКРЫТЫЕ НАХОДКИ РЕЕСТРА ШАГА (круг закрывает только их)",
+        f"- Реестр: `{step_findings_rel(p, step['id'])}`; шапка: `{header}`.",
+        *open_lines,
+        "",
+    ]
+
+
+def _step_fix_verdict_line(open_lines: list[str] | None, report_verdict: str,
+                           report_rel: str) -> str:
+    """Первая строка карточки правок шага: почему круг открыт — по реестру, а не по отчёту.
+
+    С шага 13-S2 круг правок открывает и открытая строка реестра — в том числе при
+    `APPROVE` в отчёте. Прежняя фраза «Ревьюер вернул REQUEST_CHANGES» в этом случае
+    врала исполнителю: он видел в отчёте `APPROVE`, решал, что карточка от прошлого
+    круга, и не правил ничего. Открытых строк нет — прежняя фраза дословно.
+    """
+    if open_lines:
+        return (f"Реестр находок шага держит {len(open_lines)} открытых находок "
+                f"(отчёт: {report_verdict or '—'}). Отчёт: `{report_rel}`.")
+    return f"Ревьюер вернул REQUEST_CHANGES. Отчёт: `{report_rel}`."
+
+
 def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
                      prompt: str | None = None) -> str:
     plan_id = p.plan_id
@@ -2408,6 +2581,20 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
         "Отчёт исполнителя и его транскрипт — НЕ доказательство.",
         "",
         *prompt_block,
+        "",
+        "РЕЕСТР НАХОДОК ШАГА (обязательно)",
+        f"- Файл: `{step_findings_rel(p, step['id'])}`; шапка таблицы — "
+        f"`{findings_table([], STEP_FINDINGS_HEADER, STEP_FINDINGS_KEYS)[0]}`.",
+        "- Блокирует вердикт только статус `открыто`: `закрыто` и `не блокирует` шаг не держат.",
+        "- Открытый ID закрывается фактом в колонке «Что сделать»: "
+        "`Закрыто: адрес-символ или sha правки`.",
+        "- Закрытая находка повторно не поднимается: круга она не даёт.",
+        f"- Новая тема вне контракта шага — строка в реестр плана (`{plan_findings_rel(p)}`)",
+        "  со статусом `не блокирует`; круга правок она не открывает.",
+        "- Судят открытые строки и дифф правок: открытая строка держит шаг сильнее вердикта",
+        "  отчёта, APPROVE с открытой строкой шаг не закроет.",
+        "РЕЕСТР СЕЙЧАС",
+        *step_registry_lines(p, step),
         "",
         "Гейты шага (прогнать САМОСТОЯТЕЛЬНО, свои цифры):",
         *[f"- {g}" for g in step.get("gates") or []],
@@ -2764,13 +2951,17 @@ def prompt_stale_card_body(p: Paths, step: dict, decision: dict, report_rel: str
 
 
 def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
-                  max_rounds: int = 0) -> str:
+                  max_rounds: int = 0, report_verdict: str = "") -> str:
     """Карточка правок шага. `max_rounds` — предел кругов по риску шага (`step_fix_limit`).
 
     Умолчание `0` сохраняет прежний вид карточки: без числа кругов «(круг N)» и прежняя
     строка про последний круг. Когда предел известен, шапка печатает «(круг N из M)», а
     фраза «это последний автоматический круг» остаётся только на последнем круге — на
     `high`-шаге прежний текст врал бы про единственный круг.
+
+    С шага 13-S2 карточка несёт блок открытых находок реестра шага (только их закрывает
+    круг) и говорит правду о поводе круга (`_step_fix_verdict_line`): реестр держит шаг и
+    при `APPROVE` в отчёте. Нет реестра или открытых строк — тело дословно прежнее.
     """
     plan_rel = p.cfg.rel(Path(p.plan_file))
     round_label = f"(круг {round_no} из {max_rounds})" if max_rounds else f"(круг {round_no})"
@@ -2790,12 +2981,14 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
             "ВАЖНО: это последний автоматический круг правок. Следующий REQUEST_CHANGES",
             "останавливает конвейер и уходит владельцу — доведи находки до конца.",
         ]
+    registry = step_findings_block(p, step)
     return "\n".join([
         f"ПРАВКИ ПО РЕВЬЮ шага {step['id']} плана {p.plan_id} — {step['title']} {round_label}",
         "",
-        f"Ревьюер вернул REQUEST_CHANGES. Отчёт: `{report_rel}`.",
+        _step_fix_verdict_line(open_step_findings_lines(p, step), report_verdict, report_rel),
         f"Контракт шага — `{plan_rel}` §{step['id']}, критерий: {step.get('dod', '')}",
         "",
+        *registry,
         "ЧТО ДЕЛАТЬ",
         "- Исправить БЛОКИРУЮЩИЕ находки полностью; значимые — по существу (не косметикой).",
         "- Находка — это класс: проверить соседние вызовы, ветки и тесты на тот же дефект",
@@ -2820,7 +3013,12 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
 
 def fix_comment_body(p: Paths, step: dict, round_no: int, report_rel: str,
                      review_card_id: str | None) -> str:
-    """Комментарий к карточке правок: находки ревьюера там, где идёт работа (S2)."""
+    """Комментарий к карточке правок: находки ревьюера там, где идёт работа (S2).
+
+    С шага 13-S2 первым блоком идут открытые находки реестра шага: круг правок закрывает
+    именно их, а выжимка отчёта — вторична (она может цитировать уже закрытое). Нет
+    реестра или открытых строк — тело дословно прежнее.
+    """
     report = Path(p.repo) / report_rel
     lines = [
         f"ПРАВКИ ПО РЕВЬЮ: шаг {step['id']} плана {p.plan_id} — {step['title']} "
@@ -2829,6 +3027,9 @@ def fix_comment_body(p: Paths, step: dict, round_no: int, report_rel: str,
         f"Карточка ревью: {review_card_id or '—'}",
         "",
     ]
+    registry = step_findings_block(p, step)
+    if registry:
+        lines += registry
     blocking = _blocking_findings(report, FINDINGS_LIMIT)
     if blocking:
         lines.append("Блокирующие находки — закрыть полностью, ответить на каждую:")
@@ -2920,6 +3121,11 @@ def build_ctx(p: Paths) -> dict:
                    # права. База правки тоже пустая: сравнивать не с чем.
                    prompt_findings_rel="", prompt_findings=[], prompt_findings_exists=False,
                    prompt_findings_error="", prompt_fix_baseline={},
+                   # 13-S2: реестр находок шага — те же четыре ключа, что в рабочей ветке.
+                   # На сбое сборщика шага читать нечего, но решение обязано видеть ключи, а
+                   # не падать `KeyError` там, где оно ищет открытые строки.
+                   step_findings_rel="", step_findings=[], step_findings_exists=False,
+                   step_findings_error="",
                    # D6: расхождение отметок проверять не на чем — обе сверки `False`,
                    # и решение по ревью постановки остаётся стопом, а не падением.
                    prompt_marker_text_same=False, prompt_marker_same_commit=False,
@@ -3006,6 +3212,27 @@ def build_ctx(p: Paths) -> dict:
         except (GateError, OSError, ValueError) as exc:
             ctx["prompt_findings"] = []
             ctx["prompt_findings_error"] = str(exc)
+    # Реестр находок шага (13-S2): память круга правок. Читается тем же образцом — одно
+    # чтение на тик, ошибка уходит строкой в `ctx`, а стоп по ней ставит решение
+    # (`_decide_base`): `decide` получает только `ctx` и файлов не читает.
+    step_findings_file = step_findings_path(p, step["id"]) if step else None
+    ctx["step_findings_rel"] = step_findings_rel(p, step["id"]) if step else ""
+    ctx["step_findings"] = []
+    ctx["step_findings_exists"] = False
+    ctx["step_findings_error"] = ""
+    if step_findings_file is not None:
+        try:
+            step_text = read_findings_text(step_findings_file)
+            # Словарь классов — свой и только ключевым именем (13-S2, §4.2): позиционный
+            # аргумент у этих функций — `TypeError`, а общий `FINDING_KINDS` реестр шага
+            # читать не должен (`замысел` — класс-маршрут, а не класс находки).
+            ctx["step_findings"] = parse_findings(step_text, step_findings_file,
+                                                  STEP_FINDINGS_HEADER, STEP_FINDINGS_KEYS,
+                                                  kinds=STEP_FINDING_KINDS)
+            ctx["step_findings_exists"] = bool(step_text.strip())
+        except (GateError, OSError, ValueError) as exc:
+            ctx["step_findings"] = []
+            ctx["step_findings_error"] = str(exc)
     # Второй признак устаревания постановки (план 12, S1): пофайловый отпечаток входов и
     # опора, снятая в момент заказа ревью. Только чтение файлов — тик по-прежнему делает
     # один `git diff`, стоимость не растёт.
@@ -3248,6 +3475,70 @@ def _classes_stop(sid: str, reason: str, what: str) -> dict:
     ])}
 
 
+def _step_findings_error_stop(sid: str, error: str) -> dict:
+    """Инцидентный стоп «реестр шага не читается» (13-S2, §4.6 п.2).
+
+    Ключа `kind` нет: стоп снимается сам, как только реестр прочитан (как у
+    `_classes_stop`). Шаг остаётся открытым — закрывать его по неизвестному реестру
+    значило бы простить находку, которой никто не видел.
+    """
+    return {"action": "stop", "step": sid,
+            "reason": (f"реестр находок шага {sid} не читается: {error} — шаг не закрыть "
+                       f"по неизвестному реестру")}
+
+
+def _step_findings_stop(sid: str, rows: list[dict], verdict: str, limit: int) -> dict:
+    """Инцидентный стоп «открытые строки реестра шага, бюджет кругов исчерпан» (D6).
+
+    Свой стоп, а не дописанный блок в прежнем стопе по лимиту: тексты того стопа
+    закреплены тестами и golden, и одно состояние не должно описываться двумя решениями.
+    """
+    ids = ", ".join(str(item.get("id")) for item in rows)
+    reason = (f"реестр находок шага {sid} держит открытые находки ({ids}) — "
+              f"вердикт {verdict} шаг не закрывает; лимит автоматических кругов правок "
+              f"исчерпан ({limit})")
+    details = [f"- {item.get('id')} ({item.get('kind')}): {item.get('text')} → "
+               f"{item.get('action')}" for item in rows]
+    details += [
+        "Что делать (выбери одно):",
+        "  1) закрыть находки правкой и закрыть их строки фактом, запустить тик — "
+        "ревью пойдёт заново;",
+        "  2) если правка уже сделана, закрыть строки реестра фактом и запустить тик;",
+        "  3) если реестр ведётся неверно — переписать отчёт ревью и строки реестра под "
+        "фактическое состояние, запустить тик.",
+        "Стоп инцидентный: снимется сам, как только открытых строк не останется.",
+    ]
+    return {"action": "stop", "step": sid, "reason": reason, "details": "\n".join(details)}
+
+
+def _step_registry_decision(ctx: dict, sid: str, step: dict, verdict: str,
+                            fixes: list, parent: str, blocking: int = 0) -> dict | None:
+    """Ветка реестра шага внутри ветвей вердикта (13-S2, §4.6 п.4-5).
+
+    Порядок обязателен: открытая строка реестра сильнее вердикта отчёта, поэтому ветка
+    стоит после стопов формата S1 (ошибку формата шаг обязан показать, а не сгладить) и
+    перед терминальным действием вердикта. `None` — открытых строк нет, и решение идёт
+    прежним порядком без единого изменения.
+
+    `blocking` — блокирующих в отчёте. Когда бюджет кругов исчерпан, а отчёт сам держит шаг
+    блокирующей находкой, печатается ПРЕЖНИЙ стоп по лимиту: нового в состоянии нет (ID и
+    разбор находки владелец видит в отчёте), а тексты того стопа закреплены тестом
+    `test_fix_rounds_risk::test_high_step_stops_at_six_and_names_class`, и править их или
+    этот тест постановка шага запрещает. Свой стоп реестра нужен там, где без него шаг
+    закрылся бы: отчёт без блокирующих (в том числе `APPROVE`) при открытой строке.
+    """
+    rows = open_step_findings(ctx)
+    if not rows:
+        return None
+    limit = step_fix_limit(ctx, step)
+    if len(fixes) >= limit:
+        if blocking:
+            return None
+        return _step_findings_stop(sid, rows, verdict, limit)
+    return {"action": "create_fix", "step": sid, "data": step, "round": len(fixes) + 1,
+            "parent": parent, "registry_open": [str(item.get("id")) for item in rows]}
+
+
 def _decide_base(ctx: dict) -> dict:
     """Решение без учёта стоп-флага."""
     step = ctx.get("next")
@@ -3419,6 +3710,11 @@ def _decide_base(ctx: dict) -> dict:
         what = "строки вердикта нет" if verdict["verdict"] == "NONE" else "строк вердикта несколько"
         return {"action": "stop", "step": sid,
                 "reason": f"вердикт {sid} не распознан ({what}): {Path(verdict['path']).name}"}
+    # Битый реестр шага — стоп до ветвей вердикта (13-S2, §4.6 п.2): по неизвестному реестру
+    # шаг не закрывается ни при каком вердикте. Стоп инцидентный: снимется сам, когда файл
+    # прочитается.
+    if ctx.get("step_findings_error"):
+        return _step_findings_error_stop(sid, str(ctx["step_findings_error"]))
     if verdict["verdict"] == "APPROVE":
         # Обратное расхождение (13-S1): в отчёте есть блокирующая, а вердикт APPROVE.
         # Это видимая ошибка ревьюера, а не прощение: иначе блокирующая находка закрыла бы
@@ -3431,6 +3727,12 @@ def _decide_base(ctx: dict) -> dict:
                 f"{classes['blocking']} — вердикт обязан совпадать с классами "
                 f"(есть блокирующая — REQUEST_CHANGES)",
                 "в отчёте есть блокирующая находка, а вердикт APPROVE")
+        # Ветка реестра шага (13-S2, §4.6 п.4-5): открытая строка реестра сильнее вердикта
+        # отчёта — APPROVE с открытой находкой шаг не закрывает и заказывает круг.
+        registry = _step_registry_decision(ctx, sid, step, verdict["verdict"], fixes,
+                                           last_review["id"])
+        if registry:
+            return registry
         nxt = ctx.get("next_step")
         # Правило 1: шаг не считается выполненным, пока нет постановки N+1. Гейт живёт
         # в решении, а не в отказе `apply` (D10): иначе каждый тик давал бы повторный
@@ -3465,6 +3767,13 @@ def _decide_base(ctx: dict) -> dict:
             "ошибка формата отчёта: ни одной метки класса (блокирующая, значимая, "
             "стилистическая) — вердикт не сверить с классами; поправь отчёт",
             "ни один пункт раздела не начинается с метки класса в квадратных скобках")
+    # Ветка реестра шага (13-S2, §4.6 п.4-5): стоит ПОСЛЕ стопов формата — ошибку формата
+    # шаг обязан показать, а не сгладить реестром. Открытые строки есть → круг или стоп по
+    # исчерпанному бюджету; открытых нет — прежний порядок ниже без единого изменения.
+    registry = _step_registry_decision(ctx, sid, step, verdict["verdict"], fixes,
+                                       last_review["id"], int(classes["blocking"] or 0))
+    if registry:
+        return registry
     if classes["blocking"] == 0:
         # Круга нет: замечания без блокирующего класса шаг не держат. Шаг принимается, а
         # замечания не теряются — `run_gate` дописывает их в реестр находок плана (§4.3).
@@ -6705,11 +7014,26 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         assignee, reason = assignee_or_stop(step)
         if assignee is None:
             return result
+        # Реестр шага (13-S2, §4.5): память круга заводится стражем до карточки — у
+        # ревьюера файла ещё нет, а карточка правок обязана назвать открытые строки.
+        # Ошибка реестра — инцидентный стоп: шаг не продолжается без памяти кругов.
+        try:
+            rows = ensure_step_findings(p, step, _report_rel(p, step["id"]))
+        except (GateError, OSError, ValueError) as exc:
+            reason = (f"реестр находок шага {step['id']} не заведён: {exc} — карточки "
+                      f"правок нет, шаг без памяти кругов не продолжается")
+            write_stop(p, reason, "gate", kind="incident")
+            result.update(applied=True, detail=reason)
+            touch("stop:step_findings")
+            say("⛔ " + reason)
+            return result
         key = f"planloop:{plan_id}:{step['id']}:fix:{round_no}"
         report_rel = _report_rel(p, step["id"])
         max_rounds = step_fix_limit(ctx, step)
         cid = create_card(p, f"[правки {plan_id} {step['id']} #{round_no}] {step['title']}",
-                          fix_card_body(p, step, round_no, report_rel, max_rounds=max_rounds),
+                          fix_card_body(p, step, round_no, report_rel, max_rounds=max_rounds,
+                                        report_verdict=str((ctx.get("verdict") or {})
+                                                           .get("verdict") or "")),
                           assignee, key, p.cfg.step_skills,
                           parent=decision.get("parent"), max_runtime=p.cfg.step_runtime)
         result.update(applied=bool(cid), detail=f"карточка правок: {cid}")
@@ -6725,6 +7049,10 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 msg.append("  замечания в отчёте — разбор ниже")
             msg.append(f"  подробно: {report_rel}")
             msg.append(f"  карточка правок {cid}")
+            # Реестр шага — строкой в уведомление: решение по кругу принимается по нему.
+            opened = sum(1 for item in rows if str(item.get("status") or "") == "открыто")
+            msg.append(f"  реестр шага: открытых {opened}, всего {len(rows)}, "
+                       f"файл {step_findings_rel(p, step['id'])}")
             say("\n".join(msg))
             # Находки — в саму карточку правок: отказ комментария не меняет result и не
             # рвёт тик (в `tick` ложный `applied` обрывает цепочку действий).
