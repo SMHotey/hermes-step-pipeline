@@ -171,13 +171,56 @@
   /* Правка конфигурации (S7): дифф перед сохранением, заметки и отказ валидации. */
   .config-preview { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
   /* Вопрос шага (8-S5): окно с вариантами ответа; в предпросмотре кнопки неактивны. */
-  .question { border-top: 1px solid var(--line); padding: 10px 0; }
+  .question { border-top: 1px solid var(--line); padding: 12px 0; }
+  .question:first-child { border-top: 0; padding-top: 0; }
   .question .row1 { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-  .question-text { margin: 6px 0; }
-  .question-options { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
-  .question-free { display: flex; gap: 8px; align-items: center; }
+  .question-text { margin: 8px 0 4px; line-height: 1.5; }
+  .question-options { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
+  .question-options button.opt { display: flex; gap: 10px; align-items: flex-start;
+      text-align: left; background: var(--panel-2); border: 1px solid var(--line);
+      border-radius: 10px; padding: 9px 11px; color: var(--text); font-size: 12.5px;
+      line-height: 1.45; white-space: normal; width: 100%; }
+  .question-options button.opt:hover:not(:disabled) { border-color: var(--accent); }
+  .question-options button.opt:disabled { opacity: .55; cursor: not-allowed; }
+  .question-options button.opt.rec { border-color: var(--accent); }
+  .question-options .letter { flex: 0 0 auto; font-weight: 700; color: var(--accent); }
+  .question-options .opt-body { flex: 1 1 auto; }
+  .question-deadline { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
+  .question-deadline.wait { color: var(--warn); }
+  .question-free { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
   .question-free input { flex: 1; }
+  .question-free summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+  .question-other { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .question-other button { font-size: 11px; padding: 1px 8px; margin-left: 4px; }
   #questions-hint { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  /* Вкладка «Планы» (0.33): фильтры строкой, планы карточками, черновики сверху списка. */
+  .plans-head { display: flex; gap: 10px; align-items: baseline; justify-content: space-between;
+                flex-wrap: wrap; }
+  .plans-filters { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap;
+                   margin: 12px 0 6px; }
+  .plans-filters > div { display: flex; flex-direction: column; gap: 2px; }
+  .plans-filters label { margin: 0; }
+  .plans-filters select, .plans-filters input[type=text] { min-width: 170px; width: auto; }
+  .plan-list, .draft-list { display: flex; flex-direction: column; gap: 8px; }
+  .plan-card { display: grid; grid-template-columns: minmax(190px, 1.3fr) minmax(0, 2fr) auto;
+               gap: 12px; align-items: center; border: 1px solid var(--line); border-radius: 10px;
+               padding: 10px 12px; background: var(--panel-2); }
+  .plan-card.active { border-color: var(--accent); }
+  .plan-card .where { font-size: 11px; color: var(--muted); }
+  .plan-card .name { font-size: 13.5px; margin: 2px 0 4px; }
+  .plan-card .meta { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+                     font-size: 12px; color: var(--muted); }
+  .plan-card .step-bar { width: 110px; }
+  .plan-card .acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  .plan-card .acts button { font-size: 11.5px; padding: 3px 9px; }
+  .draft-card { display: flex; gap: 12px; align-items: center; justify-content: space-between;
+                border: 1px dashed var(--line); border-radius: 10px; padding: 10px 12px; }
+  .draft-card .name { font-size: 13.5px; }
+  .draft-card .where { font-size: 11px; color: var(--muted); }
+  .group-head { margin: 16px 0 8px; font-size: 11px; color: var(--muted);
+                text-transform: uppercase; letter-spacing: .06em; }
+  .plans-empty { color: var(--muted); font-size: 12.5px; padding: 8px 2px; }
+  #ov-closed .plan-card { background: var(--panel); }
   .config-preview-head { display: flex; justify-content: space-between; gap: 10px;
                          font-size: 12px; color: var(--muted); margin-bottom: 6px; }
   #config-diff { background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
@@ -402,12 +445,16 @@
            Своего фильтра и своего простоя страница не считает — правило отрисовки одно. -->
       <div class="plans-title">Планы в работе</div>
       <div class="plans" id="ov-running"><span class="muted">—</span></div>
-      <!-- Черновики планов (S13): владелец утверждает их кнопкой, а не командой в
-           терминале. Утверждение переносит файл и пишет запись с sha256 — по ней страж
-           открывает шаги; в предпросмотре кнопок нет. -->
-      <div class="plans-title">Черновики планов</div>
-      <div class="plans" id="drafts"></div>
-      <div id="drafts-error"></div>
+      <!-- Исполненные планы (0.33): отдельный свёрнутый блок с выбором проекта. Данные —
+           те же строки `/api/projects`, что на вкладке «Планы»: второго расчёта нет. -->
+      <details class="block" id="ov-closed">
+        <summary>Исполненные планы <span class="pill" id="ov-closed-count">0</span></summary>
+        <div class="body">
+          <label for="ov-closed-project">Проект</label>
+          <select id="ov-closed-project"></select>
+          <div class="plan-list" id="ov-closed-rows"><span class="muted">—</span></div>
+        </div>
+      </details>
       <!-- Строки планов (S2A): статус, причина и одно действие — данные только из снимка. -->
       <div class="plans" id="plans"></div>
     </section>
@@ -450,13 +497,21 @@
   </div>
   </div>
 
-  <!-- Вкладка «Планы» (план 6 S5): все планы всех проектов реестра, только чтение;
-       данные — из `/api/projects`, своего правила «остановлен» страница не заводит. -->
+  <!-- Вкладка «Планы» (0.33): черновики сверху, планы — карточками. Поля прежние, но
+       списком: девять колонок в таблице не читались, а черновиков на вкладке не было. -->
   <div class="tab-panel" id="tab-plans">
     <section>
-      <h2>Планы реестра</h2>
+      <div class="plans-head">
+        <h2>Планы реестра</h2>
+        <div class="step-actions">
+          <button type="button" id="plans-add-toggle" aria-expanded="false"
+                  aria-controls="plans-add">Добавить план файлом</button>
+          <span class="muted" id="plans-total">—</span>
+        </div>
+      </div>
+
       <!-- Добавление плана файлом (план 6 S5A): проект и путь; пустой путь — диалог на сервере. -->
-      <div class="row" id="plans-add">
+      <div class="row" id="plans-add" hidden>
         <div>
           <label for="plans-add-project">Проект</label>
           <select id="plans-add-project">
@@ -465,7 +520,8 @@
         </div>
         <div>
           <label for="plans-add-path">Файл плана</label>
-          <input type="text" id="plans-add-path" autocomplete="off" placeholder="пусто — откроется окно выбора файла">
+          <input type="text" id="plans-add-path" autocomplete="off"
+                 placeholder="пусто — откроется окно выбора файла">
         </div>
         <div>
           <label>&nbsp;</label>
@@ -473,13 +529,23 @@
         </div>
       </div>
       <div class="clip" id="plans-status"></div>
-      <div class="row">
+
+      <!-- Черновики планов (0.33): раньше жили на «Обзоре», теперь там, где планы. Строки —
+           поля ответа сервера, утверждение — кнопкой (в предпросмотре кнопок нет). -->
+      <div class="plans-title">Черновики <span class="muted" id="drafts-count"></span></div>
+      <div class="draft-list" id="drafts"></div>
+      <div id="drafts-error"></div>
+      <div class="clip" id="drafts-note"></div>
+
+      <div class="plans-filters">
         <div>
+          <label for="plans-project">Проект</label>
           <select id="plans-project">
             <option value="">все проекты</option>
           </select>
         </div>
         <div>
+          <label for="plans-state">Состояние</label>
           <select id="plans-state">
             <option value="">все состояния</option>
             <option value="running">идёт</option>
@@ -489,26 +555,13 @@
           </select>
         </div>
         <div>
+          <label for="plans-text">Поиск</label>
           <input type="text" id="plans-text" autocomplete="off"
                  placeholder="номер, название, проект или стоп">
         </div>
       </div>
-      <table id="plans-table">
-        <thead>
-          <tr>
-            <th scope="col">Проект</th>
-            <th scope="col">План</th>
-            <th scope="col">Название</th>
-            <th scope="col">Состояние</th>
-            <th scope="col">Следующий шаг</th>
-            <th scope="col">Закрыто/всего</th>
-            <th scope="col">Утверждение</th>
-            <th scope="col">Стоп</th>
-            <th scope="col">Действие</th>
-          </tr>
-        </thead>
-        <tbody id="plans-rows"></tbody>
-      </table>
+      <div class="plan-list" id="plans-rows"></div>
+      <div class="plans-empty" id="plans-empty" hidden>под фильтр ничего не подошло</div>
     </section>
   </div>
 
@@ -528,6 +581,16 @@
             <button id="btn-unhold">Снять допуск</button>
             <span class="muted" id="step-hold">—</span>
           </div>
+
+          <!-- Вопросы шага (0.33): тот же список, что в окне, но на месте и без всплытия —
+               ответ принимается прямо здесь, экран перечитывается после ответа. -->
+          <details class="block" id="step-questions-block" open>
+            <summary>Вопросы шага <span class="pill" id="step-questions-count">0</span></summary>
+            <div class="body">
+              <div id="step-questions"><span class="muted">вопросов нет</span></div>
+              <div class="clip" id="step-questions-note"></div>
+            </div>
+          </details>
 
           <details class="block" id="step-contract" open>
             <summary>Контракт из плана</summary>
@@ -758,6 +821,13 @@
       <div><label>Таймаут ревью</label><input type="text" name="review"></div>
       <div><label>Таймаут постановки</label><input type="text" name="prompt"></div>
     </div>
+    <div class="row">
+      <div><label for="answer-timeout">Ждать ответа на вопрос шага, мин</label>
+        <input type="text" id="answer-timeout" name="answer_timeout"></div>
+      <div><label>&nbsp;</label>
+        <div class="muted">0 — не выбирать за вас никогда; иначе по истечении срока
+          принимается рекомендация автора вопроса</div></div>
+    </div>
     <label>Каталоги проекта (пути относительно корня)</label>
     <div class="row">
       <div><label for="path-plans">Планы</label><input type="text" id="path-plans" name="path_plans"></div>
@@ -829,8 +899,9 @@
      что `/answer` в чате и адресная команда движка; в предпросмотре кнопки неактивны. -->
 <dialog id="question-dialog" aria-label="Вопрос по шагу плана">
   <h2 style="margin-top:0">Нужен ответ по шагу</h2>
-  <div id="questions-hint">Вопрос держит шаг до ответа. Если не ответить, будет принята
-    рекомендация — как `/answer` в чате.</div>
+  <div id="questions-hint">Вопрос держит шаг, пока вы не ответите: он ждёт в том числе тогда,
+    когда все остальные работы по плану уже сделаны. Ответ можно дать здесь, в боте
+    (<code>/answer Q-1 A</code>) или на вкладке «Шаг» — результат один.</div>
   <div id="question-dialog-body"></div>
   <form method="dialog"><button type="submit">Позже</button></form>
 </dialog>
@@ -911,7 +982,7 @@ function showPlanErrors(errors) {
   el.textContent = rows.length ? "план не утверждён:\n" + rows.map((r) => "• " + r).join("\n") : "";
 }
 
-function approvePlan(id) {
+function approvePlan(id, projectId) {
   if (window.__preview) { toast("предпросмотр только читает", true); return; }
   const ok = confirm("Утвердить план " + id + "?\n\n"
     + "Черновик будет перенесён в каталог планов, а утверждение привязано к sha256 файла. "
@@ -923,7 +994,7 @@ function approvePlan(id) {
     method: "POST",
     headers: PANEL_HEADERS,
     body: JSON.stringify({plan: String(id),
-                          ...(currentProject ? {project: currentProject} : {})}),
+                          ...((projectId || currentProject) ? {project: projectId || currentProject} : {})}),
   }).then((data) => {
     if (data.ok) toast("План " + id + " утверждён");
     else {
@@ -940,57 +1011,96 @@ function approvePlan(id) {
 
 function bindApprove(scope) {
   (scope || document).querySelectorAll("[data-approve]").forEach((btn) => {
-    btn.onclick = (event) => { event.stopPropagation(); approvePlan(btn.dataset.approve); };
+    btn.onclick = (event) => {
+      event.stopPropagation();
+      approvePlan(btn.dataset.approve, btn.dataset.approveProject || "");
+    };
   });
 }
 
-function renderDrafts(data) {
+// Черновики (0.33): живут на вкладке «Планы» и собираются по всем проектам реестра —
+// без имени проекта утверждение ушло бы в каталог панели, а не в свой. Утверждённый
+// черновик — остаток: план уже стоит в списке со своим бейджем, отдельной строки нет.
+function renderDraftsTab(projects, preview) {
   const box = $("drafts");
-  const rows = data.drafts || [];
-  if (!rows.length) {
-    box.innerHTML = `<span class="muted">черновиков нет — сюда попадают планы из `
-      + `docs/plans/drafts/</span>`;
-    return;
+  if (!box) return;
+  const groups = [];
+  (projects || []).forEach((project) => {
+    (project.drafts || []).forEach((draft) => groups.push({project, draft}));
+  });
+  const pending = groups.filter((item) => !item.draft.approved);
+  const approved = groups.filter((item) => item.draft.approved);
+  const differs = approved.filter((item) => item.draft.draft_differs).length;
+  if ($("drafts-count")) $("drafts-count").textContent = pending.length ? String(pending.length) : "";
+  const note = $("drafts-note");
+  if (note) {
+    note.className = "clip";
+    note.textContent = approved.length
+      ? `в drafts/ остались файлы уже утверждённых планов: ${approved.length}`
+        + (differs ? ` (по тексту отличаются от действующего файла: ${differs})` : "")
+        + " — действует план из docs/plans/"
+      : "";
   }
-  // Черновик остаётся в `drafts/` и после утверждения: действующим считается файл в
-  // каталоге планов. Поэтому признак приходит из снимка (`d.approved`), а не из наличия
-  // файла — иначе кнопка «Утвердить» висела бы вечно и ничего не меняла.
-  //
-  // Утверждённый черновик — не черновик, а остаток: план с тем же номером уже стоит в
-  // списке планов со своим бейджем «утверждён», а файл из `drafts/` ни на что не влияет
-  // (`--accept` при наличии файла в каталоге планов утверждает именно его). Строку для
-  // него не рисуем — иначе каждый утверждённый план показан дважды, — а число остатков
-  // сообщаем одной строкой: файлы владелец может удалить сам.
-  const pending = rows.filter((d) => !d.approved);
-  const approved = rows.filter((d) => d.approved);
-  const differs = approved.filter((d) => d.draft_differs).length;
-  const leftover = approved.length
-    ? `<div class="muted">в docs/plans/drafts/ остались черновики уже утверждённых `
-      + `планов: ${approved.length}`
-      + (differs ? ` (по тексту отличаются от действующего файла: ${differs})` : "")
-      + ` — действует план из docs/plans/</div>`
-    : "";
   if (!pending.length) {
-    box.innerHTML = `<span class="muted">черновиков нет — все планы из `
-      + `docs/plans/drafts/ уже утверждены</span>` + leftover;
+    box.innerHTML = '<div class="plans-empty">черновиков нет — сюда попадают планы '
+      + 'из docs/plans/drafts/</div>';
     return;
   }
-  box.innerHTML = pending.map((d) => {
-    const pill = d.changed ? `<span class="pill bad">изменён после утверждения</span>`
-                           : `<span class="pill wait">черновик</span>`;
+  box.innerHTML = pending.map(({project, draft}) => {
+    const pill = draft.changed
+      ? '<span class="pill bad">изменён после утверждения</span>'
+      : '<span class="pill wait">черновик</span>';
+    const button = preview ? "" :
+      `<button type="button" data-approve="${esc(draft.id)}"`
+      + ` data-approve-project="${esc(project.id || "")}"`
+      + ` title="перенести в каталог планов и записать утверждение">Утвердить</button>`;
     return `
-    <div class="plan-row" data-draft="${esc(d.id)}">
-      <div class="row1">
-        ${pill}
-        <span>план ${esc(d.id)}</span>
-        <span class="muted">${esc(d.title)} · шагов: ${esc(d.steps_total || 0)}</span>
-        ${data.preview ? "" : `<button data-approve="${esc(d.id)}"
-            title="перенести в каталог планов и записать утверждение">Утвердить</button>`}
-      </div>
-      <div class="muted mono">${esc(d.file)}</div>
-    </div>`;
-  }).join("") + leftover;
+      <div class="draft-card" data-draft="${esc(draft.id)}" data-project="${esc(project.id || "")}">
+        <div>
+          <div class="name">План ${esc(draft.id)} — ${esc(draft.title || "без названия")}</div>
+          <div class="where">${esc(project.name)} · шагов: ${esc(draft.steps_total || 0)}
+            · <span class="mono">${esc(draft.file || "")}</span></div>
+        </div>
+        <div class="acts">${pill}${button}</div>
+      </div>`;
+  }).join("");
   bindApprove(box);
+}
+
+// Исполненные планы на «Обзоре» (0.33): свёрнутый блок с выбором проекта. Строки — те же
+// закрытые планы вкладки «Планы»: своё правило «исполнен» страница не заводит.
+function renderClosedPlans(projects) {
+  const box = $("ov-closed-rows");
+  if (!box) return;
+  const picker = $("ov-closed-project");
+  const ids = (projects || []).map((p) => p.id);
+  if (picker && picker.dataset.ids !== ids.join(",")) {
+    picker.dataset.ids = ids.join(",");
+    const chosen = picker.value || currentProject || ids[0] || "";
+    picker.innerHTML = ids.length
+      ? ids.map((id) => {
+          const found = (projects || []).find((p) => p.id === id) || {};
+          return `<option value="${esc(id)}">${esc(found.name || id)}</option>`;
+        }).join("")
+      : '<option value="">проектов нет</option>';
+    picker.value = ids.includes(chosen) ? chosen : (ids[0] || "");
+  }
+  const projectId = picker ? picker.value : (currentProject || "");
+  const closed = [];
+  (projects || []).forEach((project) => {
+    if (projectId && project.id !== projectId) return;
+    (project.plans || []).forEach((plan) => {
+      if (plan.state === "closed") closed.push({project, plan});
+    });
+  });
+  if ($("ov-closed-count")) $("ov-closed-count").textContent = String(closed.length);
+  if (!closed.length) {
+    box.innerHTML = '<div class="plans-empty">исполненных планов нет</div>';
+    return;
+  }
+  box.innerHTML = closed.map(({project, plan}) =>
+    planCard(project, plan, Boolean(window.__preview))).join("");
+  bindPlanActionsFor(box);
 }
 
 // ── реестр проектов (план 3 S6): один экран на все репозитории ──
@@ -1154,7 +1264,7 @@ function filterPlansTab() {
   const project = $("plans-project") ? $("plans-project").value : "";
   const state = $("plans-state") ? $("plans-state").value : "";
   const needle = ($("plans-text") && $("plans-text").value || "").trim().toLowerCase();
-  const rows = $("plans-rows").querySelectorAll("tr[data-project]");
+  const rows = $("plans-rows").querySelectorAll("[data-project][data-state]");
   let shown = 0;
   rows.forEach((row) => {
     const ok = (!project || row.dataset.project === project)
@@ -1190,30 +1300,67 @@ function renderPlansTab(data) {
     addPicker.innerHTML = '<option value="">проект панели</option>' +
       (data.projects || []).map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
   }
-  // В предпросмотре формы нет: инлайн-стиль, а не атрибут `hidden` (у `.row` свой `display: flex`).
-  $("plans-add").style.display = data.preview ? "none" : "";
+  // Форма «Добавить план» живёт за кнопкой: открытая всегда, она отбирала место у списка.
+  const toggle = $("plans-add-toggle");
+  if (toggle) {
+    toggle.disabled = Boolean(data.preview);
+    toggle.title = data.preview ? "предпросмотр только читает"
+                                : "проект и путь к файлу плана";
+    if (data.preview) {
+      toggle.setAttribute("aria-expanded", "false");
+      if ($("plans-add")) $("plans-add").hidden = true;
+    }
+  }
   const body = $("plans-rows");
   if (!body) return;
-  body.innerHTML = rows.map(({project, plan}) => {
-    const stop = plan.stop
-      ? `${esc(plan.stop.kind || "стоп")}: ${esc(plan.stop.reason || "причина не записана")}`
-      : "—";
-    const approval = plan.approval || {};
-    const label = approval.label ? esc(approval.label) : "—";
-    const stamp = approval.approved_at ? ` title="${esc(approval.approved_at)}"` : "";
-    return `<tr data-project="${esc(project.id)}" data-state="${esc(plan.state || "")}" data-plan-id="${esc(plan.id)}">
-      <td>${esc(project.name)}</td>
-      <td class="mono">${esc(plan.id)}</td>
-      <td>${esc(plan.name || "—")}</td>
-      <td><span class="pill">${esc(plan.state_label || "—")}</span></td>
-      <td class="mono">${esc(plan.next || "—")}</td>
-      <td class="mono">${esc(plan.closed)} / ${esc(plan.total)}</td>
-      <td${stamp}>${label}</td>
-      <td>${stop}</td>
-      ${planActionsCell(project, plan, Boolean(data.preview))}
-    </tr>`;
-  }).join("") + '<tr id="plans-empty"><td colspan="9" class="muted">планов нет</td></tr>';
+  if (!rows.length) {
+    body.innerHTML = '<div class="plans-empty">планов нет — ни один проект реестра не ведёт планов</div>';
+    if ($("plans-total")) $("plans-total").textContent = "";
+    return;
+  }
+  body.innerHTML = rows.map(({project, plan}) =>
+    planCard(project, plan, Boolean(data.preview))).join("");
+  const closed = rows.filter((item) => item.plan.state === "closed").length;
+  if ($("plans-total")) {
+    $("plans-total").textContent = `всего ${rows.length} · закрыто ${closed}`;
+  }
   filterPlansTab();   // перерисовка не должна снимать введённый фильтр
+}
+
+// Карточка плана: проект, номер и название, состояние, следующий шаг, прогресс и кнопки.
+// Поля — те же, что были колонками таблицы; девять колонок в строку не читались.
+function planCard(project, plan, preview) {
+  const approval = plan.approval || {};
+  const stop = plan.stop && (plan.stop.reason || plan.stop.kind)
+    ? `<span class="pill bad" title="${esc(plan.stop.reason || "")}">`
+      + `${esc(plan.stop.kind || "стоп")}: ${esc(plan.stop.reason || "причина не записана")}</span>`
+    : "";
+  const stamp = approval.approved_at ? ` title="${esc(approval.approved_at)}"` : "";
+  const state = String(plan.state || "");
+  const tone = state === "closed" ? "ok" : (state === "running" ? "run" : "wait");
+  const total = Number(plan.total) || 0;
+  const done = Number(plan.closed) || 0;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  const active = String(plan.id) === planIdOf()
+    && (!currentProject || project.id === currentProject);
+  return `
+    <div class="plan-card${active ? " active" : ""}" data-project="${esc(project.id)}"
+         data-state="${esc(state)}" data-plan-id="${esc(plan.id)}">
+      <div>
+        <div class="where">${esc(project.name)}</div>
+        <div class="name">План ${esc(plan.id)} — ${esc(plan.name || "без названия")}</div>
+        <div class="meta"><span${stamp}>${esc(approval.label || "—")}</span>${stop}</div>
+      </div>
+      <div class="meta">
+        <span class="pill ${tone}">${esc(plan.state_label || "—")}</span>
+        <span>следующий шаг: <b class="mono">${esc(plan.next || "—")}</b></span>
+        <span class="cell-bar step-bar">
+          <span class="bar"><i style="width:${pct}%"></i></span>
+          <span class="mono">${done} / ${total}</span>
+        </span>
+      </div>
+      <div class="acts" data-plan-actions="1">${planActions(project, plan, preview)}</div>
+    </div>`;
 }
 
 // Пары «проект + план» последнего рендера: обработчик кнопки берёт из них имя проекта
@@ -1310,8 +1457,8 @@ function planRowCommandText(plan) {
 
 // Девятая ячейка строки: ровно одна кнопка вида движка (или «без действия») плюс жесты владельца.
 // В предпросмотре кнопок нет вовсе: панель только читает.
-function planActionsCell(project, plan, preview) {
-  if (preview) return '<td class="mono">—</td>';
+function planActions(project, plan, preview) {
+  if (preview) return '<span class="muted">—</span>';
   const action = plan.action || {};
   const entry = ENGINE_ACTIONS[action.kind];
   const parts = [];
@@ -1330,7 +1477,12 @@ function planActionsCell(project, plan, preview) {
     if (item.when === "running" && plan.state !== "running") return;
     parts.push(`<button type="button" data-plan-panel="${esc(kind)}">${esc(item.label)}</button>`);
   });
-  return `<td data-plan-actions="1">${parts.join(" ")}</td>`;
+  return parts.join(" ");
+}
+
+// Ячейка таблицы (осталась для строк «Обзора»): та же выдача, обёрнутая в `<td>`.
+function planActionsCell(project, plan, preview) {
+  return `<td data-plan-actions="1">${planActions(project, plan, preview)}</td>`;
 }
 
 // «Добавление плана» (S5A): пустой путь — сервер откроет системный диалог, занятый — 400 с причиной.
@@ -1360,13 +1512,13 @@ function planAdd(project, path) {
 }
 
 // Один обработчик на таблицу: кнопки перерисовываются каждый кадр, привязки на них не живут.
-function bindPlansActions() {
-  const table = $("plans-table");
+function bindPlanActionsFor(container) {
+  const table = container;
   if (!table) return;
   table.addEventListener("click", (event) => {
     const button = event.target.closest("[data-plan-act], [data-plan-panel]");
     if (!button) return;
-    const row = button.closest("tr[data-project]");
+    const row = button.closest("[data-project]");
     if (!row) return;
     const project = {id: row.dataset.project, name: row.dataset.project};
     const plan = {id: row.dataset.planId};
@@ -1463,8 +1615,11 @@ async function loadProjects() {
     return;   // сводка не критична: экран проекта работает и без неё
   }
   if (data && data.ok) {
+    lastProjects = data.projects || [];
     renderProjects(data, currentProject || data.default);
     renderPlansTab(data);
+    renderDraftsTab(lastProjects, Boolean(data.preview));
+    renderClosedPlans(lastProjects);
     renderRunning(data);
   }
 }
@@ -1927,6 +2082,9 @@ function renderRollout(data) {
 
 // ── экран «Шаг» (план 3 S3): контракт, постановка, отчёт ревью, коммит ──
 let currentStep = null;   // выбранный шаг вкладки «Шаг»
+// Черновики и исполненные планы живут ответом /api/projects: снимок о них не знает,
+// а два запроса на один экран не нужны. Копия последнего ответа — для перерисовки фильтром.
+let lastProjects = [];
 let stepPairLoaded = "";  // пара «план + шаг», для которой блоки уже нарисованы
 let stepPairPending = ""; // пара, запрос по которой сейчас в полёте
 
@@ -2006,6 +2164,21 @@ async function loadStep() {
     return;
   }
   renderStep(data);
+}
+
+// Экран шага обновляется сам (0.33): отчёты, карточки и вопросы меняет тик, а не выбор
+// в списке. Раньше он перечитывался только при смене пары «план + шаг» и потому врал до
+// перезагрузки страницы. Чаще STEP_RELOAD_MS не ходим: кадры SSE идут пачками.
+const STEP_RELOAD_MS = 4000;
+let stepReloadAt = 0;
+
+function refreshStepScreen() {
+  if (!$("tab-step") || !$("tab-step").classList.contains("active")) return;
+  if (!planIdOf() || !currentStep) return;
+  if (stepPairPending && stepPairPending === stepPairOf()) return;
+  if (Date.now() - stepReloadAt < STEP_RELOAD_MS) return;
+  stepReloadAt = Date.now();
+  loadStep();
 }
 
 function clipNote(el, block, fallback) {
@@ -2472,16 +2645,102 @@ function questionMinutes(row) {
   const until = Date.parse(row.deadline_at || "");
   if (!until) return "";
   const left = Math.round((until - Date.now()) / 60000);
-  return left > 0 ? `осталось ${left} мин` : "дедлайн автовыбора прошёл";
+  return left > 0 ? `осталось ${left} мин` : "срок автовыбора истёк";
 }
 
+// Карточка вопроса одна и та же в окне и на вкладке «Шаг»: второй разметки нет.
+// Варианты — списком, в каждом «что будет, если выбрать» и цена (текст автора, не наш):
+// в одну строку это не читалось. Рекомендация поднята первой и помечена — владелец чаще
+// всего соглашается с ней, и ему не нужно искать букву в общем списке.
+function questionCard(q, opts) {
+  const preview = Boolean(window.__preview);
+  const rec = String(q.recommend || "").trim().toUpperCase();
+  const options = (q.options || []).slice().sort(
+    (a, b) => Number(String(b.letter || "").toUpperCase() === rec)
+            - Number(String(a.letter || "").toUpperCase() === rec));
+  const buttons = options.map((opt) => {
+    const hit = rec && String(opt.letter || "").toUpperCase() === rec;
+    const body = esc(opt.text || "") +
+      (hit ? ' <span class="pill ok">рекомендую</span>' : "");
+    return `
+      <button type="button" class="opt${hit ? " rec" : ""}" data-answer="${esc(q.id)}"
+              data-value="${esc(opt.letter || opt.text)}" ${preview ? "disabled" : ""}>
+        <span class="letter">${esc(opt.letter || "•")}</span>
+        <span class="opt-body">${body}</span>
+      </button>`;
+  }).join("");
+  const left = questionMinutes(q);
+  const deadline = rec
+    ? (left ? `Если не ответить (${esc(left)}), приму ${esc(rec)} сам.`
+            : "Срок автовыбора вышел — приму рекомендацию сам.")
+    : "Рекомендации нет: автовыбора не будет, вопрос ждёт вашего ответа.";
+  const where = opts && opts.where ? `<span>· шаг ${esc(q.step)}</span>` : "";
+  const plan = planIdOf() ? `<span class="pill">план ${esc(planIdOf())}</span>` : "";
+  return `
+    <div class="question" data-question="${esc(q.id)}">
+      <div class="row1"><span class="pill wait">${esc(q.id)}</span>${where}${plan}</div>
+      <div class="question-text">${esc(q.text || "")}</div>
+      ${options.length ? `<div class="question-options">${buttons}</div>`
+        : '<div class="question-options"><span class="muted">вариантов автор не дал — ответьте своими словами</span></div>'}
+      <div class="question-deadline ${rec && left ? "wait" : ""}">${deadline}</div>
+      <details><summary class="muted">свой ответ</summary>
+        <div class="question-free">
+          <input type="text" data-answer-input="${esc(q.id)}"
+                 placeholder="например: делай как A, но без миграции" ${preview ? "disabled" : ""}>
+          <button type="button" data-answer-send="${esc(q.id)}" ${preview ? "disabled" : ""}>Ответить</button>
+        </div>
+      </details>
+    </div>`;
+}
+
+function bindQuestionAnswers(box) {
+  if (!box) return;
+  box.querySelectorAll("[data-answer]").forEach((btn) => {
+    btn.onclick = () => answerQuestion(btn.dataset.answer, btn.dataset.value);
+  });
+  box.querySelectorAll("[data-answer-send]").forEach((btn) => {
+    btn.onclick = () => {
+      const input = box.querySelector(`[data-answer-input="${btn.dataset.answerSend}"]`);
+      answerQuestion(btn.dataset.answerSend, input ? input.value : "");
+    };
+  });
+}
+
+// Ответ уходит POST /api/action `answer` — тем же путём, что `/answer` в боте и адресная
+// команда движка. Кнопки гаснут на время запроса (двойной клик давал второй ответ и
+// «вопрос уже закрыт»), а отказ движка показывается его словами, а не «готово».
 function answerQuestion(qid, value) {
-  if (window.__preview) { toast("предпросмотр только читает", true); return; }
   const answer = String(value || "").trim();
-  if (!answer) { toast("нужен вариант или свой ответ", true); return; }
-  const dialog = $("question-dialog");
-  act("answer", {question: qid, value: answer, plan: planIdOf()})
-    .then(() => { questionsShown = ""; if (dialog && dialog.open) dialog.close(); });
+  if (!answer) { toast("выберите вариант или напишите свой ответ", true); return Promise.resolve(); }
+  if (window.__preview) { toast("предпросмотр только читает", true); return Promise.resolve(); }
+  const dead = [];
+  document.querySelectorAll(`.question[data-question="${qid}"]`).forEach((box) => {
+    box.querySelectorAll("button, input").forEach((el) => { el.disabled = true; dead.push(el); });
+  });
+  setBusy(true);
+  return api("/api/action", {
+    method: "POST",
+    headers: PANEL_HEADERS,
+    body: JSON.stringify({action: "answer", ...(currentProject ? {project: currentProject} : {}),
+                          question: qid, value: answer, plan: planIdOf()}),
+  }).then((data) => {
+    if (data && data.ok) {
+      toast(data.message || `ответ на ${qid} записан`);
+      questionsShown = "";
+      const dialog = $("question-dialog");
+      if (dialog && dialog.open) dialog.close();
+      stepPairLoaded = "";       // вопрос держал шаг — экран перечитывается сразу
+      return refresh().then(() => (currentStep ? loadStep() : null));
+    }
+    toast("ответ не принят: " +
+      ((data && (data.error || data.stderr)) || "движок не назвал причину"), true);
+    return refresh();
+  }).catch((err) => {
+    toast("ответ не принят: " + err, true);
+  }).finally(() => {
+    setBusy(false);
+    dead.forEach((el) => { el.disabled = false; });
+  });
 }
 
 function renderQuestions(rows) {
@@ -2493,43 +2752,33 @@ function renderQuestions(rows) {
     if (dialog.open) dialog.close();
     return;
   }
-  const preview = Boolean(window.__preview);
-  box.innerHTML = rows.map((q) => {
-    const options = (q.options || []).map((opt) => `
-      <button type="button" data-answer="${esc(q.id)}"
-              data-value="${esc(opt.letter || opt.text)}" ${preview ? "disabled" : ""}
-              title="${esc(opt.text)}">${esc((opt.letter ? opt.letter + ") " : "") + opt.text)}</button>`
-    ).join(" ");
-    const rec = q.recommend
-      ? `рекомендация: ${esc(q.recommend)}`
-      : "рекомендации нет — автовыбора не будет";
-    const left = questionMinutes(q);
-    return `
-      <div class="question" data-question="${esc(q.id)}">
-        <div class="row1"><span class="pill wait">${esc(q.id)}</span>
-          <span>· шаг ${esc(q.step)}</span>
-          ${left ? `<span class="muted">· ${esc(left)}</span>` : ""}</div>
-        <div class="question-text">${esc(q.text)}</div>
-        ${q.options_text ? `<div class="muted mono">${esc(q.options_text)}</div>` : ""}
-        <div class="question-options">${options}</div>
-        <div class="question-free">
-          <input type="text" data-answer-input="${esc(q.id)}" placeholder="свой ответ"
-                 ${preview ? "disabled" : ""}>
-          <button type="button" data-answer-send="${esc(q.id)}"
-                  ${preview ? "disabled" : ""}>Ответить</button>
-        </div>
-        <div class="muted">${rec}</div>
-      </div>`;
-  }).join("");
-  box.querySelectorAll("[data-answer]").forEach((btn) => {
-    btn.onclick = () => answerQuestion(btn.dataset.answer, btn.dataset.value);
-  });
-  box.querySelectorAll("[data-answer-send]").forEach((btn) => {
-    btn.onclick = () => {
-      const input = box.querySelector(`[data-answer-input="${btn.dataset.answerSend}"]`);
-      answerQuestion(btn.dataset.answerSend, input ? input.value : "");
-    };
-  });
+  box.innerHTML = rows.map((q) => questionCard(q, {where: true})).join("");
+  bindQuestionAnswers(box);
+}
+
+// Вкладка «Шаг»: вопросы выбранного шага — на месте, без всплытия. Вопросы других шагов
+// перечислены строкой: иначе кажется, что план стоит из-за этого экрана.
+function renderStepQuestions(rows, step) {
+  const box = $("step-questions");
+  if (!box) return;
+  const list = rows || [];
+  const mine = list.filter((q) => String(q.step) === String(step));
+  const other = list.filter((q) => String(q.step) !== String(step));
+  if ($("step-questions-count")) $("step-questions-count").textContent = String(list.length);
+  if (!mine.length) {
+    box.innerHTML = '<span class="muted">вопросов по этому шагу нет</span>';
+  } else {
+    box.innerHTML = mine.map((q) => questionCard(q, {where: false})).join("");
+    bindQuestionAnswers(box);
+  }
+  const note = $("step-questions-note");
+  if (note) {
+    note.className = "clip";
+    note.textContent = other.length
+      ? `ещё ${other.length} по другим шагам плана: ` +
+        other.map((q) => `${q.id} (шаг ${q.step})`).join(", ")
+      : "";
+  }
 }
 
 // Окно открывается один раз на набор «вопрос + дедлайн»: закрытое владельцем не всплывает
@@ -2646,7 +2895,6 @@ function render(data) {
   renderCycle(data);
   renderRollout(data);
   renderEvents(data);
-  renderDrafts(data);
   collectNotify(data.notify);
 
   const plans = data.plans || [];
@@ -2724,7 +2972,12 @@ function render(data) {
   window.__steps = plan.steps || [];
   window.__nextStep = nextId || null;
   window.__preview = !!data.preview;
+  // Вопросы всех шагов плана: движок отдаёт их в снимке, страница только раскладывает.
+  window.__questions = data.questions || [];
   fillStepPicker();
+  if (currentStep) renderStepQuestions(window.__questions, currentStep);
+  showQuestionDialog(window.__questions);
+  refreshStepScreen();
 
   $("status").textContent = [
     paused ? quietHours.reason : "",
@@ -2790,8 +3043,8 @@ async function refresh() {
   if (!res.ok && !data.error) data.error = "HTTP " + res.status;
   if (!data.ok) { toast(data.error || "не удалось получить состояние", true); return; }
   etag = res.headers.get("ETag") || etag;
-  render(data);
-  showQuestionDialog(data.questions || []);
+  render(data);   // окно вопроса открывает render(): список у него уже свой
+
   if (!data.errors || !data.errors.length) {
     // форма настроек заполняется один раз — не перетираем ввод пользователя
     if (!window.__configLoaded) {
@@ -2803,6 +3056,8 @@ async function refresh() {
       $("form-config").prompt.value = rt.prompt || "";
       $("form-config").require_prompt.checked = data.require_prompt !== false;
       $("tg-chat").value = (data.telegram || {}).chat || "";
+      // Ожидание ответа приходит секундами; в форме — минуты, как их читает человек.
+      $("answer-timeout").value = String(Math.round((Number(data.answer_timeout) || 0) / 60));
       window.__configLoaded = true;
     }
   }
@@ -3105,6 +3360,10 @@ function configPatch() {
                prompt: form.prompt.value.trim()},
     paths: {plans: form.path_plans.value.trim(), reviews: form.path_reviews.value.trim(),
             prompts: form.path_prompts.value.trim(), state: form.path_state.value.trim()},
+    // Минуты в форме, секунды в файле: ключ движка (`notify.answer_timeout`) считается
+    // в секундах, а человеку удобнее минуты. Пустое поле — «не менять» не бывает: 0.
+    notify: {answer_timeout: Math.round(
+      Number(String(form.answer_timeout.value || "0").replace(",", ".").trim() || 0) * 60)},
   };
 }
 
@@ -3238,13 +3497,22 @@ $("plans-project").addEventListener("change", filterPlansTab);
 $("plans-state").addEventListener("change", filterPlansTab);
 $("plans-text").addEventListener("input", filterPlansTab);
 $("plans-add-btn").onclick = () => planAdd($("plans-add-project").value, $("plans-add-path").value);
+$("plans-add-toggle").onclick = () => {
+  const form = $("plans-add");
+  const open = form.hidden;
+  form.hidden = !open;
+  $("plans-add-toggle").setAttribute("aria-expanded", open ? "true" : "false");
+  if (open && $("plans-add-path")) $("plans-add-path").focus();
+};
+$("ov-closed-project").addEventListener("change", () => renderClosedPlans(lastProjects));
 $("plans-add-path").addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     planAdd($("plans-add-project").value, $("plans-add-path").value);
   }
 });
-bindPlansActions();
+bindPlanActionsFor($("plans-rows"));
+bindPlanActionsFor($("ov-closed-rows"));
 $("close-hotkeys").onclick = () => $("hotkeys-help").close();
 applyTheme(currentTheme());   // подпись кнопки — по фактической теме
 

@@ -217,8 +217,10 @@ def test_owner_commands_wait_for_lock_and_do_not_act(tmp_path: Path) -> None:
         for args in (("--stop", "ручная остановка"), ("--resume",),
                      ("--hold", "S2"), ("--unhold", "S2")):
             res = run_gate(root, *args, env={"PIPELINE_LOCK_WAIT": "0"})
-            assert res.returncode == 0, res.stderr
-            assert "тик уже идёт" in res.stdout, res.stdout
+            # «Не применена» — отказ, а не успех: с кодом 0 панель показывала владельцу
+            # «готово» на непринятый ответ на вопрос (случай 17.11.2026).
+            assert res.returncode == 4, res.stdout
+            assert "тик уже идёт" in res.stderr, res.stderr
     finally:
         stop_proc(proc)
 

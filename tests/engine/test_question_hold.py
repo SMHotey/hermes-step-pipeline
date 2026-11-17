@@ -298,19 +298,19 @@ def test_answer_unknown_step_and_question_refused(project: Path, hermes_stub: Pa
 
 
 def test_auto_answer_by_timeout(project: Path, hermes_stub: Path, stand, monkeypatch):
-    """S5 п.5: через 300 с без ответа рекомендация принимается с пометкой «авто»."""
+    """S5 п.5: по истечении ожидания (умолчание — час) рекомендация принимается с «авто»."""
     cfg, p = stand
     now = clock(monkeypatch)
     write_prompt(project, f"# Постановка S1\n\n{QUESTION_LINE}\n")
     tick(p)
-    now[0] += 301
+    now[0] += 3601
 
     messages: list[str] = []
     res = tick(p, messages)
     assert res["applied"] is True
     assert res["decision"]["action"] == "question_auto", res["decision"]
     assert rows_of(project)[0]["status"] == "закрыт"
-    assert rows_of(project)[0]["answer"] == "A — авто: рекомендация по таймауту 5 мин"
+    assert rows_of(project)[0]["answer"] == "A — авто: рекомендация по таймауту 60 мин"
     assert (state_of(cfg).get("hold_steps") or []) == []
     assert (state_of(cfg).get("hold_released") or []) == []
     assert any("Q-1 принят автоматически: A (рекомендация)" in text for text in messages), \
@@ -324,7 +324,7 @@ def test_auto_answer_next_tick_creates_card(project: Path, hermes_stub: Path, st
     now = clock(monkeypatch)
     write_prompt(project, f"# Постановка S1\n\n{QUESTION_LINE}\n")
     tick(p)
-    now[0] += 301
+    now[0] += 3601     # умолчание ожидания — час
     auto: list[str] = []
     tick(p, created=auto)
     assert auto == [], auto
@@ -345,7 +345,7 @@ def test_auto_answer_keeps_risk_hold(project: Path, hermes_stub: Path, stand_hig
     now = clock(monkeypatch)
     write_prompt(project, f"# Постановка S1\n\n{QUESTION_LINE}\n")
     tick(p)
-    now[0] += 301
+    now[0] += 3601     # умолчание ожидания — час
     tick(p)
     assert rows_of(project)[0]["status"] == "закрыт"
 
@@ -367,7 +367,7 @@ def test_auto_answer_keeps_risk_hold(project: Path, hermes_stub: Path, stand_hig
     spec_p = gate.resolve_paths(config_mod.load(spec_root), "1")
     write_prompt(spec_root, f"# Постановка S1\n\n{QUESTION_LINE}\n")
     tick(spec_p)
-    now[0] += 301
+    now[0] += 3601     # умолчание ожидания — час
     tick(spec_p)
 
     spec_created: list[str] = []
@@ -474,3 +474,117 @@ def test_demo_question_flow_cli(project: Path, hermes_stub: Path):
     third = run_gate(project, "--run", "--plan", "1")
     assert third.returncode == 0, third.stderr
     assert any(row["key"].endswith(":S1:step") for row in stub_cards(hermes_stub))
+
+
+# Абзац автора, перенесённый по ширине страницы: так вопрос выглядит в живом отчёте
+# (`docs/reviews/13-S2-prompt.md`). Прежний разбор читал только первую строку и терял хвост
+# абзаца — вместе с вариантами и рекомендацией.
+MULTILINE_QUESTION = (
+    "Q1: Ветка реестра шага и стопы формата S1 — кто первый? — A) стопы формата S1 выше:\n"
+    "нечитаемый отчёт и отчёт без меток класса останавливают шаг, даже когда в реестре есть\n"
+    "открытые строки (цена: один тик простоя) / B) реестр выше: открытая строка заказывает\n"
+    "круг правок при любом отчёте (цена: круг по нечитаемому отчёту повторяется) — "
+    "рекомендация A")
+MULTILINE_TEXT = "Ветка реестра шага и стопы формата S1 — кто первый?"
+
+
+def test_multiline_question_reads_whole_paragraph(project: Path, hermes_stub: Path, stand):
+    """S5 п.2: вопрос — абзац. Переносы строк его не рвут, тире внутри текста остаётся текстом."""
+    cfg, p = stand
+    write_prompt(project, "# Постановка S1\n\n" + MULTILINE_QUESTION + "\n\n## Как проверено\n\n"
+                 "Прогонов не было.\n")
+    res = tick(p)
+
+    row = rows_of(project)[0]
+    assert row["text"] == MULTILINE_TEXT
+    assert row["recommend"] == "A"
+    assert "стопы формата S1 выше" in row["options"]
+    assert "реестр выше" in row["options"]
+    view = res["questions"][0]
+    assert [item["letter"] for item in view["options"]] == ["A", "B"]
+    assert "один тик простоя" in view["options"][0]["text"]
+    # Рекомендация названа — дедлайн автовыбора у вопроса есть.
+    assert view["deadline_at"]
+
+
+def test_truncated_open_question_is_migrated_in_place(project: Path, hermes_stub: Path, stand):
+    """S5 п.2: уже записанный обрезанный вопрос приводится к полному тексту на месте.
+
+    Второй строки не заводится, ID и время вопроса сохраняются: это тот же вопрос, а не новый.
+    """
+    cfg, p = stand
+    gate.write_questions(questions_file(project), [{
+        "id": "Q-1", "step": "S1", "text": "Ветка реестра шага и стопы формата S1",
+        "options": "кто первый? — A) стопы формата S1 выше: нечитаемый",
+        "recommend": "", "status": "открыт", "answer": ""}], "1")
+    state = gate.load_state(p)
+    asked = 1_000_000
+    state["questions"] = {"Q-1": {"asked_at": asked, "notified_at": asked}}
+    gate.save_state(p, state)
+    write_prompt(project, "# Постановка S1\n\n" + MULTILINE_QUESTION + "\n")
+
+    ctx = {"next": {"id": "S1"}, "state": state, "cards": []}
+    assert gate.register_questions(p, ctx, state) == []
+
+    rows = rows_of(project)
+    assert [row["id"] for row in rows] == ["Q-1"]
+    assert rows[0]["text"] == MULTILINE_TEXT
+    assert rows[0]["recommend"] == "A"
+    assert rows[0]["status"] == "открыт"
+    assert (state.get("questions") or {})["Q-1"]["asked_at"] == asked
+
+
+def test_status_lists_questions_of_every_step(project: Path, hermes_stub: Path, stand):
+    """S5 п.4: вьюха вопросов — по всем шагам плана, шаг остаётся полем строки.
+
+    Вкладка «Шаг» показывает вопрос выбранного шага, поэтому страже отдаёт все открытые
+    вопросы плана: иначе вопрос следующего шага в ней не виден вовсе.
+    """
+    cfg, p = stand
+    write_prompt(project, f"# Постановка S1\n\n{QUESTION_LINE}\n")
+    tick(p)
+    gate.write_questions(questions_file(project), rows_of(project) + [{
+        "id": "Q-2", "step": "S2", "text": "как проверяем следующий шаг",
+        "options": "A) тестом / B) глазами", "recommend": "A", "status": "открыт",
+        "answer": ""}], "1")
+
+    shown = gate.run_gate(p, execute=False)
+    assert {item["id"]: item["step"] for item in shown["questions"]} == {"Q-1": "S1", "Q-2": "S2"}
+    # Удержание шага по-прежнему считается по вопросу текущего шага.
+    assert shown["decision"]["question"] == "Q-1"
+
+
+def test_same_answer_twice_is_not_an_error(project: Path, hermes_stub: Path, stand):
+    """S5 п.4: повтор того же ответа — не отказ (двойной клик в окне панели)."""
+    cfg, p = stand
+    write_prompt(project, f"# Постановка S1\n\n{QUESTION_LINE}\n")
+    tick(p)
+
+    assert gate.answer_question(cfg, "1", "Q-1", "A")["ok"] is True
+    second = gate.answer_question(cfg, "1", "Q-1", "A")
+    assert second["ok"] is True and "уже закрыт тем же ответом" in second["message"]
+    other = gate.answer_question(cfg, "1", "Q-1", "B")
+    assert other["ok"] is False and "уже закрыт" in other["message"]
+    # Закрытая строка не переписана другим ответом.
+    assert rows_of(project)[0]["answer"] == "A"
+
+
+def test_question_notice_reads_like_a_message_not_a_log_line(project, hermes_stub, stand):
+    """Уведомление о вопросе: варианты списком, рекомендация и срок человеческим языком.
+
+    Однострочная склейка «варианты: A) … / B) …» в телефоне не читалась, а без срока
+    владелец не понимал, что через час вопрос решат за него.
+    """
+    cfg, p = stand
+    write_prompt(project, f"# Постановка S1\n\n{MULTILINE_QUESTION}\n")
+    tick(p)
+    item = rows_of(project)[0]
+    text = gate.question_notice_text(p, item, 3600)
+    lines = [line for line in text.splitlines() if line.strip()]
+
+    assert lines[0].startswith("❓ Q-1")
+    assert "план 1, шаг S1" in lines[1]
+    assert "стопы формата S1 выше" in text and "B) реестр выше" in text
+    assert "Рекомендую A." in text
+    assert "60 мин" in text and "приму A сам" in text
+    assert "/answer Q-1 A" in text

@@ -313,6 +313,8 @@ QUESTION_ID_RE = re.compile(r"Q-(\d+)")
 #   `Q1: <вопрос> — A) <вариант> (цена) / B) <вариант> (цена) — рекомендация A`
 # Маркер списка перед `Q` допускается: отчёт — markdown, автор пишет пунктом.
 QUESTION_LINE_RE = re.compile(r"^\s*(?:[-*+]\s*)?Q-?\s*(\d+)\s*:\s*(?P<body>\S.*)$")
+#: Начало блока вопроса: того же вида, но без тела — по нему режется абзац автора.
+QUESTION_LINE_START_RE = re.compile(r"^\s*(?:[-*+]\s*)?Q-?\s*\d+\s*:")
 # Разделитель «вопрос — варианты»: длинное тире, короткое и дефис. Автор пишет по-разному,
 # а строка вопроса — не место для спора об оформлении.
 QUESTION_DASH_RE = re.compile(r"\s+[—–-]{1,2}\s+")
@@ -325,10 +327,16 @@ QUESTION_NO_RECOMMEND_RE = re.compile(r"рекомендац\w*\s*(?:нет|от
 # Автовыбор рекомендации по таймауту (план 8, S5 п.5): секунды, 0 — выключить. Время вопроса
 # живёт в состоянии плана (`questions: {"Q-1": {"asked_at", "notified_at"}}`), а не в
 # таблице: шапка файла остаётся нормативной.
-ANSWER_TIMEOUT_DEFAULT = 300
+# Час: вопрос — решение владельца, а не дежурная мелочь; пяти минут не хватало (17.11.2026).
+ANSWER_TIMEOUT_DEFAULT = 3600
 AUTO_ANSWER_NOTE = "авто: рекомендация по таймауту"
 # Напоминание о вопросе — не чаще раза в час: тот же порядок, что у тревог и сторожа.
 QUESTION_NOTICE_GAP = 3600
+#: Код возврата «команда владельца не применена: идёт тик». Отдельный от 0, потому что код 0
+#: читается панелью и `plans_api` как «сделано»: ответ на вопрос, не записанный из-за
+#: блокировки, выглядел успехом (случай 17.11.2026). Коды 2 (конфиг и разбор) и 3 (движок
+#: не сходится с маркером) заняты, поэтому 4.
+EXIT_BUSY = 4
 
 # Постановка следующего шага и ревью постановки (план 2, S6): отметка свежести recon
 # и что считать расхождением постановки с кодом.
@@ -1407,7 +1415,9 @@ def parse_question_line(line: str) -> dict | None:
     match = QUESTION_LINE_RE.match(str(line or ""))
     if not match:
         return None
-    body = match.group("body").replace("`", "").strip()
+    # Переносы склеиваются в один пробел: абзац автора — один вопрос, и его ширина по
+    # странице не должна попадать ни в текст, ни в варианты.
+    body = " ".join(match.group("body").replace("`", "").split())
     head, recommend = body, ""
     mark = re.search(r"рекомендаци\w*", body, re.IGNORECASE)
     if mark:
@@ -1416,20 +1426,58 @@ def parse_question_line(line: str) -> dict | None:
         if not QUESTION_NO_RECOMMEND_RE.search(tail):
             letter = QUESTION_RECOMMEND_RE.search(tail)
             recommend = letter.group(1).upper() if letter else ""
-    parts = [part.strip() for part in QUESTION_DASH_RE.split(head) if part.strip()]
-    text = (parts[0] if parts else head).strip()
-    options = " — ".join(parts[1:]) if len(parts) > 1 else ""
+    # Варианты начинаются с метки `A)`/`А)` — текст вопроса это всё до неё. Деление по
+    # первому тире резало вопрос, внутри которого автор поставил тире («… — кто первый?»),
+    # и уносило половину вопроса в колонку вариантов.
+    option = QUESTION_OPTION_RE.search(head)
+    if option:
+        text = head[:option.start()].strip().strip("—–-/:;,.").strip()
+        options = head[option.start():].strip()
+    else:
+        parts = [part.strip() for part in QUESTION_DASH_RE.split(head) if part.strip()]
+        text = (parts[0] if parts else head).strip()
+        options = " — ".join(parts[1:]) if len(parts) > 1 else ""
     if not text:
         return None
     return {"id": f"Q-{int(match.group(1))}", "text": text, "options": options,
             "recommend": recommend}
 
 
+def question_blocks(text) -> list[list[str]]:
+    """Блоки строк отчёта, каждый начинается строкой `Q<N>:` (S5, п.2).
+
+    Автор переносит абзац по ширине страницы, поэтому вопрос — блок до пустой строки,
+    заголовка, строки таблицы или следующего `Q<N>:`. Обрыв на первом переносе терял хвост
+    абзаца вместе с вариантами и рекомендацией (живой случай: `13-S2-prompt.md`).
+    """
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            current = None                    # пустая строка закрывает абзац
+            continue
+        if line.startswith("#") or line.startswith("|"):
+            current = None                    # заголовок и таблица вопрос не продолжают
+            continue
+        if QUESTION_LINE_START_RE.match(line):
+            current = [line]
+            blocks.append(current)
+            continue
+        if current is not None:
+            current.append(line)              # перенос строки внутри абзаца автора
+    return blocks
+
+
 def parse_question_lines(text) -> list[dict]:
-    """Все строки вопросов отчёта: по одной записи на строку формы `Q<N>:` (S5, п.2)."""
+    """Все вопросы отчёта: по записи на блок `Q<N>:` (S5, п.2).
+
+    Вопрос — абзац, а не строка. Второго разбора нет: блок склеивается в одну строку и
+    уходит в тот же `parse_question_line`.
+    """
     found: list[dict] = []
-    for line in str(text or "").splitlines():
-        parsed = parse_question_line(line)
+    for block in question_blocks(text):
+        parsed = parse_question_line(" ".join(block))
         if parsed:
             found.append(parsed)
     return found
@@ -1466,8 +1514,15 @@ def question_view(item: dict, asked_at=None, timeout: float = 0) -> dict:
 
 
 def questions_view(ctx: dict) -> list[dict]:
-    """Открытые вопросы шага для панели: момент и дедлайн берутся из состояния плана."""
-    opened = ctx.get("step_questions") or []
+    """Открытые вопросы плана для панели: все шаги, а не только текущий.
+
+    Вопрос другого шага владельцу нужен там же, где он смотрит шаг (вкладка «Шаг»), поэтому
+    отбор по шагу здесь не делается: номер шага — поле строки, фильтрует страница.
+    Момент и дедлайн берутся из состояния плана.
+    """
+    opened = ctx.get("plan_questions")
+    if opened is None:
+        opened = ctx.get("step_questions") or []
     if not opened:
         return []
     state = ctx.get("state") if isinstance(ctx.get("state"), dict) else {}
@@ -1485,17 +1540,33 @@ def _question_minutes(seconds: float) -> int:
     return max(1, int(round(float(seconds) / 60)))
 
 
-def question_notice_text(p: Paths, item: dict) -> str:
-    """Уведомление о вопросе одной строкой (S5, п.4б): текст, варианты, рекомендация, ответ."""
-    parts = [f"❓ {item.get('id')} (план {p.plan_id}, шаг {item.get('step')}): "
-             f"{' '.join(str(item.get('text') or '').split())}"]
-    if item.get("options"):
-        parts.append(f"варианты: {item['options']}")
+def question_notice_text(p: Paths, item: dict, timeout: float = 0) -> str:
+    """Уведомление о вопросе для человека: текст, варианты с ценой, рекомендация, ответ.
+
+    Однострочное «варианты: A) … / B) …» в телефоне не читается, поэтому варианты идут
+    списком, а строка ответа — последней: её и копируют в чат. Дедлайн называется только
+    там, где автовыбор возможен (рекомендация есть и таймаут не выключен).
+    """
+    lines = [f"❓ {item.get('id')} — нужно ваше решение",
+             f"план {p.plan_id}, шаг {item.get('step') or '—'}",
+             "",
+             " ".join(str(item.get("text") or "").split())]
+    options = question_options(item.get("options"))
+    if options:
+        lines.append("")
+        lines.extend(f"{opt['letter']}) {opt['text']}" for opt in options)
     recommend = str(item.get("recommend") or "").strip()
-    parts.append(f"рекомендация: {recommend}" if recommend else "рекомендация: нет")
-    parts.append(f"ответить: /answer {item.get('id')} {recommend or '<вариант>'} "
-                 f"или окно в панели")
-    return "; ".join(parts)
+    lines.append("")
+    if recommend:
+        lines.append(f"Рекомендую {recommend}.")
+        if timeout and timeout > 0:
+            lines.append(f"Если не ответить за {_question_minutes(timeout)} мин, "
+                         f"приму {recommend} сам.")
+    else:
+        lines.append("Рекомендации нет — жду вашего ответа.")
+    lines.append(f"Ответить: /answer {item.get('id')} {recommend or '<вариант>'} "
+                 f"или кнопкой в панели.")
+    return "\n".join(lines)
 
 
 def question_hold_reason(step_id: str, item: dict, tail: str = "") -> str:
@@ -1550,6 +1621,10 @@ def register_questions(p: Paths, ctx: dict, state: dict | None = None) -> list[d
     постановка пишет `Q1`, — поэтому номер автора ID реестра не задаёт (ревью шага S5:
     вопрос второго и следующих шагов молча терялся). Битый файл вопросов — причина в
     `ctx["step_questions_error"]`, второй файл молча не заводится.
+
+    Уже записанный обрезанный вопрос приводится к полному тексту на месте (см.
+    `_question_truncated_prefix`): до правки разбора вопрос обрывался на первом переносе,
+    и в файле лежал кусок без вариантов и рекомендации. Второй строки при этом не заводится.
     """
     step = ctx.get("next")
     if not step or ctx.get("step_questions_error"):
@@ -1559,14 +1634,27 @@ def register_questions(p: Paths, ctx: dict, state: dict | None = None) -> list[d
     current = load_questions(path)
     pairs = {(_question_pair_key(item)) for item in current}
     fresh: list[dict] = []
+    migrated: list[dict] = []
     for text in step_report_texts(p, step, ctx.get("cards") or []):
         for parsed in parse_question_lines(text):
             item = dict(parsed, step=sid, status=QUESTION_OPEN, answer="")
             pair = _question_pair_key(item)
             if pair in pairs:
                 continue
+            target = next((row for row in current if _question_truncated_prefix(row, item)), None)
+            if target is not None:
+                target["text"] = item["text"]
+                target["options"] = item["options"]
+                target["recommend"] = item["recommend"]
+                pairs.add(_question_pair_key(target))
+                migrated.append(target)
+                continue
             pairs.add(pair)
             fresh.append(item)
+    if migrated:
+        write_questions(path, current, p.plan_id)
+        ctx["step_questions"] = step_questions(path, sid)
+        ctx["plan_questions"] = step_questions(path)
     if not fresh:
         return []
     rules = _question_rules()
@@ -1586,8 +1674,25 @@ def register_questions(p: Paths, ctx: dict, state: dict | None = None) -> list[d
     save_state(p, state)
     # Решение этого же тика обязано видеть новый вопрос: файл перечитан, а не «запомнен».
     ctx["step_questions"] = step_questions(path, sid)
+    ctx["plan_questions"] = step_questions(path)
     ctx["step_questions_rel"] = plan_questions_rel(p)
     return added
+
+
+#: Сколько первых символов обрезанного вопроса должны совпасть, чтобы строка считалась его
+#: началом: короче — уже случайное совпадение, а не миграция.
+QUESTION_MIGRATION_MIN = 12
+
+
+def _question_truncated_prefix(old: dict, new: dict) -> bool:
+    """`old` — обрезанное начало `new`: тот же шаг, вопрос открыт, текст — префикс нового."""
+    if str(old.get("status") or "") != QUESTION_OPEN:
+        return False
+    if str(old.get("step") or "").strip().upper() != str(new.get("step") or "").strip().upper():
+        return False
+    before = " ".join(str(old.get("text") or "").split()).lower()
+    after = " ".join(str(new.get("text") or "").split()).lower()
+    return len(before) >= QUESTION_MIGRATION_MIN and before != after and after.startswith(before)
 
 
 def _question_pair_key(item: dict) -> tuple[str, str]:
@@ -1672,6 +1777,14 @@ def answer_question(cfg: config_mod.Config, plan_id, question_id, value, *,
         return {"ok": False, "message": f"нет вопроса {qid} в плане {p.plan_id}: "
                                         f"открытые — {opened or '—'}"}
     if target.get("status") != QUESTION_OPEN:
+        # Повторное нажатие с тем же ответом — не ошибка: ответ уже записан (двойной клик в
+        # панели, повтор из чата). Другой ответ на закрытый вопрос — отказ с названием того,
+        # что уже принято.
+        if " ".join(value.split()) == " ".join(str(target.get("answer") or "").split()):
+            return {"ok": True, "qid": qid,
+                    "step": str(target.get("step") or "").strip().upper(),
+                    "question": dict(target), "answer": value,
+                    "message": f"вопрос {qid} уже закрыт тем же ответом: {value}"}
         return {"ok": False, "message": f"вопрос {qid} уже закрыт: "
                                         f"{target.get('answer') or '—'}; открытые — "
                                         f"{opened or '—'}"}
@@ -1747,6 +1860,9 @@ def sweep_questions(cfg: config_mod.Config, p: Paths, ctx: dict, state: dict | N
         save_state(p, state)
         ctx["step_questions"] = [item for item in (ctx.get("step_questions") or [])
                                  if item["id"] not in closed]
+        if ctx.get("plan_questions") is not None:
+            ctx["plan_questions"] = [item for item in ctx.get("plan_questions") or []
+                                     if item["id"] not in closed]
     return done
 
 
@@ -1777,7 +1893,8 @@ def announce_questions(cfg: config_mod.Config, p: Paths, state: dict | None = No
         entry["notified_at"] = now
         stamps[item["id"]] = entry
         sent.append(item)
-        (say or (lambda text: notify(cfg, text)))(question_notice_text(p, item))
+        (say or (lambda text: notify(cfg, text)))(
+            question_notice_text(p, item, answer_timeout_seconds(cfg)))
     if sent:
         state["questions"] = stamps
         save_state(p, state)
@@ -2957,14 +3074,18 @@ def build_ctx(p: Paths) -> dict:
     # а стоп по нему ставит решение — `decide` получает только `ctx` и файлов не читает.
     ctx["step_questions_rel"] = plan_questions_rel(p)
     ctx["step_questions"] = []
+    ctx["plan_questions"] = []
     ctx["step_questions_error"] = ""
     ctx["answer_timeout"] = answer_timeout_seconds(p.cfg)
     try:
         # Шага может не быть вовсе (план закрыт) — тогда открытых вопросов не ищем.
         ctx["step_questions"] = step_questions(plan_questions_path(p),
                                                (step or {}).get("id") or "")
+        # Все открытые вопросы плана — для вкладки «Шаг»: вопрос второго шага тоже виден.
+        ctx["plan_questions"] = step_questions(plan_questions_path(p))
     except (GateError, OSError, ValueError) as exc:
         ctx["step_questions"] = []
+        ctx["plan_questions"] = []
         ctx["step_questions_error"] = str(exc)
     # Ретроспектива после закрытия плана (D8): признак «файла ещё нет» — единственное, что
     # решает, писать ли черновик; идемпотентность держится на существовании файла.
@@ -7540,9 +7661,13 @@ def main(argv: list[str] | None = None) -> int:
             lock = state_io.acquire(Path(cfg.state_dir), what=owner_cmd)
             if lock is None:
                 who = state_io.holder(Path(cfg.state_dir)) or {}
+                # Код возврата не 0: «команда не применена» — это отказ, а не успех. С кодом 0
+                # панель показывала владельцу «готово» на непринятый ответ (случай 17.11.2026),
+                # а `plans_api` принимал жест за исполненный.
                 print(f"тик уже идёт (pid {who.get('pid', '?')}, с {who.get('at', '?')}, "
-                      f"{who.get('what', '?')}) — команда {owner_cmd} не применена")
-                return 0
+                      f"{who.get('what', '?')}) — команда {owner_cmd} не применена",
+                      file=sys.stderr)
+                return EXIT_BUSY
             try:
                 if args.stop is not None:
                     payload = write_stop(p, args.stop or "остановка владельца", "owner")

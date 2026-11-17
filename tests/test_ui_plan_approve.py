@@ -204,8 +204,11 @@ def test_page_has_plan_approval_hooks(server):
     with urllib.request.urlopen(server["url"] + "/", timeout=10) as response:
         html = response.read().decode("utf-8")
         assert response.status == 200
+    # 0.33: черновики переехали на вкладку «Планы» и собираются по всем проектам реестра,
+    # поэтому кнопка несёт ещё и проект: иначе утверждение ушло бы в каталог панели.
     for needle in ('id="drafts"', "/api/plan/accept", "data-approve", "Утвердить",
-                   "data.drafts", "renderDrafts", "approvePlan"):
+                   "data-approve-project", "renderDraftsTab", "approvePlan",
+                   'id="tab-plans"'):
         assert needle in html
 
 
@@ -220,10 +223,10 @@ def test_page_hides_approved_drafts(server):
         # Концы строк — как в рабочем дереве (core.autocrlf=true даёт CRLF): границы
         # функции ищем после нормализации, иначе тест краснеет от формата, не от правки.
         html = response.read().decode("utf-8").replace("\r\n", "\n")
-    start = html.index("function renderDrafts(data) {")
+    start = html.index("function renderDraftsTab(projects, preview) {")
     body = html[start:html.index("\n}\n", start)]
-    assert "!d.approved" in body                      # на экране только неутверждённые
-    assert "остались черновики уже утверждённых" in body
+    assert "!item.draft.approved" in body             # на экране только неутверждённые
+    assert "остались файлы уже утверждённых планов" in body
     assert "data-approve" in body                     # кнопка у настоящего черновика жива
     assert "pill ok" not in body                      # бейджа «утверждён» в блоке нет
 
@@ -242,3 +245,20 @@ def test_approve_core_matches_cli_outcome(server):
     assert again["ok"] is True
     assert again["status"] == "unchanged"
     assert "уже утверждён" in again["message"]
+
+
+def test_drafts_of_every_project_ride_the_projects_answer(server):
+    """Черновики едут строкой `/api/projects` (0.33): вкладка «Планы» видит их все сразу.
+
+    Раньше блок жил на «Обзоре» и питался снимком одного проекта — черновик чужого
+    проекта на вкладке «Планы» не появлялся вовсе.
+    """
+    _draft(server["root"])
+    with urllib.request.urlopen(server["url"] + "/api/projects", timeout=30) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    assert data["ok"] is True
+    rows = [row for row in data["projects"] if row.get("installed")]
+    assert rows, data
+    drafts = [draft for row in rows for draft in row.get("drafts") or []]
+    assert any(str(draft["id"]) == "5" for draft in drafts), drafts
+    assert all("approved" in draft for draft in drafts)

@@ -3185,3 +3185,68 @@ def test_index_has_progress_markup():
         assert anchor in html, anchor
     # Плитки этапов больше не считаются на странице: их собирает снимок.
     assert "function stageOf" not in html
+
+
+def test_save_config_sets_answer_timeout_and_keeps_channels(server):
+    """Ожидание ответа на вопрос шага (0.33): правится из основных настроек панели.
+
+    Ключ один (`notify.answer_timeout`), поэтому правка числа не должна стирать канал:
+    `token_env`, `chat_env`, `prefix` и `enabled` остаются как были — иначе бот замолчал бы
+    после первого же сохранения настроек.
+    """
+    root = server["root"]
+    before = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))["notify"]
+    status, data = post(server["url"], {"action": "save_config", "config": {
+        "notify": {"answer_timeout": 3600}}})
+    assert status == 200 and data["ok"], data
+    cfg = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
+    assert cfg["notify"]["answer_timeout"] == 3600
+    for key, value in before.items():
+        assert cfg["notify"][key] == value, key
+
+
+def test_save_config_rejects_negative_answer_timeout(server):
+    """Отрицательное ожидание — отказ панели: «до вчера» вместо ответа бессмысленно."""
+    status, data = post(server["url"], {"action": "save_config", "config": {
+        "notify": {"answer_timeout": -60}}})
+    assert status == 400 and not data["ok"]
+    assert "answer_timeout" in data["error"]
+    cfg = json.loads((server["root"] / "pipeline.json").read_text(encoding="utf-8"))
+    assert "answer_timeout" not in (cfg.get("notify") or {})
+
+
+def test_snapshot_carries_answer_timeout(server):
+    """Снимок отдаёт ожидание в секундах: форма показывает минуты, считает движок."""
+    status, data = get(server["url"] + "/api/snapshot")
+    assert status == 200 and data["ok"], data
+    assert data["answer_timeout"] == 3600         # умолчание движка, пока ключа нет
+    post(server["url"], {"action": "save_config", "config": {"notify": {"answer_timeout": 3600}}})
+    status, data = get(server["url"] + "/api/snapshot")
+    assert data["answer_timeout"] == 3600
+
+
+def test_answer_refused_when_tick_holds_the_lock(server, monkeypatch):
+    """Неприменённый ответ — не «готово»: отказ движка виден владельцу словами движка.
+
+    Живой случай 17.11.2026: движок писал «тик уже идёт … команда answer не применена»
+    и выходил с кодом 0, панель показывала «готово», ответа в файле не было.
+    """
+    import subprocess
+
+    def fake(project, name, *args, timeout=180, **kwargs):
+        return subprocess.CompletedProcess(
+            args=[name, *args], returncode=0,
+            stdout="тик уже идёт (pid 42, с 10:00, run) — команда answer не применена",
+            stderr="")
+
+    monkeypatch.setattr(ui_server.proj, "run_engine", fake)
+    root = server["root"]
+    write_questions(root, ["| Q-1 | S1 | какой лимит карточек | A) две / B) три | A | открыт |  |"])
+    status, data = post(server["url"], {"action": "answer", "plan": "1",
+                                        "question": "Q-1", "value": "B"})
+    # 400, а не 200: ответ не применён, и панель обязана это увидеть (было «готово»).
+    assert status == 400
+    assert data["ok"] is False
+    assert "не применена" in data["error"]
+    text = (root / "docs" / "reviews" / "plan-1-questions.md").read_text(encoding="utf-8")
+    assert "| открыт |" in text

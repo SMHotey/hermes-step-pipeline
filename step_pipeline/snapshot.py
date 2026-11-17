@@ -289,6 +289,29 @@ def _event_row(record: dict, root: Path, cfg: dict) -> dict:
             "flag": EVENT_FLAGS.get(kind, "")}
 
 
+#: Умолчание ожидания ответа на вопрос шага, секунды — то же число, что у движка
+#: (`gate.ANSWER_TIMEOUT_DEFAULT`): панель показывает его, пока ключа нет в файле.
+ANSWER_TIMEOUT_DEFAULT = 3600
+
+
+def _answer_timeout(cfg: dict) -> int:
+    """Секунды до автовыбора рекомендации по вопросу шага (`notify.answer_timeout`).
+
+    Разбор тот же, что у движка: ноль — автовыбора нет, нечисло — умолчание, отрицательное
+    приводится к нулю. Второго смысла у ключа нет, поэтому и правила те же.
+    """
+    raw_notify = cfg.get("notify")
+    notify = raw_notify if isinstance(raw_notify, dict) else {}
+    raw = notify.get("answer_timeout", ANSWER_TIMEOUT_DEFAULT)
+    if isinstance(raw, bool):
+        return ANSWER_TIMEOUT_DEFAULT
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return ANSWER_TIMEOUT_DEFAULT
+    return value if value > 0 else 0
+
+
 def telegram_state(project: Path) -> dict:
     """Настроены ли уведомления (значения секретов наружу не отдаются).
 
@@ -1517,6 +1540,9 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         "driven": cfg.get("driven_plans") or [],
         "require_prompt": cfg.get("require_prompt", True),
         "telegram": telegram_state(root),
+        # Ожидание ответа на вопрос шага (секунды): форму настроек панель показывает минутами,
+        # а считает его движок — страница только записывает `notify.answer_timeout`.
+        "answer_timeout": _answer_timeout(cfg),
         "preview": preview,
         "quiet_hours": {},
         "plans": [],

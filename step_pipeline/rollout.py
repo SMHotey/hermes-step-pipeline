@@ -456,7 +456,11 @@ def run_engine(rows: list[dict], *, interval: float = ROLLOUT_INTERVAL,
                     if code != 0:
                         final = _row(row, STATUS_FAILED, error=f"upgrade вернул {code}")
                     elif was == now:
-                        final = _row(row, STATUS_SKIPPED, reason="движок уже актуален")
+                        # Версию показываем и в пропуске: «пропущен» без чисел читается
+                        # как «ничего не сделал и не сказал почему» (живой случай 17.11).
+                        final = _row(row, STATUS_SKIPPED, was=was, now=now,
+                                     reason=f"движок уже {now or 'неизвестной версии'} — "
+                                            "обновлять нечего")
                     else:
                         final = _row(row, STATUS_UPDATED, was=was, now=now)
         except Exception as exc:                               # noqa: BLE001

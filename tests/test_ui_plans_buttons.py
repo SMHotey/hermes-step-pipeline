@@ -204,11 +204,11 @@ def test_engine_kinds_map_to_labels_and_channels():
     assert ENGINE_LABELS["resume"] != ENGINE_LABELS["drive"]
 
     # Источник вида — поле движка в ячейке и в обработчике, а не текст страницы.
-    cell = block(html, "function planActionsCell(", "function planAdd(")
+    cell = block(html, "function planActions(", "function planAdd(")
     for needle in ("ENGINE_ACTIONS[action.kind]", "plan.action || {}", "action.command",
                    "esc(action.kind", "clip bad"):
         assert needle in cell, needle
-    bind = block(html, "function bindPlansActions(", "// Подключение проекта из панели")
+    bind = block(html, "function bindPlanActionsFor(", "// Подключение проекта из панели")
     assert "ENGINE_ACTIONS[button.dataset.planAct]" in bind
 
     # Команду страница не собирает: своих `hermes kanban`, `gate.py`, `python .pipeline` нет.
@@ -242,7 +242,7 @@ def test_panel_kinds_hit_their_routes_and_rules(
     for needle in ("item.endpoint", "PANEL_HEADERS",
                    "JSON.stringify({project: project.id, plan: plan.id})"):
         assert needle in command, needle
-    bind = block(html, "function bindPlansActions(", "// Подключение проекта из панели")
+    bind = block(html, "function bindPlanActionsFor(", "// Подключение проекта из панели")
     for needle in ('closest("[data-plan-act], [data-plan-panel]")', "dataset.planId", "confirm("):
         assert needle in bind, needle
 
@@ -279,8 +279,8 @@ def test_add_plan_form_posts_plan_add_and_reports_statuses(
     monkeypatch.delenv("PIPELINE_CONFIG", raising=False)
     monkeypatch.setenv("PIPELINE_LOCK_WAIT", "0")
     html = page()
-    panel = block(html, 'id="tab-plans"', "</table>")
-    assert '<div class="row" id="plans-add">' in panel
+    panel = block(html, 'id="tab-plans"', '<div class="plans-filters">')
+    assert '<div class="row" id="plans-add" hidden>' in panel
     assert '<label for="plans-add-project">Проект</label>' in panel
     assert '<select id="plans-add-project">' in panel
     assert '<option value="">проект панели</option>' in panel
@@ -290,9 +290,11 @@ def test_add_plan_form_posts_plan_add_and_reports_statuses(
     # Кнопка не отправляет форму: перезагрузки страницы нет.
     assert '<button type="button" id="plans-add-btn" class="primary">Добавить план</button>' in panel
     assert '<div class="clip" id="plans-status"></div>' in panel
-    assert html.count("Добавить план") == 1
+    # Кнопка отправки одна; вторая «Добавить план файлом» — переключатель формы, не отправка.
+    assert html.count('id="plans-add-btn"') == 1
+    assert 'id="plans-add-toggle"' in html
 
-    body = block(html, "function planAdd(", "function bindPlansActions(")
+    body = block(html, "function planAdd(", "function bindPlanActionsFor(")
     for needle in ("/api/plan/add", "PANEL_HEADERS",
                    'JSON.stringify({project: project || "", path: path || ""})',
                    '"cancelled"', '"manual"', "data.errors",
@@ -302,11 +304,12 @@ def test_add_plan_form_posts_plan_add_and_reports_statuses(
     render = block(html, "function renderPlansTab(", "// Подключение проекта из панели")
     assert "plans-add-project" in render
     assert "addPicker.dataset.ids" in render
-    # В предпросмотре формы нет: у `.row` свой `display: flex`, атрибут `hidden` не прячет.
-    assert '$("plans-add").style.display = data.preview ? "none" : "";' in render
-    assert '$("plans-add").hidden' not in html
+    # 0.33: форма живёт за кнопкой «Добавить план файлом»; в предпросмотре кнопка мертва,
+    # а форма закрыта атрибутом — стилем её прятать больше не нужно.
+    assert '$("plans-add").hidden = true' in render
+    assert "toggle.disabled = Boolean(data.preview)" in render
 
-    bindings = block(html, '$("plans-add-btn").onclick', "bindPlansActions();")
+    bindings = block(html, '$("plans-add-btn").onclick', 'bindPlanActionsFor($("plans-rows"));')
     assert '$("plans-add-project").value' in bindings
     assert '$("plans-add-path").value' in bindings
     assert 'event.key === "Enter"' in bindings
@@ -336,18 +339,18 @@ def test_add_plan_form_posts_plan_add_and_reports_statuses(
 def test_preview_draws_rows_without_buttons(tmp_path: Path):
     """Предпросмотр: прочерк вместо кнопок, форма скрыта стилем, сервер отказывает."""
     html = page()
-    body = block(html, "function planActionsCell(", "function planAdd(")
+    body = block(html, "function planActions(", "function planAdd(")
     # Прочерк — до сборки кнопок: иначе `data-plan-act` успел бы появиться.
-    assert 'if (preview) return \'<td class="mono">—' in body
+    assert """if (preview) return '<span class="muted">—</span>';""" in body
     assert body.index("if (preview)") < body.index("data-plan-act")
-    # Баланс тегов: каждая кнопка, подпись и ячейка закрыты.
-    for opened, closed in (("<button", "</button>"), ("<span", "</span>"), ("<td", "</td>")):
+    # Баланс тегов: каждая кнопка и подпись закрыты (ячейки у карточки больше нет).
+    for opened, closed in (("<button", "</button>"), ("<span", "</span>")):
         assert body.count(opened) == body.count(closed), (opened, closed)
 
     render = block(html, "function renderPlansTab(", "// Подключение проекта из панели")
     assert "Boolean(data.preview)" in render
-    assert '$("plans-add").style.display = data.preview ? "none" : "";' in render
-    assert '$("plans-add").hidden' not in html
+    assert '$("plans-add").hidden = true' in render
+    assert "toggle.disabled = Boolean(data.preview)" in render
 
     bare = tmp_path / "bare"
     (bare / "docs" / "plans").mkdir(parents=True)
@@ -370,15 +373,16 @@ def test_action_cell_is_ninth_column_and_kinds_come_from_engine(
     monkeypatch.delenv("PIPELINE_CONFIG", raising=False)
     monkeypatch.setenv("PIPELINE_LOCK_WAIT", "0")
     html = page()
-    table = block(html, 'id="tab-plans"', "</table>")
-    headers = re.findall(r'<th scope="col">([^<]+)</th>', table)
-    assert headers == ["Проект", "План", "Название", "Состояние", "Следующий шаг",
-                       "Закрыто/всего", "Утверждение", "Стоп", "Действие"]
+    # 0.33: девять колонок таблицы заменены карточкой — поля те же, порядок чтения прежний.
+    card = block(html, "function planCard(", "function planActions(")
+    for needle in ("project.name", "plan.id", "plan.name", "plan.state_label", "plan.next",
+                   "plan.closed", "plan.total", "approval", "plan.stop", "planActions(",
+                   'data-project="${esc(project.id)}"', 'data-state="${esc(state)}"',
+                   'data-plan-actions="1"'):
+        assert needle in card, needle
 
     render = block(html, "function renderPlansTab(", "// Подключение проекта из панели")
-    assert 'data-plan-id="${esc(plan.id)}"' in render
-    assert "${planActionsCell(project, plan, Boolean(data.preview))}" in render
-    assert 'colspan="9"' in render
+    assert "planCard(project, plan, Boolean(data.preview))" in render
     assert "plansRows = rows;" in render
 
     alpha = install_project(tmp_path / "alpha", board="uiboard")

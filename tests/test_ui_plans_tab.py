@@ -139,21 +139,17 @@ def test_plans_tab_button_and_panel_are_in_order():
     assert 'panel.id === "tab-" + name' in html
 
 
-def test_plans_table_has_eight_data_columns_and_action_in_order():
-    """Восемь колонок данных плюс «Действие» (S5A) — в порядке §4.1, источники — поля строки."""
+def test_plans_tab_cards_keep_the_nine_fields_from_the_row():
+    """Карточка плана показывает те же девять полей, что были колонками, — из строки ответа."""
     html = page()
-    panel = block(html, 'id="tab-plans"', "</table>")
-    headers = re.findall(r'<th scope="col">([^<]+)', panel)
-    assert headers == ["Проект", "План", "Название", "Состояние", "Следующий шаг",
-                       "Закрыто/всего", "Утверждение", "Стоп", "Действие"]
-    body = block(html, "function renderPlansTab(", "// Подключение проекта из панели")
+    card = block(html, "function planCard(", "function planActions(")
     for needle in ("project.name", "plan.id", "plan.name", "plan.state_label", "plan.next",
-                   "plan.closed", "plan.total", "plan.approval", "plan.stop",
-                   "data-project", "data-state"):
-        assert needle in body, needle
+                   "plan.closed", "plan.total", "approval.label", "plan.stop.reason",
+                   "planActions(", "data-project=", "data-state="):
+        assert needle in card, needle
     # «Утверждение» и «стоп» рисуются из полей ответа, а не разбираются из текста.
-    for needle in ("label", "kind", "reason"):
-        assert needle in body, needle
+    for needle in ("approved_at", "kind", "reason"):
+        assert needle in card, needle
 
 
 def test_three_filters_are_bound_and_compare_state_value():
@@ -176,13 +172,15 @@ def test_empty_answer_draws_plans_none_and_render_hangs_on_load_projects(
     """Пустой список рисует «планов нет», а строки вкладки питает реестр, а не снимок."""
     html = page()
     body = block(html, "function renderPlansTab(", "// Подключение проекта из панели")
-    assert 'id="plans-empty"' in body
-    assert 'colspan="9"' in body
+    assert 'class="plans-empty"' in body
     assert "планов нет" in body
-    # Ряд один: в статической разметке панели его нет, иначе вхождений было бы два.
-    assert html.count("планов нет") == 1
+    # Ряд один: в статической разметке панели списка нет, иначе вхождений было бы два.
+    assert html.count("планов нет — ни один проект") == 1
     load = block(html, "async function loadProjects(", "// ── глобальная пауза панели")
     assert "renderPlansTab(data)" in load
+    # 0.33: черновики и исполненные планы питает тот же ответ — второго запроса нет.
+    assert "renderDraftsTab(lastProjects" in load
+    assert "renderClosedPlans(lastProjects)" in load
     assert "/api/snapshot" not in load
     # Живая половина: ветка «планов нет» достижима — проект без конвейера отдаёт пустой список.
     alpha = install_project(tmp_path / "alpha", board="uiboard")

@@ -306,7 +306,12 @@ def _run_engine(state: State, *args: str, timeout: int = 900) -> dict:
     out = (res.stdout or "").strip()
     err = (res.stderr or "").strip()
     state.note(f"$ gate.py {' '.join(args)}\n{out or err}".strip())
-    return {"ok": res.returncode == 0, "stdout": out, "stderr": err}
+    ok = res.returncode == 0
+    # Движок до 0.33 отвечал на «команда не применена» кодом 0: панель показывала «готово»
+    # на непринятый ответ. Текст проверяется всегда — старый движок в проекте не повод врать.
+    if ok and "не применена" in f"{out}\n{err}":
+        ok = False
+    return {"ok": ok, "stdout": out, "stderr": err}
 
 
 def act_tick(state: State, payload: dict) -> dict:
@@ -387,7 +392,16 @@ def act_answer(state: State, payload: dict) -> dict:
         return {"ok": False, "error": "нужен вопрос и вариант"}
     plan = str(payload.get("plan") or "").strip()
     extra = ["--plan", plan] if plan else []
-    return _run_engine(state, "--answer", question, value, *extra)
+    result = _run_engine(state, "--answer", question, value, *extra)
+    text = (result.get("stdout") or "").strip()
+    if result.get("ok"):
+        result["message"] = text.splitlines()[-1] if text else f"ответ на {question} записан"
+    else:
+        # Отказ читается владельцем, а не разработчиком: «ошибка:» из stderr снимается,
+        # причина остаётся дословной (вопрос закрыт, шаг чужой, идёт тик).
+        reason = (result.get("stderr") or text or "движок ответ не принял").strip()
+        result["error"] = reason.removeprefix("ошибка:").strip()
+    return result
 
 
 # ── глобальная пауза и автозагрузка: жесты на всю панель, а не на проект ──
@@ -704,6 +718,35 @@ def _validate_patch(cfg: dict, patch: dict, root: Path) -> tuple[dict, list[str]
                 notes.append("пауза включена, но интервалы не заданы — тики идут круглосуточно")
             if parsed and not enabled:
                 notes.append("интервалы заданы, но пауза выключена — тики идут круглосуточно")
+        elif key == "notify":
+            # Ожидание ответа на вопрос шага: панель правит один ключ канала, остальные
+            # (`token_env`, `chat_env`, `prefix`, `enabled`) остаются как были — иначе правка
+            # одного числа стёрла бы настройки бота.
+            if not isinstance(value, dict):
+                errors.append('notify: нужен объект вида {"answer_timeout": 3600}')
+                continue
+            old = candidate.get("notify")
+            merged = dict(old) if isinstance(old, dict) else {}
+            bad = False
+            for name, raw in value.items():
+                if name != "answer_timeout":
+                    merged[name] = raw
+                    continue
+                try:
+                    seconds = int(float(raw if raw is not None else ""))
+                except (TypeError, ValueError):
+                    errors.append("notify.answer_timeout: секунды числом (0 — автовыбора нет)")
+                    bad = True
+                    continue
+                if seconds < 0:
+                    errors.append("notify.answer_timeout: ноль или больше")
+                    bad = True
+                    continue
+                merged[name] = seconds
+                if seconds == 0:
+                    notes.append("автовыбор рекомендации выключен — вопрос ждёт ответа человека")
+            if not bad:
+                candidate["notify"] = merged
         elif key == "paths":
             if not isinstance(value, dict):
                 errors.append("paths: нужен объект вида {\"plans\": \"docs/plans\"}")
@@ -1889,7 +1932,7 @@ class Handler(BaseHTTPRequestHandler):
                    "plan": "", "next": "—", "closed": 0, "total": 0,
                    "state": "", "state_label": "",
                    "stop": None, "idle": None, "error": "", "capacity": None,
-                   "plans": [], "running": []}
+                   "plans": [], "drafts": [], "running": []}
         if not summary["installed"] and not state.preview:
             return summary
         # Занятость слотов от плана не зависит: считается до ранних выходов ниже (D5).
@@ -1902,6 +1945,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             cfg = proj.read_config(root)
             plans = self._summary_plans(state, root, cfg)
+            # Черновики планов (0.33): вкладка «Планы» показывает их по всем проектам реестра,
+            # поэтому список едет строкой сводки, а не отдельным запросом на проект.
+            summary["drafts"] = snap.drafts(root, cfg) if cfg else []
         except Exception as exc:                                # noqa: BLE001
             summary["error"] = f"{type(exc).__name__}: {exc}"
             return summary

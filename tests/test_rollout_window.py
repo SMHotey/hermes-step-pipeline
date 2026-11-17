@@ -398,3 +398,24 @@ def test_rollout_route_guards_refuse_without_side_effects(project: Path, hermes_
     assert code == 403
     assert proj.projects_file().read_bytes() == snapshot
     assert [path.name for path in calls] == [project.name]
+
+
+def test_current_engine_is_skipped_with_its_version(project: Path, hermes_stub: Path):
+    """«Пропущен» обязан называть версию, а не молчать числом.
+
+    Живой случай 17.11.2026: панель показала «обновлено: 0, пропущено: 3, ошибок: 0» —
+    и владелец прочитал это как «раскатка не работает». Версия «было → стало» и причина
+    с номером версии отвечают на вопрос «почему пропущено», не открывая терминал.
+    """
+    write_registry([project])
+    # Первый проход приводит проект к версии плагина; второй — тот самый повторный жест,
+    # который владелец и увидел: всё пропущено, а почему — не сказано.
+    rollout.run_engine(proj.read_projects(), interval=0.01, limit=1.0)
+
+    result = rollout.run_engine(proj.read_projects(), interval=0.01, limit=1.0)
+
+    row = engine_row(project)
+    assert row["status"] == "skipped"
+    assert row["from"] and row["to"] and row["from"] == row["to"]
+    assert row["to"] in row["reason"] and "обновлять нечего" in row["reason"]
+    assert result["ok"] is True
