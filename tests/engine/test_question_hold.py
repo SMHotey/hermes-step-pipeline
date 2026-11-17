@@ -224,10 +224,15 @@ def test_open_question_blocks_prompt_prefetch(project: Path, hermes_stub: Path, 
     keys = {row["key"] for row in stub_cards(hermes_stub)}
     assert not any(key.endswith((":prompt", ":step")) for key in keys), keys
     assert res["decision"]["action"] == "idle" and res["decision"]["question"] == "Q-1"
-    # Уведомление — одна строка, в ней номер, шаг и способ ответить.
+    # Уведомление — сообщение владельцу, а не лог-строка: номер, шаг, цена вариантов,
+    # рекомендация и срок, после которого её применят без него. Тот же текст уходит в
+    # проектный бот, поэтому проверяется на выходе уведомления, а не на функции разбора.
     notices = [text for text in messages if "❓ Q-1" in text]
     assert len(notices) == 1, messages
     assert "шаг S1" in notices[0] and "/answer Q-1" in notices[0]
+    assert "A) да, три" in notices[0] and "B) нет, две" in notices[0]
+    assert "Рекомендую A" in notices[0]
+    assert "60 мин" in notices[0]
 
 
 def test_open_question_does_not_move_verdict(project: Path, hermes_stub: Path, stand):
