@@ -259,10 +259,20 @@ def approve(project, value) -> dict:
                            f"черновик остался на месте"}
 
     if draft is not None and final is not None:
-        return _accept_existing(project, number, draft, final)
-    if draft is not None:
-        return _move_draft(project, number, draft)
-    return _accept_final(project, number, final)
+        result = _accept_existing(project, number, draft, final)
+    elif draft is not None:
+        result = _move_draft(project, number, draft)
+    elif final is not None:
+        result = _accept_final(project, number, final)
+    else:
+        # Ветка недостижима: выше уже отсеяно «ни черновика, ни плана». Оставлена, чтобы
+        # типы не спорили с фактом, а отказ был внятным, если порядок проверок поменяют.
+        return {"ok": False, "code": 1, "plan": number, "status": "missing", "errors": [],
+                "message": f"ошибка: план {number} не найден"}
+    if result.get("ok"):
+        # Решение владельца 18.11.2026: утверждение плана само ставит его в ведение.
+        _apply_drive(project, number, result)
+    return result
 
 
 def accept(project, value) -> int:
@@ -320,6 +330,68 @@ def _unchanged(number: str, record: dict, path: Path, project: Path) -> dict:
             "approved_at": record.get("approved_at") or "", "errors": [],
             "message": f"План {number}: уже утверждён "
                        f"({record.get('approved_at', '')}) — ничего не изменено"}
+
+
+# Решение владельца 18.11.2026: утверждение плана само ставит его в ведение. Ключ
+# `driven_plans` остаётся ключом владельца — его пишет жест владельца (панель или `--accept`),
+# а не страж; правило «страж не трогает driven_plans» не меняется.
+_DRIVE_NOTES = {
+    "added": "План {number} добавлен в driven_plans — страж возьмёт его сам.",
+    "no-config": "Ведение не записано: pipeline.json не читается — добавь план в "
+                 "driven_plans вручную.",
+}
+
+
+def _driven_list(raw) -> list[str] | None:
+    """`driven_plans` как список строк; `None` — значение не итерируется вовсе."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return None
+
+
+def drive_plan(project, number: str) -> str:
+    """Добавить номер плана в `driven_plans`: `added` / `already` / `all` / `no-config`.
+
+    `all` — список содержит `*` или ключа нет вовсе: и то и другое движок читает как «все
+    планы ведомы» (`engine/config.py`, `DEFAULTS`), править нечего. `no-config` — файла нет
+    или он битый: утверждение не падает из-за ведения, владельцу сказано, что делать.
+    """
+    project = Path(project)
+    try:
+        cfg = proj.read_config(project)
+    except Exception:  # noqa: BLE001 — диагноз вместо падения утверждения
+        return "no-config"
+    if not cfg:
+        return "no-config"
+    if "driven_plans" not in cfg:
+        return "all"
+    driven = _driven_list(cfg.get("driven_plans"))
+    if driven is None:
+        return "no-config"
+    if "*" in driven:
+        return "all"
+    if number in driven:
+        return "already"
+    driven.append(number)
+    driven.sort(key=lambda value: (0, int(value)) if value.isdigit() else (1, 0))
+    cfg["driven_plans"] = driven
+    _atomic_write_text(project / proj.MARKER,
+                       json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+    return "added"
+
+
+def _apply_drive(project: Path, number: str, result: dict) -> None:
+    """Дописать в ответ утверждения исход ведения и строку для человека."""
+    outcome = drive_plan(project, number)
+    result["driven"] = outcome
+    note = _DRIVE_NOTES.get(outcome)
+    if note:
+        head = str(result.get("message") or "").rstrip()
+        result["message"] = f"{head}\n{note.format(number=number)}".strip()
 
 
 def _refused(number: str, message: str) -> dict:

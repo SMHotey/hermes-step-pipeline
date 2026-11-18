@@ -206,6 +206,11 @@
                gap: 12px; align-items: center; border: 1px solid var(--line); border-radius: 10px;
                padding: 10px 12px; background: var(--panel-2); }
   .plan-card.active { border-color: var(--accent); }
+  /* Атрибут hidden проигрывает авторскому display: встроенное правило браузера
+     `[hidden] { display: none }` перебивается `.plan-card { display: grid }`, и фильтр
+     вкладки «Планы» считал верно, а на экране ничего не менялось (находка F1 плана 15).
+     Правило возвращает атрибуту силу и покрывает все три вида строк. */
+  .plan-card[hidden], .plan-row[hidden], .draft-card[hidden] { display: none; }
   .plan-card .where { font-size: 11px; color: var(--muted); }
   .plan-card .name { font-size: 13.5px; margin: 2px 0 4px; }
   .plan-card .meta { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
@@ -998,7 +1003,12 @@ function approvePlan(id, projectId) {
     body: JSON.stringify({plan: String(id),
                           ...((projectId || currentProject) ? {project: projectId || currentProject} : {})}),
   }).then((data) => {
-    if (data.ok) toast("План " + id + " утверждён");
+    if (data.ok) {
+      // Утверждение само ставит план в ведение (решение владельца 18.11.2026) — об этом
+      // говорим сразу, иначе строка «что сделано» в панели выглядит неполной.
+      toast("План " + id + (data.driven === "added" ? " утверждён и добавлен в driven_plans"
+                                                    : " утверждён"));
+    }
     else {
       toast("План " + id + " не утверждён: " + (data.message || data.error || "ошибка"), true);
       showPlanErrors(data.errors && data.errors.length
@@ -2961,7 +2971,9 @@ function render(data) {
   renderEvents(data);
   collectNotify(data.notify);
 
-  const plans = data.plans || [];
+  // Закрытые планы на «Обзоре» живут только в свёрнутом блоке «Исполненные планы»
+  // (`#ov-closed`): в общем списке они задваивались (находка F2 плана 15).
+  const plans = (data.plans || []).filter((p) => p.state !== "closed");
   const planBadge = {running: "run", stopped: "bad", closed: "ok", "not-driven": "wait"};
   $("plans").innerHTML = plans.map((p) => {
     // Подпись статуса и текст бейджа приходят из снимка: страница их не вычисляет.
