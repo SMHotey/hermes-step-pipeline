@@ -487,8 +487,8 @@ def link_plugin_profile(profile: str, log: Log, package: Path | None = None) -> 
 
 def _enable_plugin(profile: str) -> subprocess.CompletedProcess:
     """`hermes -p <профиль> plugins enable step_pipeline`."""
-    hermes = shutil.which("hermes") or "hermes"
-    return subprocess.run([hermes, "-p", profile, "plugins", "enable", "step_pipeline"],
+    return subprocess.run([proj.hermes_bin(), "-p", profile, "plugins", "enable",
+                           "step_pipeline"],
                           capture_output=True, text=True, encoding="utf-8", errors="replace",
                           timeout=180)
 
@@ -496,8 +496,7 @@ def _enable_plugin(profile: str) -> subprocess.CompletedProcess:
 def _plugin_cli_answers(profile: str) -> bool:
     """Отвечает ли `hermes -p <профиль> pipeline --help` (то есть зарегистрировался CLI)."""
     try:
-        res = subprocess.run([shutil.which("hermes") or "hermes", "-p", profile,
-                              "pipeline", "--help"],
+        res = subprocess.run([proj.hermes_bin(), "-p", profile, "pipeline", "--help"],
                              capture_output=True, text=True, encoding="utf-8", errors="replace",
                              timeout=120)
     except (OSError, subprocess.SubprocessError):

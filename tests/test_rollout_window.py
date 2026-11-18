@@ -415,7 +415,9 @@ def test_current_engine_is_skipped_with_its_version(project: Path, hermes_stub: 
     result = rollout.run_engine(proj.read_projects(), interval=0.01, limit=1.0)
 
     row = engine_row(project)
-    assert row["status"] == "skipped"
+    # Строка реестра целиком в тексте отказа: без неё CI-лог говорит только
+    # «'failed' != 'skipped'» и причина (error/reason) пропадает (падение 18.11.2026).
+    assert row["status"] == "skipped", f"строка реестра: {row}"
     assert row["from"] and row["to"] and row["from"] == row["to"]
     assert row["to"] in row["reason"] and "обновлять нечего" in row["reason"]
     assert result["ok"] is True

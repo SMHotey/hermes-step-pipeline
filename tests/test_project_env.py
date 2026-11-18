@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -137,3 +139,44 @@ def test_read_env_file_parses_export_quotes_and_skips_empty(tmp_path: Path):
     assert values[TOKEN] == "123:свой"
     assert values["STEP_PIPELINE_TELEGRAM_CHAT_ID"] == "42"
     assert "ПУСТОЙ" not in values
+
+
+def _write_shim(bin_dir: Path) -> Path:
+    """Заглушка `hermes` в каталоге PATH: на Windows — `hermes.cmd`, иначе скрипт."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        shim = bin_dir / "hermes.cmd"
+        shim.write_text("@echo off\r\necho ok\r\n", encoding="utf-8")
+        return shim
+    shim = bin_dir / "hermes"
+    shim.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+    shim.chmod(0o755)
+    return shim
+
+
+def test_hermes_bin_resolves_the_shim_it_can_actually_run(tmp_path: Path, monkeypatch):
+    """`hermes_bin` отдаёт то, что запускается: на Windows — `hermes.cmd` из PATH.
+
+    `CreateProcess` дописывает только `.exe` и `PATHEXT` не читает, поэтому голое имя
+    «hermes» на заглушку `hermes.cmd` не находится вовсе: `subprocess.run` падает
+    `FileNotFoundError` (windows-latest CI 18.11.2026 — раскатка движка помечала проект
+    `failed` вместо `skipped`, на ubuntu те же тесты были зелёными).
+    """
+    shim = _write_shim(tmp_path / "bin")
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+
+    name = project_mod.hermes_bin()
+
+    assert Path(name).name.lower() == shim.name.lower(), f"нашлось не то: {name}"
+    res = subprocess.run([name, "--version"], capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0 and "ok" in res.stdout
+
+
+def test_hermes_bin_honours_override(tmp_path: Path, monkeypatch):
+    """`HERMES_BIN` сильнее поиска: явный путь не перебивается тем, что лежит в PATH."""
+    _write_shim(tmp_path / "bin")
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    monkeypatch.setenv("HERMES_BIN", "/свой/путь/hermes")
+
+    assert project_mod.hermes_bin() == "/свой/путь/hermes"

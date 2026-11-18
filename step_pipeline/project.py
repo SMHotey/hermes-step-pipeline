@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -675,8 +676,18 @@ def profile_env(project: Path) -> dict[str, str]:
 
 
 def hermes_bin() -> str:
-    """"hermes" из PATH; нужен для `kanban`, `cron`, `profile`."""
-    return os.environ.get("HERMES_BIN") or "hermes"
+    """Путь к `hermes` из PATH; нужен для `kanban`, `cron`, `profile`.
+
+    Разрешается `shutil.which`, а не голым именем: на Windows `CreateProcess`
+    дописывает только `.exe` и `PATHEXT` не читает, поэтому `hermes.cmd` из PATH
+    не находится вовсе и `subprocess.run(["hermes", ...])` падает `FileNotFoundError`
+    (живой случай 18.11.2026 — windows-latest CI, раскатка движка давала `failed`
+    вместо `skipped`). Так же ищет движок (`engine/gate.py`) и мастер установки.
+    """
+    override = os.environ.get("HERMES_BIN")
+    if override:
+        return override
+    return shutil.which("hermes") or "hermes"
 
 
 def run_hermes(*args: str, timeout: int = 180) -> subprocess.CompletedProcess:

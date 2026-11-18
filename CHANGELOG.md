@@ -3,6 +3,42 @@
 Формат: [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — semver.
 Ломающее изменение поведения движка или формата `pipeline.json` — минимум минор.
 
+## 0.35.1 — 18.11.2026
+
+**Раскатка движка на Windows больше не помечает проект `failed` вместо `skipped`: путь к
+`hermes` разрешается по PATH с учётом `PATHEXT`. Основание — красная нога windows-latest на
+тегах `v0.34.0` и `v0.35.0`: один и тот же тест падал (assert `'failed' == 'skipped'`),
+ubuntu-ноги при этом были зелёными.**
+
+### Исправлено
+
+- `project.hermes_bin` отдаёт путь, найденный `shutil.which`, а не голое имя «hermes»
+  (если `HERMES_BIN` не задан). `subprocess.run` на Windows передаёт имя в `CreateProcess`,
+  а тот дописывает только `.exe` и `PATHEXT` не читает: установка или заглушка `hermes.cmd`
+  из PATH не находилась вовсе, вызов падал `FileNotFoundError`, и `rollout.run_engine`
+  писал проекту `status: failed` с пустой причиной вместо `skipped` — раскатка снаружи
+  выглядела как поломка. На linux шим лежит файлом без расширения, его находит `execvp`,
+  поэтому дефект был виден только на windows-ноге.
+  `setup_flow._enable_plugin` и `setup_flow._plugin_cli_answers` переведены на тот же шов:
+  вопроса «где hermes» теперь один ответ, а не три.
+- Тест раскатки печатает строку реестра в тексте отказа: CI-лог говорил только
+  «`'failed'` != `'skipped'`», а `error`/`reason` — то, ради чего пишется строка, — в лог не
+  попадали (это и стоит диагностики для будущих падений).
+
+### Тесты
+
+- Сторож на сам шов: `tests/test_project_env.py::test_hermes_bin_resolves_the_shim_it_can_actually_run`
+  требует, чтобы `hermes_bin()` отдавал то, что действительно запускается (на Windows —
+  `hermes.cmd` из PATH), и `test_hermes_bin_honours_override` держит приоритет `HERMES_BIN`.
+  На старом коде первый красный (`assert 'hermes' == 'hermes.cmd'`), на новом — зелёный.
+- Воспроизведение без windows-раннера: `PATH=/c/Windows/system32:/c/Windows python -m pytest
+  tests/test_rollout_window.py` — до правки красный с
+  `error: 'FileNotFoundError: [WinError 2] Не удается найти указанный файл'`, после правки
+  весь файл зелёный. Локальный прогон до правки был ложнозелёным: на хосте в PATH лежит
+  настоящий `hermes.exe`, и тест гонял живую команду вместо заглушки.
+- Полный прогон на выпуске — 1158 passed, 2 skipped (1275,02 с), `ruff check .` и
+  `hermes plugins validate step_pipeline` чисты.
+
 ## 0.35.0 — 18.11.2026
 
 **Круг правок открывается только блокирующей находкой, и у круга появилась память:

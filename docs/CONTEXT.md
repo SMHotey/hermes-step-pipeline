@@ -122,9 +122,15 @@ tests/               тесты плагина; tests/engine/ — тесты д�
 5. В репозитории нет имён и предметной логики проектов-потребителей.
 6. Действия в предпросмотре запрещены, панель слушает только localhost.
 
-## 6. Состояние на 2026-11-17
+## 6. Состояние на 2026-11-18
 
 - Репозиторий: `https://github.com/SMHotey/hermes-step-pipeline`, ветка `main`.
+- Версия `0.35.1` (18.11.2026): раскатка движка на Windows больше не помечает проект
+  `failed` вместо `skipped`. Причина была не в раскатке: `project.hermes_bin` отдавал голое
+  имя «hermes», а `CreateProcess` на Windows не читает `PATHEXT` и `hermes.cmd` из PATH не
+  находит (`FileNotFoundError` → `status: failed`, пустая причина). Теперь имя разрешается
+  `shutil.which` в одном шве; тест раскатки печатает строку реестра при расхождении, сторож
+  шва — `tests/test_project_env.py::test_hermes_bin_resolves_the_shim_it_can_actually_run`.
 - Версия `0.34.0` (17.11.2026): находки ревью плана стали читаемыми. Панель отдаёт реестр
   строками (`snapshot._plan_findings` → `findings_view`, ключ `plan_findings` в снимке и в
   `/api/step`), вкладка «Шаг» рисует `planFindingsHtml` (ID, шаг, класс, статус, текст, «что
@@ -480,6 +486,16 @@ hermes pipeline doctor  --project <путь>
   находок шага, формой ответа по номеру находки и тремя прогонами затронутых тестов:
   повторное ревью читает открытые строки реестра и дифф правок, а не отчёт заново.
   Тест-сторож: `tests/engine/test_step_findings.py`, `tests/engine/test_fix_card.py`.
+- **`subprocess.run(["hermes", …])` на Windows не находит `hermes.cmd`.** `CreateProcess`
+  дописывает только `.exe`, `PATHEXT` не читает, поэтому установка/заглушка вида `hermes.cmd`
+  из PATH не находится вовсе и вызов падает `FileNotFoundError`. Раскатка движка из-за
+  этого помечала проект `failed` вместо `skipped`, и только на windows-ноге: на linux шим
+  лежит файлом без расширения и его находит `execvp` (красная нога на тегах `v0.34.0` и
+  `v0.35.0`, дефект старше выпуска). Отсюда правило: имя внешней команды разрешается
+  `shutil.which` в одном шве — `project.hermes_bin` (так же ищет движок, `engine/gate.py`),
+  а не голым именем. Локальный прогон теста раскатки до 0.35.1 был ложнозелёным: на хосте
+  в PATH лежит настоящий `hermes.exe`, и тест исполнял живую команду вместо заглушки.
+  Тест-сторож: `tests/test_project_env.py::test_hermes_bin_resolves_the_shim_it_can_actually_run`.
 
 ## 9. Что осталось
 
