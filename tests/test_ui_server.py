@@ -3250,3 +3250,42 @@ def test_answer_refused_when_tick_holds_the_lock(server, monkeypatch):
     assert "не применена" in data["error"]
     text = (root / "docs" / "reviews" / "plan-1-questions.md").read_text(encoding="utf-8")
     assert "| открыт |" in text
+
+
+def round_history(server) -> list[dict]:
+    """Две записи круга по шагу из снимка (13-S5, §4.6): правка кода и круг постановки.
+
+    Шаг берётся из `overview.step`: вторая строка под числом «кругов правок» отвечает про
+    текущий шаг, а не про любой. Минуты те же, что у фикстуры §4.6: 10 и 20.
+    """
+    _status, data = get(server["url"] + "/api/snapshot")
+    step = str((data.get("overview") or {}).get("step") or "S1")
+    return [
+        {"ts": 1000.0, "plan": "1", "step": step, "action": "create_fix", "cause": "блокирующая"},
+        {"ts": 1600.0, "plan": "1", "step": step, "action": "create_review"},
+        {"ts": 1700.0, "plan": "1", "step": step, "action": "create_prompt_fix"},
+        {"ts": 2900.0, "plan": "1", "step": step, "action": "create_prompt_review"},
+    ]
+
+
+def test_snapshot_carries_round_cause_of_step(server):
+    """Снимок несёт причину и медиану кругов текущего шага: `overview.rounds_cause` (13-S5).
+
+    Два круга — 10 и 20 минут, медиана 15; причины: блокирующая и постановка. На пустой
+    истории — нули и `None`, а не пропавший ключ или исключение.
+    """
+    write_history(server, round_history(server))
+
+    _status, data = get(server["url"] + "/api/snapshot")
+    block = data["overview"]["rounds_cause"]
+    assert block["rounds"] == 2
+    assert block["causes"] == {"блокирующая": 1, "значимая": 0, "стилистическая": 0,
+                               "постановка": 1, "неизвестно": 0}
+    assert block["median_min"] == 15
+    assert block["open"] == 0
+    # История пустая (файла нет) — нули и `None`, а не отсутствие ключа или исключение.
+    (server["root"] / ".pipeline" / "state" / "history.jsonl").unlink()
+    snapshot.clear_cache()
+    _status, empty = get(server["url"] + "/api/snapshot")
+    blank = empty["overview"]["rounds_cause"]
+    assert (blank["rounds"], blank["median_min"], blank["open"]) == (0, None, 0)

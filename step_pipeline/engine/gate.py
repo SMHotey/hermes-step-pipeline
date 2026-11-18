@@ -1097,6 +1097,14 @@ def prompt_findings_rel(p: Paths, step_id: str) -> str:
 STEP_FINDINGS_HEADER = PROMPT_FINDINGS_HEADER
 STEP_FINDINGS_KEYS = PROMPT_FINDINGS_KEYS
 STEP_FINDING_KINDS = ("блокирующая", "значимая", "стилистическая")
+# Причина круга правок (13-S5, §4.2): старший класс находки, по которой круг открыт.
+# Порядок `STEP_FINDING_KINDS` и есть старшинство — блокирующая сильнее значимой.
+# Нет ни одного класса — пустая строка; метрика считает такой круг «неизвестно»
+# (`stats.ROUND_CAUSES`), а не догадывается о нём.
+FIX_CAUSE_ORDER = STEP_FINDING_KINDS
+#: Класс находки → ключ метрики (`stats.ROUND_CAUSES`): имя базы не зависит от языка отчёта.
+ROUND_CAUSE_KEYS = {"блокирующая": "blocking", "значимая": "significant",
+                    "стилистическая": "style"}
 # Статус строки — из класса находки: держит шаг только блокирующая.
 STEP_FINDING_STATUS = {"блокирующая": "открыто", "значимая": "не блокирует",
                        "стилистическая": "не блокирует"}
@@ -2586,6 +2594,19 @@ def open_step_findings(ctx: dict) -> list[dict]:
             if str(item.get("status") or "") == "открыто"]
 
 
+def round_cause_of(counts: dict) -> str:
+    """Старший присутствующий класс находки — причина открытого круга (13-S5, §4.2).
+
+    `counts` — счёт по классам (`{"блокирующая": 2, "значимая": 0, ...}`); берётся первый
+    ненулевой в порядке старшинства `FIX_CAUSE_ORDER`. Нет ни одного — пустая строка: метрика
+    пишет такой круг «неизвестно», а не подставляет класс наугад.
+    """
+    for cause in FIX_CAUSE_ORDER:
+        if int(counts.get(cause) or 0) > 0:
+            return cause
+    return ""
+
+
 def open_step_findings_lines(p: Paths, step: dict) -> list[str]:
     """Только строки находок реестра шага — без служебных («реестра ещё нет», ошибка)."""
     return [line for line in step_registry_lines(p, step, only_open=True)
@@ -3797,8 +3818,15 @@ def _step_registry_decision(ctx: dict, sid: str, step: dict, verdict: str,
         if blocking:
             return None
         return _step_findings_stop(sid, rows, verdict, limit)
+    # Причина круга — старший класс открытых находок (§4.2): по нему метрика считает, из-за
+    # чего круги открывались. Счёт берётся из строк реестра, а не из вердикта отчёта.
+    kinds: dict[str, int] = {}
+    for item in rows:
+        kind = str(item.get("kind") or "")
+        kinds[kind] = kinds.get(kind, 0) + 1
     return {"action": "create_fix", "step": sid, "data": step, "round": len(fixes) + 1,
-            "parent": parent, "registry_open": [str(item.get("id")) for item in rows]}
+            "parent": parent, "registry_open": [str(item.get("id")) for item in rows],
+            "cause": round_cause_of(kinds)}
 
 
 def _decide_base(ctx: dict) -> dict:
@@ -4077,7 +4105,10 @@ def _decide_base(ctx: dict) -> dict:
         # Круги правок не бесконечны, но и не один: после первого REQUEST_CHANGES исполнитель
         # получает ещё круг, и только исчерпание лимита останавливает конвейер (правило 4).
         return {"action": "create_fix", "step": sid, "data": step,
-                "round": len(fixes) + 1, "parent": last_review["id"]}
+                "round": len(fixes) + 1, "parent": last_review["id"],
+                "cause": round_cause_of({"блокирующая": classes["blocking"],
+                                         "значимая": classes["significant"],
+                                         "стилистическая": classes["style"]})}
     findings = _review_findings(Path(verdict["path"]), 5)
     high = str((step or {}).get("risk") or "normal").lower() == "high"
     tier = " (класс риска: high)" if high else ""
@@ -7462,9 +7493,14 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             return result
         try:
             text = Path(p.plan_file).read_text(encoding="utf-8", errors="replace")
+            # Причины кругов — из истории тиков (§4.3): ретроспектива отвечает на «что мешало»
+            # числами, а не пересказом. Истории нет — счёт нулевой, строка та же: владелец
+            # видит «0 кругов», а не догадывается, считали ли вообще.
+            records, _total, _bad = history_lines(p.cfg)
+            rounds = round_cause_counts(records, p.plan_id)
             state_io.atomic_write_text(
                 path, analyze.retro_text(text, p.cfg.rel(Path(p.plan_file)), p.plan_id,
-                                         _local_date(_now())))
+                                         _local_date(_now()), rounds))
         except OSError as exc:
             print(f"[retro] черновик не записан: {exc}", file=sys.stderr)
             result.update(applied=False, detail=f"ретроспектива не записана: {rel}")
@@ -7828,6 +7864,34 @@ def append_history(cfg: config_mod.Config, record: dict) -> None:
     state_io.atomic_write_text(path, "\n".join(lines) + "\n")
 
 
+def round_cause_counts(records: list[dict], plan_id: str) -> dict:
+    """Круги правок плана по причинам — по истории тиков (13-S5, §4.3).
+
+    Считаются те же круги, что и у метрики (`stats._step_rounds`, R10): `create_fix` и
+    `create_prompt_fix` без `stale`. Причина `create_fix` — поле `cause` записи (три класса
+    находки), пустое или чужое значение — `unknown`; у `create_prompt_fix` причина всегда
+    `prompt`: постановку переписывают не из-за класса находки, и поле её не дублирует.
+    Пересборка протухшей постановки и повтор ревью в счёт не идут — бюджетов они не тратят.
+
+    Ключи: `total` и по причине — `blocking`, `significant`, `style`, `prompt`, `unknown`.
+    """
+    counts = {"total": 0, "blocking": 0, "significant": 0, "style": 0,
+              "prompt": 0, "unknown": 0}
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("plan") or "") != str(plan_id):
+            continue
+        action = str(record.get("action") or "")
+        if action == "create_fix":
+            counts["total"] += 1
+            counts[ROUND_CAUSE_KEYS.get(str(record.get("cause") or ""), "unknown")] += 1
+        elif action == "create_prompt_fix" and not record.get("stale"):
+            counts["total"] += 1
+            counts["prompt"] += 1
+    return counts
+
+
 def _median(values: list[float]) -> int:
     """Медиана, округлённая до целых; чётное число — среднее двух центральных."""
     ordered = sorted(values)
@@ -7917,9 +7981,10 @@ def remember_action(p: Paths, plan_id: str, decision: dict, detail: str,
 
     В историю (`history.jsonl`) — строка на действие: `ts` (epoch, для окна и разностей),
     `at` тем же форматом, что в состоянии, план, шаг, действие, длительность в секундах,
-    `detail` (те же 200 символов), sha коммита, если он был (D4), и `stale` — признак
+    `detail` (те же 200 символов), sha коммита, если он был (D4), `stale` — признак
     пересборки протухшей постановки: по нему метрика (`stats._step_rounds`) отличает правки
-    от пересборок, не разбирая `detail` (12-S3).
+    от пересборок, не разбирая `detail` (12-S3), и `cause` — причина круга правок, старший
+    класс находки из решения (13-S5); у действий без причины поле пустое.
     """
     at = time.strftime("%d.%m.%Y %H:%M:%S")
     action = str(decision.get("action") or "")
@@ -7935,7 +8000,8 @@ def remember_action(p: Paths, plan_id: str, decision: dict, detail: str,
     append_history(p.cfg, {"ts": time.time(), "at": at, "plan": plan_id, "step": step,
                            "action": action, "duration_s": round(float(duration), 3),
                            "detail": text, "commit": str(commit or ""),
-                           "stale": bool(decision.get("stale"))})
+                           "stale": bool(decision.get("stale")),
+                           "cause": str(decision.get("cause") or "")})
 
 
 

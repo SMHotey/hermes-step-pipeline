@@ -669,6 +669,10 @@ def _overview(root: Path, cfg: dict, out: dict) -> dict:
             "reason": reason, "stop": stop, "tick_available": tick_available,
             "tick_disabled_reason": disabled_reason, "waiting": waiting,
             "fix_rounds": _fix_rounds(out.get("cards") or [], plan_id, step), "risk": risk,
+            # Круги текущего шага по причинам (13-S5, §4.5): числа считает `stats` тем же
+            # правилом, что и метрика цикла, — вторая копия разбора истории недопустима.
+            # `fix_rounds` остаётся: он по карточкам доски, история его не заменяет.
+            "rounds_cause": stats.step_round_causes(root, cfg, plan_id, step),
             "progress": progress,
             # Задел под бейдж критичных проблем шага S5 (D8): проверки здесь не запускаются.
             "checks": None}

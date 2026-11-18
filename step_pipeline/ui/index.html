@@ -254,6 +254,8 @@
   .ov-item span { font-size: 11px; color: var(--muted); text-transform: uppercase;
                   letter-spacing: .06em; }
   .ov-item b { font-size: 13px; font-weight: 600; }
+  /* Вторая строка под числом (13-S5): обычный шрифт, мелкий кегль, перевод строки под числом. */
+  .ov-item i { font-style: normal; font-size: 11px; color: var(--muted); display: block; }
   .ov-bar { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12.5px; }
   .ov-bar > span:first-child { min-width: 64px; }
   .ov-track { flex: 1; height: 6px; border-radius: 999px; overflow: hidden;
@@ -436,7 +438,7 @@
       <div class="ov-badge" id="ov-badge" hidden></div>
       <div class="ov-grid">
         <div class="ov-item"><span>висит</span><b class="mono" id="ov-waiting">—</b></div>
-        <div class="ov-item"><span>кругов правок</span><b class="mono" id="ov-rounds">0</b></div>
+        <div class="ov-item"><span>кругов правок</span><b class="mono" id="ov-rounds">0</b><i id="ov-rounds-cause"></i></div>
         <div class="ov-item"><span>постановка</span><b class="mono" id="ov-prompt">—</b></div>
         <div class="ov-item"><span>риск шага</span><b class="mono" id="ov-risk">—</b></div>
       </div>
@@ -1967,6 +1969,29 @@ function renderRunning(data) {
   }).join("") + '</tbody></table>';
 }
 
+// Вторая строка под числом кругов (13-S5, §4.5): причина и медиана — из снимка
+// (`overview.rounds_cause`), страница ничего не считает. Данных нет (снимок без конвейера,
+// старый снимок) — строка пустая: падать из-за метрики странице незачем.
+function roundsCauseText(row) {
+  if (!row) return "";
+  const total = Number(row.rounds || 0);
+  if (!total) return "кругов по истории: 0";
+  const c = row.causes || {};
+  const median = row.median_min === null || row.median_min === undefined ? "—" : row.median_min;
+  return `кругов по истории: ${total} (блокирующих ${c["блокирующая"] || 0}, ` +
+    `значимых ${c["значимая"] || 0}, стилистических ${c["стилистическая"] || 0}, ` +
+    `постановка ${c["постановка"] || 0}, неизвестно ${c["неизвестно"] || 0}) · медиана ${median} мин`;
+}
+
+function roundsCauseTitle(row) {
+  if (!row) return "";
+  const c = row.causes || {};
+  return `источник: history.jsonl; кругов ${Number(row.rounds || 0)}, ` +
+    `без закрывающего ревью ${Number(row.open || 0)}; блокирующих ${c["блокирующая"] || 0}, ` +
+    `значимых ${c["значимая"] || 0}, стилистических ${c["стилистическая"] || 0}, ` +
+    `постановка ${c["постановка"] || 0}, неизвестно ${c["неизвестно"] || 0}`;
+}
+
 function renderOverview(data) {
   // Блок «Обзор» целиком из снимка: страница ничего не додумывает и не повторяет правила
   // стража. Значения приходят готовыми строками — подпись, причина, простой, прогресс.
@@ -1979,7 +2004,13 @@ function renderOverview(data) {
   waitingEl.textContent = waiting ? waiting.text : "—";
   waitingEl.title = waiting && waiting.reason ? waiting.reason : "";
 
-  $("ov-rounds").textContent = String(ov.fix_rounds ?? 0);
+  // Круги правок по причинам (13-S5): число по карточкам и вторая строка по истории —
+  // оба значения из снимка, страница не считает.
+  const roundsEl = $("ov-rounds");
+  roundsEl.textContent = String(ov.fix_rounds ?? 0);
+  const causeEl = $("ov-rounds-cause");
+  causeEl.textContent = roundsCauseText(ov.rounds_cause);
+  causeEl.title = roundsCauseTitle(ov.rounds_cause);
   const prompt = ov.prompt || {};
   const promptEl = $("ov-prompt");
   promptEl.textContent = prompt.exists ? "есть" : "нет";

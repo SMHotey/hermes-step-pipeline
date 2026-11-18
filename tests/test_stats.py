@@ -26,6 +26,10 @@ CONFIG = {
 
 CONSTITUTION = "Конституция: docs/CONSTITUTION.md\n"
 
+#: Хвост строки «Цикл: …» и подсказки пятой плитки, когда кругов и закрытых шагов нет (13-S5).
+NO_ROUNDS_TAIL = ("круги по классу: блокирующих 0, значимых 0, стилистических 0, постановка 0, "
+                  "неизвестно 0; медиана круга — мин; с первой попытки 0 из 0")
+
 JOURNAL = """## Журнал выполнения
 
 | Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |
@@ -272,7 +276,9 @@ def test_metrics_tiles_and_empty_project(tmp_path: Path) -> None:
     assert line.startswith("Цикл:")
     assert "с разведкой 1" in line
     assert "из 3" in line
-    assert line.endswith("кругов на шаг — (правок 0, пересборок 0, закрыто находок 0)")
+    # Прежние части строки остаются на своих местах, хвост причин дописан в конец (13-S5).
+    assert "кругов на шаг — (правок 0, пересборок 0, закрыто находок 0)" in line
+    assert line.endswith("); " + NO_ROUNDS_TAIL)
 
 
 def test_metrics_counts_unreferenced_review(tmp_path: Path) -> None:
@@ -359,12 +365,21 @@ def test_metrics_counts_fix_rounds_and_zero_close_share(tmp_path: Path) -> None:
     tiles = stats.cycle_tiles(data)
     assert tiles[4]["label"] == "кругов правок на шаг"
     assert tiles[4]["value"] == "1.7"
-    assert tiles[4]["hint"] == ("правок 3, пересборок 1; закрыто находок 3 (по 0.6 за круг); "
-                                "ноль закрытых за круг у 1 из 2 шагов")
+    # Прежний текст подсказки целиком на месте, хвост причин дописан через «; » (13-S5).
+    assert tiles[4]["hint"].startswith(
+        "правок 3, пересборок 1; закрыто находок 3 (по 0.6 за круг); "
+        "ноль закрытых за круг у 1 из 2 шагов; круги по классу: ")
+    assert tiles[4]["hint"] == (
+        "правок 3, пересборок 1; закрыто находок 3 (по 0.6 за круг); ноль закрытых за круг "
+        "у 1 из 2 шагов; круги по классу: блокирующих 0, значимых 0, стилистических 0, "
+        "постановка 2, неизвестно 3; медиана круга — мин; с первой попытки 0 из 0")
     line = stats.render_cycle(data)
     assert line.startswith("Цикл:")
     # §5.7: числа про круги дописаны в конец строки, прежние части — на своих местах.
-    assert line.endswith("кругов на шаг 1.7 (правок 3, пересборок 1, закрыто находок 3)")
+    assert "кругов на шаг 1.7 (правок 3, пересборок 1, закрыто находок 3)" in line
+    assert line.endswith("); круги по классу: блокирующих 0, значимых 0, стилистических 0, "
+                         "постановка 2, неизвестно 3; медиана круга — мин; с первой попытки "
+                         "0 из 0")
 
 
 def test_tiles_hint_reads_plan_review_stale_not_rebuilds(tmp_path: Path) -> None:
@@ -399,3 +414,101 @@ def test_tiles_hint_reads_plan_review_stale_not_rebuilds(tmp_path: Path) -> None
                                 "без ссылки на конституцию 0), ждут 0, без ревью 0")
     # Пересборки — число пятой плитки («кругов правок на шаг»), не подсказки ревью плана.
     assert tiles[4]["hint"].startswith("правок 0, пересборок 5; ")
+
+
+
+def round_history() -> list[dict]:
+    """Фикстура §4.6 постановки 13-S5: одна и та же история во всех тестах кругов.
+
+    Обязательные поля — `ts`, `plan`, `step`, `action`; причина и флаг `stale` — по смыслу
+    строки. `ts` идут не по возрастанию в конце списка нарочно: порядок файла — не гарантия.
+    """
+    return [
+        {"ts": 1000.0, "plan": 1, "step": "S1", "action": "create_step"},
+        {"ts": 1100.0, "plan": 1, "step": "S1", "action": "create_fix", "cause": "блокирующая"},
+        {"ts": 1700.0, "plan": 1, "step": "S1", "action": "create_review"},
+        {"ts": 1800.0, "plan": 1, "step": "S1", "action": "create_prompt_fix"},
+        {"ts": 3000.0, "plan": 1, "step": "S1", "action": "create_prompt_review"},
+        {"ts": 3100.0, "plan": 1, "step": "S1", "action": "close_step"},
+        {"ts": 4000.0, "plan": 1, "step": "S2", "action": "create_fix"},
+        {"ts": 4600.0, "plan": 1, "step": "S2", "action": "create_review"},
+        {"ts": 5000.0, "plan": 1, "step": "S2", "action": "create_prompt_fix", "stale": True},
+        {"ts": 6000.0, "plan": 1, "step": "S2", "action": "close_step"},
+        {"ts": 7000.0, "plan": 1, "step": "S3", "action": "close_step"},
+        {"ts": 8000.0, "plan": 1, "step": "S4", "action": "create_fix",
+         "cause": "стилистическая"},
+    ]
+
+
+def test_metrics_counts_rounds_by_cause(tmp_path: Path) -> None:
+    """Круги по классу и `неизвестно`: пять ключей, медиана 10 мин, один круг без ревью (R12)."""
+    root = make_project(tmp_path / "project", {"1-plan.md": plan_text("1. План 1")},
+                        history=round_history())
+
+    data = metrics(root)
+
+    assert data["round_causes"] == {"блокирующая": 1, "значимая": 0, "стилистическая": 1,
+                                    "постановка": 1, "неизвестно": 1}
+    assert data["round_minutes_median"] == 10      # значения 10, 20 и 10 минут
+    assert data["rounds_open"] == 1                # круг S4 без закрывающего ревью
+    steps = {f"{item['plan']}-{item['step']}": item for item in data["rounds_by_step"]}
+    assert [f"{item['plan']}-{item['step']}" for item in data["rounds_by_step"]] == [
+        "1-S1", "1-S2", "1-S4"]
+    assert (steps["1-S1"]["rounds"], steps["1-S1"]["median_min"]) == (2, 15)
+    assert steps["1-S1"]["causes"] == {"блокирующая": 1, "значимая": 0,
+                                       "стилистическая": 0, "постановка": 1, "неизвестно": 0}
+    # Пересборка протухшей постановки (`stale`) кругом не считается: у S2 круг один.
+    assert (steps["1-S2"]["rounds"], steps["1-S2"]["median_min"]) == (1, 10)
+    assert steps["1-S2"]["causes"]["неизвестно"] == 1
+    assert (steps["1-S4"]["rounds"], steps["1-S4"]["median_min"]) == (1, None)
+    assert steps["1-S4"]["causes"]["стилистическая"] == 1
+
+    tail = ("круги по классу: блокирующих 1, значимых 0, стилистических 1, постановка 1, "
+            "неизвестно 1; медиана круга 10 мин; с первой попытки 1 из 3")
+    assert stats.cycle_tiles(data)[4]["hint"].endswith(tail)
+    assert stats.render_cycle(data).endswith("; " + tail)
+
+
+def test_metrics_counts_first_try_share(tmp_path: Path) -> None:
+    """Доля шагов с первой попытки: закрыты S1, S2, S3, без кругов только S3 (R12)."""
+    root = make_project(tmp_path / "project", {"1-plan.md": plan_text("1. План 1")},
+                        history=round_history())
+
+    data = metrics(root)
+
+    assert (data["first_try_steps"], data["first_try_base"]) == (1, 3)
+    assert data["first_try_share"] == 0.3
+    # Шаг S3 закрыт без кругов: в разбивке на шаг его нет — считать там нечего.
+    assert [item["step"] for item in data["rounds_by_step"]] == ["S1", "S2", "S4"]
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    none = metrics(Path(empty))
+    assert (none["first_try_steps"], none["first_try_base"], none["first_try_share"]) == (
+        0, 0, None)
+    assert none["round_causes"] == {"блокирующая": 0, "значимая": 0, "стилистическая": 0,
+                                    "постановка": 0, "неизвестно": 0}
+    assert none["round_minutes_median"] is None
+    assert none["rounds_by_step"] == []
+
+
+def test_step_round_causes_helper_for_panel(tmp_path: Path) -> None:
+    """Хелпер панели: шаг без учёта регистра, неизвестный шаг и пустая история — нули (R12)."""
+    root = make_project(tmp_path / "project", {"1-plan.md": plan_text("1. План 1")},
+                        history=round_history())
+    cfg = proj.read_config(root)
+
+    one = stats.step_round_causes(root, cfg, "1", "s1")
+    assert (one["rounds"], one["median_min"], one["open"]) == (2, 15, 0)
+    assert one["causes"] == {"блокирующая": 1, "значимая": 0, "стилистическая": 0,
+                             "постановка": 1, "неизвестно": 0}
+    assert stats.step_round_causes(root, cfg, "1", "S4")["median_min"] is None
+
+    missing = stats.step_round_causes(root, cfg, "9", "S1")
+    assert (missing["rounds"], missing["median_min"], missing["open"]) == (0, None, 0)
+    assert set(missing["causes"]) == set(stats.ROUND_CAUSES)
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    empty = stats.step_round_causes(bare, None, "1", "S1")
+    assert (empty["rounds"], empty["median_min"], empty["open"]) == (0, None, 0)

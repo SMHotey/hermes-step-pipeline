@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import subprocess
 import sys
@@ -329,6 +330,9 @@ def test_retro_draft_is_written_once_after_plan_closed(stand):
     retro = root / "docs" / "reviews" / "retro-1.md"
     body = retro.read_text(encoding="utf-8")
     assert "Ретроспектива плана 1" in body
+    # Истории нет — счёт нулевой, но строка есть: ретро отвечает «сколько и почему» (13-S5).
+    assert ("Кругов правок: 0 (блокирующих 0, значимых 0, стилистических 0, постановка 0, "
+            "неизвестно 0).") in body
     assert "| S1 (Таблица счетов) | 01.11.2026 | abc1234 | ЗАКРЫТ |" in body
     assert "| S2 (Эндпоинт списка) | 02.11.2026 | def5678 | ЗАКРЫТ |" in body
     assert "## Что мешало" in body
@@ -340,3 +344,64 @@ def test_retro_draft_is_written_once_after_plan_closed(stand):
     assert second["decision"].get("plan_done") is True
     assert board_empty(db)
     assert gate.load_stop(p) is None
+
+
+
+def closed_plan_text() -> str:
+    """План с закрытыми шагами: все шаги журнала ЗАКРЫТ — страж кладёт ретро (D8)."""
+    text = format_plan()
+    text = text.replace("| — | S1 | — | — | открыт |",
+                        "| 01.11.2026 | S1 (Таблица счетов) | abc1234 | 3 passed | ЗАКРЫТ |")
+    text = text.replace("| — | S2 | — | — | открыт |",
+                        "| 02.11.2026 | S2 (Эндпоинт списка) | def5678 | 5 passed | ЗАКРЫТ |")
+    return text
+
+
+def round_history() -> list[dict]:
+    """Та же фикстура истории, что в тестах метрики (§4.6 постановки 13-S5)."""
+    return [
+        {"ts": 1000.0, "plan": "1", "step": "S1", "action": "create_step"},
+        {"ts": 1100.0, "plan": "1", "step": "S1", "action": "create_fix", "cause": "блокирующая"},
+        {"ts": 1700.0, "plan": "1", "step": "S1", "action": "create_review"},
+        {"ts": 1800.0, "plan": "1", "step": "S1", "action": "create_prompt_fix"},
+        {"ts": 3000.0, "plan": "1", "step": "S1", "action": "create_prompt_review"},
+        {"ts": 3100.0, "plan": "1", "step": "S1", "action": "close_step"},
+        {"ts": 4000.0, "plan": "1", "step": "S2", "action": "create_fix"},
+        {"ts": 4600.0, "plan": "1", "step": "S2", "action": "create_review"},
+        {"ts": 5000.0, "plan": "1", "step": "S2", "action": "create_prompt_fix", "stale": True},
+        {"ts": 6000.0, "plan": "1", "step": "S2", "action": "close_step"},
+        {"ts": 7000.0, "plan": "1", "step": "S3", "action": "close_step"},
+        {"ts": 8000.0, "plan": "1", "step": "S4", "action": "create_fix",
+         "cause": "стилистическая"},
+    ]
+
+
+def test_retro_names_round_causes_from_history(stand):
+    """Ретро называет круги правок по причинам — числа из истории тиков (13-S5, §4.3)."""
+    root, p, _db = stand
+    write_plan(root, closed_plan_text())
+    path = Path(p.cfg.state_dir) / "history.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in round_history())
+                    + "\n", encoding="utf-8")
+
+    res = gate.run_gate(p, execute=True, notify_fn=quiet)
+
+    assert res["decision"]["action"] == "write_retro", res["decision"]
+    body = (root / "docs" / "reviews" / "retro-1.md").read_text(encoding="utf-8")
+    assert ("Кругов правок: 4 (блокирующих 1, значимых 0, стилистических 1, постановка 1, "
+            "неизвестно 1).") in body
+    # Строка стоит после «Дата: …» и до таблицы закрытых шагов — шапка черновика (§4.3 п.2).
+    assert body.index("Дата:") < body.index("Кругов правок:") < body.index("| Шаг | Дата |")
+
+
+def test_retro_without_rounds_keeps_previous_text():
+    """`rounds=None` — текст ретро прежний, ни строки о кругах (стоп-сигнал 6)."""
+    text = closed_plan_text()
+    plain = analyze.retro_text(text, "docs/plans/1-demo.md", "1", "18.11.2026")
+    assert "Кругов правок" not in plain
+    assert plain == analyze.retro_text(text, "docs/plans/1-demo.md", "1", "18.11.2026", None)
+    zeros = {"total": 0, "blocking": 0, "significant": 0, "style": 0, "prompt": 0, "unknown": 0}
+    assert "Кругов правок: 0 (блокирующих 0, значимых 0, стилистических 0, постановка 0, " \
+           "неизвестно 0)." in analyze.retro_text(text, "docs/plans/1-demo.md", "1",
+                                                  "18.11.2026", zeros)

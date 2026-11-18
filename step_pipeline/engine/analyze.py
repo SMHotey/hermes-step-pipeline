@@ -362,16 +362,29 @@ def _closed_rows(lines: list[str]) -> list[dict[str, str]]:
     return []
 
 
-def retro_text(text: str, plan_rel: str, plan_id: str, today: str) -> str:
+def retro_text(text: str, plan_rel: str, plan_id: str, today: str,
+               rounds: dict | None = None) -> str:
     """Черновик ретроспективы: факты из журнала плана и три раздела для владельца (D8).
 
     Чистая функция: страж пишет её результат один раз, повторный тик файл не трогает.
+    `rounds` — счёт кругов правок по причинам (`gate.round_cause_counts`, 13-S5): при
+    переданном словаре после строки «Дата: …» появляется строка «Кругов правок: …», без него
+    черновик остаётся дословно прежним.
     """
     lines = text.splitlines()
     title = _plan_title(lines) or plan_rel
     rows = _closed_rows(lines)
     out = [f"# Ретроспектива плана {plan_id} — {title}", "",
-           f"Дата: {today}. План: {plan_rel}. Шагов закрыто: {len(rows)}.", ""]
+           f"Дата: {today}. План: {plan_rel}. Шагов закрыто: {len(rows)}."]
+    if rounds is not None:
+        out.append(
+            f"Кругов правок: {int(rounds.get('total') or 0)} "
+            f"(блокирующих {int(rounds.get('blocking') or 0)}, "
+            f"значимых {int(rounds.get('significant') or 0)}, "
+            f"стилистических {int(rounds.get('style') or 0)}, "
+            f"постановка {int(rounds.get('prompt') or 0)}, "
+            f"неизвестно {int(rounds.get('unknown') or 0)}).")
+    out.append("")
     if rows:
         out += ["| Шаг | Дата | Коммит | Статус |", "|---|---|---|---|"]
         out += [f"| {row['step']} | {row['date']} | {row['commit']} | {row['status']} |"

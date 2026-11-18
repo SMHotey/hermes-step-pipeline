@@ -52,6 +52,15 @@ R11. Реестр находок постановки — файл `prompt-<пл
     пишет в него только id карточки. Источник: `gate.prompt_findings_path`,
     `gate.load_findings` с шапкой `gate.PROMPT_FINDINGS_HEADER`. Нечитаемый реестр —
     строка в `errors`, шаг с ним считается «нет данных».
+R12. Причина круга правок (13-S5) — поле `cause` записи истории: три класса находки
+    (`блокирующая`, `значимая`, `стилистическая`), у `create_prompt_fix` без `stale` —
+    `постановка` (поле не дублируется), у записи без причины (история до 13-S5) —
+    `неизвестно`. Длительность круга — от `ts` открывшей записи до `ts` ближайшей следующей
+    записи той же пары «план + шаг» с действием закрытия (`create_review`,
+    `create_prompt_review`); записи других видов между ними пропускаются, ревью другого шага
+    не засчитывается. Медиана — по минутам, целым числом. «С первой попытки» — шаг с записью
+    `close_step` и без единого круга. Источник: `gate.remember_action`,
+    `gate.round_cause_counts`, `gate.round_cause_of` (ветки `gate._step_registry_decision`).
 """
 from __future__ import annotations
 
@@ -105,6 +114,18 @@ CLOSED_STATUS = "закрыто"
 #: Имя реестра находок постановки (`gate.prompt_findings_path`): `prompt-12-S3-findings.md`.
 #: Группа 1 — номер плана, группа 2 — шаг; пара «план + шаг» — ключ метрик (R10, R11).
 PROMPT_FINDINGS_FILE_RE = re.compile(r"^prompt-(\d{1,2})-(.+)-findings\.md$")
+#: R12 (13-S5). Причина круга правок — три класса находки, переписывание постановки и
+#: `неизвестно`. Это те же слова, что движок пишет в поле `cause` (`gate.FIX_CAUSE_ORDER`):
+#: метрика и история говорят на одном языке, перевод — только в ключах цикла.
+FIX_CAUSE_VALUES = ("блокирующая", "значимая", "стилистическая")
+PROMPT_CAUSE = "постановка"
+UNKNOWN_CAUSE = "неизвестно"
+ROUND_CAUSES = FIX_CAUSE_VALUES + (PROMPT_CAUSE, UNKNOWN_CAUSE)
+#: Действие, закрывающее круг (R12): ревью кода закрывает правку, ревью постановки —
+#: переписывание. `create_rereview` круг не закрывает: это повтор прогона, а не новый круг.
+ROUND_CLOSING = {FIX_ACTION: "create_review", PROMPT_FIX_ACTION: "create_prompt_review"}
+#: Действие истории «шаг закрыт» — по нему считается «с первой попытки» (R12).
+CLOSE_STEP_ACTION = "close_step"
 
 _HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>\S.*?)\s*$")
 _MAX_HASHES = 6
@@ -427,6 +448,143 @@ def _step_rounds(records: list[dict]) -> dict[tuple[str, str], dict]:
     return data
 
 
+def _ts_value(value) -> float | None:
+    """`ts` записи числом; всё остальное (bool, строка, `None`) — времени нет (R12)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _sorted_records(records: list[dict]) -> list[dict]:
+    """Записи истории по возрастанию `ts`; одинаковые `ts` — в порядке файла (R12).
+
+    Записи без числового `ts` уходят в конец и между собой держат порядок файла: длительность
+    круга по ним не считается, но сам круг в счёт входит — иначе старые записи истории
+    исчезли бы из чисел.
+    """
+    def key(pair: tuple[int, dict]) -> tuple[int, float, int]:
+        index, record = pair
+        ts = _ts_value(record.get("ts"))
+        return (1, 0.0, index) if ts is None else (0, ts, index)
+    return [record for _index, record in sorted(enumerate(records), key=key)]
+
+
+def _round_info(record: dict) -> tuple[str, str] | None:
+    """Причина круга и действие, которым круг закрывается; не круг — `None` (R12).
+
+    Круг — `create_fix` и `create_prompt_fix` без `stale` (R10). Причина `create_fix` — поле
+    `cause` записи; пустое или чужое значение — `неизвестно`: история до 13-S5 поля не имела,
+    и подставлять класс наугад нельзя. У `create_prompt_fix` причина всегда `постановка`:
+    постановку переписывают не из-за класса находки (`gate.round_cause_counts`).
+    """
+    action = str(record.get("action") or "")
+    if action == FIX_ACTION:
+        cause = str(record.get("cause") or "")
+        return (cause if cause in FIX_CAUSE_VALUES else UNKNOWN_CAUSE), ROUND_CLOSING[FIX_ACTION]
+    if action == PROMPT_FIX_ACTION:
+        if record.get("stale"):
+            return None
+        return PROMPT_CAUSE, ROUND_CLOSING[PROMPT_FIX_ACTION]
+    return None
+
+
+def _round_records(records: list[dict]) -> list[dict]:
+    """Круги правок с причиной и длительностью (R12): `plan`, `step`, `cause`, `seconds`.
+
+    `seconds` — от `ts` открывшей записи до `ts` ближайшей следующей записи ТОЙ ЖЕ пары
+    «план + шаг» с действием закрытия (`ROUND_CLOSING`); записи других видов между ними
+    пропускаются, ревью другого шага и другого плана не засчитывается. Нет закрытия, нет
+    `ts` или закрытие не позже открытия — `None`: круг висит, и медиана его не видит.
+    """
+    ordered = _sorted_records([record for record in records if isinstance(record, dict)])
+    rounds: list[dict] = []
+    for index, record in enumerate(ordered):
+        info = _round_info(record)
+        if info is None:
+            continue
+        cause, closing = info
+        plan = str(record.get("plan"))
+        step = str(record.get("step") or "")
+        opened = _ts_value(record.get("ts"))
+        seconds = None
+        for later in ordered[index + 1:]:
+            if str(later.get("plan")) != plan or str(later.get("step") or "") != step:
+                continue
+            if str(later.get("action") or "") != closing:
+                continue
+            closed = _ts_value(later.get("ts"))
+            if opened is not None and closed is not None and closed > opened:
+                seconds = closed - opened
+            break
+        rounds.append({"plan": plan, "step": step, "cause": cause, "seconds": seconds})
+    return rounds
+
+
+def _median_min(seconds: list[float]) -> int | None:
+    """Медиана длительности в целых минутах (R12); чётное число — среднее центральных."""
+    minutes = sorted(value / 60.0 for value in seconds)
+    if not minutes:
+        return None
+    mid = len(minutes) // 2
+    value = minutes[mid] if len(minutes) % 2 else (minutes[mid - 1] + minutes[mid]) / 2
+    return int(round(value))
+
+
+def _round_report(rounds: list[dict]) -> dict:
+    """Счёт группы кругов: `rounds`, `causes` (все пять ключей), `median_min`, `open` (R12)."""
+    causes = {cause: 0 for cause in ROUND_CAUSES}
+    for item in rounds:
+        causes[item["cause"]] += 1
+    measured = [item["seconds"] for item in rounds if item["seconds"] is not None]
+    return {"rounds": len(rounds), "causes": causes,
+            "median_min": _median_min(measured), "open": len(rounds) - len(measured)}
+
+
+def _step_order(pair: tuple[str, str]) -> tuple[int, str, str]:
+    """Порядок разбивки: номер плана числом, затем имя шага — «10» после «9»."""
+    plan, step = pair
+    return (int(plan) if plan.isdigit() else 10 ** 6, plan, step)
+
+
+def step_rounds_report(records: list[dict]) -> dict:
+    """Круги правок плана: причина, медиана круга и разбивка на шаг (R12, шаг 13-S5).
+
+    Ключи: `rounds`, `causes`, `median_min`, `open` — по всем кругам и `steps` — по паре
+    «план + шаг» в порядке `(plan, step)`. Медианы нет (кругов не было или все висят) —
+    `None`, а не ноль: «ноль минут» было бы числом, которого никто не измерял.
+    """
+    rounds = _round_records(records)
+    report = _round_report(rounds)
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for item in rounds:
+        groups.setdefault((item["plan"], item["step"]), []).append(item)
+    steps: list[dict] = []
+    for plan, step in sorted(groups, key=_step_order):
+        row = _round_report(groups[(plan, step)])
+        # Разбивка на шаг — ровно четыре ключа постановки: «открытые» здесь не нужны,
+        # их число живёт в общем счёте (`rounds_open`).
+        steps.append({"plan": plan, "step": step, "rounds": row["rounds"],
+                      "causes": row["causes"], "median_min": row["median_min"]})
+    report["steps"] = steps
+    return report
+
+
+def step_round_causes(root, cfg: dict | None = None, plan_id="", step_id="") -> dict:
+    """Круги одного шага для панели: причина, медиана, открытые (R12, шаг 13-S5).
+
+    Шаг сравнивается без учёта регистра (`s1` и `S1` — один шаг). Нет истории, нет шага в
+    параметрах или история не читается — нули и `None`: обзор панели не падает из-за метрики.
+    """
+    plan = str(plan_id or "")
+    step = str(step_id or "").upper()
+    if not plan or not step:
+        return _round_report([])
+    paths, _marker, _regex = _settings(cfg)
+    records = _history(Path(root) / paths["state"], [])
+    return _round_report([item for item in _round_records(records)
+                          if item["plan"] == plan and item["step"].upper() == step])
+
+
 def _registry_counts(text: str) -> tuple[int, int] | None:
     """Число находок реестра постановки и число закрытых (R11); нет шапки — `None`.
 
@@ -527,6 +685,7 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
     records = _history(state_dir, errors)
     rounds = _rounds(records)
     step_rounds = _step_rounds(records)
+    round_report = step_rounds_report(records)
     registries = _prompt_registries(reviews_dir, errors)
     artifacts: dict[Path, dict[str, int]] = {}
     by_plan: list[dict] = []
@@ -593,6 +752,14 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
     zero_base = [key for key, item in step_rounds.items()
                  if (item["fix"] or item["promptfix"]) and key in registries]
     zero_steps = sum(1 for key in zero_base if registries[key]["closed"] == 0)
+    # «С первой попытки» (R12): шаг закрыт (`close_step`) и ни одного круга любой серии у его
+    # пары не было. База — все закрытые шаги, а не только с реестром: делить надо на то, что
+    # измерено закрытием, иначе доля считалась бы по выжившим.
+    closed_pairs = {(str(row.get("plan")), str(row.get("step") or "")) for row in records
+                    if str(row.get("action") or "") == CLOSE_STEP_ACTION
+                    and str(row.get("step") or "")}
+    with_rounds = {(str(item["plan"]), str(item["step"])) for item in round_report["steps"]}
+    first_try_steps = sum(1 for pair in closed_pairs if pair not in with_rounds)
     return {
         "plans_total": len(by_plan),
         "plans_with_research": plans_with_research,
@@ -616,6 +783,16 @@ def cycle_metrics(root, cfg: dict | None = None) -> dict:
         "zero_close_steps": zero_steps,
         "zero_close_base": len(zero_base),
         "zero_close_share": round(zero_steps / len(zero_base), 1) if zero_base else None,
+        # R12, шаг 13-S5: причина круга, медиана круга в минутах, висящие круги и «с первой
+        # попытки». Причина пустого отчёта — нули по всем классам, а не пропуск ключей.
+        "round_causes": round_report["causes"],
+        "round_minutes_median": round_report["median_min"],
+        "rounds_open": round_report["open"],
+        "rounds_by_step": round_report["steps"],
+        "first_try_steps": first_try_steps,
+        "first_try_base": len(closed_pairs),
+        "first_try_share": (round(first_try_steps / len(closed_pairs), 1)
+                            if closed_pairs else None),
         "plan_reviews": states.count("fresh"),
         "plan_reviews_stale": states.count("stale"),
         "plan_reviews_unbound": states.count("unbound"),
@@ -634,6 +811,24 @@ def _num(value) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value)
+
+
+def _round_cause_hint(metrics: dict) -> str:
+    """Хвост подсказки: круги по классу, медиана круга, «с первой попытки» (R12, 13-S5).
+
+    Один и тот же текст идёт в подсказку пятой плитки и в строку «Цикл: …»: два разных
+    пересказа одних чисел — это два места, где они разойдутся.
+    """
+    causes = metrics.get("round_causes") or {}
+    median = metrics.get("round_minutes_median")
+    median_text = "—" if median is None else _num(median)
+    return (f"круги по классу: блокирующих {int(causes.get('блокирующая') or 0)}, "
+            f"значимых {int(causes.get('значимая') or 0)}, "
+            f"стилистических {int(causes.get('стилистическая') or 0)}, "
+            f"постановка {int(causes.get('постановка') or 0)}, "
+            f"неизвестно {int(causes.get('неизвестно') or 0)}; "
+            f"медиана круга {median_text} мин; с первой попытки "
+            f"{int(metrics.get('first_try_steps') or 0)} из {int(metrics.get('first_try_base') or 0)}")
 
 
 def cycle_tiles(metrics: dict) -> list[dict]:
@@ -697,7 +892,7 @@ def cycle_tiles(metrics: dict) -> list[dict]:
          "value": rounds_value,
          "hint": (f"правок {fix_rounds}, пересборок {rebuilds}; закрыто находок {closed} "
                   f"(по {per_round_text} за круг); ноль закрытых за круг у "
-                  f"{zero_steps} из {zero_base} шагов")},
+                  f"{zero_steps} из {zero_base} шагов; " + _round_cause_hint(metrics))},
     ]
 
 
@@ -719,7 +914,8 @@ def render_cycle(metrics: dict) -> str:
             f"(с первого раза {int(metrics.get('plan_reviews_first') or 0)}), "
             f"кругов на шаг {rounds} (правок {int(metrics.get('fix_rounds') or 0)}, "
             f"пересборок {int(metrics.get('stale_rebuilds') or 0)}, "
-            f"закрыто находок {int(metrics.get('findings_closed') or 0)})")
+            f"закрыто находок {int(metrics.get('findings_closed') or 0)}); "
+            f"{_round_cause_hint(metrics)}")
 
 
 if __name__ == "__main__":  # ручная проба владельца: `python -m step_pipeline.stats [путь]`

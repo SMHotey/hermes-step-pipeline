@@ -23,7 +23,7 @@ import config as config_mod
 import gate
 from engine_kit import KIT, complete, make_project
 
-HISTORY_KEYS = {"ts", "at", "plan", "step", "action", "duration_s", "detail", "commit"}
+HISTORY_KEYS = {"ts", "at", "plan", "step", "action", "duration_s", "detail", "commit", "cause"}
 
 
 def sh(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
@@ -129,6 +129,24 @@ def test_remember_action_writes_history_line(env: Path):
     assert rows[-1]["duration_s"] == 0.0
     assert rows[-1]["commit"] == ""
     assert rows[-1]["detail"] == "карточка t_rev"
+
+
+def test_remember_action_writes_round_cause(env: Path):
+    """Причина круга правок (`cause`) — в историю из решения; без причины — пустая (13-S5)."""
+    cfg = config_mod.load(env)
+    p = gate.resolve_paths(cfg, "1")
+
+    gate.remember_action(p, "1", {"action": "create_fix", "step": "S1",
+                                  "cause": "блокирующая"}, "карточка t_fix1")
+    gate.remember_action(p, "1", {"action": "create_prompt_fix", "step": "S1"},
+                         "переписать постановку: t_pf")
+    gate.remember_action(p, "1", {"action": "create_step", "step": "S2"}, "карточка t_step")
+
+    rows = history_rows(p.cfg)
+    assert [row["cause"] for row in rows] == ["блокирующая", "", ""]
+    assert rows[0]["action"] == "create_fix" and rows[0]["step"] == "S1"
+    # В состоянии плана (`last_actions`) поле не дублируется: там своя форма записи.
+    assert "cause" not in gate.load_state(p)["last_actions"][-1]
 
 
 def test_history_rotates_by_lines_and_bytes(env: Path):
@@ -290,3 +308,41 @@ def test_metrics_in_snapshot_after_ticks(e2e: Path, hermes_stub: Path):
     assert metrics["step_seconds"]["measured"] == 1
     # Стоп первого тика — внутри действия `create_step`, отдельного `stop` в истории нет.
     assert metrics["incidents"] == 0
+
+
+def round_history() -> list[dict]:
+    """Фикстура §4.6 постановки 13-S5 — та же, что в тестах метрики и ретро."""
+    return [
+        {"ts": 1000.0, "plan": "1", "step": "S1", "action": "create_step"},
+        {"ts": 1100.0, "plan": "1", "step": "S1", "action": "create_fix", "cause": "блокирующая"},
+        {"ts": 1700.0, "plan": "1", "step": "S1", "action": "create_review"},
+        {"ts": 1800.0, "plan": "1", "step": "S1", "action": "create_prompt_fix"},
+        {"ts": 3000.0, "plan": "1", "step": "S1", "action": "create_prompt_review"},
+        {"ts": 3100.0, "plan": "1", "step": "S1", "action": "close_step"},
+        {"ts": 4000.0, "plan": "1", "step": "S2", "action": "create_fix"},
+        {"ts": 4600.0, "plan": "1", "step": "S2", "action": "create_review"},
+        {"ts": 5000.0, "plan": "1", "step": "S2", "action": "create_prompt_fix", "stale": True},
+        {"ts": 6000.0, "plan": "1", "step": "S2", "action": "close_step"},
+        {"ts": 7000.0, "plan": "1", "step": "S3", "action": "close_step"},
+        {"ts": 8000.0, "plan": "1", "step": "S4", "action": "create_fix",
+         "cause": "стилистическая"},
+    ]
+
+
+def test_round_cause_counts_splits_series_and_plan():
+    """Круги плана по причинам: классы, постановка, `неизвестно`; пересборка и ревью — нет.
+
+    Числа фикстуры §4.6 обязаны совпасть с метрикой (`stats.step_rounds_report`): два
+    разбора одного правила — одно место, где они разойдутся (§4.3 п.1).
+    """
+    records = round_history()
+
+    assert gate.round_cause_counts(records, "1") == {
+        "total": 4, "blocking": 1, "significant": 0, "style": 1, "prompt": 1, "unknown": 1}
+    # Пересборка протухшей постановки кругом не считается: у S2 круг один (без причины).
+    assert gate.round_cause_counts([{"action": "create_prompt_fix", "plan": "1", "step": "S2",
+                                     "stale": True}], "1")["total"] == 0
+    # Чужой план не подставляется: счёт по номеру плана, а не по всей истории.
+    assert gate.round_cause_counts(records + [{"action": "create_fix", "plan": "2", "step": "S1",
+                                               "cause": "блокирующая"}], "2")["blocking"] == 1
+    assert gate.round_cause_counts([], "1")["total"] == 0
