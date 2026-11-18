@@ -82,6 +82,11 @@ import plan_cycle  # noqa: E402 - раздел-якорь разведки (пр
 import registry  # noqa: E402 - заголовки, границы разделов, журнал
 import scout_report  # noqa: E402 - словарь исходов и гейт артефакта (R1-R5)
 
+try:  # линтер формы плана — файл движка, но в копии до `setup --upgrade` его нет
+    import plan_lint  # noqa: E402 - модуль рядом
+except ImportError:  # pragma: no cover - проект, не прошедший setup --upgrade
+    plan_lint = None  # type: ignore[assignment]
+
 #: Шапка таблицы вопросов — единственный формат, который разбирает `open_questions`.
 #: Тест сверяет её с шапкой `docs/research/TEMPLATE-questions.md`, как `COLUMNS` у
 #: `scout_report`: шаблон, разбор и счёт открытых ответов — один контракт.
@@ -855,6 +860,21 @@ def _setup_stdio() -> None:
             pass
 
 
+def _lint_lines(root: Path, plan: Path) -> list[str]:
+    """Строки находок линтера формы — дословно те же, что возвращает приём плана (Р4).
+
+    Берётся только блокирующий канал `problems`: предупреждения `warnings` приём не
+    блокируют, и пред-гейт не должен краснеть там, где приём пропускает (Р3). Если линтер
+    рядом с движком не лежит (копия до `setup --upgrade`), вывод прежний, а в stderr —
+    строка с рецептом (Р5): молчаливое «проверок формы нет» дороже одной строки.
+    """
+    if plan_lint is None:
+        print("линтер плана не найден рядом с движком: проверки формы (Л1-Л22) пропущены; "
+              "обнови копию движка: hermes pipeline setup --upgrade", file=sys.stderr)
+        return []
+    return [str(problem) for problem in plan_lint.lint_project(root, str(plan)).problems]
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI анализатора: путь плана и необязательный `--root` (D2)."""
     _setup_stdio()
@@ -885,8 +905,12 @@ def main(argv: list[str] | None = None) -> int:
     plan_rel = cfg.rel(plan)
     for finding in findings:
         print(finding.render(plan_rel))
-    if findings:
-        print(f"ИТОГ: FAIL — находок {len(findings)}")
+    lint_lines = _lint_lines(root, plan)
+    for line in lint_lines:
+        print(line)
+    total = len(findings) + len(lint_lines)
+    if total:
+        print(f"ИТОГ: FAIL — находок {total}")
         return 1
     print("ИТОГ: PASS — расхождений нет")
     return 0

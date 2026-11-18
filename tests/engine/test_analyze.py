@@ -60,7 +60,8 @@ def format_plan(*, decision: str | None = "go", research: bool = True,
         lines += [CONSTITUTION, ""]
     lines += ["Цель: проверить анализатор согласованности артефактов.", ""]
     if research:
-        lines += ["## Разведка", "", "Артефакт: `docs/research/1-prior-art.md`", ""]
+        lines += ["## Разведка", "", "Артефакт: `docs/research/1-prior-art.md`", "",
+                  "Кандидаты: `owner/repo` (лицензия MIT), `other/repo` (Apache-2.0).", ""]
         if decision is not None:
             lines += [f"Решение: {decision} — готового нет, идём своим решением", ""]
     lines += ["## Шаги", "", "### S1. Таблица счетов (1 дн)", "", *s1.splitlines(), ""]

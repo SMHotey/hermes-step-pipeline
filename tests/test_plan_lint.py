@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import helpers  # noqa: F401  (загружает плагин и алиасы модулей)
-from step_pipeline import plan_lint
+from step_pipeline.engine import plan_lint
 from step_pipeline import doctor
 from step_pipeline import plan_accept
 import cli

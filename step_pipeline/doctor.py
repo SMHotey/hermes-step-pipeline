@@ -12,11 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from . import plan_lint
+    from .engine import plan_lint
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
 except ImportError:  # pragma: no cover - отладка файлом
-    import plan_lint  # type: ignore
+    from engine import plan_lint  # type: ignore
     import project as proj  # type: ignore
     import setup_flow  # type: ignore
     import snapshot as snap  # type: ignore

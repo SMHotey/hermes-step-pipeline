@@ -25,7 +25,8 @@ import pytest
 import helpers  # noqa: F401  (загружает плагин и алиасы модулей)
 from helpers import install_project
 import ui_server
-from step_pipeline import plan_accept, plan_lint, plans_add
+from step_pipeline import plan_accept, plans_add
+from step_pipeline.engine import plan_lint
 
 PANEL = {"X-Pipeline-Panel": "1"}
 

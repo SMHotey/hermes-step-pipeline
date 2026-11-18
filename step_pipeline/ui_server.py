@@ -92,7 +92,7 @@ try:
     from . import doctor
     from . import panel_pause
     from . import plan_accept
-    from . import plan_lint
+    from .engine import plan_lint
     from . import plan_mode
     from . import plan_rounds
     from . import plans_add
@@ -106,7 +106,7 @@ except ImportError:  # pragma: no cover
     import doctor  # type: ignore
     import panel_pause  # type: ignore
     import plan_accept  # type: ignore
-    import plan_lint  # type: ignore
+    from engine import plan_lint  # type: ignore
     import plan_mode  # type: ignore
     import plan_rounds  # type: ignore
     import plans_add  # type: ignore

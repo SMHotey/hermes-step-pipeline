@@ -13,22 +13,22 @@
     9. набор шагов в разделе и в журнале совпадает;
     10. файл читается.
 
-Правила разбора плана — ОСОЗНАННАЯ КОПИЯ правил движка (решение D5): плагин не
-импортирует движок как модуль (`project.py`), поэтому регулярки скопированы из
+Правила разбора плана — ОСОЗНАННАЯ КОПИЯ правил движка (решение D5): линтер судит форму
+статически и не переспрашивает движок, поэтому регулярки скопированы из
 `engine/registry.py:31`, `engine/next_step.py:58,62` и `engine/config.py:51`
 символ в символ, а смысл проверок повторяет `next_step.py:92-122,179-197`,
 `registry.py:101-126`. Расхождение с движком — дефект, а не настройка.
+
+Модуль — файл движка (план 15, S3): он копируется в `.pipeline/` проекта вместе с
+остальными модулями и обязан работать без установленного плагина. Поэтому импортов из
+пакета плагина здесь нет, а `pipeline.json` читается локальной `_read_config`.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-
-try:
-    from . import project as proj
-except ImportError:  # pragma: no cover - отладка файлом
-    import project as proj  # type: ignore
 
 # Умолчания конфига (engine/config.py:48, :51).
 _STEPS_MARKER = "шаг"
@@ -118,15 +118,29 @@ def _is_index_file(path: Path) -> bool:
     return name in _INDEX_NAMES or name.startswith("00-")
 
 
+def _read_config(project: Path) -> dict:
+    """`pipeline.json` проекта как словарь (пустой, если файл битый).
+
+    Дословная копия `project.read_config`: линтер — файл движка, а движок работает без
+    установленного плагина, поэтому модули пакета плагина здесь не импортируются.
+    """
+    path = Path(project) / "pipeline.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def _plans_dir(project: Path) -> Path:
     """Каталог планов проекта из `pipeline.json` (умолчание — `docs/plans`)."""
-    cfg = proj.read_config(Path(project))
+    cfg = _read_config(Path(project))
     rel = (cfg.get("paths") or {}).get("plans") or _PLANS_DEFAULT
     return Path(project) / str(rel)
 
 
 def _raw_step_regex(project: Path) -> str:
-    cfg = proj.read_config(Path(project))
+    cfg = _read_config(Path(project))
     return str(cfg.get("step_id_regex") or _STEP_ID_REGEX)
 
 
@@ -145,7 +159,7 @@ def _compile_step_regex(raw: str) -> tuple[re.Pattern | None, str]:
 def settings(project: Path) -> Settings:
     """Маркеры и регулярка шага проекта; битая регулярка — `step_regex = None`."""
     project = Path(project)
-    cfg = proj.read_config(project)
+    cfg = _read_config(project)
     markers = cfg.get("markers") or {}
     steps_marker = str(markers.get("steps") or _STEPS_MARKER).lower()
     journal_marker = str(markers.get("journal") or _JOURNAL_MARKER).lower()

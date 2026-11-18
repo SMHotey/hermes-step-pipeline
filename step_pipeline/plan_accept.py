@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - отладка файлом
     import project as proj  # type: ignore
 
 try:
-    from . import plan_lint
+    from .engine import plan_lint
 except ImportError:  # шаг 1-S8 ещё не сделан — работают запасные проверки
     plan_lint = None  # type: ignore
 

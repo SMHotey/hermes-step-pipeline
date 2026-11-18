@@ -24,12 +24,12 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import plan_lint
+    from .engine import plan_lint
     from . import project as proj
     from . import telegram
     from .engine import config as engine_config
 except ImportError:  # pragma: no cover - запуск файлом при отладке
-    import plan_lint  # type: ignore
+    from engine import plan_lint  # type: ignore
     import project as proj  # type: ignore
     import telegram  # type: ignore
     import config as engine_config  # type: ignore

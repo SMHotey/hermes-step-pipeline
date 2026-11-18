@@ -31,12 +31,12 @@ from typing import Any
 
 try:  # обычный путь — пакет плагина; __main__ — ручная проверка файлом
     from . import plan_accept
-    from . import plan_lint
+    from .engine import plan_lint
     from . import plans_api
     from . import project as proj
 except ImportError:  # pragma: no cover
     import plan_accept  # type: ignore[no-redef]
-    import plan_lint  # type: ignore[no-redef]
+    from engine import plan_lint  # type: ignore[no-redef]
     import plans_api  # type: ignore[no-redef]
     import project as proj  # type: ignore[no-redef]
 

@@ -149,7 +149,7 @@ DEFAULTS: dict = {
 #: в DoorSystem роняли doctor и маркер). Порядок внутри кортежа произвольный: и копирование,
 #: и хеш идут по сортированным именам.
 ENGINE_FILES = ("__init__.py", "analyze.py", "approval.py", "check_task_prompt.py",
-                "config.py", "gate.py", "next_step.py", "plan_cycle.py", "registry.py",
+                "config.py", "gate.py", "next_step.py", "plan_cycle.py", "plan_lint.py", "registry.py",
                 "scout_report.py", "state_io.py", "step_card.py", "tick.py")
 
 # Режимы ревью постановки: иное значение в pipeline.json — ошибка конфигурации, а не
