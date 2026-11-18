@@ -158,7 +158,16 @@ COMPLETE_TRIES = 3
 COMPLETE_PAUSE = 0.25
 
 
-def complete(db: Path, key_suffix: str, status: str = "done", result: str = "") -> int:
+#: Таблица прогонов карточки в поддельной борде: `kanban_complete(summary=…)` пишет
+#: сводку в `task_runs`, а не в `tasks.result` — движок читает оба поля (13-S4).
+TASK_RUNS_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " task_id TEXT NOT NULL, status TEXT NOT NULL, outcome TEXT, summary TEXT,"
+    " started_at INTEGER, ended_at INTEGER)")
+
+
+def complete(db: Path, key_suffix: str, status: str = "done", result: str = "",
+             summary: str | None = None) -> int:
     """Отметить карточку завершённой (как это делает воркер); вернуть число закрытых.
 
     Пустой `UPDATE` — это не «уже закрыто», а «такой карточки нет»: раньше помощник молча
@@ -169,6 +178,10 @@ def complete(db: Path, key_suffix: str, status: str = "done", result: str = "") 
     и к моменту вызова её строки может ещё не быть в базе (гонка `promptfix:2`). Отказ
     остаётся громким: исчерпав попытки, помощник поднимает `AssertionError` тем же
     текстом, а не превращает промах в тихий no-op.
+
+    `summary` — сводка прогона: она уходит строкой в `task_runs` (статус `done`, исход
+    `completed`), как её пишет ядро на `kanban_complete(summary=…)`. Вызовы без `summary`
+    ведут себя ровно как раньше: таблицы прогонов в старой базе может не быть.
     """
     done = 0
     for attempt in range(1, COMPLETE_TRIES + 1):
@@ -177,8 +190,16 @@ def complete(db: Path, key_suffix: str, status: str = "done", result: str = "") 
             cur = con.execute("UPDATE tasks SET status=?, completed_at=?, result=?"
                               " WHERE idempotency_key LIKE ?",
                               (status, int(time.time()), result, "%" + key_suffix))
-            con.commit()
             done = cur.rowcount
+            if done and summary is not None:
+                row = con.execute("SELECT id FROM tasks WHERE idempotency_key LIKE ?",
+                                  ("%" + key_suffix,)).fetchone()
+                now = int(time.time())
+                con.execute(TASK_RUNS_SCHEMA)
+                con.execute("INSERT INTO task_runs (task_id, status, outcome, summary,"
+                            " started_at, ended_at) VALUES (?,?,?,?,?,?)",
+                            (row[0], "done", "completed", summary, now, now))
+            con.commit()
         finally:
             con.close()
         if done > 0:

@@ -683,6 +683,31 @@ def commit_and_push(p: Paths, files: list[str], message: str) -> tuple[bool, str
 
 # ───────────────────────────── доска ─────────────────────────────
 
+def _run_summaries(con: sqlite3.Connection) -> dict[str, str]:
+    """Сводка последнего прогона каждой карточки: `task_runs.summary` (13-S4, §4.3).
+
+    `kanban_complete(summary=…)` не заполняет `tasks.result`, а без сводки ответ
+    исполнителя по форме не нашёлся бы и карточка возвращалась бы зря. Таблицы нет
+    (поддельная борда старых тестов, старая борда) или колонок мало — пустой словарь:
+    чтение борды не имеет права валить тик.
+    """
+    try:
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "task_runs" not in tables:
+            return {}
+        columns = {row[1] for row in con.execute("PRAGMA table_info(task_runs)")}
+        if not {"id", "task_id", "summary"} <= columns:
+            return {}
+        rows = con.execute(
+            "SELECT task_id, COALESCE(summary, '') FROM task_runs"
+            " WHERE id IN (SELECT MAX(id) FROM task_runs GROUP BY task_id)"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {str(task_id): str(summary or "") for task_id, summary in rows}
+
+
 def read_cards(p: Paths, key_prefix: str) -> list[dict]:
     db = Path(p.kanban_db)
     if not db.is_file():
@@ -708,6 +733,7 @@ def read_cards(p: Paths, key_prefix: str) -> list[dict]:
             )
             columns = [item[0] for item in cur.description]
             rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+            summaries = _run_summaries(con)
         finally:
             con.close()
     except (sqlite3.Error, OSError) as exc:
@@ -717,7 +743,8 @@ def read_cards(p: Paths, key_prefix: str) -> list[dict]:
     return [{"id": r["id"], "title": r["title"], "status": r["status"],
              "assignee": r["assignee"], "key": r["idempotency_key"],
              "completed_at": int(r["completed_at"] or 0),
-             "result": r["result"], "error": r["last_failure_error"],
+             "result": r["result"], "summary": summaries.get(str(r["id"]), ""),
+             "error": r["last_failure_error"],
              "created_at": int(r.get("created_at") or 0),
              "started_at": int(r.get("started_at") or 0)} for r in rows]
 
@@ -3006,6 +3033,165 @@ def prompt_stale_card_body(p: Paths, step: dict, decision: dict, report_rel: str
     return "\n".join(lines)
 
 
+# ───────────── форма ответа исполнителя по номерам реестра шага (13-S4) ─────────────
+
+#: Три метки ответа — дословно. Второй копии этих строк в коде нет: карточка, роль и
+#: проверка берут их отсюда.
+FIX_ANSWER_FORMS = ("исправлено", "не находка", "вне объёма шага")
+
+#: Командный токен доказательства: план требует команду и её итог, а не пересказ.
+ANSWER_COMMAND_TOKENS = ("pytest", "python", "git", "grep", "ruff", "hermes")
+
+#: Маркер списка в начале строки ответа (`-`, `*`, `+`, `1.`, `1)`).
+_ANSWER_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+#: Разделитель частей ответа: длинное тире, короткое тире и дефис с пробелами.
+_ANSWER_PART_RE = re.compile(r"\s+[—–-]\s+")
+
+#: Упоминание реестра плана — замена командному токену для формы «вне объёма шага».
+_PLAN_REGISTRY_RE = re.compile(r"plan-\d+-findings\.md")
+
+
+def _answer_line_ok(fid: str, line: str) -> bool:
+    """Отвечает ли строка за номер `fid` в одной из трёх форм (13-S4, §4.2 правила 2–5)."""
+    match = re.match(rf"^{re.escape(fid)}\s*:\s*(.*)$", line)
+    if not match:
+        return False
+    rest = match.group(1).strip()
+    label = next((form for form in FIX_ANSWER_FORMS if rest.startswith(form)), "")
+    if not label:
+        return False
+    tail = rest[len(label):].strip()
+    parts = [part.strip() for part in _ANSWER_PART_RE.split(tail) if part.strip()]
+    if len(parts) < (1 if label == FIX_ANSWER_FORMS[2] else 2):
+        return False
+    lowered = rest.lower()
+    if any(token in lowered for token in ANSWER_COMMAND_TOKENS):
+        return True
+    return label == FIX_ANSWER_FORMS[2] and bool(_PLAN_REGISTRY_RE.search(rest)
+                                                 or "реестр" in lowered)
+
+
+def fix_answer_problems(open_ids: list[str], text: str) -> list[str]:
+    """ID строк реестра шага, по которым ответа формы нет; порядок — как в `open_ids`.
+
+    Чистая функция, как `step_key`: без путей, состояния и subprocess. Один номер может
+    быть отвечен несколькими строками — годится любая, где правила формы выполнены;
+    повтор номера не ошибка. Пустой список — ответ по форме есть у каждого номера.
+    """
+    lines = [_ANSWER_BULLET_RE.sub("", raw) for raw in str(text or "").splitlines()]
+    return [fid for fid in open_ids
+            if fid and not any(_answer_line_ok(fid, line) for line in lines)]
+
+
+def fix_answer_text(card: dict) -> str:
+    """Текст ответа исполнителя: `result` плюс `summary`, склеенные переводом строки.
+
+    Оба поля обязательны: `kanban_complete(summary=…)` не заполняет `tasks.result`, а
+    закрытие через `result=` не заполняет `task_runs.summary` (§4.3). Проверка формы по
+    одному полю возвращала бы карточку живому исполнителю за то, что он ответил «не туда».
+    """
+    return "\n".join(str(card.get(key) or "") for key in ("result", "summary")).strip()
+
+
+def fix_return_cards(cards: list[dict], round_no: int) -> list[dict]:
+    """Карточки возврата правок круга: ключи с суффиксом `:fix:<круг>:return`.
+
+    Чистая функция: в `fixes`/`attempt` такие карточки не попадают (`card_of` берёт только
+    `:fix` и `:fix:<N>`), поэтому номера кругов возврат не сдвигает.
+    """
+    suffix = f":fix:{round_no}:return"
+    return [card for card in cards if str(card.get("key") or "").endswith(suffix)]
+
+
+def fix_answer_block(p: Paths, step: dict, open_lines: list[str] | None = None) -> list[str]:
+    """Блок формы ответа для карточки правок (13-S4, §4.1).
+
+    Печатается тем же условием, что блок реестра: открытых строк нет — пустой список и
+    тело карточки дословно прежнее. Метки трёх форм берутся из `FIX_ANSWER_FORMS`.
+    """
+    lines = open_step_findings_lines(p, step) if open_lines is None else open_lines
+    if not lines:
+        return []
+    return [
+        "ФОРМА ОТВЕТА ПО КАЖДОМУ НОМЕРУ РЕЕСТРА (обязательно)",
+        f"- Ответить на КАЖДЫЙ открытый номер: сейчас их {len(lines)} (`F1…`); одна строка "
+        "на номер, ровно одна из трёх форм:",
+        f"  `F1: {FIX_ANSWER_FORMS[0]} — <коммит/файл> — <команда и итог>`",
+        f"  `F1: {FIX_ANSWER_FORMS[1]} — <почему, с доказательством> — <команда>`",
+        f"  `F1: {FIX_ANSWER_FORMS[2]} — в реестр плана <строка>`",
+        "- Форма по номеру и есть его строка реестра шага: ID берётся из реестра, а не",
+        "  из абзаца отчёта ревьюера.",
+        "- Ответ писать в `kanban_complete` (`result` и `summary`), карточку закрывать только",
+        "  с ответом: по нему судит страж, иначе ответа не увидит никто.",
+        "- «Не находка» — законный ответ, но только с доказательством: команда и её вывод;",
+        "  спор без доказательства остаётся находкой.",
+        "- Ответ без формы — незакрытый пункт: новый круг не заказывается, карточка",
+        "  возвращается тем же кругом один раз.",
+        "",
+    ]
+
+
+def fix_return_problem_lines(p: Paths, step: dict, problems: list[str]) -> list[str]:
+    """Строки реестра шага только по пунктам без формы — повод возврата (13-S4, §4.5)."""
+    wanted = {str(item) for item in problems}
+    rows = [line for line in open_step_findings_lines(p, step)
+            if line.startswith("- ") and line[2:].split(" ", 1)[0].rstrip(":") in wanted]
+    return rows or [f"- {item}: строка реестра шага не найдена — сверься с реестром"
+                    for item in problems]
+
+
+def fix_return_card_body(p: Paths, step: dict, round_no: int, problems: list[str],
+                         report_rel: str) -> str:
+    """Карточка возврата правок: ответ не по форме, круг тот же (13-S4, §4.5)."""
+    plan_rel = p.cfg.rel(Path(p.plan_file))
+    ids = ", ".join(problems)
+    return "\n".join([
+        f"ВОЗВРАТ ПРАВОК шага {step['id']} плана {p.plan_id} — {step['title']} "
+        f"(круг {round_no})",
+        "",
+        f"Ответ карточки правок не по форме: пункт {ids} без формы.",
+        f"Реестр находок шага: `{step_findings_rel(p, step['id'])}`; "
+        f"отчёт ревью: `{report_rel}`.",
+        f"Контракт шага — `{plan_rel}` §{step['id']}, критерий: {step.get('dod', '')}",
+        "",
+        "ПУНКТЫ БЕЗ ФОРМЫ",
+        *fix_return_problem_lines(p, step, problems),
+        "",
+        "ФОРМА ОТВЕТА (одна строка на номер, метка дословно)",
+        f"- `F1: {FIX_ANSWER_FORMS[0]} — <коммит/файл> — <команда и итог>`",
+        f"- `F1: {FIX_ANSWER_FORMS[1]} — <почему, с доказательством> — <команда>`",
+        f"- `F1: {FIX_ANSWER_FORMS[2]} — в реестр плана <строка>`",
+        "- «Не находка» — законный ответ, но только с доказательством: команда и её вывод.",
+        "",
+        "ЭТО НЕ НОВЫЙ КРУГ",
+        f"- Круг {round_no} тот же: правки круга не переделывать, повторный коммит не нужен,",
+        "  если он уже был.",
+        "- Ответ на каждый пункт — в `kanban_complete` (`result` и `summary`): по этому",
+        "  тексту страж проверяет форму.",
+        "- Второй неформальный ответ уходит на ревью: возврат на круг один.",
+        "",
+        "ГЕЙТЫ КРУГА",
+        *[f"  - {gate}" for gate in step.get("gates") or []],
+    ])
+
+
+def fix_return_comment_body(p: Paths, step: dict, round_no: int, problems: list[str],
+                            fix_card_id: str | None) -> str:
+    """Комментарий в карточку правок: какие пункты вернулись без формы (13-S4, §4.5)."""
+    return "\n".join([
+        f"ВОЗВРАТ ПРАВОК: шаг {step['id']} плана {p.plan_id} — {step['title']} "
+        f"(круг {round_no})",
+        f"Карточка правок: {fix_card_id or '—'}",
+        f"Реестр шага: {step_findings_rel(p, step['id'])}",
+        "",
+        "Пункты без формы — ответить по номеру одной строкой:",
+        *fix_return_problem_lines(p, step, problems),
+        "Формы: " + "; ".join(f"`{form}`" for form in FIX_ANSWER_FORMS)
+        + "; ответ — в `kanban_complete` (`result` и `summary`).",
+    ])[:COMMENT_MAX_LEN]
+
+
 def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
                   max_rounds: int = 0, report_verdict: str = "") -> str:
     """Карточка правок шага. `max_rounds` — предел кругов по риску шага (`step_fix_limit`).
@@ -3018,6 +3204,9 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
     С шага 13-S2 карточка несёт блок открытых находок реестра шага (только их закрывает
     круг) и говорит правду о поводе круга (`_step_fix_verdict_line`): реестр держит шаг и
     при `APPROVE` в отчёте. Нет реестра или открытых строк — тело дословно прежнее.
+
+    С шага 13-S4 к блоку реестра добавлен блок формы ответа (`fix_answer_block`): ответ на
+    каждый открытый номер одной из трёх форм, иначе карточка вернётся тем же кругом.
     """
     plan_rel = p.cfg.rel(Path(p.plan_file))
     round_label = f"(круг {round_no} из {max_rounds})" if max_rounds else f"(круг {round_no})"
@@ -3038,6 +3227,7 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
             "останавливает конвейер и уходит владельцу — доведи находки до конца.",
         ]
     registry = step_findings_block(p, step)
+    answer = fix_answer_block(p, step)
     # Разбор классов отчёта (13-S3): разбор делает S1, второй не пишем — карточка печатает счёт.
     classes = report_finding_classes_at(Path(p.repo) / report_rel)
     classes_line = (f"Классы находок отчёта: блокирующих {classes['blocking']}, "
@@ -3053,6 +3243,7 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
         classes_line,
         "",
         *registry,
+        *answer,
         "ЧТО ДЕЛАТЬ",
         "- Исправить БЛОКИРУЮЩИЕ находки полностью; значимые — по существу (не косметикой).",
         "- Находка — это класс: проверить соседние вызовы, ветки и тесты на тот же дефект",
@@ -3762,6 +3953,35 @@ def _decide_base(ctx: dict) -> dict:
             return {"action": "stop", "step": sid,
                     "reason": f"карточка правок {this_fix[-1]['id']} в статусе "
                               f"{this_fix[-1]['status']}: {detail}"}
+        # Возврат карточки правок (13-S4, §4.4): ответ исполнителя не по форме — карточка
+        # возврата того же круга. Стоит ПОСЛЕ проверок карточки правок: пока она не закрыта,
+        # судить нечего, и пока карточка возврата не закрыта — шаг ждёт ту же работу того же
+        # исполнителя (`idle`, а не стоп). Возврат один на круг: он уже был — идём в ревью.
+        returns = fix_return_cards(cards, attempt - 1)
+        if returns:
+            last_return = returns[-1]
+            if last_return["status"] not in TERMINAL:
+                return {"action": "idle",
+                        "reason": f"возврат карточки правок {sid} в работе: "
+                                  f"карточка {last_return['id']} "
+                                  f"({last_return['status']})"}
+            if last_return["status"] != "done":
+                detail = (last_return.get("error") or last_return.get("result") or "")[:300]
+                return {"action": "stop", "step": sid,
+                        "reason": f"карточка возврата правок {last_return['id']} в статусе "
+                                  f"{last_return['status']}: {detail}"}
+            return {"action": "create_review", "step": sid, "data": step, "attempt": attempt,
+                    "parent": last_return["id"]}
+        # Номера для проверки формы — открытые строки реестра шага, а не пункты отчёта:
+        # `decide` остаётся чистой функцией от `ctx`. Нет открытых строк (или реестра) —
+        # проверки нет: шаг без реестра обязан закрываться как раньше (13-S2).
+        open_ids = [str(item.get("id") or "") for item in open_step_findings(ctx)]
+        problems = (fix_answer_problems(open_ids, fix_answer_text(this_fix[-1]))
+                    if this_fix else [])
+        if problems:
+            return {"action": "create_fix_return", "step": sid, "data": step,
+                    "round": attempt - 1, "problems": problems,
+                    "parent": this_fix[-1]["id"]}
         return {"action": "create_review", "step": sid, "data": step, "attempt": attempt,
                 "parent": this_fix[-1]["id"] if this_fix else last_step["id"]}
     last_review = reviews[-1]
@@ -7132,6 +7352,42 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                                               decision.get("parent")))
         else:
             say(f"ревью {step['id']}: REQUEST_CHANGES, но карточку правок создать не удалось")
+        return result
+    if action == "create_fix_return":
+        # Возврат карточки правок того же круга (13-S4, §4.5): ответ не по форме. Новой
+        # карточки круга нет — ключ с суффиксом `:return`, и `fixes` от неё не растёт.
+        step, round_no = decision["data"], int(decision.get("round") or 1)
+        problems = [str(item) for item in (decision.get("problems") or []) if str(item)]
+        fix_card_id = decision.get("parent")
+        fix_card = next((card for card in (ctx.get("cards") or [])
+                         if str(card.get("id") or "") == str(fix_card_id)), {})
+        assignee = str(fix_card.get("assignee") or "")
+        if not assignee:
+            # Чужой профиль возврату не назначается: пусто в карточке — маршрут шага.
+            assignee, reason = assignee_or_stop(step)
+            if assignee is None:
+                return result
+        key = f"planloop:{plan_id}:{step['id']}:fix:{round_no}:return"
+        report_rel = _report_rel(p, step["id"])
+        cid = create_card(
+            p, f"[возврат правок {plan_id} {step['id']} #{round_no}] {step['title']}",
+            fix_return_card_body(p, step, round_no, problems, report_rel),
+            assignee, key, p.cfg.step_skills,
+            parent=fix_card_id, max_runtime=p.cfg.step_runtime)
+        ids = ", ".join(problems)
+        result.update(applied=bool(cid), detail=f"возврат карточки правок: {cid}, "
+                                               f"без формы: {ids}")
+        touch(f"create_fix_return:{cid}")
+        if cid:
+            say(f"план {plan_id}, шаг {step['id']}: ответ без формы по пунктам {ids} — "
+                f"вернул карточку, круг {round_no}, возврат 1 из 1")
+            # Комментарий по номерам — уведомление, а не источник факта: отказ не меняет
+            # result и не рвёт тик.
+            _comment(p, str(fix_card_id or ""),
+                     fix_return_comment_body(p, step, round_no, problems, fix_card_id))
+        else:
+            say(f"план {plan_id}, шаг {step['id']}: ответ без формы по пунктам {ids}, "
+                f"но карточку возврата создать не удалось")
         return result
     if action == "close_step":
         step, verdict = decision["data"], decision["verdict"]

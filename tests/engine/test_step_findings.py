@@ -229,7 +229,8 @@ def first_fix(root: Path, p, db: Path, spy) -> None:
     """
     res = gate.run_gate(p, notify_fn=quiet, create_card=spy)
     assert res["decision"]["action"] == "create_fix", res["decision"]
-    complete(db, ":fix:1")
+    complete(db, ":fix:1", result="F1: исправлено — step_pipeline/engine/gate.py — "
+                                  "pytest tests/engine/test_step_findings.py → 12 passed")
     res = gate.run_gate(p, notify_fn=quiet, create_card=spy)
     assert res["decision"]["action"] == "create_review", res["decision"]
     complete(db, ":review:2")
