@@ -349,6 +349,26 @@ def test_effective_verdict_by_registry():
 
 # ───────────────────────────── живые тики ─────────────────────────────
 
+def test_status_derived_from_class():
+    """Статус — из класса: «стиль» шаг не держит, «двусмысленность» держит (0.37.2)."""
+    raw = [{"id": "F1", "kind": "стиль", "status": "открыто"},
+           {"id": "F2", "kind": "двусмысленность", "status": "не блокирует"},
+           {"id": "F3", "kind": "гейт-исполнение", "status": "открыто"},
+           {"id": "F4", "kind": "двусмысленность", "status": "закрыто"}]
+    rows = gate.prompt_findings_status(raw)
+    assert [row["status"] for row in rows] == ["не блокирует", "открыто", "открыто",
+                                               "закрыто"]
+    assert raw[0]["status"] == "открыто", "исходные строки не правятся: их печатает карточка"
+
+    # Подпись «открыто» у стиля шаг не держит, хотя ревьюер так и написал.
+    view = gate.effective_prompt_verdict(ctx_with("APPROVE", rows[:1]))
+    assert view["verdict"] == "APPROVE" and view["open"] == []
+
+    # «не блокирует» у двусмысленности старт не открывает: класс сильнее подписи.
+    view = gate.effective_prompt_verdict(ctx_with("APPROVE", rows))
+    assert view["verdict"] == "REQUEST_CHANGES" and view["open"] == ["F2", "F3"]
+
+
 def test_conflict_falls_through_to_registry(stand, monkeypatch):
     """Отчёт APPROVE + открытая находка: круг правок, а не старт шага.
 

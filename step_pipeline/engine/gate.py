@@ -286,6 +286,15 @@ FINDING_ID_RE = re.compile(r"F(\d+)")
 FINDINGS_KEYS = ("id", "step", "kind", "text", "action", "status")
 PROMPT_FINDINGS_HEADER = ("ID", "Класс", "Находка", "Что сделать", "Статус")
 PROMPT_FINDINGS_KEYS = ("id", "kind", "text", "action", "status")
+# Блокирующая сила находки постановки (0.37.2) — из класса, а не из подписи ревьюера.
+# Симптом, ради которого правило заведено: три круга правок постановки 9-S2 держались
+# строками «двусмысленность» (находки настоящие — постановка неверно описывала ветви кода),
+# а соседние строки того же веса («стиль») шаг не держали: статус ставился на глаз, и один
+# класс то держал шаг, то нет. `закрыто` остаётся за ревьюером: это утверждение о факте
+# правки, а не степень важности.
+PROMPT_FINDING_STATUS = {"замысел": "открыто", "двусмысленность": "открыто",
+                         "гейт-исполнение": "открыто", "формат-стража": "не блокирует",
+                         "стиль": "не блокирует"}
 # Классы находок в отчёте ревью шага (план 13, S1): метка в квадратных скобках в пункте
 # раздела «Находки». Сверка вердикта с классами решает, откроется ли круг правок, поэтому
 # разбор один: `report_finding_classes` считает, `_decide_base` решает.
@@ -2781,8 +2790,9 @@ def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
     head = head_commit(p) or "—"
     findings_path = prompt_findings_path(p, step["id"])
     try:
-        rows = findings_table(load_findings(findings_path, PROMPT_FINDINGS_HEADER,
-                                            PROMPT_FINDINGS_KEYS),
+        rows = findings_table(prompt_findings_status(
+                                  load_findings(findings_path, PROMPT_FINDINGS_HEADER,
+                                                PROMPT_FINDINGS_KEYS)),
                               PROMPT_FINDINGS_HEADER, PROMPT_FINDINGS_KEYS)
         # Файл с одной шапкой значит «находок пока нет», а не «реестра ещё нет».
         registry_lines = rows if findings_path.is_file() else [
@@ -2821,9 +2831,15 @@ def prompt_review_card_body(p: Paths, step: dict, report_rel: str,
         "РЕЕСТР НАХОДОК ПОСТАНОВКИ (обязательно)",
         f"- Файл: `{prompt_findings_rel(p, step['id'])}`; шапка таблицы — "
         f"`{findings_table([], PROMPT_FINDINGS_HEADER, PROMPT_FINDINGS_KEYS)[0]}`.",
-        "- Блокирует вердикт только статус `открыто`: `закрыто` и `не блокирует` старт шага",
-        "  не держат. Класс (`замысел`, `двусмысленность`, `формат-стража`, `гейт-исполнение`,",
-        "  `стиль`) выбирает маршрут находки, а не вердикт.",
+        "- Статус выводится стражем из класса, а не ставится подписью: `замысел`,",
+        "  `двусмысленность`, `гейт-исполнение` держат старт шага; `формат-стража` и `стиль`",
+        "  нет. `закрыто` ставится только с фактом правки.",
+        "- Находка класса `двусмысленность` обязана назвать ДВА чтения и наблюдаемую разницу:",
+        "  что разойдётся в коде или тесте. Разницы нет — это `стиль`, и шаг он не держит:",
+        "  рассуждение о формулировке не повод для круга правок постановки.",
+        "- Находка «постановка не говорит, в какой ветви вставлять код» — тоже `стиль`:",
+        "  постановка задаёт поведение и приёмку, место вставки выбирает исполнитель, если",
+        "  гейты зелены. Сверять надо расхождение с планом и кодом, а не наличие инструкции.",
         "- Открытые ID закрыть фактом или подтвердить статус, новые находки добавлять строками",
         "  с новым F-N. Закрытые повторно не поднимаются.",
         "- `закрыто` — только с фактом: адрес-символ (`файл.py::символ`) в действующей",
@@ -3530,9 +3546,9 @@ def build_ctx(p: Paths) -> dict:
             # реестр выглядел как «файл есть, открытых нет» — то есть APPROVE по отчёту
             # REQUEST_CHANGES и «правка закрыла всё» у правила «0 закрытых».
             findings_text = read_findings_text(prompt_findings_file)
-            ctx["prompt_findings"] = parse_findings(findings_text, prompt_findings_file,
-                                                   PROMPT_FINDINGS_HEADER,
-                                                   PROMPT_FINDINGS_KEYS)
+            ctx["prompt_findings"] = prompt_findings_status(
+                parse_findings(findings_text, prompt_findings_file,
+                               PROMPT_FINDINGS_HEADER, PROMPT_FINDINGS_KEYS))
             ctx["prompt_findings_exists"] = bool(findings_text.strip())
         except (GateError, OSError, ValueError) as exc:
             ctx["prompt_findings"] = []
@@ -4380,6 +4396,29 @@ def open_findings_lines(ctx: dict) -> list[str]:
     return [f"{item.get('id')} ({item.get('step')}): {item.get('text')} — {item.get('action')}"
             for item in (ctx.get("plan_findings") or [])
             if str(item.get("status") or "") == "открыто"]
+
+
+def prompt_findings_status(rows: list[dict]) -> list[dict]:
+    """Статус находки постановки — по классу; `закрыто` остаётся за ревьюером.
+
+    Симптом: подпись «Статус» ставилась на глаз, и один и тот же класс то держал шаг, то нет
+    (9-S2: «стиль» — `не блокирует`, рядом «двусмысленность» с тем же весом — `открыто`).
+    Теперь держит шаг класс, а не оценка: `замысел`, `двусмысленность` и `гейт-исполнение`
+    (неисполнимый гейт держит шаг так же, как неверная приёмка) — держат; `формат-стража`
+    и `стиль` — нет. `закрыто` не переписывается: это утверждение
+    о факте правки, а не степень важности, и закрывать может только ревьюер.
+
+    Возвращается копия: те же строки печатает карточка ревью, и правка на месте дала бы
+    расхождение между напечатанным и посчитанным вердиктом.
+    """
+    out: list[dict] = []
+    for item in rows or []:
+        row = dict(item)
+        kind = str(row.get("kind") or "")
+        if str(row.get("status") or "") != "закрыто" and kind in PROMPT_FINDING_STATUS:
+            row["status"] = PROMPT_FINDING_STATUS[kind]
+        out.append(row)
+    return out
 
 
 def effective_prompt_verdict(ctx: dict) -> dict | None:
