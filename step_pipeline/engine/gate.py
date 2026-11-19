@@ -1238,6 +1238,28 @@ def _id_hint(id_prefix: str, id_sep: str) -> str:
     return f"{id_prefix}{id_sep}N" if id_sep else f"{id_prefix}<число>"
 
 
+def _status_of(raw, statuses: tuple) -> str | None:
+    """Статус строки реестра: слово словаря, даже если автор дописал пояснение.
+
+    Гейт решает по слову, а не по форме записи: `закрыто (круг 1: …)`, `Закрыто: сделано`,
+    `не блокирует — принято` читаются как `закрыто`/`не блокирует` (случай 18.11.2026:
+    реестр постановки S3 остановил план инцидентом из-за пояснения в ячейке статуса).
+    Слово берётся только целым — после него обязана идти граница: пробел, скобка,
+    двоеточие, тире, знак препинания или конец строки; `закрытое` статусом не становится,
+    иначе опечатка в слове открыла бы шаг. Регистр не важен: реестр шага пишет `Закрыто:`.
+    """
+    text = " ".join(str(raw or "").split())
+    folded = text.casefold()
+    for status in sorted(statuses, key=len, reverse=True):
+        word = str(status).casefold()
+        if not folded.startswith(word):
+            continue
+        rest = folded[len(word):]
+        if not rest or not (rest[0].isalnum() or rest[0] == "_"):
+            return str(status)
+    return None
+
+
 def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
                    keys: tuple = FINDINGS_KEYS, *,
                    id_re: re.Pattern = FINDING_ID_RE, id_prefix: str = "F", id_sep: str = "",
@@ -1291,9 +1313,12 @@ def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
         if kinds and "kind" in item and item["kind"] not in kinds:
             raise GateError(f"{what}: класс {item['kind']!r} вне словаря "
                             f"({' | '.join(kinds)}): {path}")
-        if "status" in keys and item["status"] not in statuses:
-            raise GateError(f"{what}: статус {item['status']!r} вне словаря "
-                            f"({' | '.join(statuses)}): {path}")
+        if "status" in keys:
+            status = _status_of(item["status"], statuses)
+            if status is None:
+                raise GateError(f"{what}: статус {item['status']!r} вне словаря "
+                                f"({' | '.join(statuses)}): {path}")
+            item["status"] = status
         found.append(item)
     return found
 
@@ -1340,7 +1365,7 @@ def write_findings(path, findings: list[dict], header: tuple = FINDINGS_HEADER,
     """
     path = Path(path)
     id_hint = _id_hint(id_prefix, id_sep)
-    rows = list(findings or [])
+    rows = [dict(item) for item in (findings or [])]
     if "id" in keys:
         ids = [str(item.get("id") or "") for item in rows]
         repeat = sorted({item for item in ids if ids.count(item) > 1})
@@ -1353,9 +1378,12 @@ def write_findings(path, findings: list[dict], header: tuple = FINDINGS_HEADER,
         if kinds and "kind" in item and item.get("kind") not in kinds:
             raise GateError(f"{what}: класс {item.get('kind')!r} вне словаря "
                             f"({' | '.join(kinds)}): {path}")
-        if "status" in keys and item.get("status") not in statuses:
-            raise GateError(f"{what}: статус {item.get('status')!r} вне словаря "
-                            f"({' | '.join(statuses)}): {path}")
+        if "status" in keys:
+            status = _status_of(item.get("status"), statuses)
+            if status is None:
+                raise GateError(f"{what}: статус {item.get('status')!r} вне словаря "
+                                f"({' | '.join(statuses)}): {path}")
+            item["status"] = status
     heading = title or _findings_title(path, title_kind, title_prefix)
     preamble = _findings_preamble(path, header) or [heading, ""]
     state_io.atomic_write_text(path, "\n".join(preamble + findings_table(rows, header, keys))
@@ -4422,7 +4450,7 @@ def _plan_growth_limits(raw) -> dict:
     """
     limit = {"percent": PLAN_GROWTH_PERCENT,
              "chars_per_finding": PLAN_GROWTH_CHARS_PER_FINDING,
-             "enforce": True}
+             "enforce": False}
     raw = raw if isinstance(raw, dict) else {}
     if isinstance(raw.get("enforce"), bool):
         limit["enforce"] = raw["enforce"]
@@ -4451,13 +4479,20 @@ def _percent_text(value) -> str:
 
 
 def plan_growth_report(before: int, after: int, closed: int, percent,
-                       chars_per_finding) -> dict:
+                       chars_per_finding, ordered: int = 0) -> dict:
     """Замер расширения плана: рост, обе границы допуска и превышение (план 7, S4).
 
-    Допуск — МЕНЬШЕЕ из двух границ: процента версии плана и символов на каждую закрытую
-    находку. Большее из них работало бы как «правке всегда выгодная граница»: при плане на
-    10000 символов и десяти находках граница находок (4000) перекрывала бы процент (1000),
-    и лимит не ограничивал бы ничего.
+    Допуск — МЕНЬШЕЕ из двух границ: процента версии плана и символов на каждую находку,
+    ради которой правку заказывали. Большее из них работало бы как «правке всегда выгодная
+    граница»: при плане на 10000 символов и десяти находках граница находок (4000)
+    перекрывала бы процент (1000), и лимит не ограничивал бы ничего.
+
+    `ordered` — сколько находок карточка правок получила при заказе (снимок версии до
+    правки). Без него граница считалась по числу находок, ЗАКРЫТЫХ на том же круге, а на
+    первом круге их всегда ноль: допуск выходил нулевой, и любая правка по ревью упиралась
+    в стоп — то есть проверка наказывала ровно за то, ради чего ревью существует (решение
+    владельца 19.11.2026). Закрытые находки остаются нижней границей смысла: закрыто
+    больше, чем заказано, — бюджет растёт вместе с ними.
 
     `percent` в результате — фактический рост в процентах (`growth * 100 / before`), а не
     потолок из конфига: цифра читается владельцем в стоп-сигнале и в состоянии плана, и
@@ -4467,21 +4502,24 @@ def plan_growth_report(before: int, after: int, closed: int, percent,
     before = max(_as_int(before, 0), 0)
     after = max(_as_int(after, 0), 0)
     closed = max(_as_int(closed, 0), 0)
+    ordered = max(_as_int(ordered, 0), 0)
     percent = max(_as_int(percent, PLAN_GROWTH_PERCENT), 0)
     chars_per_finding = max(_as_int(chars_per_finding, PLAN_GROWTH_CHARS_PER_FINDING), 0)
     growth = max(after - before, 0)
     percent_cap = before * percent // 100
-    per_finding_cap = chars_per_finding * closed
+    budget = max(closed, ordered)
+    per_finding_cap = chars_per_finding * budget
     allowed = min(percent_cap, per_finding_cap)
     if before <= 0:
         # Сравнивать не с чем: не наказываем и не считаем рост долей пустого знаменателя.
         return {"before": before, "after": after, "growth": growth, "percent": 0.0,
-                "percent_cap": 0, "per_finding_cap": per_finding_cap,
-                "allowed": 0, "closed": closed, "over": False}
+                "percent_cap": 0, "per_finding_cap": per_finding_cap, "ordered": ordered,
+                "allowed": 0, "closed": closed, "budget": budget, "over": False}
     return {"before": before, "after": after, "growth": growth,
             "percent": growth * 100.0 / before,
             "percent_cap": percent_cap, "per_finding_cap": per_finding_cap,
-            "allowed": allowed, "closed": closed, "over": growth > allowed}
+            "allowed": allowed, "closed": closed, "ordered": ordered, "budget": budget,
+            "over": growth > allowed}
 
 
 def plan_fix_snapshot(p: Paths, round_no: int, ctx: dict, findings: list[str]) -> dict:
@@ -4509,21 +4547,27 @@ def plan_fix_snapshot(p: Paths, round_no: int, ctx: dict, findings: list[str]) -
     }
 
 
-def _closed_findings(ctx: dict, baseline: dict) -> tuple[int, list[str]]:
-    """Сколько находок правки закрыто и какие: по реестру, иначе по списку карточки (S4).
+def _closed_findings(ctx: dict, baseline: dict) -> tuple[int, list[str], int]:
+    """Сколько находок правки закрыто, какие именно и сколько было заказано (S4).
 
     Мера — реестр находок плана (`docs/reviews/plan-<N>-findings.md`): открытые ID записаны
     в базовую версию при заказе правки, и закрытыми считаются те, что сменили статус на
-    `закрыто`. План без реестра (и база, записанная до появления `open_ids`) считается
-    по-старому: числом находок карточки правок.
+    `закрыто`. Третье число — бюджет допуска: столько находок правка получила при заказе.
+    Считать допуск только по закрытым нельзя: на первом круге статусы ещё `открыто` (их
+    меняет сама правка), и допуск выходил нулевым — любая правка по ревью упиралась в стоп
+    (находка владельца 19.11.2026, план 2 проекта self-analyzer).
+
+    План без реестра (и база, записанная до появления `open_ids`) считается по-старому:
+    числом находок карточки правок — и как бюджет, и как закрытые.
     """
     open_ids = [str(item) for item in (baseline.get("open_ids") or []) if str(item or "")]
     rows = ctx.get("plan_findings") or []
     if open_ids and rows:
         statuses = {str(item.get("id") or ""): str(item.get("status") or "") for item in rows}
         closed = [fid for fid in open_ids if statuses.get(fid) == "закрыто"]
-        return len(closed), closed
-    return max(_as_int(baseline.get("findings_open"), 0), 0), []
+        return len(closed), closed, len(open_ids)
+    findings_open = max(_as_int(baseline.get("findings_open"), 0), 0)
+    return findings_open, [], findings_open
 
 
 def _plan_growth_decision(ctx: dict) -> dict | None:
@@ -4554,13 +4598,20 @@ def _plan_growth_decision(ctx: dict) -> dict | None:
     limits = _plan_growth_limits(ctx.get("max_plan_growth"))
     percent = limits["percent"]
     chars_per_finding = limits["chars_per_finding"]
-    closed, closed_ids = _closed_findings(ctx, baseline)
+    closed, closed_ids, ordered = _closed_findings(ctx, baseline)
     report = plan_growth_report(baseline.get("chars"), ctx.get("plan_version_chars"), closed,
-                                percent, chars_per_finding)
+                                percent, chars_per_finding, ordered)
     if not report["over"]:
         return None
     if not limits["enforce"]:
-        return None                       # владелец выключил стоп: план растёт, шаги идут
+        # Владелец понизил правило до замера (умолчание с 19.11.2026): план вырос сверх
+        # допуска, но работу не останавливаем — цифры уходят в состояние плана, шаги идут.
+        percent_text = _percent_text(report["percent"])
+        return {"action": "note_growth", "kind": "owner", "growth": report,
+                "reason": (f"правка расширила план на {percent_text}% "
+                           f"({report['growth']} символов: было {report['before']}, стало "
+                           f"{report['after']}) сверх допуска {report['allowed']} — замер, "
+                           f"исполнение продолжается")}
     percent_text = _percent_text(report["percent"])
     card_id = str(fixes[-1].get("id") or "")
     reason = (f"правка плана расширила план на {percent_text}% ({report['growth']} символов: "
@@ -4592,6 +4643,23 @@ def _plan_growth_decision(ctx: dict) -> dict | None:
     return {"action": "stop", "plan_review": True, "kind": "owner", "growth": report,
             "reason": reason, "details": details,
             "comment": {"card": card_id, "text": comment_text}}
+
+
+def _record_plan_growth(state: dict, ctx: dict, growth: dict) -> None:
+    """Положить замер расширения плана в состояние: цифры, время и метка версии.
+
+    Метка `reported_version_sha256` — «по этой версии плана решение уже вынесено»: без неё
+    owner-стоп (или замер) повторялся бы каждый тик и после каждого `--resume`. Отчёт
+    кладётся целиком, а не одной дельтой: по состоянию читаются и границы, и число
+    закрытых находок — иначе «доложено» не диагностируется по цифрам.
+    """
+    state["plan_growth_report"] = dict(growth, at=time.strftime("%d.%m.%Y %H:%M:%S"))
+    baseline = state.get("plan_fix_baseline")
+    if isinstance(baseline, dict):
+        baseline["reported_version_sha256"] = str(
+            (ctx.get("approval") or {}).get("version_sha256") or "")
+        baseline["reported_growth"] = dict(growth)
+        baseline["reported_at"] = state["plan_growth_report"]["at"]
 
 
 def _plan_review_decision(ctx: dict) -> dict | None:
@@ -7509,6 +7577,18 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         touch(f"retro:{p.plan_id}")
         say(f"📝 план {p.plan_id} закрыт — ретроспектива: {rel} (заполняет владелец)")
         return result
+    if action == "note_growth":
+        # Правило понижено до замера (умолчание с 19.11.2026): цифры в состояние, работа
+        # дальше. Состояние сохраняется здесь же: метка версии в базе правки не даёт писать
+        # этот же замер каждый тик — без записи на диск тик повторял бы замер бесконечно.
+        growth = decision.get("growth")
+        detail = str(decision.get("reason") or "замер роста плана")
+        if isinstance(growth, dict) and growth:
+            _record_plan_growth(state, ctx, growth)
+            save_state(p, state)
+            touch(f"growth:{p.plan_id}")
+        result.update(applied=False, detail=detail)
+        return result
     if action == "stop":
         reason = decision.get("reason", "")
         # Отчёт о расширении плана (S4) — в состояние плана: цифры переживают тик, а метка
@@ -7516,15 +7596,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         # повторялся бы после каждого `--resume`).
         growth = decision.get("growth")
         if isinstance(growth, dict) and growth:
-            state["plan_growth_report"] = dict(growth, at=time.strftime("%d.%m.%Y %H:%M:%S"))
-            baseline = state.get("plan_fix_baseline")
-            if isinstance(baseline, dict):
-                baseline["reported_version_sha256"] = str(
-                    (ctx.get("approval") or {}).get("version_sha256") or "")
-                # Отчёт целиком, а не одна дельта: по состоянию должны читаться и границы,
-                # и число закрытых находок — иначе «доложено» не диагностируется по цифрам.
-                baseline["reported_growth"] = dict(growth)
-                baseline["reported_at"] = state["plan_growth_report"]["at"]
+            _record_plan_growth(state, ctx, growth)
         # Отметка «доложено» у правила «0 закрытых» (12-S2): owner-стоп ставится один раз,
         # иначе он повторялся бы каждый тик и после `--resume`. Касается только решения с
         # `zero_fix`: прочие стопы базу правки не трогают и правило не гасят.

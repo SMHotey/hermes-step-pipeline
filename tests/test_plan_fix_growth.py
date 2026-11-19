@@ -23,7 +23,7 @@ import approval  # noqa: E402 - движок импортирует соседе
 import config as config_mod  # noqa: E402
 import gate  # noqa: E402
 
-DEFAULT_LIMIT = {"percent": 10, "chars_per_finding": 400, "enforce": True}
+DEFAULT_LIMIT = {"percent": 10, "chars_per_finding": 400, "enforce": False}
 SHA_BEFORE = "a" * 64
 SHA_AFTER = "b" * 64
 
@@ -70,11 +70,17 @@ def fix_card(card_id: str = "t_fix01", status: str = "done", round_no: int = 1) 
 
 
 def ctx_with_fix(p, base: dict, *, after_chars: int, statuses=(), findings: int = 3) -> dict:
-    """Синтетический `ctx` решения: снимок, объём после правки, статусы реестра находок."""
+    """Синтетический `ctx` решения: снимок, объём после правки, статусы реестра находок.
+
+    Лимит задаётся явно с `enforce: true`: с 19.11.2026 умолчание конфига — замер без
+    остановки, а проверки ниже написаны про саму остановку, и молча зависеть от умолчания
+    они не должны.
+    """
     ctx = gate.build_ctx(p)
     ctx["plan_fix_cards"] = [fix_card()]
     ctx["plan_fix_baseline"] = dict(base)
     ctx["plan_version_chars"] = after_chars
+    ctx["max_plan_growth"] = {"percent": 10, "chars_per_finding": 400, "enforce": True}
     ctx["approval"] = dict(ctx.get("approval") or {}, version_sha256=SHA_AFTER, state="changed")
     rows = list(statuses) or ["закрыто"] * findings
     ctx["plan_findings"] = [{"id": f"F{index}", "step": "S1", "kind": "стиль",
@@ -209,6 +215,10 @@ def test_default_limit_matches_three_places(project):
 def test_stop_logged_once_and_plan_not_truncated(stand, monkeypatch):
     """Сквозной путь на файлах: стоп и замер на диске, повторный тик тот же стоп не выносит."""
     root, p = stand
+    # Стоп проверяется как стоп: умолчание с 19.11.2026 — замер без остановки, поэтому
+    # лимит включается явно, до сборки `ctx` (её читает конфиг проекта).
+    write_cfg(root, {"percent": 10, "chars_per_finding": 400, "enforce": True})
+    p = gate.resolve_paths(config_mod.load(root), "1")
     state = gate.load_state(p)
     state["plan_fix_baseline"] = gate.plan_fix_snapshot(p, 1, gate.build_ctx(p),
                                                        ["F1: находка"])
@@ -254,22 +264,58 @@ def test_stop_logged_once_and_plan_not_truncated(stand, monkeypatch):
     assert len(calls) == 1, calls
 
 
-def test_growth_enforce_off_keeps_steps_running(stand):
-    """`enforce: false` — стоп выключен владельцем: план вырос, а шаги продолжают идти.
+def test_growth_enforce_off_measures_not_stops(stand):
+    """`enforce: false` (умолчание с 19.11.2026) — замер вместо стопа: шаги идут дальше.
 
-    Стоп `max_plan_growth` блокировал план 12 после каждой правки по ревью: правка
-    закрывала находки, но росла на 365 символов, а допуск считается по числу находок,
-    закрытых на том же круге (`_closed_findings`), — на первом круге их ноль. Владелец
-    выключил остановку ключом, замер остался: решение `None`, счёт `over` не врёт.
+    Стоп `max_plan_growth` блокировал живые проекты после каждой правки по ревью: правка
+    закрывает находки, но растёт, а допуск считался по числу находок, закрытых на том же
+    круге, — на первом круге их ноль. Владелец понизил правило до замера: решение
+    `note_growth` (цифры в состояние плана), а не `stop`, и шаги не занимаются.
     """
     _root, p = stand
     statuses = ("закрыто",) * 10
     ctx = ctx_with_fix(p, baseline(10000, [f"F{index}" for index in range(1, 11)]),
                        after_chars=11500, statuses=statuses, findings=10)
     ctx["max_plan_growth"] = {"percent": 10, "chars_per_finding": 400, "enforce": False}
-    assert gate._plan_growth_decision(ctx) is None, "стоп не выключился ключом enforce"
-    assert gate.plan_growth_report(10000, 11500, 10, 10, 400)["over"] is True
-    # Остальные ветки не тронуты: без ключа тот же ctx даёт owner-стоп.
-    ctx["max_plan_growth"] = {"percent": 10, "chars_per_finding": 400}
+    decision = gate._plan_growth_decision(ctx)
+    assert decision is not None, "замер пропал вместе со стопом"
+    assert decision["action"] == "note_growth", decision
+    assert decision.get("step") is None, "замер не должен занимать слот шага"
+    assert decision["growth"]["over"] is True, decision["growth"]
+    assert "исполнение продолжается" in decision["reason"], decision["reason"]
+    # Умолчание конфига — тот же замер: проект без ключа работу не останавливает.
+    ctx.pop("max_plan_growth")
+    assert gate._plan_growth_decision(ctx)["action"] == "note_growth"
+
+
+def test_growth_allowance_counts_findings_ordered_by_fix(stand):
+    """Допуск считается по находкам, ради которых правку заказывали, а не только закрытым.
+
+    Живой случай (план 2 проекта self-analyzer): четыре находки ревью лежат `открыто`,
+    правка выросла на 900 символов. По прежнему счёту (закрыто 0) допуск был нулевой и
+    план вставал; с бюджетом «заказано 4» рост в пределах процента версии проходит.
+    """
+    _root, p = stand
+    ctx = ctx_with_fix(p, baseline(10371, ["F1", "F2", "F3", "F4"]), after_chars=11271,
+                       statuses=("открыто",) * 4, findings=4)
+    assert gate._plan_growth_decision(ctx) is None, "правка по ревью упёрлась в стоп"
+    report = gate.plan_growth_report(10371, 11271, 0, 10, 400, ordered=4)
+    assert (report["ordered"], report["budget"]) == (4, 4), report
+    assert report["allowed"] == 1037, report          # 10 % версии меньше 400 × 4
+    # Прежний счёт — только закрытые: тот же рост оказывался сверх нулевого допуска.
+    old = gate.plan_growth_report(10371, 11271, 0, 10, 400)
+    assert old["allowed"] == 0 and old["over"] is True, old
+    # Закрытые находки остаются нижней границей бюджета: закрыто больше — допуск больше.
+    assert gate.plan_growth_report(10000, 12000, 9, 10, 400, ordered=2)["budget"] == 9
+
+
+def test_growth_without_any_findings_still_stops(stand):
+    """Находок не было вовсе — роста без основания по-прежнему нет: стоп остаётся стопом."""
+    _root, p = stand
+    ctx = ctx_with_fix(p, baseline(10000, [], findings_open=0), after_chars=11000,
+                       statuses=(), findings=0)
+    assert ctx["plan_findings"] == [] or not ctx["plan_findings"], ctx["plan_findings"]
+    ctx["plan_findings"] = []
     decision = gate._plan_growth_decision(ctx)
     assert decision is not None and decision["action"] == "stop", decision
+    assert decision["growth"]["allowed"] == 0, decision["growth"]

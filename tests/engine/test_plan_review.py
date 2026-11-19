@@ -573,13 +573,12 @@ def test_reapproval_after_owner_stop_opens_new_review_round(stand):
     _to_owner_stop(root, p, db)
     _reapprove_edited(root, db)
     gate.clear_stop(p)
-    # 7-S4: переутверждение больше не прячет рост версии — правка сверх `max_plan_growth`
-    # даёт owner-стоп с замером ДО ветки утверждения (D7). Утверждение теста при этом не
-    # сужено: стоп снимает сам владелец, свежий круг ревью открывается следующим тиком.
+    # 7-S4 + решение 19.11.2026: переутверждение не прячет рост версии — замер ДО ветки
+    # утверждения (D7), но правилом-замером, а не остановкой. Утверждение теста при этом не
+    # сужено: свежий круг ревью открывается следующим тиком.
     growth = gate.run_gate(p, notify_fn=quiet)["decision"]
-    assert growth["action"] == "stop" and growth["kind"] == "owner", growth
+    assert growth["action"] == "note_growth", growth
     assert growth["growth"]["over"] is True, growth
-    gate.clear_stop(p)
 
     decision = gate.run_gate(p, notify_fn=quiet)["decision"]
     assert decision["action"] == "create_plan_review", decision
@@ -593,9 +592,8 @@ def test_reapproval_resets_review_budget(stand):
     _to_owner_stop(root, p, db)
     _reapprove_edited(root, db)
     gate.clear_stop(p)
-    # 7-S4: перед новым кругом — owner-стоп роста версии (см. тест выше).
-    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "stop"
-    gate.clear_stop(p)
+    # 7-S4: перед новым кругом — замер роста версии (см. тест выше), не остановка.
+    assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "note_growth"
     assert gate.run_gate(p, notify_fn=quiet)["decision"]["action"] == "create_plan_review"
 
     complete(db, ":planreview:4")
