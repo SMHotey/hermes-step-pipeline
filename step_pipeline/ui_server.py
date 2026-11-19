@@ -1306,6 +1306,30 @@ def _capacity(root: Path, state: State) -> dict[str, Any] | None:
     return {**limits, "occupied": occupied, "running": running, "queue": queue}
 
 
+def _plans_queue(plans: list[dict]) -> dict[str, Any]:
+    """Очередь ведомых планов по возрастанию номера (план 15 S4).
+
+    Считается на сервере, потому что порядок — правило данных, как `running` и
+    `capacity`: страница ничего не досчитывает и не сортирует (строковая сортировка
+    в JS поставила бы `13` перед `6`). Порядок числовой по номеру плана, а не по
+    порядку `driven_plans` в конфиге и не по порядку строк `gate.py --plans` —
+    движок ставит план по умолчанию первым. «Следующий» — первый ведомый план, у
+    которого состояние не «закрыт»; закрытые остаются в очереди (страж их обходит и
+    пропускает), план вне ведения не попадает ни при каком состоянии.
+    """
+    def number(row: dict) -> tuple[int, int]:
+        try:
+            return (0, int(str(row.get("id") or "")))
+        except (TypeError, ValueError):
+            return (1, 0)     # нечисловой номер — в конце, порядок ответа сохраняется
+
+    ordered = sorted((row for row in plans if row.get("driven")), key=number)
+    ids = [str(row.get("id") or "") for row in ordered]
+    next_id = next((str(row.get("id") or "") for row in ordered
+                    if str(row.get("state") or "") != "closed"), "")
+    return {"ids": ids, "next_id": next_id, "count": len(ids)}
+
+
 def _missing_snapshot(state: State) -> dict:
     """Снимок проекта без конвейера: 200 и объяснение в `errors`, а не 500.
 
@@ -1932,6 +1956,9 @@ class Handler(BaseHTTPRequestHandler):
                    "plan": "", "next": "—", "closed": 0, "total": 0,
                    "state": "", "state_label": "",
                    "stop": None, "idle": None, "error": "", "capacity": None,
+                   # Очередь планов (план 15 S4) едет в сводке, как `running` и `drafts`:
+                   # один ответ — один расчёт, отдельного запроса на проект нет.
+                   "plan_queue": {"ids": [], "next_id": "", "count": 0},
                    "plans": [], "drafts": [], "running": []}
         if not summary["installed"] and not state.preview:
             return summary
@@ -1952,6 +1979,9 @@ class Handler(BaseHTTPRequestHandler):
             summary["error"] = f"{type(exc).__name__}: {exc}"
             return summary
         summary["plans"] = plans
+        # Очередь считается из тех же строк, что уходят странице: строки планов не
+        # тронуты (13 полей `PLAN_ROW_FIELDS`), очередь — отдельный ключ сводки.
+        summary["plan_queue"] = _plans_queue(plans)
         # «В работе» — решение стража (`plan_view`), а не наличие стоп-файла: строки те же,
         # что в `plans`, отфильтрованные по состоянию. Второго сборщика нет.
         summary["running"] = [row for row in plans if row.get("state") == "running"]

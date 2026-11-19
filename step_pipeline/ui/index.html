@@ -144,6 +144,13 @@
   .plan-row button { padding: 2px 9px; font-size: 12px; margin-left: auto; }
   .plans-title { font-size: 12px; color: var(--muted); text-transform: uppercase;
                  letter-spacing: .06em; margin: 4px 0 6px; }
+  /* Строка очереди ведомых планов (план 15 S4): имя проекта, номера по возрастанию, счётчик. */
+  .plans-queue .queue-row { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
+                            font-size: 12.5px; padding: 3px 0;
+                            border-bottom: 1px solid #1b2230; }
+  .plans-queue .where { color: var(--muted); }
+  .plans-queue .ids { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  .plans-queue-note { font-size: 11.5px; margin: 0 0 10px; }
   #drafts-error { color: var(--bad); font-size: 12.5px; white-space: pre-wrap;
                   margin: 0 0 10px; }
   #drafts-error:empty { display: none; }
@@ -536,6 +543,14 @@
         </div>
       </div>
       <div class="clip" id="plans-status"></div>
+
+      <!-- Блок ведомых планов (план 15 S4): порядок, пометка «следующий» и счётчик
+           приходят готовыми из ответа `/api/projects` (ключ `plan_queue`) — страница
+           их не считает и не сортирует. -->
+      <div class="plans-title">Очередь планов <span class="muted">по возрастанию номера</span></div>
+      <div class="plans-queue" id="plans-queue"></div>
+      <div class="plans-queue-note muted">стоп-флаг держит план: «следующий» не обещает
+        старта раньше остальных</div>
 
       <!-- Черновики планов (0.33): раньше жили на «Обзоре», теперь там, где планы. Строки —
            поля ответа сервера, утверждение — кнопкой (в предпросмотре кнопок нет). -->
@@ -1288,6 +1303,27 @@ function filterPlansTab() {
   if ($("plans-empty")) $("plans-empty").hidden = shown > 0;
 }
 
+// Ведомые планы вкладки (план 15 S4): порядок, пометка «следующий» и счётчик приходят
+// готовыми из поля `plan_queue` ответа `/api/projects` — страница их не считает и не сортирует.
+function renderPlansQueue(projects) {
+  const body = $("plans-queue");
+  if (!body) return;
+  const rows = (projects || []).filter((project) => project.plan_queue && project.plan_queue.count);
+  if (!rows[0]) {
+    body.innerHTML = '<div class="plans-empty">ведомых планов нет</div>';
+    return;
+  }
+  body.innerHTML = rows.map((project) => {
+    const ids = (project.plan_queue.ids || []).map((id) => (id === project.plan_queue.next_id
+      ? `${esc(id)} <span class="pill run">следующий</span>`
+      : esc(id))).join(" → ");
+    const tail = project.plan_queue.next_id ? "" : ' <span class="muted">— все закрыты</span>';
+    return `<div class="queue-row"><span class="where">${esc(project.name)}</span>`
+      + `<span class="ids">${ids}${tail}</span>`
+      + `<span class="muted">ведётся ${project.plan_queue.count}</span></div>`;
+  }).join("");
+}
+
 // Строки вкладки — из поля `plans` ответа `/api/projects`: страница ничего не досчитывает.
 function renderPlansTab(data) {
   const rows = [];
@@ -1295,6 +1331,9 @@ function renderPlansTab(data) {
     (project.plans || []).forEach((plan) => rows.push({project, plan}));
   });
   plansRows = rows;   // пары «проект + план» последнего рендера: имена для подтверждений
+  // Блок ведомых планов рисуется до раннего выхода ниже: при пустом списке карточек
+  // строка о пустой очереди всё равно должна появиться.
+  renderPlansQueue(data.projects || []);
   // Опции проектов пересобираются только при смене набора id, иначе каждый кадр
   // сбрасывал бы выбор владельца (образец — переключатель проектов).
   const picker = $("plans-project");
