@@ -183,7 +183,7 @@ class TestEngineDriftFunctions:
     def test_extra_python_file_is_not_drift_and_not_in_marker(self, engine_project: Path):
         """Свой скрипт проекта в `.pipeline/` — не файл движка (S7 0.27.0).
 
-        Прецедент раскатки 07.11.2026: три скрипта проверок в DoorSystem считались дрейфом,
+        Прецедент раскатки 07.11.2026: три скрипта проверок в DemoApp считались дрейфом,
         а после их удаления не сходился маркер — doctor был красным при исправном движке.
         """
         setup_flow.write_engine_marker(engine_project)

@@ -29,7 +29,7 @@ systemd-шаблоны `name@instance`, Ansible-роли, `git worktree`-на-п
 2. Имя профиля допускает дефис (проверено: `zz-probe-dash` создан и удалён) — схема
    `<slug>-<роль>` технически возможна.
 3. `slug` проекта берётся из `projects.json` (`id`), а не из имени каталога: реестр — единственный
-   источник, `C:\Users\malik\gapaudit` уже расходится с именем проекта.
+   источник, `C:\Users\malik\second-demo` уже расходится с именем проекта.
 4. Скиллы роли в профиль ставит мастер (`setup`), а не клон: клон от `default` притащил бы все
    скиллы `default`, включая не относящиеся к делу.
 5. `default`-профиль принадлежит другой сессии и не клонируется «как есть» без `--clone-from` —
@@ -83,7 +83,7 @@ systemd-шаблоны `name@instance`, Ansible-роли, `git worktree`-на-п
   `.env`: один источник — ссылка на файл профиля-эталона (`profiles/<slug>/.env`), остальные роли
   читают его; копий ключа не заводим.
 - Тесты/гейты: `pytest tests/test_setup_profiles.py`; на Windows — junction создаётся и удаляется.
-- Прогон: `hermes pipeline setup --project C:/Users/malik/PycharmProjects/DoorSystem --profiles --yes`
+- Прогон: `hermes pipeline setup --project C:/Projects/DemoApp --profiles --yes`
 - Стоп, если: `default` недоступен (другая сессия) — тогда источником становится профиль проекта,
   а расхождение печатается предупреждением, а не глушится.
 - Риск: `--clone-from` тащит чужие скиллы; обходим тем, что профиль создаётся пустым, а скиллы
@@ -100,7 +100,7 @@ systemd-шаблоны `name@instance`, Ansible-роли, `git worktree`-на-п
   переустанавливает только изменившиеся; `doctor` даёт находку `skill-stale` при расхождении.
   Тот же маркер пишется в `.hermes/skills` проекта — cron и интерактивная сессия видят одно и то же.
 - Тесты/гейты: `pytest tests/test_roles_version.py tests/test_doctor*.py`
-- Прогон: `hermes -p doorsystem pipeline doctor`
+- Прогон: `hermes -p demoapp pipeline doctor`
 - Стоп, если: скилл в профиле правился руками — тогда diff показывается владельцу, а не затирается.
 - Риск: маркер разъедется с фактическим содержимым — тогда сверка по sha256, а не по номеру версии.
 - Готово = `doctor` ловит устаревший скилл, `--upgrade` лечит, руками ничего не копируется.
@@ -122,14 +122,14 @@ systemd-шаблоны `name@instance`, Ansible-роли, `git worktree`-на-п
 
 ### S5. Миграция живых установок и откат (1 дн) `pipeline`
 
-- Цель: pipeline, doorsystem и gapaudit переезжают на `<slug>-<роль>` без простоя; старые общие
+- Цель: pipeline, demoapp и second-demo переезжают на `<slug>-<роль>` без простоя; старые общие
   профили остаются, пока владелец не решит иначе; откат — одной командой.
 - Файл: `step_pipeline/setup_flow.py`, `docs/MIGRATION.md` (новый), `tests/test_profiles_migrate.py` (новый)
 - Работа: `setup --migrate-profiles` создаёт новые профили, переносит `profiles` в `pipeline.json`
   (по `--yes`), оставляет старые профили включёнными до первой успешной недели; журнал переноса в
   `.pipeline/state/profiles.json`; откат `--rollback-profiles` возвращает ключи из журнала.
-- Тесты/гейты: `pytest tests/test_profiles_migrate.py`; прогон на gapaudit в режиме `--dry-run`.
-- Прогон: `hermes pipeline setup --project C:/Users/malik/gapaudit --migrate-profiles --dry-run`
+- Тесты/гейты: `pytest tests/test_profiles_migrate.py`; прогон на second-demo в режиме `--dry-run`.
+- Прогон: `hermes pipeline setup --project C:/Projects/second-demo --migrate-profiles --dry-run`
 - Стоп, если: в момент миграции идёт шаг (running-карточка) — миграция ждёт окна.
 - Риск: две карточки на один шаг при переключении — ключи карточек не меняются, меняется только
   assignee, поэтому дублей нет.

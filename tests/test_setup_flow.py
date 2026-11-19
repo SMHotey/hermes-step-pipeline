@@ -1159,13 +1159,13 @@ def test_link_plugin_profile_connects_profile_to_package(tmp_path: Path, monkeyp
     package.mkdir(parents=True)
     (package / "plugin.yaml").write_text("name: step_pipeline\n", encoding="utf-8")
 
-    assert setup_flow.link_plugin_profile("gapaudit", setup_flow.Log(quiet=True),
+    assert setup_flow.link_plugin_profile("second-demo", setup_flow.Log(quiet=True),
                                           package=package) is True
 
-    linked = tmp_path / "h" / "gapaudit" / "plugins" / "step_pipeline"
+    linked = tmp_path / "h" / "second-demo" / "plugins" / "step_pipeline"
     assert (linked / "plugin.yaml").is_file()
     # Повторный вызов не перевязывает уже связанный профиль.
-    assert setup_flow.link_plugin_profile("gapaudit", setup_flow.Log(quiet=True),
+    assert setup_flow.link_plugin_profile("second-demo", setup_flow.Log(quiet=True),
                                           package=package) is True
 
 
@@ -1186,9 +1186,9 @@ def test_ensure_plugin_enabled_links_missing_profile_and_retries(monkeypatch):
     monkeypatch.setattr(setup_flow, "_plugin_cli_answers", lambda profile: True)
 
     log = setup_flow.Log(quiet=True)
-    assert setup_flow.ensure_plugin_enabled("gapaudit", log) == "плагин включён и команда отвечает"
-    assert linked == ["gapaudit"]
-    assert calls == ["gapaudit", "gapaudit"]
+    assert setup_flow.ensure_plugin_enabled("second-demo", log) == "плагин включён и команда отвечает"
+    assert linked == ["second-demo"]
+    assert calls == ["second-demo", "second-demo"]
 
 
 def test_ensure_plugin_enabled_reports_link_failure(monkeypatch):
@@ -1198,7 +1198,7 @@ def test_ensure_plugin_enabled_reports_link_failure(monkeypatch):
     monkeypatch.setattr(setup_flow, "link_plugin_profile", lambda profile, log: False)
 
     log = setup_flow.Log(quiet=True)
-    assert setup_flow.ensure_plugin_enabled("gapaudit", log) == "плагин не включён"
+    assert setup_flow.ensure_plugin_enabled("second-demo", log) == "плагин не включён"
 
 
 def test_plugin_cli_reads_output_as_utf8_with_replacement(monkeypatch):
@@ -1211,8 +1211,8 @@ def test_plugin_cli_reads_output_as_utf8_with_replacement(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    setup_flow._enable_plugin("gapaudit")
-    assert setup_flow._plugin_cli_answers("gapaudit") is True
+    setup_flow._enable_plugin("second-demo")
+    assert setup_flow._plugin_cli_answers("second-demo") is True
 
     assert len(calls) == 2
     first_cmd, second_cmd = calls[0][0], calls[1][0]

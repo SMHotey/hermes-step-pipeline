@@ -363,7 +363,7 @@ def test_list_drafts_marks_approved_draft(project: Path, monkeypatch):
     _draft(project, "5-demo.md", helpers.PLAN)
     assert _cmd(project, accept="5") == 0
     # Планировщик пишет черновик заново уже после утверждения — так он и остаётся в
-    # `drafts/` рядом с утверждённым планом (случай gapaudit).
+    # `drafts/` рядом с утверждённым планом (случай second-demo).
     _draft(project, "5-demo.md", helpers.PLAN)
 
     rows = plan_accept.list_drafts(project)
@@ -395,7 +395,7 @@ def test_list_drafts_keeps_approved_after_journal_line(project: Path, monkeypatc
     Страж сверяет утверждение по версии плана (`version_sha256`, содержимое журнала
     исключено), а сверка панели шла по сырым байтам: после первого закрытого шага строка
     черновика возвращалась в «изменён после утверждения», и один план был виден дважды —
-    «утверждён» в списке планов и «изменён» в черновиках (gapaudit, 12.11.2026).
+    «утверждён» в списке планов и «изменён» в черновиках (second-demo, 12.11.2026).
     """
     monkeypatch.setattr(plan_accept, "now_iso", lambda: "2026-01-01T00:00:00")
     _draft(project, "5-demo.md", helpers.PLAN)
