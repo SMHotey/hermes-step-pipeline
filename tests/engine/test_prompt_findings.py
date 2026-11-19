@@ -261,6 +261,28 @@ def test_registry_header_and_parse_errors(project):
     assert gate.load_findings(plan_path)[0]["id"] == "F1"
 
 
+def test_escaped_pipe_in_cell_is_text_not_separator(tmp_path):
+    """Экранированный `\\|` внутри ячейки — текст, а не разделитель (случай 9-S1, 19.11.2026).
+
+    Ревьюер пишет реестр руками и экранирует `|` в команде внутри ячейки, как учит markdown.
+    Пока разбор резал строку по любому `|`, реестр считался битым («ячеек 6, нужно 5»),
+    и шаг с APPROVE и коммитом не закрывался: «шаг не закрыть по неизвестному реестру».
+    """
+    path = tmp_path / "step-9-S1-findings.md"
+    path.write_text(
+        "# Реестр находок шага 9-S1\n\n"
+        "| ID | Класс | Находка | Что сделать | Статус |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| F1 | стилистическая | отчёта файлом нет: `ls docs/reports \\| grep 9-S1` → пусто "
+        "| дописать файл | не блокирует |\n",
+        encoding="utf-8")
+    rows = gate.load_findings(path, gate.STEP_FINDINGS_HEADER, gate.STEP_FINDINGS_KEYS,
+                              kinds=gate.STEP_FINDING_KINDS)
+    assert [row["id"] for row in rows] == ["F1"]
+    assert "ls docs/reports | grep 9-S1" in rows[0]["text"], rows[0]["text"]
+    assert rows[0]["status"] == "не блокирует"
+
+
 def test_status_note_after_word_is_read_as_status(project):
     """Пояснение в ячейке статуса не роняет план: статус читается по слову (18.11.2026).
 

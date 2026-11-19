@@ -169,7 +169,7 @@ def find_draft(project, value) -> Path:
     """
     project = Path(project)
     text = str(value).strip()
-    if text.isdigit():
+    if text.isdecimal():
         want = _normalize(text)
         folder = drafts_dir(project)
         found = sorted(p for p in folder.glob("*.md") if plan_number(p.name) == want)
@@ -235,7 +235,7 @@ def approve(project, value) -> dict:
     """
     project = Path(project)
     text = str(value).strip()
-    if not text.isdigit():
+    if not text.isdecimal():
         return {"ok": False, "code": 2, "plan": "", "status": "bad-number",
                 "errors": [f"--accept принимает номер плана, получено: {value}"],
                 "message": ""}
@@ -377,7 +377,7 @@ def drive_plan(project, number: str) -> str:
     if number in driven:
         return "already"
     driven.append(number)
-    driven.sort(key=lambda value: (0, int(value)) if value.isdigit() else (1, 0))
+    driven.sort(key=lambda value: (0, int(value)) if value.isdecimal() else (1, 0))
     cfg["driven_plans"] = driven
     _atomic_write_text(project / proj.MARKER,
                        json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
@@ -667,7 +667,7 @@ def _journal_rows(lines: list[str], found: list[tuple[int, int, str]],
 def _normalize(plan_id) -> str:
     """Номер в каноническом виде: `01` → `1` (как registry.normalize)."""
     text = str(plan_id).strip()
-    if not text.isdigit():
+    if not text.isdecimal():
         raise ValueError(f"номер плана должен быть числом, получено: {plan_id!r}")
     return str(int(text))
 

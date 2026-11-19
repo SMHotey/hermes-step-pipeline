@@ -543,7 +543,7 @@ def _round_report(rounds: list[dict]) -> dict:
 def _step_order(pair: tuple[str, str]) -> tuple[int, str, str]:
     """Порядок разбивки: номер плана числом, затем имя шага — «10» после «9»."""
     plan, step = pair
-    return (int(plan) if plan.isdigit() else 10 ** 6, plan, step)
+    return (int(plan) if plan.isdecimal() else 10 ** 6, plan, step)
 
 
 def step_rounds_report(records: list[dict]) -> dict:

@@ -43,7 +43,7 @@ NO_PLAN = "нужно поле plan: номер плана"
 def _plan_id(value: Any) -> str:
     """Номер плана в каноническом виде: `02` → `2`, ` 31 ` → `31` (как `registry.normalize`)."""
     text = str(value if value is not None else "").strip()
-    if not text.isdigit():
+    if not text.isdecimal():
         raise ValueError(NO_PLAN)
     return str(int(text))
 
@@ -243,7 +243,7 @@ def delete(project: Path, value: Any, board: str | None = None) -> dict:
     traces = _traces(project, plan)
     driven = _driven(project)
     present = [path for path in traces if path is not None and path.is_file()]
-    has_number = plan in {str(int(item)) for item in driven if item.isdigit()}
+    has_number = plan in {str(int(item)) for item in driven if item.isdecimal()}
     if not present and not has_number:
         return {"ok": False, "status": "missing", "plan": plan,
                 "error": f"плана {plan} нет: ни файла в каталоге планов, ни следов в состоянии"}
@@ -252,7 +252,7 @@ def delete(project: Path, value: Any, board: str | None = None) -> dict:
     if has_number:
         # Сравнение по каноническому номеру: `["02"]` движок читает как план 2.
         cfg["driven_plans"] = [item for item in driven
-                               if not (item.isdigit() and str(int(item)) == plan)]
+                               if not (item.isdecimal() and str(int(item)) == plan)]
         _write_config(project, cfg)
         driven = [str(item) for item in cfg["driven_plans"]]
         changed = True
@@ -310,7 +310,7 @@ def start(project: Path, value: Any) -> dict:
         # `*` — правило «все распознанные планы»: замена перечислением молча сняла бы
         # ведение остальных, поэтому файл не переписывается.
         message = "все планы уже ведутся (driven_plans: *)"
-    elif plan in {str(int(item)) for item in driven if item.isdigit()}:
+    elif plan in {str(int(item)) for item in driven if item.isdecimal()}:
         # Сравнение по каноническому номеру: `["02"]` движок читает как план 2, и повторный
         # жест не должен оставлять семантический дубликат `["02", "2"]`.
         message = f"план {plan} уже в driven_plans"

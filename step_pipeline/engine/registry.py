@@ -65,7 +65,7 @@ class PlanSpec:
 def normalize(plan_id: object) -> str:
     """Номер плана в каноническом виде: `01`→`1`, ` 31 `→`31`."""
     text = str(plan_id).strip()
-    if not text.isdigit():
+    if not text.isdecimal():
         raise PlanNotFound(f"номер плана должен быть числом, получено: {plan_id!r}")
     return str(int(text))
 

@@ -1154,9 +1154,23 @@ def plan_findings_rel(p: Paths) -> str:
     return p.cfg.rel(plan_findings_path(p))
 
 
+_CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
+
+
 def _finding_cells(line: str) -> list[str]:
-    """Ячейки строки таблицы: внешние `|` ячейками не считаются."""
-    return [cell.strip() for cell in str(line).strip().strip("|").split("|")]
+    """Ячейки строки таблицы: внешние `|` ячейками не считаются, `\\|` — литерал.
+
+    Ревьюер пишет реестр руками и экранирует `|` внутри команды (`ls docs/reports \\| grep`),
+    как учит markdown. Пока разбор резал строку по любому `|`, такой реестр считался битым
+    («ячеек 6, нужно 5») и шаг не закрывался по неизвестному реестру — случай 19.11.2026,
+    9-S1: APPROVE есть, коммит есть, закрытие стоит на разборе таблицы.
+    """
+    body = str(line).strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|") and not body.endswith("\\|"):
+        body = body[:-1]
+    return [cell.replace("\\|", "|").strip() for cell in _CELL_SPLIT_RE.split(body)]
 
 
 def _findings_title(path: Path, kind: str = "плана", prefix: str = "plan-") -> str:

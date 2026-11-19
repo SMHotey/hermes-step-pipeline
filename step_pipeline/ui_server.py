@@ -342,7 +342,7 @@ def act_plan_fix(state: State, payload: dict) -> dict:
     решение о лимите — у стража, а жест «+1 круг» идемпотентным не является.
     """
     raw = str(payload.get("plan") or "").strip()
-    if not raw.isdigit():
+    if not raw.isdecimal():
         return {"ok": False, "error": "нужно поле plan: номер плана"}
     plan = str(int(raw))
     marker = plan_rounds.grant(state.project, plan, "ручной круг правок из панели")
@@ -632,7 +632,7 @@ def _validate_patch(cfg: dict, patch: dict, root: Path) -> tuple[dict, list[str]
             plans: list[str] = []
             for item in items:
                 text = str(item).strip()
-                if text != "*" and not text.isdigit():
+                if text != "*" and not text.isdecimal():
                     errors.append("driven_plans: элемент должен быть * или номером плана")
                     break
                 plans.append(text)
@@ -2874,7 +2874,7 @@ class Handler(BaseHTTPRequestHandler):
         if state is None:
             return
         plan_id = str(payload.get("plan") or "").strip()
-        if not plan_id.isdigit():
+        if not plan_id.isdecimal():
             self._json(400, {"ok": False, "project": {"id": state.id, "name": state.name},
                              "error": "нужно поле plan: номер плана"})
             return
@@ -2919,7 +2919,7 @@ class Handler(BaseHTTPRequestHandler):
         if state is None:
             return
         plan_id = str(payload.get("plan") or "").strip()
-        if not plan_id.isdigit():
+        if not plan_id.isdecimal():
             self._json(400, {"ok": False, "project": {"id": state.id, "name": state.name},
                              "error": "нужно поле plan: номер плана"})
             return
