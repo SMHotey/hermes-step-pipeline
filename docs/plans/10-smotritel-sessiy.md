@@ -31,10 +31,10 @@ S0 первым), п.8 (роль — вход, артефакт и запрет;
 | Кандидат (лицензия) | Вердикт | Куда |
 |---|---|---|
 | Kubernetes — жизненный цикл пода и паттерн оператора (Apache-2.0) | берём идею | S2A, S5 |
-| healthchecks (BSD-3-Clause), Dagster (Apache-2.0) | берём идею | S2A |
+| healthchecks (BSD-3-Clause), Dagster (Apache-2.0) | берём идею | S2A, S3 |
 | Alertmanager (Apache-2.0) | берём идею | S4 |
 | StackStorm, Argo CD — `selfHeal` (обе Apache-2.0) | берём идею | S3, S2 |
-| systemd (LGPL-2.1), Nomad (BUSL-1.1), Supervisor (NOASSERTION), Sentry (FSL-1.1) | своё | S3, S5 |
+| systemd (LGPL-2.1), Nomad (BUSL-1.1), Supervisor (NOASSERTION), Sentry (FSL-1.1) | своё | S2A, S3, S5 |
 
 Правки по разведке: 7 — (1) «висит» отменяется свежим heartbeat, (2) предел отсчитывается от
 последнего события карточки, (3) лимит починок в час, (4) кулдаун на `symptom_id`, (5) dry-run и
