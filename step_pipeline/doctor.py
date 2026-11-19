@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 try:
     from .engine import plan_lint
@@ -102,6 +103,70 @@ def analyze_rows(project: Path, path: Path) -> list[str] | None:
         plan_rel = Path(path).as_posix()
     return [finding.render(plan_rel) for finding in findings
             if finding.code in ("A6", "A7", "A8")]
+
+
+def notify_rows(project: Path, cfg: dict[str, Any], driver: str) -> tuple[list[str], list[str]]:
+    """Строки канала уведомлений проекта: причина состояния и команда-рецепт.
+
+    Одна немая строка на все причины сразу никого не лечит (шаг 15-S5): владелец проекта
+    не понимает, канал выключен его решением или шаг установки не закрыт, и какой командой
+    это правится. Поэтому причина называется словами, а рядом печатается ровно та команда,
+    которая её снимает.
+
+    Причина берётся из флагов `notify` конфига проекта: сначала `enabled`, и только у
+    выключенного канала — `skipped`. Отметку `skipped` ставит мастер установки, когда
+    владелец выбрал «без бота», то есть она и есть осознанный выбор; включённый канал
+    означает, что владелец передумал, и значение `skipped` у него не спрашивается
+    (`setup_flow._telegram_fact` читает его так же).
+
+    Сети при выключенном канале нет: подтверждать нечего, тик всё равно ничего не
+    отправляет, а тест на три состояния обязан проходить без Telegram. Запрос к Bot API
+    идёт только у включённого канала и только когда обе переменные уже на месте.
+
+    В текстах — имена переменных, профиль драйвера и путь проекта: значение токена это
+    секрет, а chat id печатается лишь в успешной строке, по нему видно, куда уходят
+    сообщения.
+    """
+    notes: list[str] = []
+    problems: list[str] = []
+    notify = cfg.get("notify") or {}
+    if not isinstance(notify, dict):  # битый конфиг — повод молчать о канале, а не падать
+        notify = {}
+    values = proj.read_env_file(proj.profile_dir(driver) / ".env")
+    token_env = str(notify.get("token_env") or setup_flow.TOKEN_ENV)
+    chat_env = str(notify.get("chat_env") or setup_flow.CHAT_ENV)
+    token = values.get(token_env, "")
+    chat = values.get(chat_env, "")
+    path = Path(project).resolve().as_posix()
+    # Рецепты постановки 15-S5 (Р4): значения в команду не подставляются — только
+    # слова-подсказки, иначе токен уехал бы в терминал, в лог и в отчёт шага.
+    write_recipe = (f'hermes pipeline setup --project "{path}" --telegram-token ТОКЕН '
+                    f'--telegram-chat ЧАТ --yes --no-smoke')
+    enable_recipe = f'hermes pipeline config --project "{path}" --set notify.enabled true'
+    if notify.get("enabled"):
+        missing = [name for name, value in ((token_env, token), (chat_env, chat)) if not value]
+        if missing:
+            problems.append(f"Telegram: включён, а в .env профиля {driver} нет "
+                            f"{' и '.join(missing)} — записать: {write_recipe}")
+        else:
+            try:
+                me = telegram.get_me(token, env=proj.engine_env(project))
+                notes.append(f"Telegram: канал настроен — @{me.get('username')} → {chat}")
+            except telegram.TelegramError as exc:
+                # Текст отказа идёт в панель: токен в него не попадает (telegram.py:22-77).
+                problems.append(f"Telegram: {exc}")
+        return notes, problems
+    if notify.get("skipped"):
+        if token and chat:
+            notes.append(f"Telegram: выключен владельцем (notify.skipped=true): значения "
+                         f"в .env профиля {driver} на месте — включить: {enable_recipe}")
+        else:
+            notes.append(f"Telegram: выключен владельцем (notify.skipped=true) — "
+                         f"включить: {write_recipe}")
+        return notes, problems
+    notes.append(f"Telegram: выключен (notify.enabled=false), шаг Telegram в установке "
+                 f"не закрыт — включить: {write_recipe}")
+    return notes, problems
 
 
 def collect(project: Path, plan: str = "", *, with_lint: bool = True,
@@ -225,19 +290,11 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
                      f"({', '.join(roles)})")
     # Канал проекта — из `.env` его профиля и с его прокси: чужой `STEP_PIPELINE_TELEGRAM_*`
     # из окружения оболочки (например, профиля Hermes) проверку бы испортил (0.20.1).
-    values = proj.read_env_file(proj.profile_dir(driver) / ".env")
-    notify = proj.read_config(project).get("notify") or {}
-    token = values.get(str(notify.get("token_env") or setup_flow.TOKEN_ENV), "")
-    chat = values.get(str(notify.get("chat_env") or setup_flow.CHAT_ENV), "")
-    if token and chat:
-        try:
-            me = telegram.get_me(token, env=proj.engine_env(project))
-            notes.append(f"Telegram: @{me.get('username')} → {chat}")
-        except telegram.TelegramError as exc:
-            # Текст отказа идёт в панель: токен в него не попадает (telegram.py:22-77).
-            problems.append(f"Telegram: {exc}")
-    else:
-        notes.append("Telegram: не настроен")
+    # Причину выключенного канала и команду-рецепт печатает `notify_rows` (15-S5):
+    # значения секретов в текст не попадают, а у выключенного канала сети нет вовсе.
+    channel_notes, channel_problems = notify_rows(project, cfg, driver)
+    notes.extend(channel_notes)
+    problems.extend(channel_problems)
     marker = project / ".pipeline" / "cron.json"
     job_name = "План: страж шага (конвейер)"
     if marker.is_file():

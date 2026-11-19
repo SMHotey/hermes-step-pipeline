@@ -1153,6 +1153,12 @@ def test_checks_never_expose_bot_token(server, monkeypatch, tmp_path):
         raise ui_server.telegram.TelegramError("сеть недоступна: таймаут")
 
     monkeypatch.setattr(ui_server.telegram, "get_me", boom)
+    # Канал в фикстуре проекта выключен, а телеграм-пинг бывает только у включённого канала
+    # (шаг 15-S5): включаем его в конфиге тестового проекта, чтобы проверка осталась прежней.
+    cfg_path = server["root"] / "pipeline.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["notify"] = {**(cfg.get("notify") or {}), "enabled": True}
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     status, _headers, body = get_raw(server["url"] + "/api/checks?refresh=1")
     assert status == 200
     assert token.encode("utf-8") not in body
