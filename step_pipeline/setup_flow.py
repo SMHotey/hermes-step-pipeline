@@ -537,6 +537,33 @@ def ensure_plugin_enabled(profile: str, log: Log) -> str:
 _PLAN_NAME_RE = re.compile(r"^(\d{1,2})-.+\.md$")
 
 
+def _config_for_write(project: Path) -> tuple[dict[str, Any] | None, str]:
+    """Прочитать `pipeline.json` для правки: (конфиг, причина отказа или "").
+
+    `proj.read_config` на битом файле отдаёт `{}` (`step_pipeline/project.py:488-495`),
+    и запись поверх такого «пустого» конфига стёрла бы ключи владельца —
+    `driven_plans`, `profiles`, `paths`, `notify`. Поэтому перед записью файл
+    разбирается здесь заново, а причина отказа называется словами: её печатает
+    `log.warn`, и файл остаётся нетронутым.
+    """
+    path = Path(project) / proj.MARKER
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, f"{proj.MARKER} не найден"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, f"{proj.MARKER} не в кодировке UTF-8"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, f"{proj.MARKER} не разбирается как JSON: {exc}"
+    if not isinstance(data, dict):
+        return None, f"{proj.MARKER} должен содержать объект"
+    return data, ""
+
+
 def ensure_plans_legacy(project: Path, log: Log) -> list[str]:
     """Однократно записать `plans.legacy` живого проекта: все его планы на этот момент.
 
@@ -544,9 +571,18 @@ def ensure_plans_legacy(project: Path, log: Log) -> list[str]:
     список — решение владельца, раскатка их не переписывает. Иначе планы, созданные
     после первого обновления, молча теряли бы требование пункта «Прогон», а заполненный
     ключ менялся бы на каждом `--upgrade`. Пустой каталог планов даёт `[]`: планов нет,
-    значит и legacy нет. Возвращает записанный список номеров или `[]` — ключ уже был.
+    значит и legacy нет. Возвращает записанный список номеров или `[]` — ключ уже был
+    либо конфиг не прочитан.
+
+    Конфиг пишется, только если файл существует и разобран как JSON-объект: иначе
+    `proj.write_config` положил бы на место `pipeline.json` один блок `plans` и стёр бы
+    решения владельца (находка 9-S1/F1). В этом случае — `log.warn` с причиной, файл
+    не тронут, `[]`: ключ заполнится, когда конфиг починят.
     """
-    cfg = proj.read_config(project)
+    cfg, problem = _config_for_write(project)
+    if cfg is None:
+        log.warn(f"plans.legacy не заполнен: {problem} — файл не тронут")
+        return []
     plans = cfg.get("plans")
     if isinstance(plans, dict) and "legacy" in plans:
         return []

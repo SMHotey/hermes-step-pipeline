@@ -993,6 +993,71 @@ def test_build_config_keeps_notify_skipped(tmp_path: Path):
     assert "skipped" not in (fresh.get("notify") or {})
 
 
+def test_legacy_plans_written_once_into_readable_config(tmp_path: Path):
+    """Читаемый конфиг получает `plans.legacy` один раз, чужие ключи целы (9-S1, D9)."""
+    project = tmp_path / "shop"
+    plans = project / "docs" / "планы"
+    plans.mkdir(parents=True)
+    (plans / "1-a.md").write_text("# план\n", encoding="utf-8")
+    (plans / "2-b.md").write_text("# план\n", encoding="utf-8")
+    config = project / proj.MARKER
+    config.write_text(json.dumps({
+        "paths": {"plans": "docs/планы"}, "driven_plans": [3],
+        "profiles": {"driver": "shop"}, "plans": {"something": True},
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    log = setup_flow.Log(quiet=True)
+    assert setup_flow.ensure_plans_legacy(project, log) == ["1", "2"]
+
+    after = json.loads(config.read_text(encoding="utf-8"))
+    assert after["plans"] == {"something": True, "legacy": ["1", "2"]}
+    assert after["driven_plans"] == [3] and after["profiles"] == {"driver": "shop"}
+    # Заполненный ключ — решение владельца: второй вызов файл не трогает.
+    raw = config.read_bytes()
+    assert setup_flow.ensure_plans_legacy(project, setup_flow.Log(quiet=True)) == []
+    assert config.read_bytes() == raw
+
+
+@pytest.mark.parametrize("raw", [
+    # Лишняя запятая: `proj.read_config` отдаёт `{}`, запись стёрла бы ключи владельца.
+    '{"paths": {"plans": "docs/plans"}, "driven_plans": [3],\n'
+    ' "profiles": {"driver": "shop"},\n',
+    # Валидный JSON, но не объект: та же слепая запись.
+    '["планы"]',
+    # Пустой файл — тоже не объект.
+    "",
+])
+def test_legacy_plans_do_not_overwrite_unreadable_config(tmp_path: Path, raw: str):
+    """Битый конфиг не переписывается: `warn` с причиной, байты прежние (9-S1/F1)."""
+    project = tmp_path / "shop"
+    (project / "docs" / "plans").mkdir(parents=True)
+    (project / "docs" / "plans" / "1-a.md").write_text("# план\n", encoding="utf-8")
+    config = project / proj.MARKER
+    config.write_bytes(raw.encode("utf-8"))
+
+    log = setup_flow.Log(quiet=True)
+    assert setup_flow.ensure_plans_legacy(project, log) == []
+
+    assert config.read_bytes() == raw.encode("utf-8")
+    assert any("plans.legacy не заполнен" in line and "файл не тронут" in line
+               for line in log.lines), log.lines
+    assert not any("plans.legacy заполнен" in line for line in log.lines), log.lines
+
+
+def test_legacy_plans_do_not_create_missing_config(tmp_path: Path):
+    """Конфига нет — раскатка его не выдумывает, а говорит причину (9-S1/F1)."""
+    project = tmp_path / "shop"
+    (project / "docs" / "plans").mkdir(parents=True)
+    (project / "docs" / "plans" / "1-a.md").write_text("# план\n", encoding="utf-8")
+
+    log = setup_flow.Log(quiet=True)
+    assert setup_flow.ensure_plans_legacy(project, log) == []
+
+    assert not (project / proj.MARKER).exists()
+    assert any("не найден" in line and "файл не тронут" in line
+               for line in log.lines), log.lines
+
+
 def test_telegram_step_requires_project_step(tmp_path: Path, monkeypatch):
     """Без `pipeline.json` шаг Telegram красный: драйвер проекта ещё не известен (§4.8 п.4)."""
     _isolate_profile(monkeypatch, tmp_path)
