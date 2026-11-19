@@ -6,7 +6,8 @@
     "driver": "myproject",
     "prompter": "prompter",
     "reviewer": "reviewer",
-    "scout": "scout"
+    "scout": "scout",
+    "keeper": ""
   },
   "routing": {
     "frontend": "myproject",
@@ -51,7 +52,8 @@
     "review": "150m",
     "prompt": "45m",
     "scout": "30m",
-    "plan_review": "45m"
+    "plan_review": "45m",
+    "keeper": "30m"
   },
   "quiet_hours": {
     "enabled": false,

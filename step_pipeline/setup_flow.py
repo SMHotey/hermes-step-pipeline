@@ -84,6 +84,7 @@ SKILL_CATEGORIES = {
     "pipeline-plan-authoring": "software-development",
     "pipeline-scout": "software-development",
     "pipeline-plan-reviewer": "software-development",
+    "pipeline-keeper": "software-development",
     "agent-prompt-authoring": "autonomous-ai-agents",
 }
 TOKEN_ENV = "STEP_PIPELINE_TELEGRAM_BOT_TOKEN"

@@ -79,6 +79,7 @@
      `driven_default_id`, чтобы инцидентный стоп не писался плану вне ведения.
   4. Докстринг «registry.default_plan_id» дополнить: функция про «план для чтения», тик
      ходит через `driven_default_id`.
+- Прогон: `python -m pytest tests/engine/test_tick_address.py -m "not slow"` → exit 0, «passed»; таймаут 900
 - Тесты/гейты: `python -m pytest tests/engine/test_tick_address.py` → все пункты
   (адрес ведомого — тик идёт; адрес неведо́мого — код 2, состояние плана не тронуто;
   `--status`/`--resume` неведо́мого — работают; `driven_plans` пуст — `driven_default_id`
@@ -110,6 +111,7 @@
      поведение прежнее.
   3. Проверить, что предпросмотр (`preview`) и вкладка «Обзор» не зовут `act_tick` вовсе:
      в предпросмотре действия запрещены (инвариант).
+- Прогон: `python -m pytest tests/test_ui_server.py -m "not slow"` → exit 0, «passed»; таймаут 900
 - Тесты/гейты: `python -m pytest tests/test_ui_server.py` → зелёный, плюс два новых:
   жест тика по неведо́мому плану — 400 и без запуска движка (счётчик запусков), по
   ведо́мому — 200 и один запуск.
@@ -134,6 +136,8 @@
   3. Версия — минор (меняется решение движка на адресном вызове), `CHANGELOG.md` с
      разделом «Изменено»; тег «vX.Y.Z» и GitHub Release (правило §3 CONTEXT).
   4. `hermes pipeline update` и `hermes pipeline setup --upgrade` на живом проекте.
+- Прогон: `python -m pytest -m "not slow"` → exit 0, «passed»; таймаут 1800
+- Прогон: `ruff check .` → exit 0, «All checks passed»
 - Тесты/гейты: полный `python -m pytest` → зелёный; `ruff check .`; `hermes plugins
   validate step_pipeline`; `hermes pipeline doctor` на проекте без находок.
 - Риск: normal

@@ -69,7 +69,8 @@ def test_setup_copies_engine_roles_and_config(tmp_path: Path, fake_hermes):
     cfg = json.loads((target / "pipeline.json").read_text(encoding="utf-8"))
     assert cfg["board"] == "shopboard"
     assert cfg["profiles"] == {"driver": "shop", "prompter": "prompter",
-                               "reviewer": "reviewer", "scout": "scout"}
+                               "reviewer": "reviewer", "scout": "scout",
+                               "keeper": ""}
     assert cfg["notify"]["enabled"] is False
     assert cfg["notify"]["token_env"] == setup_flow.TOKEN_ENV
     assert cfg["runtimes"]["step"] == "3h"

@@ -208,7 +208,8 @@ def test_project_step_installs_engine_roles_and_config(stub, tmp_path: Path):  #
     cfg = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
     assert cfg["board"] == "shop"
     assert cfg["profiles"] == {"driver": "shop", "prompter": "prompter",
-                               "reviewer": "reviewer", "scout": "scout"}
+                               "reviewer": "reviewer", "scout": "scout",
+                               "keeper": ""}
     assert cfg["notify"]["enabled"] is False
 
 

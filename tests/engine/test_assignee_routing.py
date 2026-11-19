@@ -219,14 +219,14 @@ def test_owner_outside_template_stops_but_file_name_does_not(tmp_path, hermes_st
 
 
 def test_roles_readme_lists_every_role():
-    """README ролей: семь ролей, у каждой — что решает, артефакт и чего не делает."""
+    """README ролей: восемь ролей конвейера и методика — что решает, артефакт и чего не делает."""
     readme = ROLES / "README.md"
     assert readme.is_file(), "нет README ролей — не сказано, что роль решает и чего нет"
     text = readme.read_text(encoding="utf-8")
     roles = sorted(path.name for path in ROLES.iterdir() if path.is_dir())
 
-    assert len(roles) == 8                       # семь ролей + утилитарный скилл
-    assert len([name for name in roles if name.startswith("pipeline-")]) == 7
+    assert len(roles) == 9                       # восемь ролей + методика
+    assert len([name for name in roles if name.startswith("pipeline-")]) == 8
     for name in roles:
         assert name in text, f"роль {name} не описана в README"
     header = next(line for line in text.splitlines() if line.startswith("|"))
