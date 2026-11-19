@@ -228,7 +228,7 @@
   заказывает ревью, журнал содержит счётчик); golden-корпус перезаписан осознанно и
   просмотрен диффом.
 - Прогон: `python -m pytest tests/engine/test_runs_exec.py -m "not slow"` → exit 0
-- Прогон: `python -m pytest tests/engine/test_golden_verdicts.py -m "not slow"` → exit 0
+- Прогон: `python -m pytest tests/engine/test_golden_verdicts.py` → exit 0 (метка slow не ставится: с `-m "not slow"` файл отдаёт «12 deselected», exit 5)
 - Готово = на демо-проекте шаг с прогоном на код 0 закрывается, шаг с кодом 1 получает
   карточку правок без круга ревью, доказательство лежит в каталоге state/runs, счётчик
   прогонов виден в журнале, панели и уведомлении.
@@ -263,7 +263,7 @@
   зелёных; `python -m pytest tests/engine/test_golden_verdicts.py -m "not slow"` →
   зелёный после осознанной перезаписи эталонов, дифф в отчёте шага.
 - Прогон: `python -m pytest tests/engine/test_close_policy.py -m "not slow"` → exit 0
-- Прогон: `python -m pytest tests/engine/test_golden_verdicts.py -m "not slow"` → exit 0
+- Прогон: `python -m pytest tests/engine/test_golden_verdicts.py` → exit 0 (метка slow не ставится: с `-m "not slow"` файл отдаёт «12 deselected», exit 5)
 - Готово = шаг low с зелёными прогонами закрывается без вердикта, шаг normal без вердикта
   стоит с причиной «нет APPROVE», находка с кодом блокирует любой шаг, legacy-план ведёт
   себя как раньше.
