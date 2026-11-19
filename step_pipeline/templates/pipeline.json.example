@@ -32,6 +32,9 @@
     "journal": "журнал",
     "steps": "шаг"
   },
+  "plans": {
+    "legacy": []
+  },
   "step_id_regex": "(?P<id>[A-Za-z]{1,4}\\d+[A-Za-z]?(?:-\\d+)?)",
   "default_plan": null,
   "driven_plans": ["*"],

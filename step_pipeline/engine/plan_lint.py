@@ -8,6 +8,7 @@
     4. заголовки шагов вида «### S1. Название»;
     5. шаг не повторяется в разделе шагов;
     6. у шага есть пункты «Файл:», «Гейты:» (не пустые) и критерий «Готово =»;
+       пункт «Прогон» — у плана вне списка `plans.legacy` проекта (Л23);
     7. раздел-журнал со словом «журнал» есть;
     8. строки журнала — пять колонок и шаг во второй;
     9. набор шагов в разделе и в журнале совпадает;
@@ -62,6 +63,25 @@ _RESEARCH_VERDICT = ("решение", "вердикт")
 # Тексты находок — так же в §11.1, колонка «Что проверяется».
 _PROBLEM_NO_RESEARCH = ("нет раздела «Разведка» — план действующего формата обязан "
                         "содержать раздел со ссылкой на артефакт, кандидатами и решением")
+
+# Пункт «Прогон» (Л23). Разбор — дословная копия `next_step._parse_run` (D5 докстринга
+# модуля): плагин не импортирует движок как модуль. Расхождение с движком — дефект.
+_RUN_LABEL = "прогон"
+_RUN_TICK_RE = re.compile(r"`([^`]+)`")
+_RUN_ARROWS = ("→", "->")
+_RUN_EXIT_RE = re.compile(r"exit\s*:?\s*(?P<code>-?\d+)", re.IGNORECASE)
+_RUN_CONTAINS_RE = re.compile(r"содержит\s*:?\s*", re.IGNORECASE)
+_RUN_REGEX_RE = re.compile(r"regex\s*:?\s*", re.IGNORECASE)
+_RUN_QUOTES = {'"': '"', "«": "»", "`": "`"}
+# Тексты Л23 — так же в §11.1, колонка «Что проверяется».
+_RUN_MISSING = ("нет пункта «Прогон» — у плана вне списка plans.legacy шаг обязан "
+                "объявить прогон; список ведёт владелец проекта")
+_RUN_EMPTY = "пункт «Прогон» пустой"
+_RUN_NO_COMMAND = "пункт «Прогон» без команды в обратных кавычках"
+_RUN_NO_EXPECT = ("пункт «Прогон» без вида ожидания "
+                  "(exit 0, содержит \"текст\" или regex \"выражение\")")
+#: Ключ конфига проекта со списком legacy-планов (Допущение 5 плана 9).
+_LEGACY_KEY = ("plans", "legacy")
 
 
 @dataclass(frozen=True)
@@ -142,6 +162,36 @@ def _plans_dir(project: Path) -> Path:
 def _raw_step_regex(project: Path) -> str:
     cfg = _read_config(Path(project))
     return str(cfg.get("step_id_regex") or _STEP_ID_REGEX)
+
+
+def _plan_number(path: Path) -> int | None:
+    """Номер плана из имени файла (`2-demo.md` → 2); имени не по формату нет — None."""
+    match = _PLAN_NUM_RE.match(Path(path).name)
+    return int(match.group(1)) if match else None
+
+
+def _legacy_plans(project: Path) -> set[int] | None:
+    """Список legacy-планов проекта из `pipeline.json`: `None` — правило не включено.
+
+    Три состояния ключа (Допущение 5 плана 9): ключа или словаря `plans` нет — правило
+    Л23 выключено (прежнее поведение: живой проект не краснеет от выпуска версии);
+    `[]` — все планы проекта современные; список номеров — перечисленные планы идут по
+    прежнему правилу. Значение неожидаемого типа (строка, число, словарь) — тоже
+    `None`: конфиг с опечаткой не должен красить план. Мусор внутри списка пропускается.
+    """
+    plans = _read_config(Path(project)).get(_LEGACY_KEY[0])
+    if not isinstance(plans, dict):
+        return None
+    value = plans.get(_LEGACY_KEY[1])
+    if not isinstance(value, (list, tuple)):
+        return None
+    out: set[int] = set()
+    for item in value:
+        try:
+            out.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _compile_step_regex(raw: str) -> tuple[re.Pattern | None, str]:
@@ -246,9 +296,69 @@ def _in_plans_dir(path: Path, plans_dir: Path) -> bool:
 
 # ───────────────────────────── проверки ─────────────────────────────
 
-def _bullet_problems(shown: str, sid: str, line: int,
-                     body: list[str]) -> list[Problem]:
-    """Пункты шага: файл, гейты (не пустые) и критерий готовности."""
+def _run_problem(text: str) -> str:
+    """Почему пункт «Прогон» не разбирается движком; пустая строка — разбирается.
+
+    Копия правил `next_step::_parse_run` (D5 докстринга модуля), расхождение — дефект.
+    Проверяется ровно то, от чего зависит исполнение прогона: команда в обратных
+    кавычках, стрелка и вид ожидания. Хвосты (`таймаут`, `slow`) на разбор не влияют —
+    битый таймаут движок просто игнорирует, и находки об этом нет.
+    """
+    match = _RUN_TICK_RE.search(text)
+    if match is None or not match.group(1).strip():
+        return _RUN_NO_COMMAND
+    rest = text[match.end():]
+    arrow = next((item for item in _RUN_ARROWS if item in rest), None)
+    if arrow is None:
+        return _RUN_NO_EXPECT
+    after = rest.split(arrow, 1)[1].lstrip()
+    if _RUN_EXIT_RE.match(after):
+        return ""
+    for regex, tick in ((_RUN_CONTAINS_RE, False), (_RUN_REGEX_RE, True)):
+        match = regex.match(after)
+        if match is None:
+            continue
+        quoted = after[match.end():].lstrip()
+        closer = _RUN_QUOTES.get(quoted[0]) if quoted else None
+        if closer is None or (quoted[0] == "`" and not tick):
+            return _RUN_NO_EXPECT
+        return "" if quoted.find(closer, 1) > 0 else _RUN_NO_EXPECT
+    return _RUN_NO_EXPECT
+
+
+def _run_problems(shown: str, sid: str, line: int, body: list[str],
+                  *, require: bool) -> list[Problem]:
+    """Л23: пункт «Прогон» у шага (формат — §5 формата плана).
+
+    `require=True` — правило включено (`plans.legacy` есть, плана в списке нет): пункта
+    нет вовсе — находка, пункт есть, но не разбирается движком — тоже, потому что такой
+    прогон не исполнится.
+
+    `require=False` — план из списка legacy: Л23 молчит целиком, включая форматные
+    находки. Иначе старые планы начали бы краснеть от выпуска версии: у плана 12 этого
+    репозитория «Прогоны:» написаны прозой, и его счёт находок вырос бы, хотя план идёт
+    по прежнему правилу. Список legacy — это «прежнее поведение», а не «прежнее
+    поведение без требования пункта».
+    """
+    if not require:
+        return []
+    blocks = [item for item in _section_blocks(body) if item[0].startswith(_RUN_LABEL)]
+    if not blocks:
+        return [Problem(shown, line, f"шаг {sid}: {_RUN_MISSING}", sid)]
+    out: list[Problem] = []
+    for _label, text, _full in blocks:
+        if text.strip() in _EMPTY_GATES:
+            out.append(Problem(shown, line, f"шаг {sid}: {_RUN_EMPTY}", sid))
+            continue
+        reason = _run_problem(text)
+        if reason:
+            out.append(Problem(shown, line, f"шаг {sid}: {reason}", sid))
+    return out
+
+
+def _bullet_problems(shown: str, sid: str, line: int, body: list[str],
+                     *, require_runs: bool = False) -> list[Problem]:
+    """Пункты шага: файл, гейты (не пустые), прогон (Л23) и критерий готовности."""
     blocks = _section_blocks(body)
     files = [b for b in blocks if b[0].startswith("файл")]
     gates = [b for b in blocks if b[0].startswith(("тест", "гейт", "проверк"))]
@@ -259,6 +369,7 @@ def _bullet_problems(shown: str, sid: str, line: int,
         out.append(Problem(shown, line, f"шаг {sid}: нет пункта «Гейты:»", sid))
     elif all(b[1].strip() in _EMPTY_GATES for b in gates):
         out.append(Problem(shown, line, f"шаг {sid}: гейты пустые", sid))
+    out.extend(_run_problems(shown, sid, line, body, require=require_runs))
     ready = False
     for _label, _text, full in blocks:
         m = _READY_RE.search(full)
@@ -385,14 +496,21 @@ def _research_section(lines: list[str], found: list[tuple[int, int, str]],
 
 
 def _research_problems(shown: str, lines: list[str],
-                       found: list[tuple[int, int, str]], settings: Settings) -> list[Problem]:
+                       found: list[tuple[int, int, str]], settings: Settings,
+                       *, silent: bool = False) -> list[Problem]:
     """Л18 и Л19 (§5a) — только у плана действующего формата.
 
     Дискриминатор — строка `Конституция:` в шапке (D1): без неё план legacy, линтер
     молчит и про раздел, и про его поля, счётчики ведомых планов не растут (§5a).
     Поля — слова-маркеры §5a (D2): таблица, проза и списки равны, важны слова. Число
     находок — по числу отсутствующих полей: ревьюер читает, какого поля не хватает.
+
+    `silent` — план из списка `plans.legacy` проекта (Д1 плана 9): молчит до чтения
+    строки `Конституция:`, потому что переутверждение плана в новый формат его в
+    современные не переводит — форма плана остаётся прежней, пока снимает его владелец.
     """
+    if silent:
+        return []
     if _constitution_line(lines, found) is None:
         return []  # legacy-план: ни Л18, ни Л19 не срабатывают (§5a, D1)
     section = _research_section(lines, found, settings)
@@ -597,9 +715,16 @@ def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
     if step_regex is None:  # pragma: no cover - отсекается в lint_project
         return problems
     found = _headings(lines)
+    # Список legacy-планов проекта (Допущение 5 плана 9): у плана из списка Л23 молчит,
+    # а Л18/Л19 не срабатывают даже при строке `Конституция:`; у плана вне списка
+    # пункт «Прогон» обязателен. Ключа нет — правило не включено вовсе.
+    legacy = _legacy_plans(project)
+    number = _plan_number(path)
+    require_runs = legacy is not None and number not in legacy
     # Уровень плана (Л18, Л19): до разделов шагов и журнала — у плана действующего
     # формата разведка обязательна, даже если остальной формат сломан и там своя находка.
-    problems.extend(_research_problems(shown, lines, found, settings))
+    problems.extend(_research_problems(shown, lines, found, settings,
+                                       silent=legacy is not None and number in legacy))
     sections = [(idx, level) for idx, level, title in found
                 if level >= 2 and settings.steps_marker in title.lower()]
     if not sections:
@@ -628,7 +753,8 @@ def lint_file(path: Path, project: Path, settings: Settings) -> list[Problem]:
             continue
         sid = m.group("id").upper()
         body_end = _span_end(inside, pos, end)
-        problems.extend(_bullet_problems(shown, sid, idx + 1, lines[idx + 1:body_end]))
+        problems.extend(_bullet_problems(shown, sid, idx + 1, lines[idx + 1:body_end],
+                                         require_runs=require_runs))
         if sid in steps:
             problems.append(Problem(shown, idx + 1, f"шаг {sid} повторяется в разделе шагов", sid))
             continue

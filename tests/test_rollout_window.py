@@ -336,7 +336,14 @@ def test_engine_marker_matches_plugin_after_upgrade(project: Path, hermes_stub: 
     assert digest == setup_flow.engine_digest(proj.ENGINE_SRC)
     assert setup_flow.engine_marker_problem(project) == ""
     assert (project / VERSION).read_text(encoding="utf-8").strip() == setup_flow.plugin_version()
-    assert (project / "pipeline.json").read_bytes() == config
+    # Конфиг тронут ровно одним: раскатка однократно заполняет `plans.legacy`
+    # (`setup_flow.ensure_plans_legacy`, шаг 9-S1). Всё остальное обязано совпасть байт
+    # в байт — иначе `upgrade` молча переписывает решения владельца.
+    after = json.loads((project / "pipeline.json").read_text(encoding="utf-8"))
+    before = json.loads(config)
+    assert after.pop("plans", {}).get("legacy") == ["1"], after
+    before.pop("plans", None)
+    assert after == before
     scripts = home / "demo" / "scripts"
     assert (scripts / "pipeline_tick.py").is_file()
     assert (scripts / "pipeline_update.py").is_file()

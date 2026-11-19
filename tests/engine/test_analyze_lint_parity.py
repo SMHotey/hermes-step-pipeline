@@ -32,12 +32,14 @@ CONSTITUTION = "Конституция: docs/CONSTITUTION.md"
 STEP1 = "\n".join([
     "- Файл: `app/models/invoice.py`, `tests/test_invoice.py`",
     "- Тесты/гейты: `python -m pytest tests/test_invoice.py -q` → 3 passed",
+    "- Прогон: `python -m pytest tests/test_invoice.py -q` → exit 0",
     "- Готово = таблица `invoice` создана, 3 теста зелёные",
 ])
 
 STEP2 = "\n".join([
     "- Файл: `app/api/invoices.py`, `tests/test_api_invoice.py`",
     "- Тесты/гейты: `python -m pytest tests/test_api_invoice.py -q` → 5 passed",
+    "- Прогон: `python -m pytest tests/test_api_invoice.py -q` → exit 0",
     "- Готово = `GET /invoices` отдаёт 200 и список",
 ])
 

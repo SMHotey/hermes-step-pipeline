@@ -23,6 +23,7 @@ BROKEN = """# 2. Кривой план
 
 - Файл: `app/x.py`
 - Тесты/гейты: `python -m pytest tests/test_x.py -q` → 1 passed
+- Прогон: `python -m pytest tests/test_x.py -q` → exit 0
 
 ## Журнал выполнения
 
@@ -690,3 +691,74 @@ def test_doctor_shows_constitution_warning(project: Path):
     # Итог и код возврата считают только problems: предупреждение установку не краснит.
     assert doctor.format_report(doctor.Report(warnings=list(report.warnings))).splitlines()[-1] \
         == "ИТОГ: OK"
+
+
+# ── Л23: пункт «Прогон» у плана вне списка `plans.legacy` (шаг 9-S1). ──────────
+#
+# Список legacy — политика проекта, а не грамматика плана, поэтому он лежит в
+# `pipeline.json` и читается в `lint_file`. Три состояния ключа: нет ключа — правило
+# выключено, `[]` — все планы современные, список номеров — перечисленные идут по
+# прежнему правилу (и Л18/Л19 у них молчат).
+
+def set_legacy(project: Path, value) -> None:
+    """Записать `plans.legacy` в конфиг проекта; `None` — убрать ключ целиком."""
+    cfg = proj.read_config(project)
+    if value is None:
+        cfg.pop("plans", None)
+    else:
+        cfg["plans"] = {"legacy": value}
+    proj.write_config(project, cfg)
+
+
+def run_findings(problems) -> list[str]:
+    """Находки про пункт «Прогон» — по ним и судится Л23."""
+    return [problem.text for problem in problems if "Прогон" in problem.text]
+
+
+def test_run_bullet_required_outside_legacy(project: Path):
+    """`plans.legacy == []`: шаг без «Прогон» — находка, шаг с пунктом — молчание."""
+    set_legacy(project, [])
+    path = project / "docs" / "plans" / "2-runs.md"
+    path.write_text(helpers.PLAN, encoding="utf-8")
+
+    assert len(run_findings(plan_lint.lint_file(path, project,
+                                                plan_lint.settings(project)))) == 2
+
+    with_runs = helpers.PLAN.replace("- Готово =", "- Прогон: `python -m pytest -q` → exit 0\n"
+                                              "- Готово =")
+    path.write_text(with_runs, encoding="utf-8")
+    assert run_findings(plan_lint.lint_file(path, project, plan_lint.settings(project))) == []
+
+
+def test_run_bullet_silent_for_plan_in_legacy_list(project: Path):
+    """План из списка `plans.legacy` идёт по прежнему правилу: пункт «Прогон» не требуется."""
+    set_legacy(project, ["2"])
+    path = project / "docs" / "plans" / "2-legacy.md"
+    path.write_text(helpers.PLAN, encoding="utf-8")
+
+    assert run_findings(plan_lint.lint_file(path, project,
+                                            plan_lint.settings(project))) == []
+
+
+def test_legacy_plan_without_constitution_and_run_is_clean(project: Path):
+    """План из списка без строки `Конституция:` и без «Прогон» — ноль блокирующих находок."""
+    set_legacy(project, ["2"])
+    path = project / "docs" / "plans" / "2-legacy.md"
+    path.write_text(helpers.PLAN, encoding="utf-8")
+
+    assert plan_lint.lint_project(project, "2").problems == []
+
+
+def test_plan_without_legacy_key_is_clean(project: Path):
+    """Ключа `plans.legacy` нет — правило не включено: прежнее поведение, находок нет."""
+    set_legacy(project, None)
+    path = project / "docs" / "plans" / "2-runs.md"
+    path.write_text(helpers.PLAN, encoding="utf-8")
+
+    assert plan_lint.lint_project(project, "2").problems == []
+
+
+def test_repo_plans_in_legacy_list_are_silent():
+    """Планы этого репозитория: 10 в списке (молчит), 9 вне его — и его шаги несут «Прогон»."""
+    assert run_findings(plan_lint.lint_project(helpers.REPO, "10").problems) == []
+    assert plan_lint.lint_project(helpers.REPO, "9").problems == []

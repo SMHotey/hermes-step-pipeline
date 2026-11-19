@@ -24,7 +24,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +52,23 @@ class Step:
     # «Авто: да»: контракт шага, по которому страж решает про ручной допуск.
     risk: str = "normal"
     auto: bool = False
+    runs: list["StepRun"] = field(default_factory=list)
+
+
+# ANCHOR:структура_прогона — стабильная ссылка для спеки и ревью
+@dataclass(frozen=True)
+class StepRun:
+    """Прогон шага как данные: команда, вид ожидания, значение, таймаут, пометка slow.
+
+    Поле `runs` собирается из пунктов «Прогон:» (`_parse_run`, формат — §5 формата
+    плана). Исполняет прогоны страж, а не этот модуль: здесь только разбор.
+    """
+
+    command: str
+    expect: str          # exit | contains | regex
+    value: str           # пустая строка у exit, иначе код/подстрока/выражение
+    timeout: int | None = None   # None — умолчание исполнения
+    slow: bool = False
 
 
 # Маркер пункта ВЕРХНЕГО уровня: строка с отступом — продолжение предыдущего пункта.  # ANCHOR:пункты
@@ -65,7 +82,7 @@ _OWNER_LINE_RE = re.compile(r"^(?:исполнитель|owner)\s*[=:]\s*`?([a-z
 # Пункты, которые НЕ годятся в «цель шага».
 _GOAL_SKIP_LABELS = ("файл", "тест", "гейт", "готово", "замер", "доказательств",
                      "запрет", "важно", "исполнитель", "owner", "чита",
-                     "риск", "авто")
+                     "риск", "авто", "прогон")
 
 
 def _norm(text: str) -> str:
@@ -97,6 +114,86 @@ def _yes(text: str) -> bool:
     """Пункт «Авто: да» — признак зафиксированной договорённости, не отмена риска."""
     token = (_norm(text).split() or [""])[0].lower().strip(".,;:()«»\"'")
     return token in ("да", "yes", "true", "1")
+
+
+# ───────────────────── пункт «Прогон»: прогон шага как данные ─────────────────────
+# Формат — одна строка (§5 формата плана):
+#     `- Прогон: `<команда>` → <ожидание>[; таймаут N сек][; slow]`
+# Команда — первый токен в обратных кавычках (только она исполняется), дальше стрелка,
+# затем ожидание одного из трёх видов: `exit 0`, `содержит "текст"` (или «ёлочки»),
+# `regex "выражение"` (двойные, «ёлочки» или обратные кавычки). Хвосты отделяются `;`
+# или `,` и идут после ожидания. Исполняет прогон страж, а не этот модуль.
+_RUN_TICK_RE = re.compile(r"`([^`]+)`")
+_RUN_ARROWS = ("→", "->")
+_RUN_EXIT_RE = re.compile(r"exit\s*:?\s*(?P<code>-?\d+)", re.IGNORECASE)
+_RUN_CONTAINS_RE = re.compile(r"содержит\s*:?\s*", re.IGNORECASE)
+_RUN_REGEX_RE = re.compile(r"regex\s*:?\s*", re.IGNORECASE)
+_RUN_TIMEOUT_RE = re.compile(r"таймаут\s*:?\s*(?P<seconds>\d+)", re.IGNORECASE)
+_RUN_SLOW_RE = re.compile(r"\bslow\b")
+#: Пары кавычек ожидания: двойные, «ёлочки» и (только для regex) обратные.
+_RUN_QUOTES = {'"': '"', "«": "»", "`": "`"}
+
+
+def _quoted_value(text: str, *, tick: bool = False) -> tuple[str, str] | None:
+    """Фрагмент в кавычках с начала строки: (значение внутри, остаток после кавычек)."""
+    text = text.lstrip()
+    if not text:
+        return None
+    closer = _RUN_QUOTES.get(text[0])
+    if closer is None or (text[0] == "`" and not tick):
+        return None
+    end = text.find(closer, 1)
+    if end <= 0:
+        return None
+    return text[1:end], text[end + 1:]
+
+
+def _expectation(text: str) -> tuple[str, str, str] | None:
+    """Вид ожидания, значение и остаток строки (хвосты); None — вид не распознан."""
+    match = _RUN_EXIT_RE.match(text)
+    if match:
+        return "exit", match.group("code"), text[match.end():]
+    match = _RUN_CONTAINS_RE.match(text)
+    if match:
+        quoted = _quoted_value(text[match.end():])
+        return ("contains", quoted[0], quoted[1]) if quoted else None
+    match = _RUN_REGEX_RE.match(text)
+    if match:
+        quoted = _quoted_value(text[match.end():], tick=True)
+        return ("regex", quoted[0], quoted[1]) if quoted else None
+    return None
+
+
+def _parse_run(text: str) -> StepRun | None:
+    """Пункт «Прогон» → данные прогона; None — пункт не разбирается.
+
+    Функция никогда не бросает: битый пункт — это «не прогон», а не падение сборщика
+    контекста. Разбор повторяет правила §5 формата плана дословно — их же копией судит
+    линтер (`plan_lint._run_problem`), поэтому правка здесь требует правки там.
+    """
+    match = _RUN_TICK_RE.search(text)
+    if match is None:
+        return None
+    command = match.group(1).strip()
+    if not command:
+        return None
+    rest = text[match.end():]
+    arrow = next((item for item in _RUN_ARROWS if item in rest), None)
+    if arrow is None:
+        return None
+    parsed = _expectation(rest.split(arrow, 1)[1].lstrip())
+    if parsed is None:
+        return None
+    expect, value, tail = parsed
+    timeout: int | None = None
+    found = _RUN_TIMEOUT_RE.search(tail)
+    if found:
+        try:
+            timeout = int(found.group("seconds"))
+        except ValueError:  # pragma: no cover - регулярка уже отобрала цифры
+            timeout = None
+    return StepRun(command=command, expect=expect, value=value, timeout=timeout,
+                   slow=_RUN_SLOW_RE.search(tail) is not None)
 
 
 def section_blocks(lines: list[str]) -> list[tuple[str, str, str]]:
@@ -182,6 +279,7 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
     goal = goal or title
     files: list[str] = []
     gates: list[str] = []
+    runs: list[StepRun] = []
     dod = ""
     notes: list[str] = []
     risk = "normal"
@@ -193,6 +291,12 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
         # ANCHOR:гейты — стабильная ссылка для спеки и ревью
         elif label.startswith(("тест", "гейт", "проверк")):
             gates.append(text)
+        # ANCHOR:прогоны — прогон шага собирается в данные, а не в гейты: одна и та же
+        # команда иначе печаталась бы в карточке дважды, а анализатор судил бы её как гейт.
+        elif label.startswith("прогон"):
+            run = _parse_run(text)
+            if run is not None:
+                runs.append(run)
         # ANCHOR:заметки — стабильная ссылка для спеки и ревью
         elif label.startswith(("важно", "примечани", "ограничени")):
             notes.append(text)
@@ -212,7 +316,7 @@ def _step_from_section(cfg: config_mod.Config, sid: str, raw_title: str,
     return Step(id=sid, epoch="", title=title, days=days, owner=owner, goal=goal,
                 files=files, gates=gates, dod=dod,
                 read=[f"{cfg.rel(plan_file)} §{sid}"], notes=" ".join(notes),
-                risk=risk, auto=auto)
+                risk=risk, auto=auto, runs=runs)
 
 
 def plan_steps(cfg: config_mod.Config, plan_file: Path) -> list[Step]:

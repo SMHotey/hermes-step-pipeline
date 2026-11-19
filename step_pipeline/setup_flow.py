@@ -533,8 +533,45 @@ def ensure_plugin_enabled(profile: str, log: Log) -> str:
 
 
 
+#: Имя файла плана: «номер-слаг.md» — как у линтера и реестра планов.
+_PLAN_NAME_RE = re.compile(r"^(\d{1,2})-.+\.md$")
+
+
+def ensure_plans_legacy(project: Path, log: Log) -> list[str]:
+    """Однократно записать `plans.legacy` живого проекта: все его планы на этот момент.
+
+    Ключ заполняется **только когда его нет** (Допущение 5 плана 9): `[]` и непустой
+    список — решение владельца, раскатка их не переписывает. Иначе планы, созданные
+    после первого обновления, молча теряли бы требование пункта «Прогон», а заполненный
+    ключ менялся бы на каждом `--upgrade`. Пустой каталог планов даёт `[]`: планов нет,
+    значит и legacy нет. Возвращает записанный список номеров или `[]` — ключ уже был.
+    """
+    cfg = proj.read_config(project)
+    plans = cfg.get("plans")
+    if isinstance(plans, dict) and "legacy" in plans:
+        return []
+    folder = Path(project) / str((cfg.get("paths") or {}).get("plans") or "docs/plans")
+    numbers: list[int] = []
+    if folder.is_dir():
+        for path in sorted(folder.glob("*.md")):
+            match = _PLAN_NAME_RE.match(path.name)
+            if match:
+                numbers.append(int(match.group(1)))
+    filled = [str(number) for number in sorted(set(numbers))]
+    block = plans if isinstance(plans, dict) else {}
+    block["legacy"] = filled
+    cfg["plans"] = block
+    proj.write_config(project, cfg)
+    log.ok(f"plans.legacy заполнен: {len(filled)} планов "
+           f"(ключ больше не переписывается)")
+    return filled
+
+
 def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
     """Обновить движок и роли в уже поставленном проекте, не трогая конфиг.
+
+    Единственное исключение — однократное заполнение `plans.legacy` (`ensure_plans_legacy`):
+    проект без ключа иначе остался бы с выключенным правилом Л23 навсегда.
 
     Роли синхронизируются с плагином (прежняя версия уходит в `.pipeline/roles-backup/`):
     иначе правки `step_pipeline/roles/` до поставленного проекта не доезжают вовсе.
@@ -562,6 +599,9 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
         log.ok(f"движок и роли уже актуальны ({now})")
     quarantine_stale_plugins(log)
     cfg = proj.read_config(project)
+    # Однократное заполнение списка legacy-планов — единственная запись конфига в этом
+    # обновлении: иначе проект, поставленный до этой версии, навсегда остался бы без Л23.
+    ensure_plans_legacy(project, log)
     driver = roles_from_config(cfg)[0]
     plugin_state = ensure_plugin_enabled(driver, log)  # noqa: F841 - важен сам вызов, а не итог
     # Разведка — четвёртая роль: движок берёт `profiles.scout`, а без ключа — профиль
@@ -588,7 +628,8 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
         log.warn("доверие проекту не оформлялось (--no-trust)")
         tail = "доверие ролям пропущено (--no-trust)"
     log.step(f"── Движок: {was} → {now}, роли: {len(roles.refreshed)} обновлено. "
-             f"Конфиг и telegram не тронуты; {tick}; {tail} ──")
+             f"Конфиг не тронут, кроме однократного заполнения plans.legacy; "
+             f"telegram не тронут; {tick}; {tail} ──")
     return 0
 
 
