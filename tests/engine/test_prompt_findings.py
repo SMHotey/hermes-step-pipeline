@@ -261,6 +261,38 @@ def test_registry_header_and_parse_errors(project):
     assert gate.load_findings(plan_path)[0]["id"] == "F1"
 
 
+def test_status_note_after_word_is_read_as_status(project):
+    """Пояснение в ячейке статуса не роняет план: статус читается по слову (18.11.2026).
+
+    Реестр постановки S3 одного проекта-потребителя содержал `закрыто (круг 1: …)` — гейт
+    счёл ячейку чужим статусом, остановил план инцидентом и завёл `plan_1_stop.json`.
+    Слово берётся только целым: `закрытое` и `починил` остаются ошибкой словаря,
+    а запись хранит каноническое слово, а не форму записи автора.
+    """
+    p = paths(project)
+    path = gate.prompt_findings_path(p, "S1")
+    rows = [("F1", "замысел", "т", "д",
+             "закрыто (круг 1: шапка переписана, recon_commit=ded23bc)"),
+            ("F2", "стиль", "т", "д", "Закрыто: правка внесена"),
+            ("F3", "стиль", "т", "д", "не блокирует — принято при закрытии")]
+    write_findings(project, rows)
+    loaded = gate.load_findings(path, gate.PROMPT_FINDINGS_HEADER, gate.PROMPT_FINDINGS_KEYS)
+    assert [item["status"] for item in loaded] == ["закрыто", "закрыто", "не блокирует"]
+
+    for bad in ("закрытое", "починил", "закрыто2"):
+        write_findings(project, [("F1", "замысел", "т", "д", bad)])
+        with pytest.raises(gate.GateError) as exc:
+            gate.load_findings(path, gate.PROMPT_FINDINGS_HEADER, gate.PROMPT_FINDINGS_KEYS)
+        assert "статус" in str(exc.value), str(exc.value)
+
+    gate.write_findings(path, [{"id": "F1", "kind": "замысел", "text": "т", "action": "д",
+                                "status": "закрыто (круг 2)"}],
+                        gate.PROMPT_FINDINGS_HEADER, gate.PROMPT_FINDINGS_KEYS,
+                        "постановки", "prompt-")
+    text = path.read_text(encoding="utf-8")
+    assert "| закрыто |" in text, "запись обязана хранить слово словаря, а не пояснение"
+
+
 # ───────────────────────────── действующий вердикт ─────────────────────────────
 
 def test_effective_verdict_by_registry():
