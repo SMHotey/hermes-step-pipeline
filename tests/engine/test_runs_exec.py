@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """Прогоны шага исполняет страж (план 9, S2).
 
-Тринадцать тестов постановки: три вида ожидания (`exit`, `содержит`, `regex`), таймаут,
-кэш по паре sha-команда, бюджет шага (хвост догоняет следующий тик), зелёный прогон как
-карточка ревью, красный — карточка правок с находкой F03 вместо ревью (включая
-исчерпание лимита кругов), строка прогона в журнале и блок прогона в панели.
+Пятнадцать тестов постановки: три вида ожидания (`exit`, `содержит`, `regex`), таймаут,
+кэш по паре sha-команда, бюджет шага (хвост догоняет следующий тик, а признак исчерпания —
+пропуск, не сумма), зелёный прогон как карточка ревью, красный — карточка правок с
+находкой F03 вместо ревью (включая исчерпание лимита кругов), строка прогона в журнале и
+блок прогона в панели.
 
 Команды прогонов — только первый токен `python` и встроенные модули stdlib: строка
 пункта «Прогон» обязана исполняться одинаково в bash и в cmd.
@@ -37,6 +38,7 @@ CMD_MISSING = "python -m module_s2_missing"
 CMD_ZEN = "python -m this"
 CMD_SLEEP = "python -c \"import time; time.sleep(10)\""
 CMD_SLOW = "python -c \"import time; time.sleep(1.5)\""
+CMD_RED_SLOW = "python -c \"import sys, time; time.sleep(1.5); sys.exit(1)\""
 
 EMPTY_RUNS = {"sha": "", "total": 0, "green": 0, "seconds": 0, "items": []}
 
@@ -298,6 +300,51 @@ def test_budget_stops_remaining_runs(project: Path, hermes_stub: Path):
     stop = json.loads(stop_file.read_text(encoding="utf-8"))
     assert stop["kind"] == "incident"
     assert "бюджет" in stop["reason"] and "1 из 2" in stop["reason"]
+
+
+def test_all_green_over_budget_orders_review(project: Path, hermes_stub: Path):
+    """Сумма прогонов перевалила за лимит, но ничего не пропущено — ревью, а не стоп.
+
+    Находка 9-S2 F1: признак исчерпания — факт пропуска. Два зелёных прогона, чья сумма
+    дошла до лимита, доказательство собрали полностью, и стоп на них — ложный инцидент.
+    """
+    p = stand(project, hermes_stub,
+              [f"- Прогон: `{CMD_SLOW}` → exit 0", f"- Прогон: `{CMD_SLOW}` → exit 0"],
+              budget=3)
+    created: list[tuple[str, str]] = []
+
+    res = tick(p, created=created)
+
+    proof = proof_of(p)
+    assert [row["outcome"] for row in proof["runs"]] == ["green", "green"]
+    assert proof["budget"]["spent"] >= 3                   # сумма дошла до лимита
+    assert proof["budget"]["exhausted"] is False           # но пропуска не было
+    assert res["decision"]["action"] == "create_review"
+    assert not (project / ".pipeline" / "state" / "plan_1_stop.json").exists()
+
+
+def test_stop_counts_executed_not_green(project: Path, hermes_stub: Path):
+    """«Исполнено N из M» — исполненные прогоны, а не зелёные (находка 9-S2 F1).
+
+    Красный прогон съел бюджет, хвост пропущен: исполнено один из двух, зелёных ноль.
+    Причина стопа обязана назвать первое число, иначе человек читает «0 из 2» и ищет
+    два несуществующих пропуска.
+    """
+    p = stand(project, hermes_stub,
+              [f"- Прогон: `{CMD_RED_SLOW}` → exit 0", f"- Прогон: `{CMD_MARK}` → exit 0"],
+              budget=1)
+
+    proof = gate.run_step_runs(p, next_step_dict(project))
+
+    assert [row["outcome"] for row in proof["runs"]] == ["red", "skipped"]
+    assert proof["budget"]["exhausted"] is True
+    assert not (project / MARKER).exists()
+
+    tick(p)
+    stop = json.loads((project / ".pipeline" / "state" / "plan_1_stop.json")
+                      .read_text(encoding="utf-8"))
+    assert "1 из 2 исполнено" in stop["reason"], stop["reason"]
+    assert "0 из 2" not in stop["reason"]
 
 
 # ─────────────────── зелёный → ревью, красный → правки ───────────────────

@@ -1119,9 +1119,11 @@ def run_step_runs(p: Paths, step: dict) -> dict | None:
     либо `skipped` (бюджет, D5), плюс код возврата, секунды и хвост.
 
     Бюджет шага (`step_runs.budget`, 600 с по умолчанию) считается по времени,
-    потраченному В ЭТОМ вызове: кэш бюджет не ест. Исчерпанный бюджет молча не
-    поднимается — `budget.exhausted` в файле читает решение и превращает тик в
-    инцидентный стоп (D5).
+    потраченному В ЭТОМ вызове: кэш бюджет не ест. Признак `budget.exhausted` — факт
+    пропуска прогона (`skipped`), а не «потрачено ≥ лимита»: два зелёных прогона, чья
+    сумма перевалила за лимит, ничего не пропустили и обязаны вести в ревью
+    (находка 9-S2 F1). Исчерпанный бюджет молча не поднимается — `budget.exhausted`
+    в файле читает решение и превращает тик в инцидентный стоп (D5).
 
     У шага без пунктов «Прогон» — `None`: решению нечего читать, файл не создаётся.
     Команда, которая не запустилась, — красный прогон с `code: null`, а не исключение:
@@ -1184,11 +1186,11 @@ def run_step_runs(p: Paths, step: dict) -> dict | None:
                      # ПОЧЕМУ прогон красный («подстроки нет», «код 1»), а не только код.
                      "reason": reason})
     proof = {"plan": p.plan_id, "step": str(step.get("id") or ""), "sha": sha,
-             "total": len(declared),
+             "total": len(rows),
              "green": sum(1 for row in rows if row.get("outcome") == "green"),
              "seconds": round(sum(float(row.get("seconds") or 0) for row in rows), 3),
              "budget": {"limit": limit, "spent": round(spent, 3),
-                        "exhausted": spent >= limit},
+                        "exhausted": any(row.get("outcome") == "skipped" for row in rows)},
              "runs": rows,
              # id карточки правок, заказанной по этому доказательству (D7): пустая строка —
              # не заказывалась. Без неё ветвь «fix_card заполнен» недостижима, и тик
@@ -4268,11 +4270,14 @@ def runs_gate_decision(ctx: dict, step: dict, fixes: list[dict],
     sid = str(step.get("id") or "")
     total = int(proof.get("total") or 0)
     green = int(proof.get("green") or 0)
+    rows = [row for row in proof.get("runs") or [] if isinstance(row, dict)]
+    skipped = sum(1 for row in rows if row.get("outcome") == "skipped")
+    executed = max(total - skipped, 0)   # исполнено — строки без `skipped` (F1), не зелёные
     budget = proof.get("budget") if isinstance(proof.get("budget"), dict) else {}
     if budget.get("exhausted"):
         return {"action": "stop", "step": sid, "kind": "incident",
                 "reason": (f"прогоны шага {sid}: бюджет прогонов исчерпан "
-                           f"({green} из {total} исполнено за "
+                           f"({executed} из {total} исполнено за "
                            f"{_seconds_text(budget.get('spent') or 0)} при лимите "
                            f"{_seconds_text(budget.get('limit') or 0)})"),
                 "details": ("Как снять: поднять `step_runs.budget` в `pipeline.json` и "
