@@ -217,6 +217,27 @@ class TestStuckCards:
         found = gate.stuck_cards(db, deadline_hours=12, fresh_minutes=30, now=NOW)
         assert [item["id"] for item in found["stuck"]] == ["t_oldest", "t_young"]
 
+    def test_archived_card_is_neither_stuck_nor_nearest(self, db: Path):
+        """Архив — закрытая карточка, а не висящая (F1): её не видит и `read_cards`."""
+        add_card(db, "t_arch_old", status="archived", age_hours=30)
+        add_card(db, "t_arch_new", status="archived", age_hours=1)
+        found = gate.stuck_cards(db, deadline_hours=12, fresh_minutes=30, now=NOW)
+        assert found == {"stuck": [], "nearest": None}
+
+    def test_archived_card_ignored_on_reduced_board(self, db: Path):
+        """Урезанная схема (`stub_hermes`): хватает статуса, событий для этого не нужно."""
+        add_plain_card(db, "t_plain_arch", status="archived", age_hours=30)
+        assert gate.stuck_cards(db, deadline_hours=12, fresh_minutes=30,
+                                now=NOW) == {"stuck": [], "nearest": None}
+
+    def test_live_card_next_to_archived_is_still_stuck(self, db: Path):
+        """Архив пропущен, живая карточка того же плана — нет: фильтр не глушит проверку."""
+        add_card(db, "t_arch", status="archived", age_hours=30)
+        add_card(db, "t_stale", age_hours=13)
+        found = gate.stuck_cards(db, deadline_hours=12, fresh_minutes=30, now=NOW,
+                                 key_prefix="planloop:1:")
+        assert [item["id"] for item in found["stuck"]] == ["t_stale"]
+
     def test_reduced_board_counts_age_by_created_at(self, db: Path):
         """Урезанная борда (`stub_hermes`): ни событий, ни heartbeat — считаем по созданию."""
         add_plain_card(db, "t_plain", age_hours=20)
@@ -341,6 +362,38 @@ class TestDecide:
         decision = gate.decide(ctx(cards=[], stuck_cards=[{"id": "t_stale", "status": "todo",
                                                            "title": "шаг", "age": HOUR * 20}]))
         assert decision["action"] == "create_step"
+
+    def test_closed_plan_is_not_stopped_by_stale_card(self):
+        """F2: у закрытого плана работы нет по определению — `idle` с `plan_done`."""
+        decision = gate.decide(ctx(next=None,
+                                   stuck_cards=[{"id": "t_arch", "status": "todo",
+                                                 "title": "шаг", "age": 356 * HOUR}]))
+        assert decision["action"] == "idle"
+        assert decision.get("plan_done") is True
+        assert "kind" not in decision                # владельческого стопа нет
+
+    def test_approval_wait_is_not_stopped_by_stale_card(self):
+        """F2: неутверждённый план ждёт владельца — ограда та же, что у предзаказа."""
+        decision = gate.decide(ctx(cards=[],
+                                   approval={"ok": False, "started": False,
+                                             "block_kind": None,
+                                             "reason": "план не утверждён"},
+                                   stuck_cards=[{"id": "t_stale", "status": "todo",
+                                                 "title": "шаг", "age": 13 * HOUR}]))
+        assert decision["action"] == "idle"
+        assert decision.get("approval_blocked") is True
+        assert "kind" not in decision
+
+    def test_question_wait_is_not_stopped_by_stale_card(self):
+        """F2: шаг ждёт ответа на вопрос — ожидание по делу, а не простой."""
+        decision = gate.decide(ctx(cards=[],
+                                   step_questions=[{"id": "Q1", "text": "какой путь?",
+                                                    "options": "A / B", "recommend": "A"}],
+                                   stuck_cards=[{"id": "t_stale", "status": "todo",
+                                                 "title": "шаг", "age": 13 * HOUR}]))
+        assert decision["action"] == "idle"
+        assert decision.get("question") == "Q1"
+        assert "kind" not in decision
 
 
 # ────────────────── тик целиком: build_ctx + run_gate (З3/З4) ──────────────────

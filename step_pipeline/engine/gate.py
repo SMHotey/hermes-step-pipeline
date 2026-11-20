@@ -167,6 +167,13 @@ def verify_engine_integrity(base: Path) -> tuple[bool, str]:
 
 TERMINAL = {"done", "blocked", "crashed", "timed_out", "gave_up"}
 
+# Архивная карточка — закрытая, а не висящая (находка F1 ревью 10-S2A): `hermes kanban
+# archive` ставит `archived` уже закрытой карточке, и собственный читатель карточек стража
+# её не видит (`read_cards`, `status <> 'archived'`). В набор `TERMINAL` статус не входит
+# намеренно: набор читают `reused_card` и ветки `_decide_base`, где архив — отдельный
+# случай, а не терминальность, и смена набора изменила бы их решения.
+CARD_HIDDEN_STATUSES = frozenset({"archived"})
+
 # ── Предел ожидания карточки (план 10, S2A) ──────────────────────────────────
 # Источники метки «карточка жива»: те же, что у сканера смотрителя (S2), плюс
 # комментарии. Свежий комментарий и есть жизнь карточки: ревьюер объяснил, что
@@ -813,6 +820,14 @@ def _board_cards(con: sqlite3.Connection, key_prefix: str = "") -> list[dict]:
     `PRAGMA table_info`, отсутствующая таблица или колонка — не ошибка, а
     «метки нет» (образец — `_run_summaries`). Нет `id`/`status` — таблица не
     борда: `sqlite3.Error` наружу, вызывающий отвечает пустым результатом.
+
+    Цена на живой борде (находка F4 ревью 10-S2A): 99.7 мс на проход при 667 карточках
+    и 21 190 событиях — четыре `GROUP BY task_id` читают события всей борды, а ключ
+    фильтрует только `tasks`. Проход идёт на каждый тик каждого ведомого плана и на
+    каждый `--status` панели: для тика раз в 10 минут терпимо, для панели заметно.
+    Сужение событий до отобранных карточек (`WHERE task_id IN (…)`) — возможное
+    ускорение, но оно меняет чтение при деградации схемы, поэтому цена записана,
+    а не спрятана.
     """
     have = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
     if not {"id", "status"} <= have:
@@ -870,7 +885,9 @@ def stuck_cards(db, *, deadline_hours: int, fresh_minutes: int, now: float,
     `MAX(comments.created_at)`. `running` со свежим heartbeat (`fresh_minutes`) —
     живой шаг, а не висящий: он не попадает ни в `stuck`, ни в `nearest`.
     Нетерминальность — по `TERMINAL` стража, а не по набору сканера: `blocked` страж
-    считает терминальным и останавливаться из-за него не имеет права.
+    считает терминальным и останавливаться из-за него не имеет права. Архив
+    (`CARD_HIDDEN_STATUSES`) — тоже не висящий: это закрытая карточка, которую страж
+    не видит и своим читателем (`read_cards`).
 
     Деградация молчаливая (`_run_summaries`, `_board_cards`): нет базы, таблицы,
     колонки, у карточки ни одной метки времени — карточка никуда не попадает. Ложный
@@ -903,8 +920,8 @@ def stuck_cards(db, *, deadline_hours: int, fresh_minutes: int, now: float,
     fresh = max(int(fresh_minutes or 0), 0) * 60
     for card in cards:
         status = str(card.get("status") or "")
-        if status in TERMINAL:
-            continue
+        if status in TERMINAL or status in CARD_HIDDEN_STATUSES:
+            continue                           # закрытая, архивная — не висящая (F1)
         heartbeat = _stamp(card.get("last_heartbeat_at"))
         if status == "running" and heartbeat and now - heartbeat <= fresh:
             continue                           # живой шаг: ни висящий, ни «ближайший»
@@ -4287,6 +4304,21 @@ def _card_deadline_stop(ctx: dict) -> dict | None:
             "reason": reason, "details": details}
 
 
+# Ожидание по законной причине (находка F2 ревью 10-S2A): `idle` с одним из этих флагов —
+# не простой, а ожидание ответа, допуска или закрытие плана, и останавливать там нечего.
+# Ограда одна на обе ветки, которые перебивают `idle` (висящая карточка и предзаказ
+# постановки): два списка дали бы два ответа на один вопрос и разошлись бы при первой
+# правке одного из них. `question` — из той же семьи, поэтому он здесь наравне с
+# `plan_clarify`: шаг, ждущий ответа владельца, тоже не «висит».
+IDLE_WAIT_FLAGS = ("approval_blocked", "incident", "plan_done", "close_blocked",
+                   "plan_clarify", "question")
+
+
+def _legit_idle_wait(base: dict) -> bool:
+    """`idle` ждёт по делу (ответа, допуска, закрытия плана), а не простаивает молча."""
+    return any(bool(base.get(flag)) for flag in IDLE_WAIT_FLAGS)
+
+
 def decide(ctx: dict) -> dict:
     """Чистое решение по состоянию: одно действие (или ожидание). Без побочных эффектов.
 
@@ -4306,19 +4338,18 @@ def decide(ctx: dict) -> dict:
                            f"дальше — {base['action']}")
     # План 10, S2A: висящая карточка вместо тихого ожидания. Стоит после стоп-флага
     # (владельческий стоп не перебивается) и до предзаказа постановки: ждать карточку,
-    # которая висит дольше предела, значит стоять молча. Заменяет только `idle` —
-    # решение, которое что-то заказывает, не перехватывается.
+    # которая висит дольше предела, значит стоять молча. Заменяет только `idle` — и только
+    # `idle`, который действительно простой: та же ограда, что у предзаказа ниже
+    # (`_legit_idle_wait`), иначе стоп подменял решение закрытого плана (`plan_done`),
+    # ожидание утверждения (`approval_blocked`) и ожидание ответа (`question`) — F2.
     deadline = _card_deadline_stop(ctx)
-    if deadline and base["action"] == "idle":
+    if deadline and base["action"] == "idle" and not _legit_idle_wait(base):
         return deadline
     # Предзаказ постановки N+1 (правило 2): только поверх ожидания и без его блокировок.
     # `plan_clarify` — тоже блокировка (план 5, S10): у плана, остановленного вопросами
     # посередине, тик иначе заказал бы постановку следующего шага — работу, которую
     # решение только что отложило.
-    if (base["action"] == "idle" and not base.get("approval_blocked")
-            and not base.get("incident") and not base.get("plan_done")
-            and not base.get("close_blocked") and not base.get("plan_clarify")
-            and not base.get("question")):
+    if base["action"] == "idle" and not _legit_idle_wait(base):
         prefetch = _prefetch_decision(ctx)
         if prefetch:
             return prefetch

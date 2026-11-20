@@ -7,7 +7,8 @@
 судит страж: второй разбор дал бы владельцу два разных ответа на один вопрос.
 
 Файл держит ровно пять тестов из постановки (З5): равенство порога с `config.load`,
-пустая борда, скобка «ближайшая через …», счёт без скобки и выключенная проверка.
+пустая борда, скобка «ближайшая через …», счёт без скобки и выключенная проверка; шестой
+кейс — «архивная карточка в счёт не идёт» (находка F1 круга правок).
 Часы подменяются там же, где их читает диагностика: `doctor` держит модуль движка
 (`gate_mod`), и `gate` ниже — он же, поэтому второй точки подмены времени не появляется.
 """
@@ -137,6 +138,15 @@ class TestCardsRow:
         report = doctor.collect(quiet, with_lint=False)
         assert cards_note(report) == ["висящие карточки: 2"]
         assert limit_warn(report) == []
+
+    def test_archived_card_is_not_counted(self, quiet: Path, board: Path, clock):
+        """F1: архивная карточка — закрытая; считаем только действительно висящую."""
+        set_config(quiet, card_deadline_hours=12, runtimes_step="14h")
+        add_card(board, "t_archived", age_seconds=356 * HOUR, status="archived")
+        add_card(board, "t_stale", age_seconds=13 * HOUR)
+        report = doctor.collect(quiet, with_lint=False)
+        assert cards_note(report) == ["висящие карточки: 1"]
+        assert len(limit_warn(report)) == 1
 
     def test_zero_limit_says_check_is_off(self, quiet: Path, board: Path, clock):
         """Предел 0 и мусор в `runtimes.step`: проверка выключена, предупреждений нет."""
