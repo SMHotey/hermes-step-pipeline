@@ -116,7 +116,16 @@ def test_spec_anchors_resolve_to_code():
     assert refs, "в спеке не осталось якорей — проверь, не откатили ли перевод адресов"
     code = "".join(p.read_text(encoding="utf-8")
                    for p in (PLUGIN / "step_pipeline" / "engine").glob("*.py"))
-    missing = sorted(r for r in refs if f"# ANCHOR:{r}" not in code)
+    def _anchor_hits(name: str) -> int:
+        """Вхождений якоря с точным именем: символ слова сразу после имени — это другой якорь.
+
+        Без границы `прогоны` совпадал бы с `прогоны_исполнение`: подсчёт подстрокой валил
+        шаг, который вводил якорь с общим префиксом (план 9-S2, якорь `прогоны_исполнение`).
+        """
+        return len(re.findall(rf"# ANCHOR:{re.escape(name)}(?![\w])", code))
+
+    missing = sorted(r for r in refs if not _anchor_hits(r))
     assert not missing, f"якоря без кода: {missing}"
-    doubled = sorted(r for r in refs if code.count(f"# ANCHOR:{r}") > 1)
+    doubled = sorted(r for r in refs if _anchor_hits(r) > 1)
     assert not doubled, f"якорь встречается дважды: {doubled}"
+
