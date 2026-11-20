@@ -77,6 +77,12 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
                      help="показать паузу по расписанию: окна и действует ли сейчас")
     run.set_defaults(handler=cmd_run)
 
+    keeper = sub.add_parser("keeper", help="смотритель: --scan — симптомы простоя (план 10)")
+    keeper.add_argument("--project", default="")
+    keeper.add_argument("--scan", action="store_true", help="собрать симптомы (по умолчанию)")
+    keeper.add_argument("--json", action="store_true", help="машинный вывод")
+    keeper.set_defaults(handler=cmd_keeper)
+
     ui = sub.add_parser("ui", help="локальный UI с визуализацией конвейера")
     ui.add_argument("--project", default="")
     ui.add_argument("--port", type=int, default=0)
@@ -249,6 +255,22 @@ def cmd_run(args) -> int:
     res = proj.run_engine(project, "gate.py", "--run", *extra, timeout=600)
     out = (res.stdout or "").strip()
     print(out or "тик выполнен: конвейер ждёт (шаг в работе, ревью идёт или стоп-флаг)")
+    if res.returncode != 0:
+        print((res.stderr or "").strip(), file=sys.stderr)
+    return res.returncode
+
+
+def cmd_keeper(args) -> int:
+    """Скан симптомов смотрителя: запускает модуль движка проекта, ничего не решает сам."""
+    project = _project(args.project)
+    extra = ["--scan"]
+    if getattr(args, "json", False):
+        extra.append("--json")
+    # Каталог пакета передаётся строкой: движок в .pipeline/ пакета не видит, а
+    # импортировать плагин из движка нельзя — движок обязан работать без установки.
+    extra += ["--plugin-dir", str(proj.PLUGIN_DIR)]
+    res = proj.run_engine(project, "keeper_scan.py", *extra, timeout=180)
+    print((res.stdout or "").strip())
     if res.returncode != 0:
         print((res.stderr or "").strip(), file=sys.stderr)
     return res.returncode

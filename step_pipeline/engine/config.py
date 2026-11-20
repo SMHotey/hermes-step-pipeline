@@ -110,6 +110,12 @@ DEFAULTS: dict = {
     # В `pipeline.json` проекта ключ не пишется вовсе: умолчание живёт в коде.
     "step_runs": {"timeout": 120, "budget": 600},
     "runtimes": {"step": "3h", "review": "150m", "prompt": "45m"},
+    # Смотритель и страж: один порог «висит» на двоих (план 10, S2). Возраст карточки —
+    # от последнего события карточки, а не от `waiting_since` стража; `running` со свежим
+    # heartbeat висящей не считается. `card_deadline_hours = 0` выключает проверку.
+    # Мусор в значении (`abc`, `-1`, `null`) — умолчание и WARNING в stderr, а не стоп
+    # конвейера: владелец, поправивший ключ руками, не должен останавливать тик проекта.
+    "watchdog": {"heartbeat_fresh_minutes": 30, "card_deadline_hours": 12},
     # Пауза по расписанию: окна локального времени ОС, в которые тик не работает.
     # Выключено — поведение проектов не меняется. Интервалов не больше двух: владелец
     # просил два (ночь и обед), а длинный список настраивать руками никто не будет.
@@ -158,8 +164,9 @@ DEFAULTS: dict = {
 #: в DoorSystem роняли doctor и маркер). Порядок внутри кортежа произвольный: и копирование,
 #: и хеш идут по сортированным именам.
 ENGINE_FILES = ("__init__.py", "analyze.py", "approval.py", "check_task_prompt.py",
-                "config.py", "gate.py", "next_step.py", "plan_cycle.py", "plan_lint.py", "registry.py",
-                "scout_report.py", "state_io.py", "step_card.py", "tick.py")
+                "config.py", "gate.py", "keeper_scan.py", "next_step.py", "plan_cycle.py",
+                "plan_lint.py", "registry.py", "scout_report.py", "state_io.py",
+                "step_card.py", "tick.py")
 
 # Режимы ревью постановки: иное значение в pipeline.json — ошибка конфигурации, а не
 # молчаливое «auto»: владелец должен узнать, что его настройка не подействовала.
@@ -343,6 +350,55 @@ def _step_runs(value: object) -> dict:
     return out
 
 
+def _watchdog_number(value: object, default: int) -> int | None:
+    """Целое ≥ 0 из настройки: строка из цифр и целое `1.0` годятся, `bool` — нет.
+
+    `None` — значение не принято (вызывающий берёт умолчание и пишет WARNING).
+    `0` — законное значение: проверка выключена, а не «мусор».
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 and value.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip()
+        return int(text) if text.isdigit() else None
+    return None
+
+
+def _watchdog(value: object) -> dict:
+    """Пороги смотрителя и стража (план 10, S2): терпимый разбор, а не `ConfigError`.
+
+    Форма осознанно отличается от `_fix_rounds` и `_quiet_hours`: там мусор — ошибка
+    конфигурации, потому что значение гейт. Здесь предел не гейт — тик не должен
+    вставать из-за опечатки владельца, поэтому мусор даёт умолчание и одну строку
+    WARNING в stderr (его видит cron-лог; stdout читают панель и cron — туда нельзя).
+    """
+    default = DEFAULTS["watchdog"]
+    out = dict(default)
+    if value is None:
+        return out
+    if not isinstance(value, dict):
+        print(f"WARNING: watchdog={value!r} — ожидается объект, беру умолчания"
+              f" {default}", file=sys.stderr)
+        return out
+    for key, raw in value.items():
+        if key not in default:
+            print(f"WARNING: watchdog.{key}={raw!r} — неизвестный ключ, беру"
+                  f" {sorted(default)}", file=sys.stderr)
+            continue
+        number = _watchdog_number(raw, default[key])
+        if number is None:
+            print(f"WARNING: watchdog.{key}={raw!r} — беру {default[key]}", file=sys.stderr)
+            continue
+        out[key] = number
+    return out
+
+
 def _pause_time(value: object, where: str) -> int:
     """Время окна паузы в минутах суток; всё, кроме `ЧЧ:ММ`, — ошибка конфигурации.
 
@@ -483,6 +539,7 @@ class Config:
     max_stale_rebuilds: int
     max_plan_growth: dict
     step_runs: dict
+    watchdog: dict
     quiet_hours: dict
     step_runtime: str
     review_runtime: str
@@ -689,6 +746,7 @@ def load(repo: Path | str | None = None) -> Config:
         max_stale_rebuilds=_stale_rebuilds(raw.get("max_stale_rebuilds")),
         max_plan_growth=_plan_growth(raw.get("max_plan_growth")),
         step_runs=_step_runs(raw.get("step_runs")),
+        watchdog=_watchdog(raw.get("watchdog")),
         quiet_hours=_quiet_hours(raw.get("quiet_hours")),
         step_runtime=str(runtimes.get("step") or "3h"),
         review_runtime=str(runtimes.get("review") or "150m"),
