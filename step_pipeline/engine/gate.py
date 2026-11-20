@@ -9013,6 +9013,31 @@ def tick(cfg: config_mod.Config, execute: bool = True,
                 # со старым sha, и панель вечно показывала «изменён после утверждения»
                 # без кнопки (у стартовавшего плана блокировки утверждения нет).
                 ensure_approval(p, ctx)
+                # Автовыбор рекомендации по таймауту (S5, п.5) — и для простаивающего плана.
+                # Вопрос держит шаг, решение выходит `idle`, а `run_gate` для `idle` не
+                # зовётся; пока `sweep_questions` жил только внутри него, просроченный
+                # вопрос не снимался ни одним тиком и план стоял до ответа человека
+                # (20.11.2026: планы встали на S9 и S10 при истёкших дедлайнах). Тик
+                # закрывает вопрос и на этом заканчивается — карточка шага, как и в
+                # `run_gate`, следующим тиком (требование плана, п. 5).
+                closed = sweep_questions(p.cfg, p, ctx, ctx.get("state"),
+                                         lambda text: notify(cfg, text))
+                if closed:
+                    entry = {"plan": spec.id, "action": "question_auto",
+                             "step": _step_of({"step": closed[-1].get("step")}),
+                             "applied": True,
+                             "detail": str(closed[-1].get("message") or "")}
+                    actions.append(entry)
+                    last_decision = {"action": "question_auto", "step": entry["step"],
+                                     "question": closed[-1].get("qid"),
+                                     "reason": entry["detail"]}
+                    reason = entry["detail"]
+                    # Строка статуса — та же, что увидит владелец: без неё вывод тика
+                    # заканчивался бы «планов с распознанным журналом не найдено».
+                    status_by_plan[spec.id] = entry["detail"]
+                    remember_action(p, spec.id, last_decision, entry["detail"])
+                    finish = True
+                    break
             decision = decide(ctx)
             status_by_plan[spec.id] = status_text(ctx, decision)
             if decision["action"] == "idle":
