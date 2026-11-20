@@ -166,6 +166,15 @@ def verify_engine_integrity(base: Path) -> tuple[bool, str]:
 
 
 TERMINAL = {"done", "blocked", "crashed", "timed_out", "gave_up"}
+
+# ── Предел ожидания карточки (план 10, S2A) ──────────────────────────────────
+# Источники метки «карточка жива»: те же, что у сканера смотрителя (S2), плюс
+# комментарии. Свежий комментарий и есть жизнь карточки: ревьюер объяснил, что
+# делает, — конвейер останавливать не за что. Таблица или колонка отсутствует —
+# источник просто не участвует (схема борды от версии к версии разная).
+CARD_EVENT_SOURCES = (("task_events", "created_at"), ("task_runs", "last_heartbeat_at"),
+                      ("task_runs", "ended_at"), ("comments", "created_at"))
+
 # Разбор вердикта — один шаблон на весь движок: он живёт в `approval.py`, где его читает
 # и привязка ревью плана к версии (S6). Здесь только псевдонимы для кода стража.
 VERDICT_RE = approval.VERDICT_RE
@@ -771,6 +780,149 @@ def card_status(p: Paths, card_id: str, key: str) -> str:
         if str(card.get("id") or "") == str(card_id):
             return str(card.get("status") or "")
     return ""
+
+
+def watchdog_limits(raw: object) -> dict:
+    """Пороги смотрителя и стража из сырого `pipeline.json` (план 10, S2A).
+
+    Тонкая обёртка над разбором шага S2 (`config._watchdog`): у диагностики нет
+    загруженного `Config` — `doctor` держит сырой словарь `proj.read_config`, а
+    `config.load` в нём падает на любом другом сломанном ключе ровно там, где
+    диагностика нужнее всего. Своего разбора здесь нет: второй разбор — второй
+    ответ на один вопрос. Умолчания (30/12) живут в `config.DEFAULTS`, не тут.
+    """
+    section = raw.get("watchdog") if isinstance(raw, dict) else None
+    return dict(config_mod._watchdog(section))
+
+
+def _stamp(value: object) -> int:
+    """Метка борды в epoch; не число, `null` и отрицательное — 0 («метки нет»)."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        stamp = int(value or 0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return stamp if stamp > 0 else 0
+
+
+def _board_cards(con: sqlite3.Connection, key_prefix: str = "") -> list[dict]:
+    """Карточки борды с меткой последнего события (план 10, S2A; только чтение).
+
+    Схема борды от версии к версии разная: колонки берутся по фактическому
+    `PRAGMA table_info`, отсутствующая таблица или колонка — не ошибка, а
+    «метки нет» (образец — `_run_summaries`). Нет `id`/`status` — таблица не
+    борда: `sqlite3.Error` наружу, вызывающий отвечает пустым результатом.
+    """
+    have = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+    if not {"id", "status"} <= have:
+        raise sqlite3.Error("в таблице tasks нет колонок id/status")
+    columns = [name for name in ("id", "title", "status", "idempotency_key",
+                                 "created_at", "started_at", "last_heartbeat_at")
+               if name in have]
+    query = "SELECT " + ", ".join(columns) + " FROM tasks"
+    params: tuple = ()
+    if key_prefix:
+        if "idempotency_key" not in have:      # фильтровать нечем — чужих не берём
+            return []
+        query += " WHERE idempotency_key LIKE ?"
+        params = (key_prefix + "%",)
+    cards = [dict(zip(columns, row)) for row in con.execute(query, params)]
+    events: dict[str, int] = {}
+    for table, column in CARD_EVENT_SOURCES:
+        try:
+            rows = con.execute(f"SELECT task_id, MAX({column}) FROM {table}"
+                               " GROUP BY task_id").fetchall()
+        except sqlite3.Error:
+            continue                           # таблицы или колонки нет — что есть, то и берём
+        for card_id, stamp in rows:
+            if stamp is None:
+                continue
+            events[str(card_id)] = max(events.get(str(card_id), 0), _stamp(stamp))
+    for card in cards:
+        card["last_event"] = max(_stamp(card.get("created_at")),
+                                 _stamp(card.get("started_at")),
+                                 _stamp(card.get("last_heartbeat_at")),
+                                 events.get(str(card.get("id")), 0))
+    return cards
+
+
+def stuck_cards(db, *, deadline_hours: int, fresh_minutes: int, now: float,
+                key_prefix: str = "") -> dict:
+    """Висящие карточки борды: предел ожидания по последнему событию (план 10, S2A).
+
+    Одно исполнение правила «карточка висит» на стража и на диагностику (`build_ctx`
+    для своего плана, `doctor.collect` для всей борды): второй разбор в другом месте
+    дал бы владельцу два ответа на один вопрос.
+
+    Возврат: `{"stuck": [...], "nearest": ...}`.
+
+    - `stuck` — только просроченные (`age > deadline_hours * 3600`), по убыванию `age`:
+      причина стопа называет первую запись, то есть самую старую карточку;
+    - `nearest` — непросроченная карточка с наименьшим остатком
+      `remaining = deadline_hours * 3600 - age` (`0` — ровно на пределе, ещё не
+      висящая) либо `None`;
+    - `age`/`remaining` — целые секунды, карточка — `{id, status, title}`.
+
+    Возраст — от максимума меток: `tasks.created_at`, `tasks.started_at`,
+    `tasks.last_heartbeat_at`, `MAX(task_events.created_at)`,
+    `MAX(task_runs.last_heartbeat_at)`, `MAX(task_runs.ended_at)`,
+    `MAX(comments.created_at)`. `running` со свежим heartbeat (`fresh_minutes`) —
+    живой шаг, а не висящий: он не попадает ни в `stuck`, ни в `nearest`.
+    Нетерминальность — по `TERMINAL` стража, а не по набору сканера: `blocked` страж
+    считает терминальным и останавливаться из-за него не имеет права.
+
+    Деградация молчаливая (`_run_summaries`, `_board_cards`): нет базы, таблицы,
+    колонки, у карточки ни одной метки времени — карточка никуда не попадает. Ложный
+    стоп на самодельной борде хуже пропущенного. `deadline_hours <= 0` — проверка
+    выключена (пустые ключи). Часы приходят параметром `now`: `_now()` остаётся
+    единственной точкой подмены времени.
+    """
+    empty: dict = {"stuck": [], "nearest": None}
+    try:
+        limit = float(deadline_hours or 0)
+    except (TypeError, ValueError):
+        return empty
+    if limit <= 0:
+        return empty
+    try:
+        path = Path(db) if db else None
+    except TypeError:
+        return empty
+    if path is None or not path.is_file():
+        return empty
+    try:
+        con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        try:
+            cards = _board_cards(con, key_prefix)
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        return empty
+    deadline = int(limit * 3600)
+    fresh = max(int(fresh_minutes or 0), 0) * 60
+    for card in cards:
+        status = str(card.get("status") or "")
+        if status in TERMINAL:
+            continue
+        heartbeat = _stamp(card.get("last_heartbeat_at"))
+        if status == "running" and heartbeat and now - heartbeat <= fresh:
+            continue                           # живой шаг: ни висящий, ни «ближайший»
+        last = int(card.get("last_event") or 0)
+        if last <= 0:
+            continue                           # времени нет — возраст не вычисляем
+        age = int(max(now - last, 0))
+        entry = {"id": str(card.get("id") or ""), "status": status,
+                 "title": str(card.get("title") or ""), "age": age}
+        if age > deadline:
+            empty["stuck"].append(entry)
+            continue
+        remaining = deadline - age
+        nearest = empty["nearest"]
+        if nearest is None or remaining < nearest["remaining"]:
+            empty["nearest"] = dict(entry, remaining=remaining)
+    empty["stuck"].sort(key=lambda item: item["age"], reverse=True)
+    return empty
 
 
 def next_fix_round(cards: list[dict], fallback: int = 1) -> int:
@@ -3851,6 +4003,11 @@ def build_ctx(p: Paths) -> dict:
                    plan_decision="", plan_decision_note="", questions_rel="",
                    questions_open=None, step_questions_rel="", step_questions=[],
                    step_questions_error="", answer_timeout=0,
+                   # План 10, S2A: на сбое сборщика шагов судить о висящих карточках не
+                   # по чему, но ключи обязаны быть — решение читает только `ctx`. Порог
+                   # берётся разобранным из конфига: второго разбора в `decide` нет.
+                   watchdog=dict(getattr(p.cfg, "watchdog", None) or {}),
+                   stuck_cards=[], card_deadline_reported=str(state.get("card_deadline_reported") or ""),
                    retro_rel="", retro_missing=False)
         return ctx
     step = pkg.get("next")
@@ -4061,6 +4218,19 @@ def build_ctx(p: Paths) -> dict:
     ctx["scout_artifact_rel"] = p.cfg.rel(scout_artifact(p))
     ctx["scout_artifact_ready"] = scout_artifact(p).is_file()
     ctx["plan_fix_profile"] = plan_fix_profile(p.cfg)
+    # Предел ожидания карточки (план 10, S2A): порог приходит из разобранного конфига
+    # (`cfg.watchdog`), висящие карточки своего плана считаются здесь один раз за тик —
+    # `decide` получает только `ctx` и борду не читает. Чужие планы на той же борде свой
+    # страж не останавливают: их остановит страж их плана, а владелец увидит их в `doctor`.
+    ctx["watchdog"] = dict(getattr(p.cfg, "watchdog", None) or {})
+    ctx["stuck_cards"] = stuck_cards(
+        p.kanban_db,
+        deadline_hours=int(ctx["watchdog"].get("card_deadline_hours") or 0),
+        fresh_minutes=int(ctx["watchdog"].get("heartbeat_fresh_minutes") or 0),
+        now=_now(), key_prefix=f"planloop:{p.plan_id}:")["stuck"]
+    # Отметка «по этой карточке уже доложено»: owner-стоп снимает владелец, и без
+    # отметки тот же стоп ставился бы после каждого `--resume` и каждого тика.
+    ctx["card_deadline_reported"] = str(state.get("card_deadline_reported") or "")
     return ctx
 
 
@@ -4068,6 +4238,53 @@ def stop_kind(stop: dict | None) -> str:
     if not stop:
         return ""
     return stop.get("kind") or ("owner" if stop.get("source") == "owner" else "incident")
+
+
+def _card_deadline_stop(ctx: dict) -> dict | None:
+    """Владельческий стоп по висящей карточке (план 10, S2A).
+
+    Заменяет молчаливое ожидание: карточка в нетерминальном статусе, дольше предела
+    не менявшая последнего события, — это простой, о котором владелец должен узнать
+    с командами, а не «в работе: карточка» каждые десять минут.
+
+    Решение чистое: всё нужное пришло в `ctx["stuck_cards"]` из `build_ctx`. Отметка
+    `card_deadline_reported` гасит повторный стоп на ту же карточку — стоп
+    владельческий, снимается `--resume`, и без отметки он возвращался бы после каждого
+    снятия. Другая карточка после снятия даёт новый стоп: гасится только свой id.
+    """
+    stuck = [item for item in (ctx.get("stuck_cards") or []) if isinstance(item, dict)]
+    if not stuck:
+        return None
+    oldest = stuck[0]
+    card_id = str(oldest.get("id") or "")
+    if not card_id or card_id == str(ctx.get("card_deadline_reported") or ""):
+        return None
+    limits = ctx.get("watchdog")
+    limit = int((limits or {}).get("card_deadline_hours") or 0) if isinstance(limits, dict) else 0
+    age = int(oldest.get("age") or 0)
+    status = str(oldest.get("status") or "")
+    title = str(oldest.get("title") or "")[:60]
+    tail = f" (предел {limit} ч)" if limit else ""
+    reason = (f"карточка {card_id} висит {_ago(age)}{tail}: статус {status} — конвейер "
+              f"не двигается, нужно решение владельца")
+    details = "\n".join([
+        f"- карточка {card_id} «{title}», статус {status}, последнее событие "
+        f"{_ago(age)} назад;",
+        f"- предел ожидания: `watchdog.card_deadline_hours` = {limit or '—'} ч "
+        f"(предел смотрителя, `pipeline.json` проекта);",
+        "Что сделать (одно из трёх):",
+        f"  1) работа сделана — закрыть карточку: "
+        f"`hermes kanban --board <борда> complete {card_id} --result \"…\"`;",
+        f"  2) работа не пойдёт — заблокировать: "
+        f"`hermes kanban --board <борда> block {card_id} \"причина\"`;",
+        f"  3) карточка потеряна — снять прогон и выпустить заново: "
+        f"`hermes kanban --board <борда> reclaim {card_id}`, затем тик закажет новую;",
+        "Поднять предел: `watchdog.card_deadline_hours` в `pipeline.json` проекта "
+        "(0 — проверка выключена).",
+        "Стоп владельческий: снимается `python .pipeline/gate.py --resume`.",
+    ])
+    return {"action": "stop", "kind": "owner", "card_deadline": card_id,
+            "reason": reason, "details": details}
 
 
 def decide(ctx: dict) -> dict:
@@ -4087,6 +4304,13 @@ def decide(ctx: dict) -> dict:
         return dict(base, clear_incident=True,
                     reason=f"стоп-причина снята (было: {stop.get('reason', '')}); "
                            f"дальше — {base['action']}")
+    # План 10, S2A: висящая карточка вместо тихого ожидания. Стоит после стоп-флага
+    # (владельческий стоп не перебивается) и до предзаказа постановки: ждать карточку,
+    # которая висит дольше предела, значит стоять молча. Заменяет только `idle` —
+    # решение, которое что-то заказывает, не перехватывается.
+    deadline = _card_deadline_stop(ctx)
+    if deadline and base["action"] == "idle":
+        return deadline
     # Предзаказ постановки N+1 (правило 2): только поверх ожидания и без его блокировок.
     # `plan_clarify` — тоже блокировка (план 5, S10): у плана, остановленного вопросами
     # посередине, тик иначе заказал бы постановку следующего шага — работу, которую
@@ -8206,6 +8430,13 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         previous = (ctx.get("stop") or {}).get("reason")
         # `kind` из решения: эскалация владельцу (`owner`) не должна сниматься тиком сама (D6).
         write_stop(p, reason, "gate", kind=decision.get("kind") or "incident")
+        # Отметка «по этой карточке уже доложено» (план 10, S2A): owner-стоп снимает только
+        # владелец, и без отметки тот же стоп ставился бы после каждого `--resume`. Пишет
+        # применение, а не `decide`: решение остаётся чистым и без записи на диск.
+        marked = decision.get("card_deadline")
+        if marked and str(state.get("card_deadline_reported") or "") != str(marked):
+            state["card_deadline_reported"] = str(marked)
+            save_state(p, state)
         result.update(applied=True, detail=reason)
         touch("stop")
         # Замер — комментарием в карточку правок: без него лимит выглядел бы молчаливым

@@ -8,6 +8,7 @@ JSON'ом, поэтому проверки в браузере не могут �
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,11 @@ try:  # A6-A8 (план 7, S5) — свой блок по той же причи
     from .engine import analyze
 except ImportError:  # pragma: no cover - движка рядом нет: A6-A8 не проверяются
     analyze = None  # type: ignore
+
+try:  # предел ожидания карточки (план 10, S2A): правило живёт в движке, не здесь
+    from .engine import gate as gate_mod
+except ImportError:  # pragma: no cover - движка рядом нет: строка не печатается
+    gate_mod = None  # type: ignore
 
 
 @dataclass
@@ -169,6 +175,69 @@ def notify_rows(project: Path, cfg: dict[str, Any], driver: str) -> tuple[list[s
     return notes, problems
 
 
+def runtime_seconds(value: object) -> int:
+    """Длительность вида `3h`/`150m` в секундах (план 10, S2A); непонятное — 0.
+
+    Разбор короткий и свой: парсера в движке нет, а единственный потребитель —
+    предупреждение «предел ожидания меньше обычного шага» (`runtimes.step`). Мусор,
+    `0` и `0m` предупреждения не дают: диагностика не имеет права падать из-за единицы
+    измерения в чужом ключе. Понадобится третьему потребителю — переедет в движок.
+    """
+    text = str(value or "").strip().lower()
+    match = re.fullmatch(r"(\d+)\s*([hm])", text)
+    if not match:
+        return 0
+    number = int(match.group(1))
+    return number * 3600 if match.group(2) == "h" else number * 60
+
+
+def cards_deadline_rows(db: Path, cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Строка «висящие карточки» и предупреждение о коротком пределе (план 10, S2A).
+
+    Считает движок (`gate.stuck_cards`), а не этот модуль: правило «висит» одно, и
+    второй его разбор в диагностике разошёлся бы со стражем. Порог берётся там же
+    (`gate.watchdog_limits` на сыром конфиге — `config.load` в диагностике падает на
+    любом другом сломанном ключе).
+
+    Здесь нет карточек — «нет»; проверка выключена (`card_deadline_hours = 0`) — так и
+    пишется: владелец должен видеть, что предел не проверяется, а не что всё в порядке.
+    Предупреждение о пределе меньше `runtimes.step` — потому что живой шаг иначе
+    объявят висящим: предел обязан быть длиннее обычной работы над шагом.
+    """
+    notes: list[str] = []
+    warnings: list[str] = []
+    if gate_mod is None:
+        return notes, warnings
+    limits = gate_mod.watchdog_limits(cfg)
+    limit = int(limits.get("card_deadline_hours") or 0)
+    if limit <= 0:
+        notes.append("висящие карточки: проверка выключена")
+        return notes, warnings
+    found = gate_mod.stuck_cards(
+        db, deadline_hours=limit,
+        fresh_minutes=int(limits.get("heartbeat_fresh_minutes") or 0),
+        now=gate_mod._now(), key_prefix="")
+    stuck = found.get("stuck") or []
+    nearest = found.get("nearest")
+    if not stuck:
+        notes.append("висящие карточки: нет")
+    elif nearest:
+        notes.append(f"висящие карточки: {len(stuck)} (ближайшая через "
+                     f"{gate_mod._ago((nearest or {}).get('remaining') or 0)})")
+    else:
+        notes.append(f"висящие карточки: {len(stuck)}")
+    step = None
+    runtimes = cfg.get("runtimes")
+    if isinstance(runtimes, dict):
+        step = runtimes.get("step")
+    step_seconds = runtime_seconds(step)
+    if step_seconds and limit * 3600 < step_seconds:
+        warnings.append(f"предел ожидания карточки (watchdog.card_deadline_hours={limit}) "
+                        f"меньше runtimes.step={step} — живой шаг объявят висящим; "
+                        f"поднять предел в pipeline.json")
+    return notes, warnings
+
+
 def collect(project: Path, plan: str = "", *, with_lint: bool = True,
             preview: bool = False, board: str = "") -> Report:
     """Проверить установку конвейера: движок, борда, доверие, ключи, cron, Telegram.
@@ -261,6 +330,11 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
     notes.append(f"борда БД: {db} ({'есть' if db.is_file() else 'НЕТ'})")
     if not db.is_file():
         problems.append("нет sqlite борды — карточки не создадутся (проверь --board)")
+    else:
+        # Предел ожидания карточки (план 10, S2A): счёт — движком, строка — здесь.
+        deadline_notes, deadline_warnings = cards_deadline_rows(db, cfg)
+        notes.extend(deadline_notes)
+        report.warnings.extend(deadline_warnings)
     roles = setup_flow.roles_from_config(cfg)
     driver = roles[0]
     # Доверие проверяем чтением конфига профиля: `skills trust` с путём ПИШЕТ в него.

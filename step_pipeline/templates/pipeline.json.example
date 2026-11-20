@@ -63,6 +63,10 @@
     "enabled": false,
     "windows": []
   },
+  "watchdog": {
+    "heartbeat_fresh_minutes": 30,
+    "card_deadline_hours": 12
+  },
   "ui": {
     "progress": {
       "learn": true,
