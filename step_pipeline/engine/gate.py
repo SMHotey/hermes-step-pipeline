@@ -83,6 +83,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import ssl
@@ -941,6 +942,261 @@ def head_commit(p: Paths) -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     return res.stdout.strip().lower() if res.returncode == 0 else ""
+
+
+# ───────────────── прогоны шага: исполнение стражем (план 9, S2) ─────────────────
+# Прогон — пункт «Прогон» шага, разобранный `next_step` в `StepRun`. Страж исполняет
+# прогоны ПЕРЕД ревью: красный прогон отсекает шаг карточкой правок с находкой F03 и не
+# тратит круг ревью, зелёный — заказывает ревью, а его строка идёт в отчёт ревьюера,
+# в уведомление и в строку журнала. Исполнение не держится на плагине: движок копируется
+# в проект (`ENGINE_FILES`), поэтому здесь только stdlib и subprocess.
+
+#: Каталог доказательств прогона: один файл на план-шаг-sha (`state/runs/`).
+RUNS_DIR_NAME = "runs"
+#: Хвост вывода прогона в доказательстве и в карточке правок (2000 символов, S2).
+RUN_TAIL_CHARS = 2000
+
+
+def runs_dir(p: Paths) -> Path:
+    """Каталог доказательств прогона: `<state_dir>/runs/` (создаётся при записи)."""
+    return Path(p.cfg.state_dir) / RUNS_DIR_NAME
+
+
+def runs_proof_path(p: Paths, step_id: str, sha: str) -> Path:
+    """Доказательство прогонов шага: `plan-{план}-{шаг}-{sha}.json`, полный sha.
+
+    Файл на план-шаг-sha, а не на паре «sha и команда» (D9): команда живёт внутри
+    файла, и счётчик N/M доказательства считается по шагу целиком.
+    """
+    return runs_dir(p) / f"plan-{p.plan_id}-{str(step_id).upper()}-{sha}.json"
+
+
+def load_runs_proof(p: Paths, step_id: str, sha: str) -> dict | None:
+    """Доказательство прогона текущего sha: нет файла, битый файл или не объект — `None`.
+
+    «Доказательства нет» — не сбой, а триггер исполнения: именно этот `None` читает
+    `runs_gate_decision`, а `run_gate` по нему запускает прогоны (§4 п.5-6). Падение на
+    битом файле оставило бы шаг навсегда — файл пишет прошлая версия движка.
+    """
+    if not sha:
+        return None
+    try:
+        data = json.loads(runs_proof_path(p, step_id, sha).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_runs_proof(p: Paths, proof: dict) -> None:
+    """Записать доказательство прогона атомарной заменой (`state_io.save_json`).
+
+    Путь собирается из самого доказательства (`plan`, `step`, `sha`), поэтому запись из
+    `run_step_runs` и запись `fix_card` из ветки `create_fix` попадают в один файл.
+    `OSError` не глотается: без записи ветвь «fix_card заполнен» недостижима, и следующий
+    тик заказал бы второй круг на том же sha (D6).
+    """
+    runs_dir(p).mkdir(parents=True, exist_ok=True)
+    path = runs_proof_path(p, str(proof.get("step") or ""), str(proof.get("sha") or ""))
+    try:
+        state_io.save_json(path, proof)
+    except OSError as exc:
+        raise GateError(f"доказательство прогона не записано: {path}: {exc}",
+                        plan_id=p.plan_id) from exc
+
+
+def runs_proof_for(p: Paths, step_id: str, sha: str) -> dict | None:
+    """Доказательство прогона к коммиту шага (§4 п.8).
+
+    Точно по коммиту из отчёта ревью, а если для него файла нет — по текущему HEAD:
+    ревью обычно смотрит последний коммит шага, и расхождение сокращённого sha в отчёте
+    с полным именем файла не должно терять строку журнала. Нет ни того, ни другого —
+    `None`: строка прогона в журнал и уведомление не добавляется.
+    """
+    proof = load_runs_proof(p, step_id, sha) if sha else None
+    return proof if proof is not None else load_runs_proof(p, step_id, head_commit(p))
+
+
+def runs_argv(p: Paths, command: str) -> list[str]:
+    """`argv` прогона: строка плана режется `shlex.split` в posix-режиме, `shell` не
+    участвует (D1): поведение `cmd.exe` и `sh` на одной строке различается, а план
+    обязан давать один и тот же результат на любой машине.
+
+    Первый токен `python`/`python3` заменяется на интерпретатор движка (D2): голый
+    `python` в PATH — чужой venv, а строки «- Прогон» почти всегда начинаются с него.
+    Другие имена не подставляются: `ruff` в PATH нет, и это строка плана (D8).
+    """
+    argv = shlex.split(str(command or ""), posix=True)
+    if argv and argv[0] in ("python", "python3"):
+        argv[0] = _python(p)
+    return argv
+
+
+def _seconds_text(seconds: float) -> str:
+    """41 с / 1 мин 20 с — длительность прогона для журнала и панели."""
+    total = int(round(float(seconds or 0)))
+    if total >= 60:
+        return f"{total // 60} мин {total % 60} с"
+    return f"{total} с"
+
+
+def runs_counter(proof: dict | None) -> str:
+    """Счётчик прогона для журнала, уведомления и карточки: `Прогоны: 3/3, 41 с`.
+
+    N — зелёные, M — всего, S — секунды: числа берутся из доказательства, а не
+    пересчитываются по файлам, и строка одинакова во всех трёх местах, где её видит
+    владелец (журнал, уведомление о закрытии, карточка ревью). Доказательства нет или
+    у шага нет пунктов «Прогон» — пустая строка, тогда дословно прежняя четвёртая
+    колонка журнала (golden `04-review-approve` это держит).
+    """
+    if not proof or not int(proof.get("total") or 0):
+        return ""
+    return (f"Прогоны: {int(proof.get('green') or 0)}/{int(proof['total'])}, "
+            f"{_seconds_text(proof.get('seconds') or 0)}")
+
+
+def _text_of(value) -> str:
+    """Вывод субпроцесса строкой: `subprocess` отдаёт байты даже при `text=True` (timeout)."""
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _run_tail(text: str) -> str:
+    """Хвост вывода прогона: 2000 символов конца, замер повреждённых байтов не падает."""
+    text = text or ""
+    return text[-RUN_TAIL_CHARS:]
+
+
+def runs_outcome(run: dict, code: int | None, output: str,
+                 timed_out: bool = False) -> tuple[str, str]:
+    """Исход прогона и короткая причина: `green` | `red` | `timeout`.
+
+    Ровно три вида ожидания из §5 формата плана: `exit`, `содержит`, `regex`. Неизвестный
+    вид — не совпало с пояснением: ошибка в плане не должна останавливать шаг как успех.
+    Таймаут — исход `timeout` отдельно от `red`: владелец читает, что прогон УБИТ, а не
+    «не завершился». Сбой запуска (`code is None`) — красный: исходы `green`/`red`/`timeout`
+    исчерпывают форму, `skipped` ставит только бюджет.
+    """
+    if timed_out:
+        return "timeout", "прогон убит по таймауту, результата нет"
+    if code is None:
+        return "red", "прогон не запустился"
+    expect = str(run.get("expect") or "exit")
+    value = str(run.get("value") or "")
+    if expect == "exit":
+        try:
+            want = int(value)
+        except ValueError:
+            return "red", f"ожидание `exit` не число: {value!r}"
+        return ("green" if code == want else "red"), f"код {code}"
+    if expect == "contains":
+        found = value in output
+        return (("green" if found else "red"),
+                f"подстрока {value!r} найдена" if found
+                else f"подстроки {value!r} в выводе нет")
+    if expect == "regex":
+        try:
+            found = re.search(value, output) is not None
+        except re.error as exc:
+            return "red", f"выражение `{value}` не разбирается: {exc}"
+        return (("green" if found else "red"),
+                f"выражение `{value}` совпало" if found
+                else f"выражение `{value}` не совпало")
+    return "red", f"неизвестное ожидание `{expect}`"
+
+
+# ANCHOR:прогоны_исполнение — стабильная ссылка для спеки и ревью
+def run_step_runs(p: Paths, step: dict) -> dict | None:
+    """Исполнить пункты «Прогон» шага и записать доказательство текущего sha (S2).
+
+    Первым читается доказательство текущего sha: файл есть — возвращается он как есть и
+    НЕ запускается ни одной команды (F03, тест 7). Иначе прогоны идут по порядку списка
+    `step["runs"]` в корне проекта: `argv` собирает `runs_argv` (без `shell`, D1), вывод
+    читается в UTF-8 с `errors="replace"`, stdout и stderr склеиваются, хвост — 2000
+    символов. Исход каждого прогона — строка доказательства: `green`, `red`, `timeout`
+    либо `skipped` (бюджет, D5), плюс код возврата, секунды и хвост.
+
+    Бюджет шага (`step_runs.budget`, 600 с по умолчанию) считается по времени,
+    потраченному В ЭТОМ вызове: кэш бюджет не ест. Исчерпанный бюджет молча не
+    поднимается — `budget.exhausted` в файле читает решение и превращает тик в
+    инцидентный стоп (D5).
+
+    У шага без пунктов «Прогон» — `None`: решению нечего читать, файл не создаётся.
+    Команда, которая не запустилась, — красный прогон с `code: null`, а не исключение:
+    падение тика оставило бы шаг без доказательства навсегда. Сбой чтения git или
+    записи файла — `GateError`: это сбой стенда, и без доказательства шаг не двигается.
+    """
+    declared = [dict(run) for run in (step or {}).get("runs") or []]
+    if not declared:
+        return None
+    sha = head_commit(p)
+    proof = load_runs_proof(p, str(step.get("id") or ""), sha)
+    if proof is not None:
+        return proof                      # кэш: файл есть — ни одной команды (F03)
+    if not sha:
+        raise GateError(f"прогоны шага {step.get('id')}: коммита нет — `git rev-parse "
+                        f"HEAD` не отвечает, доказательство не записано",
+                        plan_id=p.plan_id)
+    settings = p.cfg.step_runs
+    limit = int(settings["budget"])
+    rows: list[dict] = []
+    spent = 0.0
+    for run in declared:
+        command = str(run.get("command") or "")
+        if not command:
+            continue
+        timeout = int(run.get("timeout") or int(settings["timeout"]))
+        if spent >= limit:
+            # Бюджет исчерпан ДО запуска: исход `skipped`, а не `red` (D5) — хвост не
+            # помечен красным, а остаток догоняет следующий тик на том же sha.
+            rows.append({"command": command, "expect": str(run.get("expect") or ""),
+                         "value": str(run.get("value") or ""), "outcome": "skipped",
+                         "code": None, "seconds": 0.0, "tail": ""})
+            continue
+        argv = runs_argv(p, command)
+        started = time.monotonic()
+        code: int | None = None
+        output = ""
+        timed_out = False
+        try:
+            res = subprocess.run(argv, cwd=str(Path(p.repo)), capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace",
+                                 timeout=timeout)
+            code = int(res.returncode)
+            output = (res.stdout or "") + (res.stderr or "")
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            output = f"таймаут {timeout} с\n{_run_tail(_text_of(exc.stdout))}" \
+                     f"{_text_of(exc.stderr)}"
+        except OSError as exc:
+            # Команды нет или интерпретатор не запустился: красный прогон с `code: null`
+            # и текстом ошибки в хвосте, а не исключение — тик обязан дойти до решения.
+            output = f"{type(exc).__name__}: {exc}"
+        seconds = round(time.monotonic() - started, 3)
+        spent += seconds
+        outcome, reason = runs_outcome(run, code, output, timed_out)
+        rows.append({"command": command, "expect": str(run.get("expect") or ""),
+                     "value": str(run.get("value") or ""), "outcome": outcome,
+                     "code": code, "seconds": seconds, "tail": _run_tail(output),
+                     # Причина — поле сверх формы §4 п.3: карточка правок обязана назвать
+                     # ПОЧЕМУ прогон красный («подстроки нет», «код 1»), а не только код.
+                     "reason": reason})
+    proof = {"plan": p.plan_id, "step": str(step.get("id") or ""), "sha": sha,
+             "total": len(declared),
+             "green": sum(1 for row in rows if row.get("outcome") == "green"),
+             "seconds": round(sum(float(row.get("seconds") or 0) for row in rows), 3),
+             "budget": {"limit": limit, "spent": round(spent, 3),
+                        "exhausted": spent >= limit},
+             "runs": rows,
+             # id карточки правок, заказанной по этому доказательству (D7): пустая строка —
+             # не заказывалась. Без неё ветвь «fix_card заполнен» недостижима, и тик
+             # заказывал бы новый круг на том же sha вопреки D6.
+             "fix_card": ""}
+    save_runs_proof(p, proof)
+    return proof
+
 
 
 def prompt_fresh(p: Paths, recon: str | None) -> bool:
@@ -2702,7 +2958,7 @@ def _step_fix_verdict_line(open_lines: list[str] | None, report_verdict: str,
 
 
 def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
-                     prompt: str | None = None) -> str:
+                     prompt: str | None = None, runs: dict | None = None) -> str:
     plan_id = p.plan_id
     plan_rel = p.cfg.rel(Path(p.plan_file))
     if prompt:
@@ -2726,6 +2982,23 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
             "- Постановки шага в каталоге промтов НЕТ — зафиксировать это находкой",
             "  («шаг исполнен без постановки») и ревьюить только по §шага плана.",
         ]
+    # Прогоны шага (план 9, S2): строка стража в карточке ревью — то же доказательство,
+    # что в журнале и в уведомлении. Ревьюер видит, что прогон уже прогнан, и сверяет СВОИМ
+    # прогоном гейта: расхождение двух доказательств — находка, а не повод закрыть шаг.
+    runs_block = []
+    counter = runs_counter(runs) if runs else ""
+    if counter:
+        proof_rel = p.cfg.rel(runs_proof_path(p, step["id"],
+                                              str(runs.get("sha") or "")))
+        runs_block = [
+            "",
+            "ПРОГОНЫ ШАГА (исполнил страж до ревью)",
+            f"- {counter}",
+            f"- Доказательство: `{proof_rel}` (sha `{runs.get('sha') or '—'}`)",
+            "- Свой прогон гейта обязателен и идёт отдельно: если он красный, а строка стража",
+            "  зелёная (или наоборот) — это находка про расхождение доказательств, а не",
+            "  повод закрыть шаг по одной из двух строк.",
+        ]
     return "\n".join([
         f"РЕВЬЮ ШАГА {step['id']} плана {plan_id} — {step['title']} (круг {attempt})",
         "",
@@ -2736,6 +3009,7 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
         "Отчёт исполнителя и его транскрипт — НЕ доказательство.",
         "",
         *prompt_block,
+        *runs_block,
         "",
         "РЕЕСТР НАХОДОК ШАГА (обязательно)",
         f"- Файл: `{step_findings_rel(p, step['id'])}`; шапка таблицы — "
@@ -3352,6 +3626,86 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
     ])
 
 
+def runs_fix_card_body(p: Paths, step: dict, round_no: int, proof: dict,
+                       max_rounds: int) -> str:
+    """Карточка правок по красному прогону (план 9, S2, §4 п.7).
+
+    Находка F03 идёт текстом до S4 (коды в реестре вводит он): карточка обязана назвать
+    команду, ожидание, код возврата, секунды и хвост вывода, иначе исполнителю нечего
+    чинить — «прогон красный» без вывода это догадка, а не находка. Отчёта ревью ещё нет,
+    поэтому реестр находок шага НЕ заводится (`ensure_step_findings` не зовётся: строка
+    без отчёта была бы сиротой) и блок классов в тело не входит.
+
+    `max_rounds` — предел кругов из `step_fix_limit`: тело обязано печатать «Осталось
+    кругов: N из M», а в поле решения `create_fix` предела нет. Пятый аргумент —
+    осознанное отклонение от сигнатуры §4 п.7, и его причина — ровно эта строка.
+    """
+    round_label = (f"(круг {round_no} из {max_rounds})" if max_rounds
+                   else f"(круг {round_no})")
+    sha = str(proof.get("sha") or "")
+    lines = [
+        f"ПРАВКИ ПО ПРОГОНАМ шага {step['id']} плана {p.plan_id} — {step['title']} "
+        f"{round_label}",
+        "",
+        "F03 Прогон красный: страж исполнил пункты «Прогон» шага ДО ревью, и шаг не",
+        "     получил карточки ревью — круг ревью не потрачен.",
+        f"Доказательство: `{p.cfg.rel(runs_proof_path(p, step['id'], sha))}` "
+        f"(sha `{sha or '—'}`)",
+        runs_counter(proof),
+        "",
+        "НАХОДКИ (F03 — метка обязательна: до S4 находка с кодом — это метка в тексте)",
+    ]
+    red = [row for row in proof.get("runs") or []
+           if isinstance(row, dict) and row.get("outcome") != "green"]
+    for row in red:
+        code = row.get("code")
+        where = f"код {code}" if code is not None else "без кода возврата"
+        reason = str(row.get("reason") or row.get("outcome") or "").strip()
+        lines.append(f"F03 — прогон `{row.get('command')}` красный ({where}): {reason}")
+    lines += ["", "КОМАНДЫ И ИТОГИ"]
+    for row in proof.get("runs") or []:
+        if not isinstance(row, dict):
+            continue
+        code = row.get("code")
+        lines.append(f"- {row.get('command')} → {row.get('outcome')} "
+                     f"(ожидание `{row.get('expect')} {row.get('value')}`; код "
+                     f"{code if code is not None else '—'}; "
+                     f"{_seconds_text(float(row.get('seconds') or 0))})")
+        tail = str(row.get("tail") or "").strip()
+        if tail and row.get("outcome") != "green":
+            lines.append("  хвост вывода (конец):")
+            lines.append("  ```")
+            lines.extend(f"  {line}" for line in tail.splitlines()[-25:])
+            lines.append("  ```")
+    lines += [
+        "",
+        "ЧТО ДЕЛАТЬ",
+        "- Починить ПРИЧИНУ, а не прогон: прогон объявлен в плане, шаг без него не закроется.",
+        "- Пункт «Прогон» в плане править нельзя (его ведёт только владелец): если команда",
+        "  неверна — это вопрос владельцу в отчёте, а не правка плана исполнителем.",
+        "- Гейты шага перегнать и показать фактические цифры:",
+        *[f"  - {g}" for g in step.get("gates") or []],
+        "- Тесты не ослаблять и не удалять; расширение объёма шага — находка.",
+        "",
+        "ВАЖНО",
+        "- До S4 «находка с кодом» — это метка F01–F09 в ТЕКСТЕ находки: блокирует",
+        "  наличие метки, а не её проверка. Закрытый словарь кодов и отказ на код вне",
+        "  словаря появятся в S4 — сейчас словаря нет и метка ни с чем не сверяется.",
+        "- Номера в скобках по всему документу — из реестра находок шага и к метке",
+        "  карточки не относятся; реестр шага здесь НЕ заводится (отчёта ревью ещё нет).",
+        "",
+        "ЗАВЕРШЕНИЕ",
+        "1. Коммит и пуш ТОЛЬКО файлов правок (`git add <файлы>`, НЕ `-A`), сообщение на русском.",
+        "2. kanban_complete: что исправлено, прогоны с цифрами, sha коммита.",
+        "   Журнал плана не трогать. Следующий тик снова исполнит прогоны и при зелёном",
+        "   результате сам заказывает ревью.",
+        "",
+        f"Осталось кругов: {max(0, max_rounds - round_no)} из {max_rounds}. "
+        "Исчерпание лимита — стоп владельцу.",
+    ]
+    return "\n".join(lines)
+
+
 def fix_comment_body(p: Paths, step: dict, round_no: int, report_rel: str,
                      review_card_id: str | None) -> str:
     """Комментарий к карточке правок: находки ревьюера там, где идёт работа (S2).
@@ -3467,6 +3821,9 @@ def build_ctx(p: Paths) -> dict:
                    # не падать `KeyError` там, где оно ищет открытые строки.
                    step_findings_rel="", step_findings=[], step_findings_exists=False,
                    step_findings_error="",
+                   # 9-S2: прогоны на сбое сборщика неисчислимы — пустой ключ, а не
+                   # отсутствие: решение читает только `ctx` и падать не имеет права.
+                   step_runs=None,
                    # D6: расхождение отметок проверять не на чем — обе сверки `False`,
                    # и решение по ревью постановки остаётся стопом, а не падением.
                    prompt_marker_text_same=False, prompt_marker_same_commit=False,
@@ -3524,6 +3881,10 @@ def build_ctx(p: Paths) -> dict:
     ctx["prompt"] = prompt
     ctx["prompt_recon"] = recon
     ctx["prompt_fresh"] = prompt_fresh(p, recon) if prompt else False
+    # Прогоны шага (план 9, S2): доказательство текущего HEAD. `None` — файла нет, и это
+    # триггер исполнения в `run_gate` (§4 п.6); чтение файла и `git rev-parse` живут здесь,
+    # `decide` получает только `ctx`. Один вызов `head_commit` на тик.
+    ctx["step_runs"] = load_runs_proof(p, step["id"], head_commit(p)) if step else None
     # Спека high-шага (8-S2B): считается до решения о ветке — страж пускает шаг по факту
     # полной спеки, а не по наличию файла постановки.
     ctx["prompt_spec"] = prompt_spec_problems(p, step) if step else []
@@ -3887,6 +4248,77 @@ def _step_registry_decision(ctx: dict, sid: str, step: dict, verdict: str,
             "cause": round_cause_of(kinds)}
 
 
+def runs_gate_decision(ctx: dict, step: dict, fixes: list[dict],
+                       step_card_id: str) -> dict | None:
+    """Ветвь прогонов перед заказом ревью (план 9, S2). `None` — идти в ревью.
+
+    Порядок ветвей строгий (§4 п.5): у шага нет пунктов «Прогон» → доказательства нет
+    (это триггер исполнения в `run_gate`, а не решение) → исчерпанный бюджет →
+    зелёное доказательство → исчерпанный лимит кругов → карточка правок → на том же sha
+    круг уже заказан. Помощник читает только `ctx` и `step`: ни файлов, ни подпроцессов,
+    ни `Paths`. Стоп-флаг пишет `run_gate` в общей ветке `action == "stop"` с
+    `kind="incident"`: у функции исполнения нет права останавливать конвейер, а
+    `--resume` инцидент не снимает (D5).
+    """
+    if not (step or {}).get("runs"):
+        return None
+    proof = ctx.get("step_runs")
+    if not isinstance(proof, dict):
+        return None                      # файла нет — триггер фазы исполнения (п.6)
+    sid = str(step.get("id") or "")
+    total = int(proof.get("total") or 0)
+    green = int(proof.get("green") or 0)
+    budget = proof.get("budget") if isinstance(proof.get("budget"), dict) else {}
+    if budget.get("exhausted"):
+        return {"action": "stop", "step": sid, "kind": "incident",
+                "reason": (f"прогоны шага {sid}: бюджет прогонов исчерпан "
+                           f"({green} из {total} исполнено за "
+                           f"{_seconds_text(budget.get('spent') or 0)} при лимите "
+                           f"{_seconds_text(budget.get('limit') or 0)})"),
+                "details": ("Как снять: поднять `step_runs.budget` в `pipeline.json` и "
+                            "закоммитить (sha меняется — доказательство пересчитается "
+                            "заново), либо удалить файл доказательства этого sha из "
+                            "`state/runs` решением владельца. `--resume` этот стоп не "
+                            "снимает.")}
+    if total and green >= total:
+        return None                      # всё зелёное — ревью заказывается прежним путём
+    fix_card = str(proof.get("fix_card") or "")
+    if not fix_card:
+        limit = step_fix_limit(ctx, step)
+        if len(fixes) >= limit:
+            red_rows = [row for row in proof.get("runs") or []
+                        if isinstance(row, dict) and row.get("outcome") != "green"]
+            last = red_rows[-1] if red_rows else {}
+            return {"action": "stop", "step": sid, "kind": "incident",
+                    "reason": (f"прогон шага {sid} красный — исчерпан лимит "
+                               f"автоматических кругов правок ({limit}, класс риска: "
+                               f"{step.get('risk') or 'normal'})"),
+                    "details": (
+                        f"Круг {len(fixes) + 1} не заказан: израсходовано кругов "
+                        f"{len(fixes)} при пределе {limit}. Последний красный прогон: "
+                        f"`{last.get('command') or '—'}` (код "
+                        f"{last.get('code')}). Варианты владельцу: (1) доправить код и "
+                        f"закрыть карточку правок — тик пойдёт дальше; (2) поднять "
+                        f"`max_fix_rounds` (или `max_fix_rounds_high`) в `pipeline.json` "
+                        f"— цена: больше кругов исполнителя без человека; (3) переписать "
+                        f"строку «- Прогон» плана, если прогон требует оболочки или "
+                        f"чужого интерпретатора (D1, D2) — цена: это зона владельца (D8). "
+                        f"Стоп инцидентный: снимется сам, как только прогон позеленеет "
+                        f"или предел поднят.")}
+        return {"action": "create_fix", "step": sid, "data": step, "runs": True,
+                "round": len(fixes) + 1, "parent": step_card_id,
+                "cause": "",
+                "reason": (f"прогоны шага {sid} красные: {green} из {total} зелёных — "
+                           f"карточка правок вместо ревью (круг {len(fixes) + 1})")}
+    return {"action": "stop", "step": sid, "kind": "incident",
+            "reason": (f"правки шага {sid} по красному прогону уже заказаны карточкой "
+                       f"`{fix_card}`, а прогон на этом sha красный: второго круга на "
+                       f"том же sha нет"),
+            "details": ("Как снять: новый коммит правки (доказательство пересчитается "
+                        "на новом sha) или удаление файла доказательства этого sha из "
+                        "`state/runs` решением владельца.")}
+
+
 def _decide_base(ctx: dict) -> dict:
     """Решение без учёта стоп-флага."""
     step = ctx.get("next")
@@ -4039,6 +4471,11 @@ def _decide_base(ctx: dict) -> dict:
             return {"action": "stop", "step": sid,
                     "reason": f"карточка правок {this_fix[-1]['id']} в статусе "
                               f"{this_fix[-1]['status']}: {detail}"}
+        # Прогоны шага (план 9, S2): ветвь стоит в обоих возвратах `create_review` — после
+        # проверок карточки правок (пока она в работе, нечего гонять) и возврата по форме.
+        # Красный прогон отсекает шаг карточкой правок с находкой F03 и не тратит круг
+        # ревью; зелёный — заказывает ревью, чья карточка и уведомление несут строку
+        # прогона. Смотрит только `ctx` и `step` — `runs_gate_decision`.
         # Возврат карточки правок (13-S4, §4.4): ответ исполнителя не по форме — карточка
         # возврата того же круга. Стоит ПОСЛЕ проверок карточки правок: пока она не закрыта,
         # судить нечего, и пока карточка возврата не закрыта — шаг ждёт ту же работу того же
@@ -4056,8 +4493,9 @@ def _decide_base(ctx: dict) -> dict:
                 return {"action": "stop", "step": sid,
                         "reason": f"карточка возврата правок {last_return['id']} в статусе "
                                   f"{last_return['status']}: {detail}"}
-            return {"action": "create_review", "step": sid, "data": step, "attempt": attempt,
-                    "parent": last_return["id"]}
+            return runs_gate_decision(ctx, step, fixes, last_step["id"]) or {
+                "action": "create_review", "step": sid, "data": step,
+                "attempt": attempt, "parent": last_return["id"]}
         # Номера для проверки формы — открытые строки реестра шага, а не пункты отчёта:
         # `decide` остаётся чистой функцией от `ctx`. Нет открытых строк (или реестра) —
         # проверки нет: шаг без реестра обязан закрываться как раньше (13-S2).
@@ -4068,8 +4506,9 @@ def _decide_base(ctx: dict) -> dict:
             return {"action": "create_fix_return", "step": sid, "data": step,
                     "round": attempt - 1, "problems": problems,
                     "parent": this_fix[-1]["id"]}
-        return {"action": "create_review", "step": sid, "data": step, "attempt": attempt,
-                "parent": this_fix[-1]["id"] if this_fix else last_step["id"]}
+        return runs_gate_decision(ctx, step, fixes, last_step["id"]) or {
+            "action": "create_review", "step": sid, "data": step, "attempt": attempt,
+            "parent": this_fix[-1]["id"] if this_fix else last_step["id"]}
     last_review = reviews[-1]
     if last_review["status"] not in TERMINAL:
         return {"action": "idle", "reason": f"ревью {sid} идёт: карточка {last_review['id']}"}
@@ -5532,6 +5971,12 @@ def status_text(ctx: dict, decision: dict) -> str:
     lines.append(f"Ручной допуск (hold): {', '.join(hold) or '—'}")
     # Шага нет — и риска нет: «normal» у пустой строки читается как «риск обычный».
     lines.append(f"Риск шага: {((step.get('risk') or 'normal') if step else '—')}")
+    # Прогоны шага (план 9, S2): строка видна всегда, даже в простое: по ней владелец
+    # решает, гоняются ли прогоны и чем они заканчиваются. Формат — та же строка-счётчик,
+    # что в журнале, уведомлении и карточке (`runs_counter`), источник — доказательство.
+    counter = runs_counter(ctx.get("step_runs"))
+    if counter:
+        lines.append(f"Прогоны шага: {counter}")
     # Пересборки постановки по свежести видны всегда (план 12, S1): по цифре владелец решает,
     # поднимать ли лимит. При нуле строка тоже есть — иначе счётчик невидим.
     if step:
@@ -6908,20 +7353,34 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
     return result
 
 
-def _evidence(p: Paths, verdict: dict, remarks: int = 0) -> str:
+def _evidence(p: Paths, verdict: dict, remarks: int = 0, step_id: str = "") -> str:
     """Четвёртая колонка журнала: чем шаг доказан.
 
     `remarks` > 0 — шаг принят с замечаниями (13-S1): вердикт `REQUEST_CHANGES`, блокирующих
     находок ноль. Строка APPROVE остаётся дословной: её держит golden-эталон
     `04-review-approve`, и менять эталон закрытия APPROVE нельзя.
+
+    `step_id` (план 9, S2) — к строке добавляется `Прогоны: 3/3, 41 с`: счётчик берётся из
+    доказательства прогона, привязанного к коммиту из отчёта ревью (`verdict["commit"]`), а
+    если для него файла нет — к текущему HEAD; нет ни того, ни другого — строки нет вовсе.
+    У шага без пунктов «Прогон» файла доказательства нет, и golden-эталон держит именно
+    такой шаг. Красный или исчерпанный по бюджету прогон сюда не попадает: такой шаг до
+    журнала не доходит.
     """
     commit = f"коммит `{verdict['commit']}`" if verdict.get("commit") else "коммит не указан"
     report = p.cfg.rel(Path(verdict["path"]))
+    runs_suffix = ""
+    sha = str(verdict.get("commit") or "")
+    proof = runs_proof_for(p, step_id, sha) if step_id else None
+    counter = runs_counter(proof)
+    if counter:
+        runs_suffix = f"; {counter}"
     if remarks:
         return (f"ревью `{p.cfg.reviewer}` — {REMARKS_EVIDENCE}, находок вне блокирующих: "
-                f"{remarks} (`{report}`, {commit}); замечания — в реестре находок плана")
+                f"{remarks} (`{report}`, {commit}); замечания — в реестре находок плана"
+                f"{runs_suffix}")
     return (f"ревью `{p.cfg.reviewer}` — APPROVE (`{report}`, {commit}); "
-            f"гейты шага прогнаны ревьюером самостоятельно")
+            f"гейты шага прогнаны ревьюером самостоятельно{runs_suffix}")
 
 
 def _register_remarks(p: Paths, step: dict, verdict: dict) -> int:
@@ -7066,6 +7525,32 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             f"stall:{plan_id}", say)
         return True
 
+    # Фаза прогонов (план 9, S2, §4 п.6): тик, решающий заказать ревью, сначала
+    # исполняет пункты «Прогон» и пересчитывает решение — зелёное доказательство даёт
+    # карточку ревью, красное — карточку правок, исчерпанный бюджет — стоп в том же тике.
+    # Прогоны не карточка: правило «один тик — одно действие» ими не нарушается; фаза
+    # живёт в ветке исполнения, поэтому `run_gate(execute=False)` (предпросмотр) прогонов
+    # не запускает. `result` собирается со статусом ДО этой точки, поэтому статус и
+    # решение пересчитываются вместе — иначе `--status` напечатает «create_review» при уже
+    # заказанной карточке правок (F13). Сбой чтения или записи доказательства — стоп
+    # инцидентный: без файла шаг не может ни в ревью, ни в правку, а молчаливый «зелёный»
+    # прогон был бы враньём; пишет его общая ветка `action == "stop"`.
+    if (decision.get("action") == "create_review" and ctx.get("next")
+            and (ctx["next"].get("runs") or []) and ctx.get("step_runs") is None):
+        runs_step = ctx["next"]
+        try:
+            runs_proof = run_step_runs(p, runs_step)
+        except (GateError, OSError, subprocess.SubprocessError) as exc:
+            reason = (f"прогоны шага {runs_step.get('id')} не исполнены: "
+                      f"{type(exc).__name__}: {exc}")
+            decision = {"action": "stop", "step": str(runs_step.get("id") or ""),
+                        "kind": "incident", "reason": reason}
+            result.update(applied=True, detail=reason)
+        else:
+            ctx["step_runs"] = runs_proof
+            decision = decide(ctx)
+            result["decision"] = decision
+            result["status"] = status_text(ctx, decision)
     action = decision["action"]
     if action == "idle":
         # Простой виден только здесь (и в tick), поэтому и записывается здесь.
@@ -7312,14 +7797,23 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         report_rel = _report_rel(p, step["id"])
         cid = create_card(p, f"[ревью {plan_id} {step['id']} #{attempt}] {step['title']}",
                           review_card_body(p, step, attempt, report_rel,
-                                           prompt_rel(p, step["id"])),
+                                           prompt_rel(p, step["id"]),
+                                           runs=ctx.get("step_runs")),
                           p.cfg.reviewer, key, p.cfg.review_skills,
                           parent=decision.get("parent"),
                           max_runtime=p.cfg.review_runtime)
         result.update(applied=bool(cid), detail=f"карточка ревью: {cid}")
         touch(f"create_review:{cid}")
         if cid:
-            say(f"план {plan_id}, шаг {step['id']} исполнен, отправлен на ревью (карточка {cid})")
+            say(f"план {plan_id}, шаг {step['id']} исполнен, отправлен на ревью "
+                f"(карточка {cid})")
+            # Строка прогона в том же уведомлении, что и в карточке и в журнале (S2):
+            # владелец без опыта читает её как единственный факт «чего проверили».
+            runs = ctx.get("step_runs")
+            counter = runs_counter(runs)
+            if counter:
+                say(f"  {counter} — доказательство "
+                    f"{p.cfg.rel(runs_proof_path(p, step['id'], str(runs.get('sha') or '')))}")
         else:
             say(f"не смог поставить ревью шага {step['id']} плана {plan_id}")
         return result
@@ -7455,34 +7949,74 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         return result
     if action == "create_fix":
         step, round_no = decision["data"], decision["round"]
+        # Красный прогон (план 9, S2, §4 п.7): карточка того же ключа `:fix:<номер>`,
+        # но текст собирает `runs_fix_card_body`, реестр шага НЕ заводится (отчёта ревью
+        # ещё нет), а в уведомление идут числа прогона, а не находки ревьюера.
+        by_runs = bool(decision.get("runs"))
         assignee, reason = assignee_or_stop(step)
         if assignee is None:
             return result
-        # Реестр шага (13-S2, §4.5): память круга заводится стражем до карточки — у
-        # ревьюера файла ещё нет, а карточка правок обязана назвать открытые строки.
-        # Ошибка реестра — инцидентный стоп: шаг не продолжается без памяти кругов.
-        try:
-            rows = ensure_step_findings(p, step, _report_rel(p, step["id"]))
-        except (GateError, OSError, ValueError) as exc:
-            reason = (f"реестр находок шага {step['id']} не заведён: {exc} — карточки "
-                      f"правок нет, шаг без памяти кругов не продолжается")
-            write_stop(p, reason, "gate", kind="incident")
-            result.update(applied=True, detail=reason)
-            touch("stop:step_findings")
-            say("⛔ " + reason)
-            return result
+        rows: list[dict] = []
+        if not by_runs:
+            # Реестр шага (13-S2, §4.5): память круга заводится стражем до карточки — у
+            # ревьюера файла ещё нет, а карточка правок обязана назвать открытые строки.
+            # Ошибка реестра — инцидентный стоп: шаг не продолжается без памяти кругов.
+            try:
+                rows = ensure_step_findings(p, step, _report_rel(p, step["id"]))
+            except (GateError, OSError, ValueError) as exc:
+                reason = (f"реестр находок шага {step['id']} не заведён: {exc} — карточки "
+                          f"правок нет, шаг без памяти кругов не продолжается")
+                write_stop(p, reason, "gate", kind="incident")
+                result.update(applied=True, detail=reason)
+                touch("stop:step_findings")
+                say("⛔ " + reason)
+                return result
         key = f"planloop:{plan_id}:{step['id']}:fix:{round_no}"
         report_rel = _report_rel(p, step["id"])
         max_rounds = step_fix_limit(ctx, step)
-        cid = create_card(p, f"[правки {plan_id} {step['id']} #{round_no}] {step['title']}",
-                          fix_card_body(p, step, round_no, report_rel, max_rounds=max_rounds,
-                                        report_verdict=str((ctx.get("verdict") or {})
-                                                           .get("verdict") or "")),
-                          assignee, key, p.cfg.step_skills,
+        proof = dict(ctx.get("step_runs") or {}) if by_runs else {}
+        if by_runs:
+            title = f"[прогоны {plan_id} {step['id']} #{round_no}] {step['title']}"
+            body = runs_fix_card_body(p, step, round_no, proof, max_rounds)
+        else:
+            title = f"[правки {plan_id} {step['id']} #{round_no}] {step['title']}"
+            body = fix_card_body(p, step, round_no, report_rel, max_rounds=max_rounds,
+                                 report_verdict=str((ctx.get("verdict") or {})
+                                                    .get("verdict") or ""))
+        cid = create_card(p, title, body, assignee, key, p.cfg.step_skills,
                           parent=decision.get("parent"), max_runtime=p.cfg.step_runtime)
         result.update(applied=bool(cid), detail=f"карточка правок: {cid}")
         touch(f"create_fix:{cid}")
-        if cid:
+        if cid and by_runs:
+            # id карточки — в `fix_card` доказательства (F07): без этой записи ветвь
+            # «fix_card заполнен» недостижима, и тик заказал бы второй круг правок на том
+            # же sha вопреки D6. Запись — до конца тика; сбой записи стоп инцидентный.
+            proof["fix_card"] = str(cid)
+            try:
+                save_runs_proof(p, proof)
+            except (GateError, OSError) as exc:
+                reason = (f"карточка правок {cid} создана, но fix_card не записан в "
+                          f"доказательство прогона шага {step['id']}: {exc}")
+                write_stop(p, reason, "gate", kind="incident")
+                result.update(applied=True, detail=reason)
+                touch("stop:runs_fix_card")
+                say("⛔ " + reason)
+                return result
+            ctx["step_runs"] = proof
+            red = [row for row in proof.get("runs") or []
+                   if isinstance(row, dict) and row.get("outcome") != "green"]
+            msg = [f"план {plan_id}, прогоны шага {step['id']}: красных {len(red)} из "
+                   f"{int(proof.get('total') or 0)} — карточка правок вместо ревью "
+                   f"(круг {round_no} из {max_rounds})",
+                   f"  {runs_counter(proof)}"]
+            for row in red:
+                msg.append(f"  {row.get('command')} → {row.get('outcome')}")
+            msg.append(f"  карточка правок {cid}")
+            say("\n".join(msg))
+            # Комментарий карточки — тем же текстом, что тело (§4 п.7): отказ не меняет
+            # result и не рвёт тик.
+            _comment(p, cid, body)
+        elif cid:
             findings = _review_findings(Path(p.repo) / report_rel, 3)
             msg = [f"план {plan_id}, ревью {step['id']}: нужны правки, круг {round_no} "
                    f"из {max_rounds}"]
@@ -7502,6 +8036,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             # рвёт тик (в `tick` ложный `applied` обрывает цепочку действий).
             _comment(p, cid, fix_comment_body(p, step, round_no, report_rel,
                                               decision.get("parent")))
+        elif by_runs:
+            say(f"прогоны {step['id']} красные, но карточку правок создать не удалось")
         else:
             say(f"ревью {step['id']}: REQUEST_CHANGES, но карточку правок создать не удалось")
         return result
@@ -7563,7 +8099,7 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 return result
         remarks = int(decision.get("remarks") or 0)
         added = append_journal_row(p, step["id"], step["title"], commit,
-                                   _evidence(p, verdict, remarks))
+                                   _evidence(p, verdict, remarks, step["id"]))
         if added and remarks:
             # Замечания не теряются (13-S1, §4.3): строки реестра — ПОСЛЕ журнала (он —
             # единственное доказательство закрытия) и ДО коммита (реестр входит в тот же
@@ -7597,8 +8133,12 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         if ok:
             closing = (f"принято с замечаниями, находок вне блокирующих: {remarks}"
                        if remarks else f"ревью APPROVE, коммит {detail}")
+            # Строка прогона (план 9, S2) — та же, что в журнале и в карточке: владелец
+            # читает её в момент закрытия, а не из файла журнала.
+            counter = runs_counter(runs_proof_for(p, step["id"], commit))
             say(f"✅ план {plan_id}, шаг {step['id']} закрыт ({closing}). "
-                f"Следующий шаг стартует автоматически")
+                + (f"{counter}. " if counter else "")
+                + "Следующий шаг стартует автоматически")
         else:
             state["pending_commit"] = {"files": files, "step": step["id"], "reason": detail,
                                        "message": subject}

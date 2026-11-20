@@ -103,6 +103,12 @@ DEFAULTS: dict = {
     # решения владельца: ревью существует, чтобы менять план, а рост объёма — следствие
     # правки; стоп срабатывал на первом же круге, где закрытых находок ещё ноль.
     "max_plan_growth": {"percent": 10, "chars_per_finding": 400, "enforce": False},
+    # Прогоны шага (план 9, S2): страж исполняет пункты «Прогон» до ревью, и красный прогон
+    # отсекает шаг карточкой правок, а не кругом ревью. `timeout` — предел одного прогона,
+    # `budget` — суммарный бюджет шага: исчерпанный бюджет — инцидентный стоп, который
+    # снимает не `--resume`, а новый коммит (sha меняется) или решение владельца.
+    # В `pipeline.json` проекта ключ не пишется вовсе: умолчание живёт в коде.
+    "step_runs": {"timeout": 120, "budget": 600},
     "runtimes": {"step": "3h", "review": "150m", "prompt": "45m"},
     # Пауза по расписанию: окна локального времени ОС, в которые тик не работает.
     # Выключено — поведение проектов не меняется. Интервалов не больше двух: владелец
@@ -304,6 +310,39 @@ def _plan_growth(value: object) -> dict:
     return out
 
 
+def _step_runs(value: object) -> dict:
+    """Прогоны шага (план 9, S2): `timeout` одного прогона и `budget` шага в секундах.
+
+    Умолчание — 120 с на прогон и 600 с на шаг: страж исполняет пункты «Прогон» сам,
+    до ревью, и это поведение по умолчанию — план обязан чем-то доказываться, а не
+    пересказом исполнителя. Мусор в `pipeline.json` — ошибка конфигурации, а не
+    молчаливое умолчание (тот же принцип, что у `_fix_rounds`): иначе владелец думает,
+    что поднял бюджет, а страж работает по прежнему лимиту. Отсутствующий ключ —
+    умолчание целиком; поля целые не меньше 1, неизвестные поля — тоже ошибка.
+    """
+    default = DEFAULTS["step_runs"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict):
+        raise ConfigError(f"step_runs должен быть объектом JSON, получено: {value!r}")
+    out = dict(default)
+    unknown = sorted(str(key) for key in value if key not in default)
+    if unknown:
+        raise ConfigError(f"step_runs: неизвестные поля {unknown}, "
+                          f"допустимы {sorted(default)}, получено: {value!r}")
+    for key in ("timeout", "budget"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ConfigError(f"step_runs.{key} должен быть целым числом секунд, "
+                              f"получено: {raw!r}")
+        if raw < 1:
+            raise ConfigError(f"step_runs.{key} должен быть ≥ 1, получено: {raw!r}")
+        out[key] = raw
+    return out
+
+
 def _pause_time(value: object, where: str) -> int:
     """Время окна паузы в минутах суток; всё, кроме `ЧЧ:ММ`, — ошибка конфигурации.
 
@@ -443,6 +482,7 @@ class Config:
     max_fix_rounds_high: int
     max_stale_rebuilds: int
     max_plan_growth: dict
+    step_runs: dict
     quiet_hours: dict
     step_runtime: str
     review_runtime: str
@@ -648,6 +688,7 @@ def load(repo: Path | str | None = None) -> Config:
         max_fix_rounds_high=_fix_rounds_high(raw.get("max_fix_rounds_high")),
         max_stale_rebuilds=_stale_rebuilds(raw.get("max_stale_rebuilds")),
         max_plan_growth=_plan_growth(raw.get("max_plan_growth")),
+        step_runs=_step_runs(raw.get("step_runs")),
         quiet_hours=_quiet_hours(raw.get("quiet_hours")),
         step_runtime=str(runtimes.get("step") or "3h"),
         review_runtime=str(runtimes.get("review") or "150m"),

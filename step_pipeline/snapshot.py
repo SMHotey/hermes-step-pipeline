@@ -1516,6 +1516,9 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
         plan_rounds.reset_at(root, plan), _review(root, cfg, "plan", plan, cap), now)
     return {"ok": True, "plan": plan, "step": step, "title": contract.get("title") or "",
             "contract": contract, "prompt": prompt, "review": review,
+            # Прогоны шага (9-S2): блок доказательства для панели — sha, счётчик и
+            # пошаговый исход. Снимок прогоны не исполняет, читает файл стража.
+            "runs": _step_runs(root, plan, step),
             "commit": _git_show(root, review.get("commit") or "", cap),
             "cards": step_cards, "progress": step_progress, "plan_review": plan_review,
             "plan_findings": _plan_findings(root, cfg, plan),
@@ -1528,6 +1531,45 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
                      "stop": str(stop.get("kind") or ""),
                      "stop_reason": str(stop.get("reason") or "")},
             "limit": cap}
+
+
+def _step_runs(root: Path, plan_id, step_id) -> dict:
+    """Прогоны шага из доказательства стража (план 9, S2, §4 п.9).
+
+    Снимок прогоны НЕ исполняет и не пересчитывает: он читает свежайший файл
+    `state/runs/plan-{план}-{шаг}-{sha}.json` (по mtime) и отдаёт те же числа, что страж
+    пишет в карточку ревью, уведомление и журнал. Свежий по mtime, а не «последний в
+    сортировке»: sha меняется с каждым коммитом шага, и панели нужен файл текущего sha.
+    Файлов нет или файл не читается — пустая форма (`sha: ""`, `items: []`), а не ошибка:
+    панель отвечает на вопрос «что гонялось», а не падает на битом файле.
+    """
+    empty = {"sha": "", "total": 0, "green": 0, "seconds": 0.0, "items": []}
+    if not plan_id or not step_id:
+        return empty
+    folder = proj.state_dir(root) / "runs"
+    prefix = f"plan-{plan_id}-{str(step_id).upper()}-"
+    try:
+        files = sorted((path for path in folder.glob(f"{prefix}*.json")),
+                       key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return empty
+    if not files:
+        return empty
+    try:
+        data = json.loads(files[0].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    items = [{"command": str(row.get("command") or ""),
+              "outcome": str(row.get("outcome") or ""),
+              "seconds": float(row.get("seconds") or 0)}
+             for row in data.get("runs") or [] if isinstance(row, dict)]
+    return {"sha": str(data.get("sha") or ""),
+            "total": int(data.get("total") or len(items)),
+            "green": int(data.get("green") or 0),
+            "seconds": float(data.get("seconds") or 0),
+            "items": items[:20]}
 
 
 def _rollout_status() -> dict:
