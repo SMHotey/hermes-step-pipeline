@@ -80,6 +80,9 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     keeper = sub.add_parser("keeper", help="смотритель: --scan — симптомы простоя (план 10)")
     keeper.add_argument("--project", default="")
     keeper.add_argument("--scan", action="store_true", help="собрать симптомы (по умолчанию)")
+    keeper.add_argument("--heal", action="store_true", help="выполнить починки белого списка")
+    keeper.add_argument("--dry-run", action="store_true",
+                        help="только показать, что было бы сделано")
     keeper.add_argument("--json", action="store_true", help="машинный вывод")
     keeper.set_defaults(handler=cmd_keeper)
 
@@ -261,15 +264,24 @@ def cmd_run(args) -> int:
 
 
 def cmd_keeper(args) -> int:
-    """Скан симптомов смотрителя: запускает модуль движка проекта, ничего не решает сам."""
+    """Скан симптомов и починки смотрителя: запускает модуль движка проекта, не решает сам.
+
+    Без `--heal` работает сканер (только чтение, `keeper_scan.py --scan`); с `--heal` —
+    модуль починок, у которого скан уже встроен, поэтому `--scan` туда не передаётся:
+    режим (dry-run или apply) решает движок по маркерам `state/keeper.on/off`, а не CLI.
+    """
     project = _project(args.project)
-    extra = ["--scan"]
+    heal = bool(getattr(args, "heal", False))
+    extra = ["--heal"] if heal else ["--scan"]
     if getattr(args, "json", False):
         extra.append("--json")
     # Каталог пакета передаётся строкой: движок в .pipeline/ пакета не видит, а
     # импортировать плагин из движка нельзя — движок обязан работать без установки.
     extra += ["--plugin-dir", str(proj.PLUGIN_DIR)]
-    res = proj.run_engine(project, "keeper_scan.py", *extra, timeout=180)
+    if heal and getattr(args, "dry_run", False):
+        extra.append("--dry-run")
+    name = "keeper_heal.py" if heal else "keeper_scan.py"
+    res = proj.run_engine(project, name, *extra, timeout=180)
     print((res.stdout or "").strip())
     if res.returncode != 0:
         print((res.stderr or "").strip(), file=sys.stderr)
