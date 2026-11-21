@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Починки смотрителя по белому списку, предохранители и часовой обход (план 10, S3–S4).
+"""Починки смотрителя по белому списку, предохранители, часовой обход и находки (план 10, S3–S5).
 
 Модуль берёт симптомы сканера (`keeper_scan.py`) и применяет закрытую таблицу
 «вид → действие» (`ACTIONS`): снять мёртвый `tick.lock`, перезапустить упавшую
@@ -20,7 +20,8 @@
 карточках шага модуль не принимает: вердикт, закрытие шага и строка журнала — не
 работа смотрителя.
 
-Что модуль пишет: только журнал `keeper.jsonl`, (по команде человека) маркеры
+Что модуль пишет: только журнал `keeper.jsonl`, реестр находок `keeper-findings.md`
+(строка на кодовый дефект, `atomic_write_text`), (по команде человека) маркеры
 `keeper.on`/`keeper.off` в каталоге состояния проекта и — в режиме apply — одну
 карточку на борде. Единственный файл, который он
 удаляет, — `tick.lock` там же, и только если pid в полезной нагрузке мёртв. Код
@@ -74,8 +75,9 @@ COOLDOWN_MINUTES = 120.0             # кулдаун на тот же symptom_i
 RUN_TIMEOUT = 120.0                  # потолок одной внешней команды (обновление движка)
 DETAIL_LIMIT = 200                   # длина `detail` в строке журнала
 
-#: Ровно четыре исхода: `planned` — dry-run, команда не запускалась.
-STATUSES = ("ok", "failed", "refused", "planned")
+#: Ровно пять исходов: `planned` — dry-run, команда не запускалась; `found` — заведена
+#: находка реестра (кодовый дефект), а это не починка (D2).
+STATUSES = ("ok", "failed", "refused", "planned", "found")
 
 REASON_OFF = "off"
 REASON_BLACKLIST = "not_in_whitelist"
@@ -140,6 +142,40 @@ SEVERITY_HIGH = "high"
 REASON_KEEPER_RUNNING = "keeper_running"
 REASON_TICK_RUNNING = "tick_running"
 REASON_CONVEYOR_BUSY = "conveyor_busy"
+
+
+# ─────────────────── константы маршрута находки (S5) ───────────────────
+
+#: Вид симптома «кодовый дефект движка»: сканер его не производит (это ограничение S2),
+#: он приходит переданным списком симптомов и уходит в реестр находок, а не в починку.
+CODE_KIND = "code"
+
+#: Реестр находок в каталоге состояния проекта (D3): `docs/reviews/` — чужой файл
+#: ревьюера плана, а запись в отслеживаемый git делала бы дерево грязным.
+FINDINGS_NAME = "keeper-findings.md"
+
+#: Класс строки — из закрытого словаря `gate.FINDING_KINDS` (D5): `замысел` + `открыто`
+#: означает «нужна правка кодом», то есть шаг плана.
+FINDING_CLASS = "замысел"
+FINDING_STATUS = "открыто"           # закрывает человек фактом правки, не смотритель
+FINDING_STEP = "—"                   # дефект движка не принадлежит шагу плана (D4)
+FINDING_TODO = ("правка движка шагом плана: устранить дефект по адресу"
+                " и закрыть находку фактом правки")
+FINDING_ACTION = "finding"           # имя действия в записи отчёта (D1)
+FINDING_TOKEN = "симптом"            # хвост «Находки»: `(симптом 1a2b3c4d5e6f7a8b)` (D7)
+REASON_NO_PROOF = "no_proof"         # находке не хватает адреса `путь:строка` или доказательства
+
+#: Шапка реестра плана — буквальная копия `gate.FINDINGS_HEADER` (D4): своя шапка
+#: разошлась бы с читателем движка, и `gate.load_findings` перестал бы находить таблицу.
+#: Паритет копии стережёт тест.
+FINDING_HEADER = ("ID", "Шаг", "Класс", "Находка", "Что сделать", "Статус")
+FINDING_ID_RE = re.compile(r"F(\d+)")
+ADDRESS_RE = re.compile(r".+:\d+")
+FINDING_TITLE = "# Реестр находок смотрителя"
+FINDING_NOTE = ("Файл ведёт движок (`keeper_heal.py`): строки дописываются прогоном,"
+                " ручные правки перезаписываются.")
+#: Разделитель ячеек — как у `gate._finding_cells`: `\|` внутри ячейки остаётся литералом.
+_CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
 
 
 # ───────────────────────────── состояние прогона ─────────────────────────────
@@ -454,8 +490,192 @@ def _refuse(record: dict, reason: str, detail: str) -> dict:
     return record
 
 
+# ─────────────────── маршрут кодового дефекта: реестр находок (S5) ───────────────────
+
+def findings_path(state_dir) -> Path:
+    """Путь реестра находок в каталоге состояния проекта (D3, как `journal_path`)."""
+    return Path(state_dir) / FINDINGS_NAME
+
+
+class FindingsError(Exception):
+    """Реестр находок не читается: нет шапки таблицы или строка не той формы (Т6)."""
+
+
+def _finding_cells(line: str) -> list[str]:
+    """Ячейки строки markdown-таблицы; `\\|` внутри ячейки — литерал (как у `gate`)."""
+    body = str(line).strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|") and not body.endswith("\\|"):
+        body = body[:-1]
+    return [cell.replace("\\|", "|").strip() for cell in _CELL_SPLIT_RE.split(body)]
+
+
+def parse_registry(text: str) -> list[dict]:
+    """Строки реестра по порядку: `{"id", "number", "cells", "line"}`.
+
+    Пустой текст — пустой список (файла ещё нет). Без шапки непустой файл — `FindingsError`:
+    «реестр не читается» и «находок нет» — разные факты, и молча стереть чужой файл нельзя.
+    Полного разбора с валидацией классов здесь и нет (D4): для номера и дедупа достаточно
+    шапки, `F`-номеров и токена симптома; строгость проверяет читатель движка в тесте.
+    """
+    if not str(text).strip():
+        return []
+    lines = str(text).splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if tuple(_finding_cells(line)) == FINDING_HEADER:
+            start = index + 1
+            break
+    if start is None:
+        raise FindingsError("нет шапки таблицы находок")
+    rows: list[dict] = []
+    for line in lines[start:]:
+        if not line.strip().startswith("|"):
+            continue
+        cells = _finding_cells(line)
+        if all(cell and set(cell) <= set("-: ") for cell in cells):
+            continue                                  # строка-разделитель
+        if len(cells) != len(FINDING_HEADER):
+            raise FindingsError(f"строка с {len(cells)} ячейками вместо {len(FINDING_HEADER)}")
+        match = FINDING_ID_RE.fullmatch(cells[0])
+        if match is None:
+            raise FindingsError(f"идентификатор {cells[0]!r} не вида F<число>")
+        rows.append({"id": cells[0], "number": int(match.group(1)),
+                     "cells": cells, "line": "| " + " | ".join(cells) + " |"})
+    return rows
+
+
+def _escape_cell(value: object) -> str:
+    """Ячейка таблицы: `|` → `/`, переводы строк → пробелы (как `gate.findings_table`)."""
+    return str(value or "").replace("|", "/").replace("\n", " ").strip()
+
+
+def finding_cells(number: int, symptom: dict) -> list[str]:
+    """Ячейки новой строки в порядке `FINDING_HEADER` (D4).
+
+    Токен `(симптом <id>)` едет хвостом «Находки»: отдельной колонки под ключ дедупа в
+    реестре плана нет (D7), а дедуп по адресу ломался бы от правки формулировки.
+    """
+    address = str(symptom.get("address") or "")
+    evidence = " ".join(str(symptom.get("evidence") or "").split())
+    return [f"F{number}", FINDING_STEP, FINDING_CLASS,
+            _escape_cell(f"{address}: {evidence} {_token_of(symptom)}"),
+            _escape_cell(FINDING_TODO), FINDING_STATUS]
+
+
+def _finding_line(number: int, symptom: dict) -> str:
+    """Строка таблицы: `| F7 | — | замысел | … | … | открыто |`."""
+    return "| " + " | ".join(finding_cells(number, symptom)) + " |"
+
+
+def _registry_doc(rows: list[str]) -> str:
+    """Текст нового реестра: заголовок, пояснение одной строкой и таблица."""
+    return "\n".join([FINDING_TITLE, "", FINDING_NOTE, "",
+                      "| " + " | ".join(FINDING_HEADER) + " |",
+                      "|" + "|".join("---" for _ in FINDING_HEADER) + "|",
+                      *rows]) + "\n"
+
+
+def _read_registry(path: Path) -> str:
+    """Текст реестра; файла нет — пустая строка (его создаст запись)."""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def registry_rows(state_dir) -> tuple[Path, list[dict]]:
+    """Путь и строки реестра; битый файл — `FindingsError`, а не «пустой реестр»."""
+    path = findings_path(state_dir)
+    return path, parse_registry(_read_registry(path))
+
+
+def _token_of(symptom: dict) -> str:
+    """Токен дедупа: `(симптом <symptom_id>)` — 16 hex от `проект|вид|адрес` (D7)."""
+    return f"({FINDING_TOKEN} {symptom.get('symptom_id') or ''})"
+
+
+def preview_finding(state_dir, symptom: dict) -> dict:
+    """Что записалось бы: `{"id", "path", "known"}`; ничего не пишет (Т3).
+
+    Реестр при dry-run читается, чтобы `detail` сказал правду: «записал бы находку F2»
+    или «находка F1 уже в реестре». Битый реестр — `FindingsError`, как и в apply.
+    """
+    path, rows = registry_rows(state_dir)
+    token = _token_of(symptom)
+    for row in rows:
+        if token in row["line"]:
+            return {"id": row["id"], "path": path, "known": True}
+    return {"id": f"F{max((row['number'] for row in rows), default=0) + 1}",
+            "path": path, "known": False}
+
+
+def add_finding(state_dir, symptom: dict) -> dict:
+    """Записать находку: `{"id", "path", "added"}`; повтор по токену — прежняя строка (D7).
+
+    Запись — только `state_io.atomic_write_text` (Ф10): реестр либо старый целиком, либо
+    новый целиком. Битый реестр — `FindingsError` до записи: данные не перезаписываются.
+    """
+    path, rows = registry_rows(state_dir)
+    token = _token_of(symptom)
+    for row in rows:
+        if token in row["line"]:
+            return {"id": row["id"], "path": path, "added": False}
+    number = max((row["number"] for row in rows), default=0) + 1
+    line = _finding_line(number, symptom)
+    text = _read_registry(path)
+    state_io.atomic_write_text(path, text.rstrip("\n") + "\n" + line + "\n"
+                               if text.strip() else _registry_doc([line]))
+    return {"id": f"F{number}", "path": path, "added": True}
+
+
+def heal_code(symptom: dict, state: HealState) -> dict:
+    """Один кодовый симптом: отказ, план или строка реестра; команд не запускает (D8).
+
+    Предохранители белого списка сюда не приходят (D1): находка не трогает проект и не
+    пишет журнал починок, а от повторов защищена дедупом по `symptom_id`. Kill-switch
+    остаётся абсолютным: `off` — отказ, файл не пишется.
+    """
+    record = _record(symptom)
+    record["action"] = FINDING_ACTION
+    record["finding"] = {"id": "", "path": "", "added": False}
+    if state.mode == "off":
+        return _refuse(record, REASON_OFF,
+                       f"kill-switch: {OFF_MARKER} в каталоге состояния —"
+                       " находки выключены владельцем")
+    relative = state.cfg.rel(findings_path(state.state_dir))
+    address = str(symptom.get("address") or "")
+    missing: list[str] = []
+    if not ADDRESS_RE.fullmatch(address):
+        missing.append(f"адрес вида путь:строка (пришёл {address or 'пустой'})")
+    if not str(symptom.get("evidence") or "").strip():
+        missing.append("доказательство (evidence пустое)")
+    if missing:
+        return _refuse(record, REASON_NO_PROOF, "находке не хватает: " + ", ".join(missing))
+    try:
+        if state.dry_run:
+            plan = preview_finding(state.state_dir, symptom)
+            record["finding"] = {"id": plan["id"], "path": relative, "added": False}
+            says = (f"находка {plan['id']} уже в реестре" if plan["known"]
+                    else f"записал бы находку {plan['id']}")
+            record.update(status="planned", detail=f"{says}: {relative}")
+            return record
+        written = add_finding(state.state_dir, symptom)
+    except (FindingsError, OSError) as exc:
+        record.update(status="failed",
+                      detail=f"реестр находок не перезаписан ({relative}): {exc}")
+        return record
+    record["finding"] = {"id": written["id"], "path": relative, "added": written["added"]}
+    tail = "заведена" if written["added"] else "уже в реестре"
+    record.update(status="found", detail=f"находка {written['id']} {tail}: {relative}")
+    return record
+
+
 def heal_one(symptom: dict, state: HealState) -> dict:
-    """Один симптом: предохранители → dry-run (`planned`) → действие → журнал."""
+    """Один симптом: кодовый дефект — находка, остальное — предохранители и действие."""
+    if str(symptom.get("kind") or "") == CODE_KIND:
+        return heal_code(symptom, state)
     record = _record(symptom)
     blocked = guard(symptom, state)
     if blocked is not None:
@@ -1043,13 +1263,18 @@ def format_hourly(result: dict) -> str:
 
 
 def format_human(result: dict) -> str:
-    """Человеческий вывод: шапка с режимом и счётчиками, строка на симптом."""
+    """Человеческий вывод: шапка с режимом и счётчиками, строка на симптом.
+
+    Статусы перечисляются поимённо, поэтому пятый (`found`) добавлен в шапку: иначе находка
+    кодового дефекта в сводке не видна. Слово «починок» заменено на «строк» — находка не
+    починка; строка на симптом осталась прежней, ID находки и путь реестра читаются в `detail`.
+    """
     counts = result.get("counts") or {}
+    results = result.get("results") or []
+    named = ", ".join(f"{name} {counts.get(name, 0)}" for name in STATUSES)
     lines = [f"Проект {result.get('project')}: режим {result.get('mode')},"
-             f" починок {counts.get('ok', 0)} (ok {counts.get('ok', 0)},"
-             f" failed {counts.get('failed', 0)}, refused {counts.get('refused', 0)},"
-             f" planned {counts.get('planned', 0)})"]
-    for item in result.get("results") or []:
+             f" строк {len(results)} ({named})"]
+    for item in results:
         action = item.get("action") or "—"
         lines.append(f"{item['status']}  {item['kind']}  {item['address']} → {action}:"
                      f" {item['detail']}")

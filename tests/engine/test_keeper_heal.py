@@ -26,6 +26,7 @@ from engine_kit import ENGINE  # noqa: F401 - фикстура `project` при�
 sys.path.insert(0, str(ENGINE))
 
 import config as config_mod  # noqa: E402 - движок на sys.path
+import gate  # noqa: E402 - формат реестра проверяется читателем движка (Ф7)
 import keeper_heal  # noqa: E402
 import keeper_scan  # noqa: E402
 import state_io  # noqa: E402
@@ -677,3 +678,164 @@ def test_env_is_clean_after_main(project: Path) -> None:
     """`main --project` пишет `PIPELINE_REPO`, как сканер: путь остаётся в окружении."""
     keeper_heal.main(["--json", "--project", str(project)])
     assert os.environ.get("PIPELINE_REPO") == str(Path(project).resolve())
+
+
+# ─────────────────── маршрут кодового дефекта: находка вместо правки (S5) ───────────────────
+
+CODE_ADDRESS = "step_pipeline/engine/gate.py:139"
+
+
+def code_symptom(cfg, address: str = CODE_ADDRESS,
+                 evidence: str = "счётчик не сбрасывается между тиками",
+                 severity: str = "normal") -> dict:
+    """Кодовый дефект: вид `code` сканер не производит, поля — как у симптома (Ф3, Ф7)."""
+    return {"project": str(cfg.project),
+            "symptom_id": keeper_scan.symptom_id(str(cfg.project), "code", address),
+            "kind": "code", "severity": severity, "address": address,
+            "evidence": evidence, "healable": False}
+
+
+def registry_file(project: Path) -> Path:
+    return keeper_heal.findings_path(state_dir(project))
+
+
+def registry_rows_file(project: Path) -> list[dict]:
+    """Строки реестра глазами движка: `gate.parse_findings`, без своего разбора таблицы (Ф7)."""
+    path = registry_file(project)
+    return gate.parse_findings(path.read_text(encoding="utf-8"), path)
+
+
+def test_registry_header_copies_gate() -> None:
+    """Шапка реестра — буквальная копия `gate.FINDINGS_HEADER`: иначе читатель не найдёт таблицу."""
+    assert keeper_heal.FINDING_HEADER == gate.FINDINGS_HEADER
+    assert keeper_heal.FINDING_CLASS in gate.FINDING_KINDS
+    assert keeper_heal.FINDING_STATUS in gate.FINDING_STATUSES
+
+
+def test_code_symptom_becomes_one_finding(project: Path) -> None:
+    """Дефект движка — одна строка реестра формата плана, а не починка (Т1, D2–D4)."""
+    cfg = config_mod.load(project)
+    confirm(project)
+    run = FakeRun()
+    result = run_heal(project, [code_symptom(cfg)], run=run)
+    entry = item(result, "code")
+    assert entry["status"] == "found" and entry["action"] == keeper_heal.FINDING_ACTION
+    assert entry["finding"]["id"] == "F1" and entry["finding"]["added"] is True
+    assert entry["finding"]["path"].endswith("state/keeper-findings.md")
+    assert result["counts"]["found"] == 1
+    assert sum(result["counts"].values()) == len(result["results"])
+    rows = registry_rows_file(project)
+    assert len(rows) == 1
+    assert rows[0]["id"] == "F1" and rows[0]["kind"] == keeper_heal.FINDING_CLASS
+    assert rows[0]["status"] == keeper_heal.FINDING_STATUS and rows[0]["step"] == "—"
+    assert CODE_ADDRESS in rows[0]["text"]
+    assert "счётчик не сбрасывается" in rows[0]["text"]
+    assert f"(симптом {code_symptom(cfg)['symptom_id']})" in rows[0]["text"]
+    assert run.commands("ui") == [] and run.commands("setup") == []
+    assert journal_lines(project) == []
+
+
+def test_second_run_does_not_duplicate_finding(project: Path) -> None:
+    """Повтор того же дефекта — прежняя строка: `added false` и тот же ID (Т2, D7)."""
+    cfg = config_mod.load(project)
+    confirm(project)
+    first = run_heal(project, [code_symptom(cfg)])
+    second = run_heal(project, [code_symptom(cfg)], now=NOW + 3600)
+    entry = item(second, "code")
+    assert first["counts"]["found"] == 1 and second["counts"]["found"] == 1
+    assert entry["finding"]["id"] == "F1" and entry["finding"]["added"] is False
+    assert len(registry_rows_file(project)) == 1
+
+
+def test_dry_run_plans_code_finding_without_writing(project: Path) -> None:
+    """Dry-run: `planned`, «записал бы», файла нет; повтор — «уже в реестре» (Т3, D8)."""
+    cfg = config_mod.load(project)
+    entry = item(run_heal(project, [code_symptom(cfg)], dry_run=True), "code")
+    assert entry["status"] == "planned" and entry["finding"]["id"] == "F1"
+    assert "записал бы" in entry["detail"]
+    assert entry["detail"].endswith("keeper-findings.md")
+    assert not registry_file(project).exists()
+    confirm(project)
+    run_heal(project, [code_symptom(cfg)])                 # находка уже в реестре
+    again = item(run_heal(project, [code_symptom(cfg)], dry_run=True), "code")
+    assert again["status"] == "planned"
+    assert "уже в реестре" in again["detail"] and "F1" in again["detail"]
+
+
+def test_kill_switch_refuses_code_finding(project: Path) -> None:
+    """Kill-switch абсолютен и для находки: `refused`/`off`, файла нет (Т4, D8)."""
+    cfg = config_mod.load(project)
+    switch_off(project)
+    entry = item(run_heal(project, [code_symptom(cfg)]), "code")
+    assert entry["status"] == "refused" and entry["reason"] == keeper_heal.REASON_OFF
+    assert not registry_file(project).exists()
+
+
+@pytest.mark.parametrize("address,evidence,missing", [
+    ("step_pipeline/engine/gate.py", "счётчик не сбрасывается", "путь:строка"),
+    (CODE_ADDRESS, "   ", "доказательство"),
+])
+def test_code_finding_requires_address_and_proof(project: Path, address: str,
+                                                 evidence: str, missing: str) -> None:
+    """Без адреса `путь:строка` или без доказательства находки нет (Т5, D6)."""
+    cfg = config_mod.load(project)
+    confirm(project)
+    entry = item(run_heal(project, [code_symptom(cfg, address, evidence)]), "code")
+    assert entry["status"] == "refused" and entry["reason"] == keeper_heal.REASON_NO_PROOF
+    assert missing in entry["detail"]
+    assert not registry_file(project).exists()
+
+
+def test_broken_registry_fails_without_rewrite(project: Path) -> None:
+    """Битый реестр — `failed` с путём и без записи: чужие данные не перезаписываются (Т6)."""
+    cfg = config_mod.load(project)
+    confirm(project)
+    path = registry_file(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    junk = "# чужой файл\n\n| F1 | без шапки |\n"
+    path.write_text(junk, encoding="utf-8")
+    entry = item(run_heal(project, [code_symptom(cfg)]), "code")
+    assert entry["status"] == "failed"
+    assert "keeper-findings.md" in entry["detail"]
+    assert path.read_text(encoding="utf-8") == junk
+
+
+def test_format_human_names_finding_and_registry(project: Path) -> None:
+    """Сводка называет пятый статус, а строка находки — ID и путь реестра (Т7)."""
+    cfg = config_mod.load(project)
+    confirm(project)
+    text = keeper_heal.format_human(run_heal(project, [code_symptom(cfg)]))
+    assert "Проект demo: режим apply" in text
+    for name in ("ok", "failed", "refused", "planned", "found"):
+        assert f"{name} 0" in text or f"{name} 1" in text
+    assert "found 1" in text and "строк 1" in text
+    assert CODE_ADDRESS in text and "F1" in text and "keeper-findings.md" in text
+
+
+def test_code_finding_keeps_engine_and_tree_untouched(project: Path) -> None:
+    """«Готово =»: `engine/*.py` не меняется — равенство хешей до и после (Т8)."""
+    cfg = config_mod.load(project)
+    package = make_package(project.parent / "pkg", project, roles=("pipeline-keeper",))
+    confirm(project)
+    before = snapshot(project, package)
+    result = run_heal(project, [code_symptom(cfg)], plugin_dir=package)
+    assert [entry["status"] for entry in result["results"]] == ["found"]
+    assert snapshot(project, package) == before
+    assert registry_file(project).is_file()
+    assert state_dir(project).resolve() in registry_file(project).resolve().parents
+
+
+def test_two_code_symptoms_get_next_numbers_and_survive_pipe(project: Path) -> None:
+    """Две находки — `F1` и `F2` по порядку `_order`; `|` и перевод строки не рвут таблицу (Т9)."""
+    cfg = config_mod.load(project)
+    confirm(project)
+    high = code_symptom(cfg, "step_pipeline/engine/tick.py:88",
+                        "сбой | в таблице\nи вторая строка", severity="high")
+    low = code_symptom(cfg, "step_pipeline/engine/state_io.py:12", "мелочь", severity="low")
+    result = run_heal(project, [low, high])
+    assert [entry["finding"]["id"] for entry in result["results"]] == ["F1", "F2"]
+    assert [entry["address"] for entry in result["results"]] == [high["address"], low["address"]]
+    rows = registry_rows_file(project)              # `GateError` здесь и был бы падением
+    assert [row["id"] for row in rows] == ["F1", "F2"]
+    assert "|" not in rows[0]["text"] and "\n" not in rows[0]["text"]
+    assert "вторая строка" in rows[0]["text"]
