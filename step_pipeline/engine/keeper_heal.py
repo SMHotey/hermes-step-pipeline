@@ -9,9 +9,11 @@
 Часовой обход (`--hourly`, S4) — один вход для cron-джобы: скан, починки белого
 списка, карточка со скиллом `pipeline-keeper` на профиль `profiles.keeper`
 (умолчание — `profiles.driver`) с JSON симптомов и отчётом, сообщение владельцу
-при находке `severity=high`. Пустой скан не заводит карточку вовсе — модель не
-будится на целом проекте. Обход не идёт, пока держится живой `tick.lock` или на
-борде есть нетерминальная карточка конвейера: две работы разом не запускаются.
+при находке `severity=high`. Карточка заводится при находках в любом режиме
+починок: `keeper.on` разрешает команды, а не извещение. Пустой скан не заводит
+карточку вовсе — модель не будится на целом проекте. Обход не идёт, пока
+держится живой `tick.lock` или на борде идёт карточка конвейера (`running` со
+свежим heartbeat): две работы разом не запускаются.
 
 Запускают его cron-часовой (S4) командой `python .pipeline/keeper_heal.py --hourly`
 и роль `pipeline-keeper`, которая читает журнал. Своих решений о шагах, планах и
@@ -42,16 +44,13 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
-import ssl
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -107,7 +106,7 @@ COMMAND_ACTIONS = ("panel_restart", "engine_upgrade")
 DEFAULT_UI_PORT = 8770
 
 
-# ─────────────────────── константы часового обхода (S4) ───────────────────────
+# ─────────────────── константы часового обхода (S4) ───────────────────
 
 #: Скилл карточки: вид работы различает он, а не профиль (S1).
 KEEPER_SKILL = "pipeline-keeper"
@@ -115,29 +114,32 @@ KEEPER_SKILL = "pipeline-keeper"
 #: Потолок карточки, если `runtimes.keeper` не задан: обход — не шаг плана.
 DEFAULT_KEEPER_RUNTIME = "30m"
 
-#: Ключ своих карточек: по нему обход отличает работу смотрителя от работы конвейера.
+#: Ключ своих карточек смотрителя и префикс ключей конвейера (D5): по первому
+#: обход узнаёт себя, по второму — идущую работу.
 KEEPER_KEY_PREFIX = "keeper:"
+PLANLOOP_KEY_PREFIX = "planloop:"
 
-#: Замок обхода: тот же примитив, что у тика (`state_io.acquire`), свой файл —
-#: иначе обход, сняв мёртвый `tick.lock`, потерял бы собственный замок.
+#: Замок обхода — свой файл в каталоге состояния (D11): взять `tick.lock` значило бы
+#: отключить все починки белого списка (`heal` отказывает при живом держателе), включая
+#: снятие мёртвого замка. Форма нагрузки и признак протухания — как у `state_io`, имя
+#: своё; правка `state_io` вне трёх путей шага (Г7).
 KEEPER_LOCK_NAME = "keeper.lock"
-
-CARD_TITLE_LIMIT = 90       # заголовок карточки — одна строка борды
-ESCALATION_LIMIT = 3        # сколько high-находок перечислять в сообщении владельцу
-
-#: Каталог профилей Hermes; тесты подменяют его переменной, движку он нужен,
-#: чтобы карточка не ушла несуществующему исполнителю.
-PROFILES_ENV = "PIPELINE_PROFILES_HOME"
-
-SEVERITY_HIGH = "high"
-
-REASON_BUSY = "busy"
-REASON_NO_PROFILE = "no_profile"
-REASON_CARD = "card_failed"
+KEEPER_LOCK_STALE = 1800.0
 
 #: Окно «работа идёт сейчас», если `watchdog.heartbeat_fresh_minutes` не задан:
 #: то же умолчание, что в шаблоне `pipeline.json`.
 DEFAULT_FRESH_MINUTES = 30
+
+CARD_TITLE_LIMIT = 90       # заголовок карточки — одна строка борды
+NOTIFY_TEXT_LIMIT = 300     # сообщение владельцу — одна строка
+NOTIFY_HIGH_LIMIT = 3       # сколько high-симптомов перечислять в сообщении
+
+SEVERITY_HIGH = "high"
+
+#: Причины пропуска прогона — значения `reason` в схеме §4.1.
+REASON_KEEPER_RUNNING = "keeper_running"
+REASON_TICK_RUNNING = "tick_running"
+REASON_CONVEYOR_BUSY = "conveyor_busy"
 
 
 # ───────────────────────────── состояние прогона ─────────────────────────────
@@ -552,44 +554,51 @@ def heal(cfg: config_mod.Config | None = None, symptoms: list[dict] | None = Non
 
 # ───────────────────────────── часовой обход (S4) ─────────────────────────────
 
-def profiles_home() -> Path:
-    """Каталог профилей Hermes: `PIPELINE_PROFILES_HOME` → `HERMES_HOME` → LOCALAPPDATA."""
-    explicit = (os.environ.get(PROFILES_ENV) or "").strip()
-    if explicit:
-        return Path(explicit)
-    home = (os.environ.get("HERMES_HOME") or "").strip()
-    if home:
-        return Path(home) / "profiles"
-    local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    return Path(local) / "hermes" / "profiles"
-
-
-def profile_exists(name: str) -> bool:
-    """Профиль Hermes есть на диске: каталог `profiles/<имя>`.
-
-    Цена ошибки — карточка с неизвестным исполнителем: канбан-диспетчер её молча
-    не берёт, и она висит в `ready` навсегда. Поэтому проверка файловая, а не по
-    `pipeline.json`: имя в конфиге может быть, а профиля в Hermes — нет.
-    """
-    if not name:
-        return False
-    return (profiles_home() / str(name)).is_dir()
-
-
 def keeper_profile(cfg: config_mod.Config) -> str:
-    """Исполнитель карточки смотрителя: `profiles.keeper` → `profiles.driver` (S1)."""
+    """Исполнитель карточки обхода (D4): `profiles.keeper`, иначе `profiles.driver`.
+
+    Поля для `profiles.keeper` в `Config` нет (Ф9), поэтому ключ читается из сырого
+    `cfg._raw`. Имя, которого нет в `config_mod.known_profiles(cfg)`, — опечатка
+    владельца: карточка с таким исполнителем не доставляется вовсе, поэтому берётся
+    драйвер, а владелец видит строку в stderr. Пустой драйвер — `ConfigError`
+    (код 2): карточки без исполнителя не бывает.
+    """
     raw = cfg.state if isinstance(cfg.state, dict) else {}
     profiles = raw.get("profiles") if isinstance(raw.get("profiles"), dict) else {}
-    name = str((profiles or {}).get("keeper") or "").strip()
-    return name or str(cfg.driver or "").strip()
+    value = (profiles or {}).get("keeper")
+    name = value.strip() if isinstance(value, str) else ""
+    driver = str(cfg.driver or "").strip()
+    if not driver:
+        raise config_mod.ConfigError(
+            "нет исполнителя карточки смотрителя: profiles.driver не задан")
+    if not name:
+        return driver
+    # Своё значение `known_profiles` тоже считает объявленным (оно лежит в `profiles`),
+    # поэтому из набора вычитается вклад самого ключа: иначе проверка не проверяла бы
+    # ничего и любая опечатка уходила бы в карточку несуществующему профилю.
+    own = {str(item).strip() for key, item in (profiles or {}).items() if key == "keeper"}
+    declared = (set(config_mod.known_profiles(cfg)) - own) | {driver}
+    if name in declared:
+        return name
+    print(f"[keeper] профиль {name} из profiles.keeper не объявлен в конфиге"
+          f" — карточка идёт на {driver}", file=sys.stderr)
+    return driver
 
 
 def keeper_runtime(cfg: config_mod.Config) -> str:
-    """Потолок карточки: `runtimes.keeper` → 30 минут."""
+    """Потолок карточки: `runtimes.keeper` из сырого конфига, умолчание 30m (Ф9)."""
     raw = cfg.state if isinstance(cfg.state, dict) else {}
     runtimes = raw.get("runtimes") if isinstance(raw.get("runtimes"), dict) else {}
-    name = str((runtimes or {}).get("keeper") or "").strip()
+    value = (runtimes or {}).get("keeper")
+    name = value.strip() if isinstance(value, str) else ""
     return name or DEFAULT_KEEPER_RUNTIME
+
+
+def fresh_window(cfg: config_mod.Config) -> float:
+    """Окно «работа идёт сейчас» в секундах: `watchdog.heartbeat_fresh_minutes`."""
+    data = cfg.watchdog if isinstance(cfg.watchdog, dict) else {}
+    minutes = _int(data.get("heartbeat_fresh_minutes"))
+    return (minutes if minutes > 0 else DEFAULT_FRESH_MINUTES) * 60
 
 
 def card_in_board(cfg: config_mod.Config, card_id: str) -> bool | None:
@@ -613,103 +622,188 @@ def card_in_board(cfg: config_mod.Config, card_id: str) -> bool | None:
     return row is not None
 
 
-def fresh_window(cfg: config_mod.Config) -> float:
-    """Окно «работа идёт сейчас» в секундах: `watchdog.heartbeat_fresh_minutes`."""
-    data = cfg.watchdog if isinstance(cfg.watchdog, dict) else {}
-    minutes = _int(data.get("heartbeat_fresh_minutes"))
-    return (minutes if minutes > 0 else DEFAULT_FRESH_MINUTES) * 60
+def conveyor_busy(cfg: config_mod.Config, now: float | None = None) -> tuple[bool, str]:
+    """Идёт ли карточка конвейера прямо сейчас (D5): `(да/нет, описание для лога)`.
 
+    «Идёт» — ровно `running` со свежим heartbeat не старше
+    `watchdog.heartbeat_fresh_minutes`. `todo`/`ready`/`blocked` — очередь, а не
+    работа: висящая карточка как раз и есть самый важный симптом смотрителя, и
+    запрещать из-за неё обход значило бы терять находку. Считаются только карточки
+    с ключом `planloop:`; `running` без heartbeat окно не включает.
 
-def live_pipeline_card(cfg: config_mod.Config, now: float) -> dict | None:
-    """Карточка конвейера, по которой прямо сейчас идёт работа, или `None`.
-
-    «Идёт работа» — событие карточки свежее окна `watchdog.heartbeat_fresh_minutes`:
-    диспетчер только что её взял или исполнитель шлёт heartbeat. Просто
-    нетерминальная карточка работой не считается: висящая карточка — как раз то,
-    что смотритель обязан увидеть и назвать, а не повод молчать каждый час.
-
-    Свои карточки (`idempotency_key` с префиксом `keeper:`) не считаются работой
-    конвейера: иначе обход блокировал бы сам себя до закрытия своей же карточки.
+    Борды нет или схема чужая — `(False, "")`: обход продолжается, а причину назовёт
+    сканер источником `board`.
     """
+    moment = time.time() if now is None else float(now)
     db = Path(cfg.kanban_db)
     if not db.is_file():
-        return None
+        return False, ""
     try:
         con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
         try:
             cards = keeper_scan._read_cards(con)
-            try:
-                keys = {str(cid): str(key or "") for cid, key in
-                        con.execute("SELECT id, idempotency_key FROM tasks")}
-            except sqlite3.Error:
-                keys = {}                   # колонки нет — своих карточек не различить
+            have = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+            keys: dict[str, str] = {}
+            if "idempotency_key" in have:
+                for card_id, key in con.execute("SELECT id, idempotency_key FROM tasks"):
+                    keys[str(card_id)] = str(key or "")
         finally:
             con.close()
     except sqlite3.Error:
-        return None
+        return False, ""
     window = fresh_window(cfg)
     for card in cards:
-        if str(card.get("status") or "") in keeper_scan.TERMINAL_STATUSES:
+        card_id = str(card.get("id") or "")
+        if not keys.get(card_id, "").startswith(PLANLOOP_KEY_PREFIX):
             continue
-        card_id = str(card.get("id"))
-        if keys.get(card_id, "").startswith(KEEPER_KEY_PREFIX):
+        if str(card.get("status") or "") != "running":
             continue
-        last = max(_stamp(card.get("last_event")), _stamp(card.get("created_at")),
-                   _stamp(card.get("started_at")), _stamp(card.get("last_heartbeat_at")))
-        if last > 0 and now - last <= window:
-            card["idempotency_key"] = keys.get(card_id, "")
-            return card
-    return None
+        heartbeat = _stamp(card.get("last_heartbeat_at")) or _stamp(card.get("last_event"))
+        if heartbeat <= 0 or moment - heartbeat > window:
+            continue
+        age = max(0, int(moment - heartbeat))
+        return True, f"{card_id} (running, heartbeat {age} с назад)"
+    return False, ""
 
 
-def busy_reason(cfg: config_mod.Config, now: float) -> tuple[str, str] | None:
-    """Почему обход сейчас не идёт: живой тик или живая карточка конвейера.
+# ───────────────────────────── свой замок обхода ─────────────────────────────
 
-    Порядок один: сначала замок тика (он держится секунды), затем борда. Оба
-    случая — «работа уже идёт», разница только в адресе для человека.
+def keeper_lock_holder(state_dir) -> dict | None:
+    """Полезная нагрузка чужого `keeper.lock` (для строки пропуска)."""
+    try:
+        data = json.loads((Path(state_dir) / KEEPER_LOCK_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _keeper_payload() -> dict:
+    """Нагрузка своего замка — та же форма, что пишет `state_io`."""
+    return {"pid": os.getpid(), "host": socket.gethostname(),
+            "at": time.strftime("%d.%m.%Y %H:%M:%S"), "at_ts": time.time(),
+            "what": "keeper"}
+
+
+def _keeper_lock_stale(payload: dict | None, now: float) -> bool:
+    """Замок протух: возраст, чужой хост или мёртвый PID (как `state_io._stale`)."""
+    if not payload:
+        return True
+    at_ts = _stamp(payload.get("at_ts"))
+    if at_ts <= 0 or now - at_ts > KEEPER_LOCK_STALE:
+        return True
+    if str(payload.get("host") or "") != socket.gethostname():
+        return True
+    return not keeper_scan._alive(_stamp(payload.get("pid")))
+
+
+def take_keeper_lock(state_dir, now: float | None = None) -> Path | None:
+    """Взять свой замок обхода `keeper.lock`; `None` — держит живой чужой (D11).
+
+    Примитив тот же, что у тика (`os.open` с `O_CREAT | O_EXCL`, без `msvcrt` и
+    `fcntl`). Гонку за протухший замок проигравшая сторона не ждёт: прогон просто
+    пропускается, следующий будет через час.
     """
-    pid = live_tick_pid(cfg.state_dir)
-    if pid:
-        return REASON_BUSY, (f"идёт тик стража: {state_io.LOCK_NAME} держит живой"
-                             f" pid {pid}")
-    card = live_pipeline_card(cfg, now)
-    if card is not None:
-        title = " ".join(str(card.get("title") or "").split())[:60]
-        return REASON_BUSY, (f"на борде {cfg.board} идёт карточка"
-                             f" {card.get('id')} ({card.get('status')}): {title}")
+    path = Path(state_dir) / KEEPER_LOCK_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    moment = time.time() if now is None else float(now)
+    payload = _keeper_payload()
+    for attempt in (1, 2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            if attempt == 2 or not _keeper_lock_stale(keeper_lock_holder(state_dir), moment):
+                return None
+            try:
+                path.unlink()
+            except OSError:
+                return None
+            continue
+        try:
+            os.write(fd, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+        except BaseException:
+            os.close(fd)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            raise
+        os.close(fd)
+        return path
     return None
+
+
+def release_keeper_lock(path: Path | None) -> None:
+    """Снять ТОЛЬКО свою запись: сверка pid и host, как у `state_io.release`."""
+    if path is None:
+        return
+    path = Path(path)
+    current = keeper_lock_holder(path.parent)
+    if not current:
+        return
+    if _stamp(current.get("pid")) != os.getpid():
+        return
+    if str(current.get("host") or "") != socket.gethostname():
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+# ───────────────────────────── карточка смотрителя ─────────────────────────────
+
+def _severity_counts(symptoms: list[dict]) -> dict:
+    """Счёт по трём классам severity (схема §4.1)."""
+    counts = {name: 0 for name in SEVERITY_ORDER}
+    for item in symptoms:
+        name = str(item.get("severity") or "")
+        if name in counts:
+            counts[name] += 1
+    return counts
 
 
 def card_title(cfg: config_mod.Config, symptoms: list[dict]) -> str:
-    """Заголовок карточки: сколько находок и в каком проекте (одна строка борды)."""
+    """Заголовок карточки: проект и счёт находок (одна строка борды)."""
     high = sum(1 for item in symptoms if str(item.get("severity")) == SEVERITY_HIGH)
-    tail = f", high {high}" if high else ""
-    return (f"Смотритель: находок {len(symptoms)}{tail} — {cfg.project}")[:CARD_TITLE_LIMIT]
+    return f"[смотритель] {cfg.project}: симптомов {len(symptoms)} (high {high})"[:CARD_TITLE_LIMIT]
 
 
 def card_key(cfg: config_mod.Config, symptoms: list[dict]) -> str:
     """Ключ идемпотентности: один и тот же набор находок не даёт вторую карточку.
 
-    Хеш от набора `symptom_id`, а не от времени: повторный обход того же простоя
-    получает ту же карточку из борды, а не соседнюю.
+    Хеш от набора `symptom_id`, а не от времени и не от `evidence` (D6): повторный
+    обход того же простоя получает ту же карточку из борды, а растущий список
+    изменённых путей новую не порождает.
     """
     ids = sorted(str(item.get("symptom_id") or "") for item in symptoms)
     digest = hashlib.sha256("|".join(ids).encode("utf-8")).hexdigest()[:16]
     return f"{KEEPER_KEY_PREFIX}{cfg.project}:{digest}"
 
 
-def card_body(cfg: config_mod.Config, result: dict, symptoms: list[dict]) -> str:
-    """Тело карточки: JSON симптомов (его читает скилл) и отчёт починок."""
-    counts = (result.get("heal") or {}).get("counts") or {}
+def _heal_tail(item: dict) -> str:
+    """Хвост строки результатов починки: причина и деталь."""
+    reason = str(item.get("reason") or "")
+    detail = str(item.get("detail") or "")
+    head = f" (причина: {reason})" if reason else ""
+    return f"{head}: {detail}" if detail else head
+
+
+def card_body(cfg: config_mod.Config, healed: dict, symptoms: list[dict]) -> str:
+    """Тело карточки: шапка, ПОЛНЫЙ JSON симптомов и строки результатов починки.
+
+    JSON не усекается: карточка — единственный вход роли `pipeline-keeper`.
+    """
+    severity = _severity_counts(symptoms)
     lines = [
         "# Смотритель: находки часового обхода",
         "",
         f"- Проект: {cfg.project} (`{Path(cfg.repo).as_posix()}`)",
-        f"- Обход: {result.get('ran_at')}, режим {result.get('mode')}",
-        f"- Находок: {len(symptoms)}; high:"
-        f" {sum(1 for item in symptoms if str(item.get('severity')) == SEVERITY_HIGH)}",
-        f"- Починки: ok {counts.get('ok', 0)}, failed {counts.get('failed', 0)},"
-        f" refused {counts.get('refused', 0)}, planned {counts.get('planned', 0)}",
+        f"- Режим починок: {healed.get('mode') or '—'}",
+        f"- Находок: {len(symptoms)} (high {severity['high']},"
+        f" normal {severity['normal']}, low {severity['low']})",
+        f"- Журнал починок: `{healed.get('journal') or '—'}`",
+        "",
+        "Симптомы пришли из сканера: нет симптома — нет действия.",
         "",
         "## JSON симптомов",
         "",
@@ -720,57 +814,43 @@ def card_body(cfg: config_mod.Config, result: dict, symptoms: list[dict]) -> str
         "## Отчёт починок",
         "",
     ]
-    for item in (result.get("heal") or {}).get("results") or []:
+    results = healed.get("results") or []
+    if not results:
+        lines.append("- починок не было: симптомы вне белого списка или режим dry-run")
+    for item in results:
         action = item.get("action") or "—"
-        lines.append(f"- {item.get('status')} {item.get('kind')}"
-                     f" {item.get('address')} → {action}: {item.get('detail')}")
-    lines += [
-        "",
-        "## Что дальше",
-        "",
-        "- Починка белого списка — `hermes pipeline keeper --heal`"
-        " (журнал: `state/keeper.jsonl`).",
-        "- Кодовый дефект движка — находка в план (`путь:строка`, доказательство),"
-        " а не правка `engine/*.py`.",
-        "- Шаг, закрытие шага и вердикт ревью — вне работы смотрителя.",
-    ]
+        lines.append(f"- {item.get('kind')} {item.get('address')} → {action}:"
+                     f" {item.get('status')}{_heal_tail(item)}")
     return "\n".join(lines) + "\n"
 
 
-def create_card(cfg: config_mod.Config, result: dict, symptoms: list[dict],
-                state: HealState) -> tuple[str, str, str, str]:
-    """Карточка смотрителя на борду: `(статус, пояснение, id, код причины)`.
+def create_card(cfg: config_mod.Config, healed: dict, symptoms: list[dict],
+                state: HealState, profile: str) -> tuple[str, str]:
+    """Одна карточка на прогон: `(id, пояснение)`.
 
-    Исполнитель проверяется ДО вызова CLI: карточка с несуществующим профилем
-    не заводится вовсе (диспетчер её молча не возьмёт), а причина уходит в отчёт
-    и в сообщение владельцу — «отказ доставки» из стоп-условий шага.
+    Отказ CLI и невидимая борде карточка не роняют обход: строка в stderr, пустой
+    `card` в схеме, следующий час повторит с тем же ключом (идемпотентность CLI
+    вернёт уже созданную карточку). Видимость проверяется один раз (D10).
     """
-    profile = str(result.get("profile") or "")
-    if not profile:
-        return ("failed",
-                "нет профиля: в конфигурации нет ни profiles.keeper, ни profiles.driver",
-                "", REASON_NO_PROFILE)
-    if not profile_exists(profile):
-        return ("failed",
-                f"профиль {profile} не найден в {profiles_home().as_posix()}:"
-                f" карточка без исполнителя висела бы в ready — не завожу",
-                "", REASON_NO_PROFILE)
+    key = card_key(cfg, symptoms)
     body_path = ""
     try:
         fd, body_path = tempfile.mkstemp(prefix="keeper-", suffix=".md")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(card_body(cfg, result, symptoms))
+            fh.write(card_body(cfg, healed, symptoms))
         argv = [state.hermes, "kanban", "--board", cfg.board,
                 "create", card_title(cfg, symptoms),
                 "--body-file", body_path,
                 "--assignee", profile, "--tenant", cfg.tenant,
                 "--workspace", f"dir:{Path(cfg.repo).as_posix()}",
-                "--idempotency-key", card_key(cfg, symptoms),
+                "--idempotency-key", key,
                 "--max-runtime", keeper_runtime(cfg),
                 "--skill", KEEPER_SKILL]
         res = state.run(argv, RUN_TIMEOUT)
     except (OSError, subprocess.SubprocessError) as exc:
-        return "failed", f"hermes kanban create не запустился: {str(exc)[:160]}", "", REASON_CARD
+        tail = f"hermes kanban create не запустился: {str(exc)[:140]}"
+        print(f"[card] не создано: {tail}", file=sys.stderr)
+        return "", f"карточка не создана: {tail}"
     finally:
         if body_path:
             try:
@@ -779,135 +859,128 @@ def create_card(cfg: config_mod.Config, result: dict, symptoms: list[dict],
                 pass
     out = ((res.stdout or "") + (res.stderr or "")).strip()
     match = re.search(r"t_[0-9a-f]{6,}", out)
-    if not match:
-        return ("failed", f"карточку не создал: {out[:200] or 'пустой вывод hermes'}",
-                "", REASON_CARD)
+    if res.returncode != 0 or not match:
+        tail = " ".join(out.split())[:160] or "пустой вывод hermes"
+        print(f"[card] не создано: {tail}", file=sys.stderr)
+        return "", f"карточка не создана: {tail}"
     card_id = match.group(0)
-    exists = card_in_board(cfg, card_id)
-    if exists is False:
-        return ("failed",
-                f"карточка {card_id} заказана, но борды {cfg.board} её не знает:"
-                f" строки нет в {Path(cfg.kanban_db).name}", card_id, REASON_CARD)
+    visible = card_in_board(cfg, card_id)
+    if visible is False:
+        print(f"[card] создано, но борды {cfg.board} её не знает: {card_id}", file=sys.stderr)
+        return "", f"карточка {card_id} заказана, но борды {cfg.board} её не знает"
     detail = f"карточка {card_id} на профиле {profile}"
-    if exists is None:
+    if visible is None:
         detail += " (борда не читается — видимость не проверена)"
-    return "carded", detail, card_id, ""
+    return card_id, detail
 
 
-def _unresolved_high(symptoms: list[dict], results: list[dict]) -> list[dict]:
-    """High-находки, которые починка не сняла: повод для сообщения владельцу."""
-    healed = {str(item.get("symptom_id") or "")
-              for item in results if str(item.get("status")) == "ok"}
-    return [item for item in symptoms
-            if str(item.get("severity")) == SEVERITY_HIGH
-            and str(item.get("symptom_id") or "") not in healed]
+# ───────────────────────────── сообщение владельцу ─────────────────────────────
 
+def notify_owner(cfg: config_mod.Config, text: str) -> bool:
+    """Единственный канал проекта (Ф5): ленивый `import gate` и `gate.notify`.
 
-def escalation_text(cfg: config_mod.Config, findings: list[dict], card: dict) -> str:
-    """Сообщение владельцу: вид, адрес и доказательство каждой high-находки."""
-    parts = "; ".join(f"{item.get('kind')} {item.get('address')} —"
-                      f" {str(item.get('evidence') or '')[:100]}" for item in findings[:ESCALATION_LIMIT])
-    rest = len(findings) - ESCALATION_LIMIT
-    if rest > 0:
-        parts += f"; и ещё {rest}"
-    where = (f"карточка {card.get('id')}" if card.get("id")
-             else f"карточка не создана: {card.get('detail') or 'причина неизвестна'}")
-    return (f"Смотритель {cfg.project}: находок high {len(findings)} — {parts}."
-            f" Итог: {where}.")
-
-
-#: Прокси Bot API — тот же набор переменных, что у стража (`gate.tg_api_base`).
-TG_BASE_ENVS = ("STEP_PIPELINE_TELEGRAM_API_BASE", "TELEGRAM_API_BASE_URL")
-
-#: Явные наборы корней: у хранилища ОС бывают просроченные CA (см. `gate.ca_bundle`).
-CA_ENV_VARS = ("STEP_PIPELINE_CA_BUNDLE", "HERMES_CA_BUNDLE", "SSL_CERT_FILE",
-               "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
-
-
-def tg_api_base() -> str:
-    """Хост Bot API: прокси из окружения, иначе прямой Telegram."""
-    base = ""
-    for name in TG_BASE_ENVS:
-        base = (os.environ.get(name) or "").strip().rstrip("/")
-        if base:
-            break
-    if not base:
-        return "https://api.telegram.org"
-    return base[: -len("/bot")] if base.endswith("/bot") else base
-
-
-def _ssl_context() -> ssl.SSLContext:
-    """Контекст TLS с явным набором корней, если он найден."""
-    for name in CA_ENV_VARS:
-        path = (os.environ.get(name) or "").strip()
-        if path and os.path.isfile(path):
-            return ssl.create_default_context(cafile=path)
-    try:
-        import certifi
-    except ImportError:
-        return ssl.create_default_context()
-    return ssl.create_default_context(cafile=certifi.where())
-
-
-def _default_notify(cfg: config_mod.Config, text: str) -> tuple[str, str]:
-    """Сообщение владельцу в Telegram: `(статус, пояснение)`.
-
-    Уведомления выключены — строка в stderr и исход `skipped`: cron с `--deliver
-    local` покажет её в выводе, а карточка на борде остаётся доказательством.
+    Импорт ленивый: `gate` тянет полдвижка, а нужен он только при `high`. Отказ
+    импорта и сбой доставки — строка в stderr и `False`, не исключение: обход не
+    падает из-за канала, карточка на борде остаётся доказательством.
     """
-    notify_cfg = cfg.notify if isinstance(cfg.notify, dict) else {}
-    prefix = str(notify_cfg.get("prefix") or "")
-    message = f"{prefix}{text}" if prefix else text
-    if not notify_cfg.get("enabled"):
-        print(f"[notify] {message}", file=sys.stderr)
-        return "skipped", "уведомления выключены (notify.enabled=false): строка в лог"
-    token = os.environ.get(str(notify_cfg.get("token_env") or "PIPELINE_TG_TOKEN"))
-    chat = os.environ.get(str(notify_cfg.get("chat_env") or "PIPELINE_TG_CHAT"))
-    if not token or not chat:
-        return "skipped", "нет токена или чата в окружении профиля: сообщение не отправлено"
-    data = urllib.parse.urlencode({"chat_id": chat, "text": message,
-                                   "disable_web_page_preview": "true"}).encode()
-    request = urllib.request.Request(f"{tg_api_base()}/bot{token}/sendMessage", data=data)
     try:
-        with urllib.request.urlopen(request, timeout=20, context=_ssl_context()) as resp:
-            if 200 <= resp.status < 300:
-                return "ok", "сообщение владельцу отправлено"
-            return "failed", f"Bot API ответил {resp.status}"
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        return "failed", f"сообщение не доставлено: {str(exc)[:160]}"
-
-
-def notify_owner(cfg: config_mod.Config, text: str, notify=None) -> dict:
-    """Эскалация владельцу через подменяемую функцию `(cfg, text) → (статус, деталь)`."""
-    if not text:
-        return {"status": "none", "detail": ""}
-    fn = _default_notify if notify is None else notify
+        import gate as gate_mod  # noqa: PLC0415 - канал нужен только при high
+    except Exception as exc:                        # noqa: BLE001 - канал не обязателен
+        print(f"[notify] канал недоступен: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
     try:
-        outcome = fn(cfg, text)
-    except Exception as exc:              # noqa: BLE001 - отказ доставки не роняет обход
-        return {"status": "failed", "detail": f"сбой уведомления: {type(exc).__name__}: {exc}"}
-    status, detail = (outcome if isinstance(outcome, tuple) else (str(outcome), ""))
-    return {"status": str(status), "detail": str(detail)}
+        return bool(gate_mod.notify(cfg, text))
+    except Exception as exc:                        # noqa: BLE001 - обход не падает
+        print(f"[notify] сбой доставки: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
 
 
-def run_hourly(cfg: config_mod.Config | None = None, symptoms: list[dict] | None = None, *,
-               plugin_dir=None, now: float | None = None, run=None, probe=None,
-               hermes: str | None = None, notify=None, dry_run: bool | None = None) -> dict:
-    """Один часовой обход: скан → починки → карточка → эскалация.
+def escalation_text(cfg: config_mod.Config, findings: list[dict], card_id: str) -> str:
+    """Одна строка владельцу: сколько high-симптомов, каких видов и где карточка."""
+    kinds = [str(item.get("kind") or "") for item in findings]
+    shown = ", ".join(kinds[:NOTIFY_HIGH_LIMIT])
+    if len(kinds) > NOTIFY_HIGH_LIMIT:
+        shown += f" и ещё {len(kinds) - NOTIFY_HIGH_LIMIT}"
+    where = (f"карточка {card_id} (борда {cfg.board})" if card_id
+             else "карточка не создана")
+    text = f"смотритель {cfg.project}: high-симптомов {len(findings)} ({shown}), {where}"
+    return text[:NOTIFY_TEXT_LIMIT]
 
-    Правила шага, все проверяются тестами по отдельности:
 
-    * маркер `state/keeper.off` — обхода нет вовсе, одна строка в лог;
-    * занятый замок обхода (`keeper.lock`, тот же примитив, что у тика) — «другой
-      смотритель уже идёт», пропуск: два обхода разом не запускаются;
-    * живой `tick.lock` или живая карточка конвейера — пропуск: две работы разом
-      не запускаются;
-    * пустой скан — одна строка, ни карточки, ни сообщения: модель не будится;
-    * находки — карточка со скиллом `pipeline-keeper` на `profiles.keeper`
-      (умолчание `profiles.driver`), а несуществующий профиль — отказ без карточки;
-    * `severity=high`, которую починка не сняла, — сообщение владельцу;
-    * без `state/keeper.on` режим остаётся dry-run: ни команд, ни карточки, ни
-      сообщения — только отчёт о том, что было бы сделано (S3/D5).
+def escalate(cfg: config_mod.Config, findings: list[dict], card_id: str,
+             now: float) -> bool:
+    """Одно сообщение владельцу за прогон и только вне окна паузы (D7).
+
+    Пауза — про «не будить», а не про «не видеть»: карточка к этому моменту уже
+    заведена, в лог уходит `[notify] отложено до ЧЧ:ММ`, `notified` остаётся ложным.
+    """
+    pause = config_mod.pause_state(cfg, now)
+    if pause.get("paused"):
+        print(f"[notify] отложено до {pause.get('until') or '—'}:"
+              f" high-симптомов {len(findings)}", file=sys.stderr)
+        return False
+    return notify_owner(cfg, escalation_text(cfg, findings, card_id))
+
+
+# ───────────────────────────── API часового обхода ─────────────────────────────
+
+def _result_stub(cfg: config_mod.Config, moment: float) -> dict:
+    """Каркас ответа по схеме §4.1: заказанные ключи на своих местах."""
+    return {
+        "project": str(cfg.project),
+        "repo": Path(cfg.repo).resolve().as_posix(),
+        "ran_at": datetime.fromtimestamp(moment).strftime("%d.%m.%Y %H:%M:%S"),
+        "ran_ts": int(moment),
+        "status": "skipped",
+        "reason": "",
+        "symptoms": 0,
+        "severity": {"high": 0, "normal": 0, "low": 0},
+        "card": "",
+        "key": "",
+        "profile": "",
+        "mode": "",
+        "heal": {},
+        "notified": False,
+        # Расширение схемы: готовая строка итога для истории cron (одна строка).
+        "line": "",
+        "detail": "",
+    }
+
+
+def _skip(result: dict, reason: str, detail: str) -> dict:
+    """Пропуск прогона: причина окон, карточки нет, код 0."""
+    result.update(status="skipped", reason=reason, detail=detail,
+                  line=f"смотритель {result['project']}: пропуск — {detail}")
+    return result
+
+
+def _findings_line(cfg: config_mod.Config, result: dict, detail: str) -> str:
+    """Строка итога при находках: счёт, режим и карточка (или причина отказа)."""
+    severity = result.get("severity") or {}
+    head = (f"смотритель {cfg.project}: симптомов {result.get('symptoms')}"
+            f" (high {severity.get('high', 0)}), режим {result.get('mode') or '—'}")
+    if result.get("card"):
+        return f"{head}, карточка {result['card']} (ключ {result.get('key')})"
+    return f"{head}, карточка не создана: {detail}"
+
+
+def hourly(cfg: config_mod.Config | None = None, *, symptoms: list[dict] | None = None,
+           plugin_dir=None, now: float | None = None, run=None, probe=None,
+           hermes: str | None = None, dry_run: bool | None = None) -> dict:
+    """Один часовой обход: окна → скан → починки белого списка → карточка → владелец.
+
+    Правила шага, каждое проверяется своим тестом:
+
+    * порядок до скана: свой замок `keeper.lock` → живой `tick.lock` → идущая
+      карточка конвейера; пропуск — `status="skipped"`, причина в `reason`, код 0;
+    * пустой скан — `status="idle"` и одна строка в лог: `heal` не зовётся вовсе,
+      чтобы не создавать каталог состояния на целом проекте;
+    * находки — `heal` теми же зависимостями, затем ОДНА карточка со скиллом
+      `pipeline-keeper` на `profiles.keeper` (умолчание `profiles.driver`) и полным
+      JSON симптомов; режим починок карточку не отменяет (`keeper.on` разрешает
+      команды, а не извещение);
+    * `severity=high` — не больше одного сообщения владельцу за прогон, вне окна
+      паузы (`config.pause_state`).
     """
     if cfg is None:
         cfg = config_mod.load()
@@ -917,119 +990,56 @@ def run_hourly(cfg: config_mod.Config | None = None, symptoms: list[dict] | None
     probe_fn = keeper_scan._default_probe if probe is None else probe
     found = shutil.which("hermes") if hermes is None else (hermes or None)
     state_dir = Path(cfg.state_dir)
-    mode = mode_of(state_dir, dry_run)
-    profile = keeper_profile(cfg)
-    result: dict = {
-        "project": str(cfg.project),
-        "repo": Path(cfg.repo).resolve().as_posix(),
-        "ran_at": datetime.fromtimestamp(moment).strftime("%d.%m.%Y %H:%M:%S"),
-        "ran_ts": int(moment),
-        "mode": mode,
-        "dry_run": mode != "apply",
-        "profile": profile,
-        "status": "silent",
-        "reason": "",
-        "detail": "",
-        "card": {"id": "", "profile": profile, "title": "", "key": "", "status": "",
-                 "detail": ""},
-        "escalated": {"status": "none", "detail": "", "text": ""},
-        "symptoms": [],
-        "heal": {},
-        "lines": [],
-    }
-    if mode == "off":
-        result.update(status="off", reason=REASON_OFF,
-                      detail=f"kill-switch {OFF_MARKER}: смотритель выключен владельцем")
-        result["lines"] = [f"смотритель {cfg.project}: выключен ({OFF_MARKER})"]
-        return result
-    lock = state_io.acquire(state_dir, what="keeper", wait=0, name=KEEPER_LOCK_NAME)
+    result = _result_stub(cfg, moment)
+    lock = take_keeper_lock(state_dir, moment)
     if lock is None:
-        payload = state_io.holder(state_dir, KEEPER_LOCK_NAME) or {}
-        pid = _stamp(payload.get("pid"))
-        result.update(status="skipped", reason=REASON_BUSY,
-                      detail=(f"другой смотритель уже идёт: {KEEPER_LOCK_NAME} держит"
-                              f" живой pid {pid or '?'}"))
-        result["lines"] = [f"смотритель {cfg.project}: пропуск — {result['detail']}"]
-        return result
-    state = HealState(cfg=cfg, state_dir=state_dir, plugin_dir=package, now=moment,
-                      mode=mode, hermes=found or "hermes", hermes_found=bool(found),
-                      run=run_fn, probe=probe_fn)
+        holder = keeper_lock_holder(state_dir) or {}
+        return _skip(result, REASON_KEEPER_RUNNING,
+                     f"другой смотритель уже идёт: {KEEPER_LOCK_NAME} держит"
+                     f" живой pid {_stamp(holder.get('pid')) or '?'}")
     try:
-        return _hourly_pass(state, symptoms, result, notify=notify, dry_run=dry_run)
-    finally:
-        state_io.release(lock)
-
-
-def _hourly_pass(state: HealState, symptoms: list[dict] | None, result: dict, *,
-                 notify, dry_run: bool | None) -> dict:
-    """Тело обхода под взятым замком: окна, скан, починки, карточка, эскалация."""
-    cfg = state.cfg
-    moment = state.now
-    mode = state.mode
-    hermes = state.hermes if state.hermes_found else None
-    blocked = busy_reason(cfg, moment)
-    if blocked is not None:
-        result.update(status="skipped", reason=blocked[0], detail=blocked[1])
-        result["lines"] = [f"смотритель {cfg.project}: пропуск — {blocked[1]}"]
-        return result
-
-    if symptoms is None:
-        scanned = keeper_scan.scan(cfg, plugin_dir=state.plugin_dir, now=moment,
-                                   run=state.run, probe=state.probe, hermes=hermes)
-        symptoms = scanned["symptoms"]
-    symptoms = _order(list(symptoms or []))
-    result["symptoms"] = symptoms
-    if not symptoms:
-        result["lines"] = [f"смотритель {cfg.project}: находок нет — чисто,"
-                           f" карточки нет ({result['ran_at']})"]
-        return result
-
-    healed = heal(cfg, symptoms=symptoms, plugin_dir=state.plugin_dir, now=moment,
-                  run=state.run, probe=state.probe, hermes=hermes, dry_run=dry_run)
-    result["heal"] = {"mode": healed["mode"], "counts": healed["counts"],
-                      "results": healed["results"], "journal": healed["journal"]}
-    result["card"]["title"] = card_title(cfg, symptoms)
-    result["card"]["key"] = card_key(cfg, symptoms)
-
-    if mode != "apply":
-        result.update(status="planned",
-                      detail=f"dry-run: карточку на профиль {result['profile']} не завожу,"
-                             f" внешних команд нет")
-        result["card"].update(status="planned", detail=result["detail"])
-    else:
-        status, detail, card_id, reason = create_card(cfg, result, symptoms, state)
-        result.update(status=status, detail=detail, reason=reason)
-        result["card"].update(id=card_id, status=status, detail=detail)
-
-    if mode == "apply":
-        findings = _unresolved_high(symptoms, result["heal"]["results"])
+        pid = live_tick_pid(state_dir)
+        if pid:
+            return _skip(result, REASON_TICK_RUNNING,
+                         f"идёт тик стража: {state_io.LOCK_NAME} держит живой pid {pid}")
+        busy, who = conveyor_busy(cfg, moment)
+        if busy:
+            return _skip(result, REASON_CONVEYOR_BUSY, f"идёт карточка конвейера {who}")
+        result["profile"] = keeper_profile(cfg)
+        state = HealState(cfg=cfg, state_dir=state_dir, plugin_dir=package, now=moment,
+                          mode=mode_of(state_dir, dry_run), hermes=found or "hermes",
+                          hermes_found=bool(found), run=run_fn, probe=probe_fn)
+        if symptoms is None:
+            symptoms = keeper_scan.scan(cfg, plugin_dir=package, now=moment, run=run_fn,
+                                        probe=probe_fn, hermes=found)["symptoms"]
+        symptoms = _order(list(symptoms or []))
+        result["symptoms"] = len(symptoms)
+        result["severity"] = _severity_counts(symptoms)
+        if not symptoms:
+            result.update(status="idle",
+                          line=f"смотритель {cfg.project}: симптомов 0 — карточка не нужна")
+            return result
+        healed = heal(cfg, symptoms=symptoms, plugin_dir=package, now=moment,
+                      run=run_fn, probe=probe_fn, hermes=found, dry_run=dry_run)
+        result["heal"] = healed
+        result["mode"] = str(healed.get("mode") or "")
+        result["key"] = card_key(cfg, symptoms)
+        card_id, detail = create_card(cfg, healed, symptoms, state, result["profile"])
+        result.update(status="carded", card=card_id, detail=detail)
+        result["line"] = _findings_line(cfg, result, detail)
+        findings = [item for item in symptoms
+                    if str(item.get("severity")) == SEVERITY_HIGH]
         if findings:
-            text = escalation_text(cfg, findings, result["card"])
-            result["escalated"] = dict(notify_owner(cfg, text, notify), text=text)
-
-    counts = result["heal"]["counts"]
-    result["lines"] = [
-        f"смотритель {cfg.project}: находок {len(symptoms)}, high"
-        f" {sum(1 for item in symptoms if str(item.get('severity')) == SEVERITY_HIGH)},"
-        f" починки ok {counts.get('ok', 0)}/failed {counts.get('failed', 0)}"
-        f"/refused {counts.get('refused', 0)}; {result['status']}: {result['detail']}",
-    ]
-    for item in result["heal"]["results"]:
-        result["lines"].append(f"  {item.get('status')} {item.get('kind')}"
-                               f" {item.get('address')} → {item.get('action') or '—'}:"
-                               f" {item.get('detail')}")
-    if result["escalated"]["status"] != "none":
-        result["lines"].append(f"  эскалация владельцу: {result['escalated']['status']}"
-                               f" — {result['escalated']['detail']}")
-    return result
+            result["notified"] = escalate(cfg, findings, card_id, moment)
+        return result
+    finally:
+        release_keeper_lock(lock)
 
 
 def format_hourly(result: dict) -> str:
-    """Человеческий вывод обхода: строки отчёта, по строке на находку."""
-    lines = list(result.get("lines") or [])
-    if not lines:
-        lines = [f"смотритель {result.get('project')}: {result.get('status')}"]
-    return "\n".join(lines)
+    """Человеческий вывод обхода: ровно одна строка итога (история cron)."""
+    line = str(result.get("line") or "").strip()
+    return line or f"смотритель {result.get('project')}: {result.get('status')}"
 
 
 def format_human(result: dict) -> str:
@@ -1053,7 +1063,8 @@ def main(argv: list[str] | None = None) -> int:
     `--heal` — только починки белого списка (S3); `--hourly` — часовой обход
     целиком (S4): скан, починки, карточка, эскалация. Коды возврата как у сканера:
     `0` — прогон выполнен (отказы и сбои починок — строки отчёта, а не ошибка
-    запуска), `2` — конфигурация не читается, `1` — непойманный сбой.
+    запуска), `2` — конфигурация не читается или аргументы противоречат друг другу,
+    `1` — непойманный сбой.
     """
     parser = argparse.ArgumentParser(
         prog="keeper_heal.py", description="Починки смотрителя по белому списку")
@@ -1069,13 +1080,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", default="", help="корень проекта")
     parser.add_argument("--hermes", default="", help="путь к CLI hermes")
     args = parser.parse_args(argv)
+    if args.hourly and args.heal:
+        print("--hourly и --heal взаимоисключающие: выбери один режим", file=sys.stderr)
+        return 2
     if args.project:
         os.environ["PIPELINE_REPO"] = str(Path(args.project).expanduser().resolve())
     try:
         if args.hourly:
-            result = run_hourly(plugin_dir=args.plugin_dir or None,
-                                hermes=args.hermes or None,
-                                dry_run=True if args.dry_run else None)
+            result = hourly(plugin_dir=args.plugin_dir or None,
+                            hermes=args.hermes or None,
+                            dry_run=True if args.dry_run else None)
         else:
             result = heal(plugin_dir=args.plugin_dir or None, hermes=args.hermes or None,
                           dry_run=True if args.dry_run else None)

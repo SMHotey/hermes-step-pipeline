@@ -1309,15 +1309,23 @@ KEEPER_JOB = "План: смотритель (конвейер)"
 KEEPER_SCRIPT = '''# -*- coding: utf-8 -*-
 """Часовой обход смотрителя: скан симптомов, починки белого списка, карточка, эскалация.
 
-Джоба `--no-agent`: модели в ней нет вообще — пустой обход это одна строка в лог, а
-модель будится только карточкой на борде (`--skill pipeline-keeper`). Скрипт — тонкая
-обёртка: решение о паузе, предохранителях и карточке принимает `keeper_heal.py`
-движка проекта, здесь только запуск.
+Джоба `--no-agent` с доставкой `--deliver local`: модели в ней нет вообще — пустой
+обход это одна строка в лог, а модель будится только карточкой на борде
+(`--skill pipeline-keeper`). Скрипт решений не принимает: дочитывает `.env` профиля и
+передаёт управление `.pipeline/keeper_heal.py --hourly` движка проекта. Разбор `.env`
+скопирован из `step_pipeline/engine/tick.py` намеренно: cron-скрипт не импортирует
+пакет плагина, а унаследованный канал чужого профиля уводит уведомления от чужого
+имени (проверено на живом шлюзе 16.11.2026).
 """
 import os
 import runpy
 import sys
 from pathlib import Path
+
+#: Префикс переменных канала уведомлений конвейера (как `NOTIFY_ENV_PREFIX` в `project.py`).
+NOTIFY_ENV_PREFIX = "STEP_PIPELINE_TELEGRAM_"
+#: Общие переменные Bot API: прокси/база тоже принадлежат каналу, а не процессу-родителю.
+NOTIFY_SHARED_ENVS = ("TELEGRAM_API_BASE_URL", "TELEGRAM_API_BASE_FILE_URL")
 
 ENGINE_SCRIPT = "keeper_heal.py"
 
@@ -1333,47 +1341,100 @@ def _setup_stdio():
             pass
 
 
+def drop_inherited_notify_env():
+    """Убрать чужой канал уведомлений, унаследованный от процесса-родителя.
+
+    cron-джоба живёт в процессе шлюза, а шлюз держит в своём окружении `.env` того
+    профиля, чей Telegram-адаптер поднялся первым: без этого сообщения смотрителя
+    уходили бы от чужого имени. Свой канал берётся только из `.env` своего профиля.
+    """
+    for key in [k for k in os.environ
+                if k.startswith(NOTIFY_ENV_PREFIX) or k in NOTIFY_SHARED_ENVS]:
+        del os.environ[key]
+
+
+def load_profile_env():
+    """Переменные `.env` профиля: `PIPELINE_ENV`, иначе `profiles/<имя>/.env`."""
+    drop_inherited_notify_env()
+    paths = []
+    explicit = os.environ.get("PIPELINE_ENV")
+    if explicit:
+        paths.append(Path(explicit))
+    paths.append(Path(__file__).resolve().parents[1] / ".env")
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, _, value = line.partition("=")
+            value = value.strip().strip('"').strip("'")
+            if key.strip() and value:
+                os.environ.setdefault(key.strip(), value)
+
+
 def find_engine():
-    """Модуль движка в копии проекта: `PIPELINE_REPO`, рабочий каталог, потом профиль."""
+    """Движок проекта: `PIPELINE_REPO`, рабочий каталог, потом каталог скрипта."""
     candidates = []
     repo = os.environ.get("PIPELINE_REPO")
     if repo:
         candidates.append(Path(repo) / ".pipeline" / ENGINE_SCRIPT)
     candidates.append(Path.cwd() / ".pipeline" / ENGINE_SCRIPT)
-    candidates.append(Path(__file__).resolve().parents[1] / ".pipeline" / ENGINE_SCRIPT)
+    candidates.append(Path(__file__).resolve().parent / ENGINE_SCRIPT)
     for cand in candidates:
         if cand.is_file():
             return cand
     return None
 
 
+def hermes_home():
+    """Корень Hermes: HERMES_HOME, иначе LOCALAPPDATA/hermes, иначе ~/.hermes."""
+    env = os.environ.get("HERMES_HOME")
+    if env:
+        return Path(env)
+    local = os.environ.get("LOCALAPPDATA")
+    if local and (Path(local) / "hermes").is_dir():
+        return Path(local) / "hermes"
+    return Path.home() / ".hermes"
+
+
 def find_plugin():
-    """Каталог установленного плагина: рядом с профилем, иначе в ~/.hermes."""
+    """Каталог установленного плагина: рядом с профилем, иначе в корне Hermes.
+
+    Признак пакета — файл `update.py` (как в скрипте автообновления): он есть только
+    у полной установки. Не найден — `--plugin-dir` не передаётся, источники
+    `version`/`skills` в скане остаются `skipped` (это и означает `plugin_dir=None`).
+    """
     here = Path(__file__).resolve()
     candidates = [here.parents[1] / "plugins" / "step_pipeline",
-                  Path.home() / ".hermes" / "plugins" / "step_pipeline"]
+                  hermes_home() / "plugins" / "step_pipeline"]
     for cand in candidates:
-        if (cand / "keeper_heal.py").is_file() or (cand / "engine" / "keeper_heal.py").is_file():
+        if (cand / "update.py").is_file():
             return cand
     return None
 
 
 def main():
     _setup_stdio()
+    load_profile_env()
     engine = find_engine()
     if engine is None:
-        print("pipeline_keeper: в проекте нет .pipeline/keeper_heal.py — обход не пошёл",
-              file=sys.stderr)
-        return 0
-    argv = [str(engine), "--hourly"]
+        print("pipeline_keeper: keeper_heal.py не найден"
+              " (задай PIPELINE_REPO или --workdir джобы)", file=sys.stderr)
+        return 1
+    argv = [str(engine), "--hourly", "--project", str(engine.resolve().parent.parent)]
     plugin = find_plugin()
     if plugin is not None:
         argv += ["--plugin-dir", str(plugin)]
     sys.argv = argv
-    try:
-        runpy.run_path(str(engine), run_name="__main__")
-    except SystemExit as exc:
-        return int(exc.code or 0)
+    runpy.run_path(str(engine), run_name="__main__")
     return 0
 
 
@@ -1412,7 +1473,7 @@ def ensure_keeper_cron(driver: str, project: Path, log: Log, *, skip: bool) -> N
                           "--deliver", "local",
                           "--workdir", str(project))
     if res.returncode == 0:
-        log.ok(f"cron-джоба смотрителя создана ({KEEPER_CRON}, раз в час)")
+        log.ok(f"cron-джоба смотрителя создана ({KEEPER_CRON}, каждый час)")
     else:
         log.warn(f"cron смотрителя: {(res.stderr or res.stdout or '').strip()[:300]}")
         log.warn("завести вручную: " + keeper_cron_command(driver, project))

@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """Часовой обход смотрителя и cron-джоба (план 10, S4).
 
-Проверяется контракт шага, а не факт наличия функций: пустой скан не заводит
-карточку, находка заводит ровно одну, живой тик и карточка конвейера блокируют
-запуск, карточка уходит существующему профилю (иначе канбан-диспетчер её молча
-не возьмёт) и получает скилл `pipeline-keeper`, high-находка даёт сообщение
-владельцу. Внешние команды, живость панели и отправка сообщения подменяются:
-тесты не пишут в живую борду и не ходят в сеть.
+Доказательство приёмки шага: пустой скан не создаёт карточку, находка создаёт ровно
+одну, пересечение с тиком стража и идущей карточкой конвейера блокирует запуск, а
+карточка получает существующего исполнителя, скилл `pipeline-keeper` и полный JSON
+симптомов. Внешние команды, живость панели и отправка сообщения подменяются: ни один
+кейс не запускает настоящий `hermes` и не пишет в живой профиль.
 """
 from __future__ import annotations
 
@@ -22,9 +21,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from helpers import install_project  # noqa: F401 - фикстура `project` из conftest
+from helpers import install_project, stub_cards  # noqa: F401 - фикстура `project`
 from step_pipeline import setup_flow as setup_flow_mod
-from step_pipeline.setup_flow import KEEPER_CRON, KEEPER_JOB
+from step_pipeline.setup_flow import KEEPER_CRON, KEEPER_JOB, KEEPER_SCRIPT
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "step_pipeline" / "engine"
@@ -34,15 +33,20 @@ import config as config_mod  # noqa: E402 - движок на sys.path
 import keeper_heal  # noqa: E402
 import keeper_scan  # noqa: E402
 
-#: Фиксированный момент замера: 20.11.2026, 12:00 MSK.
+#: Фиксированный момент замера: 20.11.2026, 12:00 MSK. Часы берутся из `now`, а не из
+#: `time.time()`: тест не флакует на границе минуты и суток.
 NOW = 1795164000.0
 
-#: Схема борды: смотрителю нужны `id`, `status`, `title` и ключ идемпотентности.
+#: Схема «живой» борды (как `test_keeper_scan.BOARD_SCHEMA`): окну D5 нужен
+#: `last_heartbeat_at`, а поддельной борде `helpers.KANBAN_SCHEMA` этой колонки нет.
 BOARD_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tasks (
-    id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT,
-    idempotency_key TEXT, created_at INTEGER
-);
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT,
+                    created_at INTEGER, started_at INTEGER, completed_at INTEGER,
+                    last_heartbeat_at INTEGER, idempotency_key TEXT, tenant TEXT);
+CREATE TABLE task_events (task_id TEXT, run_id TEXT, kind TEXT, payload TEXT,
+                          created_at INTEGER);
+CREATE TABLE task_runs (task_id TEXT, status TEXT, last_heartbeat_at INTEGER,
+                        started_at INTEGER, ended_at INTEGER);
 """
 
 
@@ -51,11 +55,12 @@ CREATE TABLE IF NOT EXISTS tasks (
 class FakeRun:
     """Подмена внешних команд: пишет вызовы, читает тело карточки, отдаёт id."""
 
-    def __init__(self, create_out: str = "t_abc12345", rc: int = 0) -> None:
+    def __init__(self, create_out: str = "t_abc12345", rc: int = 0, on_call=None) -> None:
         self.calls: list[list[str]] = []
         self.bodies: list[str] = []
         self.create_out = create_out
         self.rc = rc
+        self.on_call = on_call
 
     def __call__(self, cmd, timeout):
         cmd = list(cmd)
@@ -63,6 +68,8 @@ class FakeRun:
         if "--body-file" in cmd:
             path = Path(cmd[cmd.index("--body-file") + 1])
             self.bodies.append(path.read_text(encoding="utf-8") if path.is_file() else "")
+        if self.on_call is not None:
+            self.on_call(cmd)
         out = ""
         if "create" in cmd:
             out = self.create_out
@@ -74,16 +81,58 @@ class FakeRun:
         return [call for call in self.calls if "create" in call]
 
 
-class Notifier:
-    """Подмена сообщения владельцу: запоминает текст, исход задаёт тест."""
+class Result:
+    """Ответ поддельного `hermes` для мастера установки."""
 
-    def __init__(self, outcome: tuple[str, str] = ("ok", "отправлено")) -> None:
-        self.texts: list[str] = []
-        self.outcome = outcome
+    def __init__(self, stdout: str = "", returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.stderr = ""
+        self.returncode = returncode
 
-    def __call__(self, cfg, text):
-        self.texts.append(text)
-        return self.outcome
+
+def _stub_setup(monkeypatch, tmp_path: Path, listing: str = ""):
+    """Подмена профилей и CLI: мастер пишет скрипты во временный каталог."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(setup_flow_mod.proj, "profile_dir", lambda p: home / "profiles" / p)
+    calls: list[tuple] = []
+
+    def run(*argv, timeout=180):
+        calls.append(argv)
+        return Result(stdout=listing if argv[-1] == "list" else "")
+
+    monkeypatch.setattr(setup_flow_mod.proj, "run_hermes", run)
+    return home, calls
+
+
+#: Переменные, которых у cron-джобы быть не должно: они увели бы прогон в чужой проект.
+_PROBE_DROP = ("PIPELINE_REPO", "PIPELINE_STATE_DIR", "PIPELINE_CONFIG", "PIPELINE_BOARD",
+               "PIPELINE_ENV", "PIPELINE_PROFILES_HOME", "TELEGRAM_API_BASE_URL",
+               "TELEGRAM_API_BASE_FILE_URL")
+
+
+def _cron_env(**extra: str) -> dict[str, str]:
+    """Окружение как у cron-джобы: без переменных конвейера и маркеров профиля."""
+    env = {key: value for key, value in os.environ.items()
+           if key not in _PROBE_DROP
+           and not key.startswith("STEP_PIPELINE_TELEGRAM_")}
+    env.update(extra)
+    return env
+
+
+def _install_script(tmp_path: Path, driver: str = "demo") -> Path:
+    """Текст `KEEPER_SCRIPT` в структуре `profiles/<профиль>/scripts/`."""
+    scripts = tmp_path / "profiles" / driver / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    target = scripts / "pipeline_keeper.py"
+    target.write_text(KEEPER_SCRIPT, encoding="utf-8")
+    return target
+
+
+def _run_script(script: Path, cwd: Path, **extra: str) -> subprocess.CompletedProcess:
+    """Запуск установленного скрипта отдельным процессом, как это делает cron."""
+    return subprocess.run([sys.executable, str(script)], cwd=str(cwd), env=_cron_env(**extra),
+                          capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=300)
 
 
 def make_symptom(project: str, kind: str, address: str = "addr",
@@ -101,398 +150,324 @@ def make_symptom(project: str, kind: str, address: str = "addr",
     }
 
 
-@pytest.fixture(autouse=True)
-def isolated_env(tmp_path, monkeypatch, board, profiles):
-    """Своё окружение: каталог профилей, борда и никаких PIPELINE-переменных.
+def _hourly(project: Path, symptoms: list[dict], run=None, **kw) -> dict:
+    """Один обход с подменёнными внешними зависимостями и фиксированным `now`."""
+    cfg = config_mod.load(project)
+    return keeper_heal.hourly(cfg, symptoms=symptoms, now=NOW,
+                              run=run if run is not None else FakeRun(),
+                              probe=lambda host, port: True, hermes="/fake/hermes", **kw)
 
-    `keeper_heal.main` (как и CLI движка) пишет `PIPELINE_REPO` прямо в `os.environ`, а
-    снятая `monkeypatch.delenv` переменная при восстановлении такого значения не
-    откатывает: следующий тест уехал бы в чужой проект, а его `gate.py` — в чужой
-    каталог состояния (наблюдалось на прогоне 21.11.2026 в `test_lock.py`).
-    """
-    names = ("PIPELINE_REPO", "PIPELINE_STATE_DIR", "PIPELINE_CONFIG", "PIPELINE_BOARD")
-    before = {name: os.environ.get(name) for name in names}
-    for name in names:
-        monkeypatch.delenv(name, raising=False)
-    yield tmp_path
-    for name, value in before.items():
-        if value is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = value
+
+def _edit_config(project: Path, **updates) -> None:
+    """Дописать ключи верхнего уровня в `pipeline.json` проекта."""
+    path = project / "pipeline.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(updates)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _set_profiles(project: Path, **profiles) -> None:
+    """Дописать `profiles` в `pipeline.json` проекта."""
+    path = project / "pipeline.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("profiles", {}).update(profiles)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 @pytest.fixture()
 def board(tmp_path, monkeypatch) -> Path:
-    db = tmp_path / "kanban.db"
+    """Борда «живой» схемы: `last_heartbeat_at` и таблицы событий на месте."""
+    db = tmp_path / "board.db"
     monkeypatch.setenv("PIPELINE_KANBAN_DB", str(db))
     return db
 
 
-@pytest.fixture()
-def profiles(tmp_path, monkeypatch) -> Path:
-    """Профиль исполнителя существует: карточка на него имеет право уйти."""
-    home = tmp_path / "profiles"
-    (home / "demo").mkdir(parents=True)
-    monkeypatch.setenv(keeper_heal.PROFILES_ENV, str(home))
-    return home
-
-
-@pytest.fixture()
-def apply_mode(project: Path) -> Path:
-    """Подтверждение владельца: без `keeper.on` обход — только наблюдение."""
-    marker = project / ".pipeline" / "state" / keeper_heal.ON_MARKER
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text("", encoding="utf-8")
-    return marker
-
-
-def write_board(db: Path, *cards: tuple[str, str, str], created_at: float | None = None) -> Path:
-    """Поддельная борда: `(id, статус, ключ идемпотентности)` и время создания."""
-    moment = int(NOW if created_at is None else created_at)
+def write_board(db: Path, *cards: dict) -> Path:
+    """Поддельная борда живой схемы: карточка — словарь полей `tasks`."""
     con = sqlite3.connect(db)
     try:
         con.executescript(BOARD_SCHEMA)
-        for card_id, status, key in cards:
-            con.execute("INSERT INTO tasks (id, title, status, idempotency_key, created_at)"
-                        " VALUES (?, ?, ?, ?, ?)",
-                        (card_id, "карточка " + card_id, status, key, moment))
+        for card in cards:
+            row = {"id": card["id"], "title": card.get("title", "карточка"),
+                   "status": card.get("status", "todo"), "assignee": card.get("assignee", "demo"),
+                   "created_at": card.get("created_at", int(NOW)),
+                   "started_at": card.get("started_at", 0), "completed_at": 0,
+                   "last_heartbeat_at": card.get("last_heartbeat_at", 0),
+                   "idempotency_key": card.get("key", ""), "tenant": "plan"}
+            con.execute("INSERT INTO tasks (" + ", ".join(row) + ") VALUES ("
+                        + ", ".join("?" * len(row)) + ")", tuple(row.values()))
         con.commit()
     finally:
         con.close()
     return db
 
 
-def hourly(project: Path, symptoms: list[dict], run=None, probe=True, notify=None, **kw) -> dict:
-    """Один обход с подменёнными внешними зависимостями."""
-    cfg = config_mod.load(project)
-    return keeper_heal.run_hourly(
-        cfg, symptoms, now=NOW, run=run if run is not None else FakeRun(),
-        probe=lambda host, port: probe, hermes="/fake/hermes",
-        notify=notify if notify is not None else Notifier(), **kw)
+def write_lock(project: Path, name: str, payload: dict) -> Path:
+    """Положить файл блокировки в каталог состояния проекта."""
+    path = project / ".pipeline" / "state" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
-def set_profiles(project: Path, **profiles) -> None:
-    """Дописать `profiles` в `pipeline.json` проекта (без остальных ключей)."""
-    path = project / "pipeline.json"
-    cfg = json.loads(path.read_text(encoding="utf-8"))
-    cfg.setdefault("profiles", {}).update(profiles)
-    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+# ───────────────────────────── джоба и скрипт (мастер) ─────────────────────────────
 
-
-# ───────────────────────────── cron-джоба ─────────────────────────────
-
-class Result:
-    """Ответ поддельного `hermes` для мастера установки."""
-
-    returncode = 0
-    stdout = ""
-    stderr = ""
-
-
-def _stub_setup(monkeypatch, tmp_path):
-    """Подмена профилей и CLI: мастер пишет скрипты во временный каталог."""
-    home = tmp_path / "home"
-    monkeypatch.setattr(setup_flow_mod.proj, "profile_dir", lambda p: home / "profiles" / p)
-    calls: list[tuple] = []
-
-    def run(*argv, timeout=180):
-        calls.append(argv)
-        return Result()
-
-    monkeypatch.setattr(setup_flow_mod.proj, "run_hermes", run)
-    return home, calls
-
-
-def test_keeper_cron_outside_tick(monkeypatch, tmp_path):
-    """Обход — своя джоба раз в час в :05, а не в минуты тика стража `*/10`."""
+def test_keeper_cron_writes_script_and_creates_job(tmp_path: Path, monkeypatch):
+    """Т1: скрипт лежит в профиле, джоба одна — `5 * * * *`, no-agent, доставка local."""
     home, calls = _stub_setup(monkeypatch, tmp_path)
     project = tmp_path / "shop"
     project.mkdir()
+
     setup_flow_mod.ensure_keeper_cron("shop", project, setup_flow_mod.Log(), skip=False)
 
     script = home / "profiles" / "shop" / "scripts" / "pipeline_keeper.py"
     assert script.is_file()
     text = script.read_text(encoding="utf-8")
-    assert "--hourly" in text and "keeper_heal.py" in text
+    assert "keeper_heal.py" in text and "--hourly" in text and "load_profile_env" in text
 
     created = [call for call in calls if "create" in call]
-    assert len(created) == 1
+    assert len(created) == 1, created
     cron = created[0]
     assert KEEPER_CRON in cron
-    assert "pipeline_keeper.py" in cron and "--no-agent" in cron and "local" in cron
     assert cron[cron.index("--name") + 1] == KEEPER_JOB
-    minute = int(KEEPER_CRON.split()[0])
-    assert minute % 10 != 0, "минута обхода обязана быть вне тика стража (*/10)"
+    assert "pipeline_keeper.py" in cron and "--no-agent" in cron
+    assert cron[cron.index("--deliver") + 1] == "local"
+    assert cron[cron.index("--workdir") + 1] == str(project)
 
 
-def test_keeper_cron_respects_no_cron(monkeypatch, tmp_path):
-    """`--no-cron` — обещание не заводить джобы: смотритель тоже не заводится."""
+def test_keeper_cron_is_idempotent_and_rewrites_script(tmp_path: Path, monkeypatch):
+    """Т2: второй прогон не заводит джобу, но перезаписывает испорченный скрипт."""
+    home, calls = _stub_setup(monkeypatch, tmp_path, listing=f"{KEEPER_JOB}   5 * * * *   local")
+    project = tmp_path / "shop"
+    project.mkdir()
+    scripts = home / "profiles" / "shop" / "scripts"
+    scripts.mkdir(parents=True)
+    installed = scripts / "pipeline_keeper.py"
+    installed.write_text("# старая рукописная копия\n", encoding="utf-8")
+
+    setup_flow_mod.ensure_keeper_cron("shop", project, setup_flow_mod.Log(), skip=False)
+
+    assert installed.read_text(encoding="utf-8") == KEEPER_SCRIPT
+    assert not [call for call in calls if "create" in call], calls
+
+
+def test_keeper_cron_respects_no_cron(tmp_path: Path, monkeypatch):
+    """Т3: `--no-cron` — обещание не заводить джобы: ни вызовов, ни файла."""
     home, calls = _stub_setup(monkeypatch, tmp_path)
     project = tmp_path / "shop"
     project.mkdir()
+
     setup_flow_mod.ensure_keeper_cron("shop", project, setup_flow_mod.Log(), skip=True)
+
     assert calls == []
     assert not (home / "profiles" / "shop" / "scripts" / "pipeline_keeper.py").exists()
 
 
-def test_cron_all_includes_keeper(monkeypatch, tmp_path):
-    """Мастер установки заводит обход вместе со стражем: иначе он «пока панель открыта»."""
+def test_cron_all_includes_keeper(tmp_path: Path, monkeypatch):
+    """Т4: мастер заводит обход вместе со стражем; при `--no-cron` — метка `skipped`."""
     _home, calls = _stub_setup(monkeypatch, tmp_path)
-    project = tmp_path / "shop"
-    project.mkdir()
-    setup_flow_mod.ensure_cron_all("shop", project, setup_flow_mod.Log(), skip=False, enabled=False)
+    project = install_project(tmp_path / "shop")
+
+    setup_flow_mod.ensure_cron_all("shop", project, setup_flow_mod.Log(), skip=False)
+
     names = [call[call.index("--name") + 1] for call in calls if "create" in call]
-    assert KEEPER_JOB in names
+    assert KEEPER_JOB in names, names
+
+    silent_calls: list[tuple] = []
+    monkeypatch.setattr(setup_flow_mod.proj, "run_hermes",
+                        lambda *argv, timeout=180: silent_calls.append(argv) or Result())
+    other = install_project(tmp_path / "quiet")
+    setup_flow_mod.ensure_cron_all("shop", other, setup_flow_mod.Log(), skip=True)
+
+    assert silent_calls == []
+    marker = json.loads((other / ".pipeline" / "cron.json").read_text(encoding="utf-8"))
+    assert marker.get("skipped") is True, marker
 
 
-# ───────────────────────────── пустой скан ─────────────────────────────
+# ───────────────────────────── установленный скрипт (субпроцесс) ─────────────────────────────
 
-def test_empty_scan_creates_no_card(project, apply_mode):
-    """Чистый проект — одна строка в лог: модель не будится, команд нет."""
-    run = FakeRun()
-    result = hourly(project, [], run=run)
-    assert result["status"] == "silent"
-    assert result["card"]["id"] == ""
-    assert run.calls == []
-    assert len(result["lines"]) == 1
+def test_hourly_empty_scan_creates_no_card(project: Path, hermes_stub: Path, tmp_path: Path):
+    """Т5: чистый проект — код 0, ни одной карточки, строка «симптомов 0»."""
+    script = _install_script(tmp_path)
 
+    done = _run_script(script, project)
 
-def test_off_marker_stops_the_pass(project, profiles):
-    """`keeper.off` сильнее находок: ни скана, ни починок, ни карточки."""
-    (project / ".pipeline" / "state" / keeper_heal.OFF_MARKER).write_text("", encoding="utf-8")
-    run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
-    assert result["status"] == "off"
-    assert run.calls == []
-    assert keeper_heal.OFF_MARKER in result["lines"][0]
+    assert done.returncode == 0, done.stderr
+    assert stub_cards(hermes_stub) == []
+    assert "симптомов 0" in done.stdout, done.stdout + done.stderr
 
 
-def test_dry_run_without_confirmation_changes_nothing(project, profiles):
-    """Без `keeper.on` — наблюдение: карточки нет, команд нет, профиль назван."""
-    run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
-    assert result["status"] == "planned"
-    assert result["mode"] == "dry-run"
-    assert result["card"]["status"] == "planned"
-    assert result["card"]["profile"] == "demo"
-    assert run.calls == []
+def test_keeper_script_reports_missing_engine(tmp_path: Path):
+    """Т6: проекта нет — код 1 и причина в stderr, а не зелёный «ok» на мёртвом обходе."""
+    loner = tmp_path / "probe" / "scripts" / "pipeline_keeper.py"
+    loner.parent.mkdir(parents=True)
+    loner.write_text(KEEPER_SCRIPT, encoding="utf-8")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    done = _run_script(loner, empty)
+
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "keeper_heal.py не найден" in done.stderr, done.stderr
 
 
-# ───────────────────────────── находка и карточка ─────────────────────────────
+# ───────────────────────────── обход (движок напрямую) ─────────────────────────────
 
-def test_finding_creates_exactly_one_card(project, apply_mode):
-    run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
-    assert len(run.creates()) == 1
-    assert result["status"] == "carded"
-    assert result["card"]["id"] == "t_abc12345"
-    assert result["card"]["key"].startswith(keeper_heal.KEEPER_KEY_PREFIX)
+def test_hourly_finding_creates_exactly_one_card(project: Path, hermes_stub: Path,
+                                                 tmp_path: Path):
+    """Т7: мёртвый `tick.lock` — ровно одна карточка на драйвера, `30m`, ключ `keeper:demo:`."""
+    script = _install_script(tmp_path)
+    write_lock(project, "tick.lock", {"pid": 999999, "host": socket.gethostname(),
+                                      "at_ts": time.time()})
+
+    done = _run_script(script, project)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    cards = stub_cards(hermes_stub)
+    assert len(cards) == 1, cards
+    assert cards[0]["assignee"] == "demo"
+    assert str(cards[0]["key"]).startswith("keeper:demo:")
+    assert cards[0]["max_runtime"] == "30m"
+    assert "симптомов 1" in done.stdout, done.stdout + done.stderr
 
 
-def test_card_gets_profile_skill_and_json(project, apply_mode):
+def test_hourly_card_carries_skill_and_symptom_json(project: Path):
+    """Т8: в команде `create` есть скилл, исполнитель и ключ, в теле — JSON симптома."""
     run = FakeRun()
     symptom = make_symptom("demo", "card_stuck", address="t_be793ad3",
                            evidence="карточка висит 152.0 ч")
-    result = hourly(project, [symptom], run=run)
-    create = run.creates()[0]
-    assert create[create.index("--assignee") + 1] == "demo"
-    assert create[create.index("--skill") + 1] == keeper_heal.KEEPER_SKILL
-    assert create[create.index("--max-runtime") + 1] == keeper_heal.DEFAULT_KEEPER_RUNTIME
-    assert create[create.index("--idempotency-key") + 1] == result["card"]["key"]
-    body = run.bodies[0]
-    assert symptom["symptom_id"] in body and "```json" in body
-    assert "## Отчёт починок" in body
 
+    result = _hourly(project, [symptom], run=run)
 
-def test_profiles_keeper_wins_over_driver(project, apply_mode, profiles):
-    """`profiles.keeper` сильнее умолчания: вид работы различает скилл, не профиль."""
-    (profiles / "keeper-role").mkdir()
-    set_profiles(project, keeper="keeper-role")
-    run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
-    assert result["card"]["profile"] == "keeper-role"
-    create = run.creates()[0]
-    assert create[create.index("--assignee") + 1] == "keeper-role"
-
-
-def test_missing_profile_refuses_card(project, apply_mode, profiles, tmp_path):
-    """Несуществующий профиль — отказ без карточки: в `ready` она висела бы навсегда."""
-    set_profiles(project, keeper="ghost")
-    notifier = Notifier()
-    run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run, notify=notifier)
-    assert result["status"] == "failed"
-    assert result["reason"] == keeper_heal.REASON_NO_PROFILE
-    assert "ghost" in result["detail"]
-    assert run.creates() == []
-    assert notifier.texts and "ghost" in notifier.texts[0]
-
-
-def test_card_not_on_board_is_failure(project, apply_mode, board):
-    """Id из вывода CLI — не карточка: борда её не знает, значит не создана."""
-    write_board(board)
-    run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
-    assert result["status"] == "failed"
-    assert "не знает" in result["detail"]
-
-
-def test_card_visible_on_board_is_success(project, apply_mode, board):
-    write_board(board, ("t_abc12345", "ready", "keeper:demo:x"))
-    run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
     assert result["status"] == "carded"
-    assert "видимость" not in result["detail"]
+    create = run.creates()[0]
+    assert create[create.index("--skill") + 1] == keeper_heal.KEEPER_SKILL
+    assert create[create.index("--assignee") + 1] == "demo"
+    assert create[create.index("--idempotency-key") + 1] == result["key"]
+    assert str(result["key"]).startswith("keeper:demo:")
+    body = run.bodies[0]
+    assert symptom["symptom_id"] in body and '"kind"' in body
 
 
-# ───────────────────────────── окна «не запускать» ─────────────────────────────
-
-def test_live_tick_blocks_the_pass(project, apply_mode):
-    """Тот же замок, что у тика: обход поверх идущего тика не идёт."""
-    state_dir = project / ".pipeline" / "state"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"pid": os.getpid(), "host": socket.gethostname(),
-               "at": "20.11.2026 12:00:00", "at_ts": NOW}
-    (state_dir / "tick.lock").write_text(json.dumps(payload), encoding="utf-8")
+def test_hourly_skips_while_conveyor_card_runs(project: Path, board: Path):
+    """Т9: идущая карточка конвейера (`running` со свежим heartbeat) — пропуск."""
+    write_board(board, {"id": "t_run111", "status": "running", "key": "planloop:1:S1:step",
+                        "last_heartbeat_at": int(NOW)})
     run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
+
+    result = _hourly(project, [make_symptom("demo", "card_stuck")], run=run)
+
     assert result["status"] == "skipped"
-    assert result["reason"] == keeper_heal.REASON_BUSY
-    assert "тик" in result["detail"]
-    assert run.calls == []
+    assert result["reason"] == "conveyor_busy"
+    assert "t_run111" in result["line"]
+    assert run.creates() == []
 
 
-def test_keeper_lock_blocks_second_pass(project, apply_mode):
-    """Два обхода разом не запускаются: замок `keeper.lock` держит первый."""
-    state_dir = project / ".pipeline" / "state"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    payload = {"pid": os.getpid(), "host": socket.gethostname(),
-               "at": "сейчас", "at_ts": time.time(), "what": "keeper"}
-    (state_dir / keeper_heal.KEEPER_LOCK_NAME).write_text(json.dumps(payload),
-                                                          encoding="utf-8")
+def test_hourly_runs_when_running_card_is_stale(project: Path, board: Path):
+    """Т10: heartbeat старше окна и очередь `todo` работой не считаются (граница D5)."""
+    write_board(board,
+                {"id": "t_stale1", "status": "running", "key": "planloop:1:S1:step",
+                 "last_heartbeat_at": int(NOW - 5 * 3600)},
+                {"id": "t_todo01", "status": "todo", "key": "planloop:1:S2:step",
+                 "created_at": int(NOW)})
     run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
-    assert result["status"] == "skipped"
-    assert result["reason"] == keeper_heal.REASON_BUSY
-    assert "смотритель" in result["detail"]
-    assert run.calls == []
 
+    result = _hourly(project, [make_symptom("demo", "card_stuck")], run=run)
 
-def test_keeper_lock_is_released(project, apply_mode):
-    """Замок обхода снят после прогона: иначе следующий час молчал бы впустую."""
-    hourly(project, [make_symptom("demo", "card_stuck")])
-    assert not (project / ".pipeline" / "state" / keeper_heal.KEEPER_LOCK_NAME).exists()
-
-
-def test_pipeline_card_blocks_the_pass(project, apply_mode, board):
-    """Идёт карточка конвейера — вторая работа не запускается."""
-    write_board(board, ("t_111111", "running", "plan1:S1"))
-    run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
-    assert result["status"] == "skipped"
-    assert "t_111111" in result["detail"]
-    assert run.calls == []
-
-
-def test_own_card_does_not_block(project, apply_mode, board):
-    """Своя карточка — не работа конвейера: иначе обход блокировал бы сам себя."""
-    write_board(board, ("t_abc12345", "todo", keeper_heal.KEEPER_KEY_PREFIX + "demo:abc"))
-    run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
     assert result["status"] == "carded"
     assert len(run.creates()) == 1
 
 
-def test_hanging_card_does_not_block_the_pass(project, apply_mode, board):
-    """Висящая карточка работой не считается: молчать из-за неё — потерять находку.
-
-    Живая работа — событие карточки свежее окна `watchdog.heartbeat_fresh_minutes`;
-    карточка, по которой два дня ничего не происходило, — как раз то, что смотритель
-    обязан назвать карточкой-находкой.
-    """
-    write_board(board, ("t_333333", "todo", "plan1:S1"),
-                ("t_abc12345", "ready", keeper_heal.KEEPER_KEY_PREFIX + "demo:old"),
-                created_at=NOW - 48 * 3600)
+def test_hourly_skips_on_live_tick_lock(project: Path):
+    """Т11: живой держатель `tick.lock` — пропуск с причиной `tick_running`."""
+    write_lock(project, "tick.lock", {"pid": os.getpid(), "host": socket.gethostname(),
+                                      "at_ts": NOW, "what": "run"})
     run = FakeRun()
-    result = hourly(project, [make_symptom("demo", "card_stuck")], run=run)
+
+    result = _hourly(project, [make_symptom("demo", "card_stuck")], run=run)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "tick_running"
+    assert run.calls == []
+
+
+def test_hourly_key_is_stable_and_symptom_dependent(project: Path):
+    """Т12: ключ — от набора `symptom_id`: тот же набор тот же ключ, иной — другой."""
+    symptom = make_symptom("demo", "card_stuck", address="t_be793ad3")
+
+    first = _hourly(project, [symptom])
+    second = _hourly(project, [dict(symptom)])
+    changed = dict(symptom, symptom_id="0" * 16)
+    third = _hourly(project, [changed])
+
+    assert first["key"] == second["key"]
+    assert third["key"] != first["key"]
+
+
+def test_keeper_profile_falls_back_to_driver(project: Path, capsys):
+    """Т13: неизвестное имя из `profiles.keeper` — драйвер плюс строка в stderr."""
+    _set_profiles(project, keeper="demo")
+    assert keeper_heal.keeper_profile(config_mod.load(project)) == "demo"
+
+    _set_profiles(project, keeper="ghost")
+    cfg = config_mod.load(project)
+    assert keeper_heal.keeper_profile(cfg) == cfg.driver
+    assert "[keeper]" in capsys.readouterr().err
+
+    _set_profiles(project, keeper="")
+    assert keeper_heal.keeper_profile(config_mod.load(project)) == cfg.driver
+
+
+def test_high_severity_notifies_once_and_respects_pause(project: Path, monkeypatch, capsys):
+    """Т14: один вызов владельцу на прогон; в окне паузы — ни одного (`отложено до`)."""
+    calls: list[str] = []
+    monkeypatch.setattr(keeper_heal, "notify_owner",
+                        lambda cfg, text: calls.append(text) or True)
+    symptom = make_symptom("demo", "tick_lock_dead", address="state/tick.lock")
+    high = make_symptom("demo", "card_stuck", address="t_be793ad3")
+
+    result = _hourly(project, [symptom, high])
+
     assert result["status"] == "carded"
-    assert run.creates()
+    assert result["notified"] is True
+    assert len(calls) == 1
+    assert str(result["card"]) in calls[0]
+
+    _edit_config(project, quiet_hours={"enabled": True,
+                                       "windows": [{"from": "00:00", "to": "23:59"}]})
+    calls.clear()
+    capsys.readouterr()
+
+    quiet = _hourly(project, [symptom])
+
+    assert quiet["notified"] is False
+    assert calls == []
+    assert "отложено до" in capsys.readouterr().err
 
 
-# ───────────────────────────── эскалация владельцу ─────────────────────────────
+def test_hourly_skips_on_second_keeper(project: Path):
+    """Т15: свой замок обхода держит второй прогон; мёртвый замок перезаписывается."""
+    write_lock(project, keeper_heal.KEEPER_LOCK_NAME,
+               {"pid": os.getpid(), "host": socket.gethostname(), "at_ts": NOW,
+                "what": "keeper"})
+    run = FakeRun()
 
-def test_high_finding_escalates_to_owner(project, apply_mode):
-    notifier = Notifier()
-    symptom = make_symptom("demo", "card_stuck", address="t_be793ad3",
-                           evidence="висит 152.0 ч")
-    result = hourly(project, [symptom], notify=notifier)
-    assert result["escalated"]["status"] == "ok"
-    assert len(notifier.texts) == 1
-    assert "t_be793ad3" in notifier.texts[0] and "high" in notifier.texts[0]
-    assert result["card"]["id"] in notifier.texts[0]
+    blocked = _hourly(project, [make_symptom("demo", "card_stuck")], run=run)
 
+    assert blocked["status"] == "skipped"
+    assert blocked["reason"] == "keeper_running"
+    assert run.creates() == []
 
-def test_healed_high_finding_is_not_escalated(project, apply_mode):
-    """Починка белого списка сняла high — владельца не будим.
+    lock_path = write_lock(project, keeper_heal.KEEPER_LOCK_NAME,
+                           {"pid": 999999, "host": socket.gethostname(), "at_ts": NOW,
+                            "what": "keeper"})
+    seen: list[dict] = []
 
-    Симптом `tick_lock_dead` берётся вместе с его причиной (замок с мёртвым pid 0),
-    иначе починка нечего снимать и она честно возвращает `failed`.
-    """
-    state_dir = project / ".pipeline" / "state"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "tick.lock").write_text(json.dumps({"pid": 0, "host": socket.gethostname()}),
-                                         encoding="utf-8")
-    notifier = Notifier()
-    result = hourly(project, [make_symptom("demo", "tick_lock_dead")], notify=notifier)
-    assert result["heal"]["counts"]["ok"] == 1
-    assert result["escalated"]["status"] == "none"
-    assert notifier.texts == []
+    def read_lock(_cmd):
+        seen.append(json.loads(lock_path.read_text(encoding="utf-8")))
 
+    passed = _hourly(project, [make_symptom("demo", "card_stuck")], run=FakeRun(on_call=read_lock))
 
-def test_low_finding_is_not_escalated(project, apply_mode):
-    """Low-находка чинится молча: панель поднялась — сообщения нет."""
-    notifier = Notifier()
-    result = hourly(project, [make_symptom("demo", "panel_down")], notify=notifier)
-    assert result["heal"]["counts"]["ok"] == 1
-    assert result["escalated"]["status"] == "none"
-    assert notifier.texts == []
-
-
-def test_failed_delivery_is_reported(project, apply_mode):
-    """Отказ доставки не роняет обход, но виден в отчёте и в логе."""
-    notifier = Notifier(outcome=("failed", "не доставлено: 401"))
-    result = hourly(project, [make_symptom("demo", "card_stuck")], notify=notifier)
-    assert result["escalated"]["status"] == "failed"
-    assert any("эскалация владельцу: failed" in line for line in result["lines"])
-
-
-# ───────────────────────────── точка входа cron ─────────────────────────────
-
-def test_main_hourly_json_dry_run(project, board, capsys):
-    """Скрипт cron запускается как `--hourly --json` и не трогает живой проект."""
-    code = keeper_heal.main(["--hourly", "--json", "--project", str(project)])
-    assert code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["project"] == "demo"
-    assert payload["mode"] == "dry-run"
-    assert payload["card"]["id"] == ""
-
-
-@pytest.mark.slow
-def test_keeper_script_runs_the_engine_copy(monkeypatch, tmp_path, project):
-    """Cron-скрипт из профиля действительно запускает движок проекта, а не копию кода.
-
-    Проверяется переход «скрипт профиля → `.pipeline/keeper_heal.py`»: без него
-    джоба выглядела бы зелёной при мёртвом обходе (прецедент двух копий движка 1-S17).
-    """
-    home, _calls = _stub_setup(monkeypatch, tmp_path)
-    setup_flow_mod.ensure_keeper_cron("demo", project, setup_flow_mod.Log(), skip=False)
-    script = home / "profiles" / "demo" / "scripts" / "pipeline_keeper.py"
-    env = dict(os.environ, PIPELINE_REPO=str(project))
-    res = subprocess.run([sys.executable, str(script)], cwd=str(project),
-                         capture_output=True, text=True, encoding="utf-8",
-                         errors="replace", env=env)
-    assert res.returncode == 0, res.stderr
-    assert "смотритель demo" in res.stdout
-    assert "находок нет" in res.stdout
+    assert passed["status"] == "carded"
+    assert seen and seen[0]["pid"] == os.getpid()
+    assert not lock_path.exists(), "свой замок обязан сниматься в finally"
