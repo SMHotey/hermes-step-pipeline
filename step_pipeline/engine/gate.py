@@ -393,6 +393,11 @@ QUESTION_NO_RECOMMEND_RE = re.compile(r"рекомендац\w*\s*(?:нет|от
 # Час: вопрос — решение владельца, а не дежурная мелочь; пяти минут не хватало (17.11.2026).
 ANSWER_TIMEOUT_DEFAULT = 3600
 AUTO_ANSWER_NOTE = "авто: рекомендация по таймауту"
+# Тревога «вопрос без рекомендации ждёт владельца»: не чаще раза в 6 ч на вопрос. Автовыбор
+# по таймауту такой вопрос не закрывает (нет буквы), поэтому единственный признак простоя —
+# тревога; без неё вопрос молчит до ответа человека (21.11.2026, план 34: 3 ч простоя и вся
+# ночь впереди, причины «рекомендации нет» таймера не имели).
+QUESTION_ALARM_GAP = 21600
 # Напоминание о вопросе — не чаще раза в час: тот же порядок, что у тревог и сторожа.
 QUESTION_NOTICE_GAP = 3600
 #: Код возврата «команда владельца не применена: идёт тик». Отдельный от 0, потому что код 0
@@ -2598,13 +2603,39 @@ def answer_question(cfg: config_mod.Config, plan_id, question_id, value, *,
             "message": f"вопрос {qid} закрыт: {answer}"}
 
 
+def _question_alarm_due(entry: dict, now: float) -> bool:
+    """Пора ли снова тревожить по вопросу без рекомендации: одна тревога в `QUESTION_ALARM_GAP`."""
+    last = entry.get("alarm_at")
+    return not isinstance(last, (int, float)) or now - float(last) >= QUESTION_ALARM_GAP
+
+
+def question_idle_text(p: Paths, item: dict, timeout: int) -> str:
+    """Текст тревоги: вопрос без рекомендации стоит, автовыбор по таймауту не сработает."""
+    return attention_text(
+        p.plan_id,
+        f"вопрос {item['id']} без рекомендации — конвейер стоит, шаг {item.get('step') or '—'}",
+        evidence=[
+            f"Вопрос: {item.get('text') or '—'}",
+            f"Варианты: {item.get('options') or '—'}",
+            f"Рекомендация не названа, поэтому автовыбор по таймауту "
+            f"({_question_minutes(timeout)} мин) не срабатывает — вопрос закрывает владелец",
+        ],
+        todo=[f"ответить на вопрос {item['id']}: вариант или отклонение "
+              f"(`python .pipeline/gate.py --plan {p.plan_id} --answer {item['id']} <буква>`)"],
+        commands=[f"python .pipeline/gate.py --plan {p.plan_id} --status"],
+    )
+
+
 def sweep_questions(cfg: config_mod.Config, p: Paths, ctx: dict, state: dict | None = None,
                     say=None) -> list[dict]:
     """Принять рекомендацию по таймауту (S5, п.5); запись идёт той же `answer_question`.
 
     Автовыбор — не молчаливое согласие: он работает только при названной рекомендации,
     пишет пометку «авто» и уведомляет владельца строкой. Вопрос без рекомендации, без
-    известного времени вопроса и ключ `answer_timeout: 0` ждут человека.
+    известного времени вопроса и ключ `answer_timeout: 0` ждут человека — но вопрос без
+    рекомендации, у которого истёк срок, не молчит: он поднимает тревогу и пишет строку
+    в stderr, чтобы тик перестал быть «silent» (21.11.2026, план 34: вопрос с решением
+    «рекомендации нет» ждал ответа 3 ч, таймера у него не было).
     """
     timeout = answer_timeout_seconds(cfg)
     if timeout <= 0:
@@ -2619,12 +2650,30 @@ def sweep_questions(cfg: config_mod.Config, p: Paths, ctx: dict, state: dict | N
     stamps = dict(stamps)
     now = _now()
     done: list[dict] = []
+    alarmed = False
     for item in rows:
         if item.get("status") != QUESTION_OPEN:
             continue
         recommend = str(item.get("recommend") or "").strip()
-        asked = (stamps.get(item["id"]) or {}).get("asked_at")
+        entry = stamps.get(item["id"])
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        asked = entry.get("asked_at")
         if not recommend or not isinstance(asked, (int, float)):
+            # Вопрос без рекомендации автовыбором не закрывается никогда: решение срабатывает
+            # только по букве варианта. Раньше такой вопрос просто `continue` — и стоял молча
+            # до ответа владельца, а тик выходил «silent». Тревога не решает за человека: она
+            # называет вопрос, будит и повторяется не чаще QUESTION_ALARM_GAP.
+            if (isinstance(asked, (int, float)) and now - float(asked) >= timeout
+                    and _question_alarm_due(entry, now)):
+                entry["alarm_at"] = now
+                stamps[item["id"]] = entry
+                alarmed = True
+                sent = attention(cfg, question_idle_text(p, item, timeout),
+                                 f"question_idle:{p.plan_id}:{item['id']}", say=say)
+                print(f"[attention] план {p.plan_id}, вопрос {item['id']}: рекомендации нет, "
+                      f"ждёт владельца {_question_minutes(now - float(asked))} мин — "
+                      f"{'тревога отправлена' if sent else 'повтор подавлен'}",
+                      file=sys.stderr)
             continue
         if now - float(asked) < timeout:
             continue
@@ -2636,7 +2685,7 @@ def sweep_questions(cfg: config_mod.Config, p: Paths, ctx: dict, state: dict | N
         (say or (lambda text: notify(cfg, text)))(
             f"⏱ {item['id']} принят автоматически: {recommend} (рекомендация) — "
             f"прошло {_question_minutes(timeout)} мин")
-    if done:
+    if done or alarmed:
         closed = {item["qid"] for item in done}
         if stamps:
             state["questions"] = stamps
