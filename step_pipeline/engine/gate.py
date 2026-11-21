@@ -350,11 +350,42 @@ QUESTION_LINE_START_RE = re.compile(r"^\s*(?:[-*+]\s*)?Q-?\s*\d+\s*:")
 # Разделитель «вопрос — варианты»: длинное тире, короткое и дефис. Автор пишет по-разному,
 # а строка вопроса — не место для спора об оформлении.
 QUESTION_DASH_RE = re.compile(r"\s+[—–-]{1,2}\s+")
+# ── Замер вопроса вместо вопроса (S2B плана 10) ───────────────────────────────────────────
+# Вопрос, ответ на который даёт команда, не должен ждать человека: план 15 стоял на Q-1
+# «копия не равна выпуску» 1 ч 30 мин, а ответ — `sha256sum` плюс `grep -c`, полминуты.
+# Страж исполняет такую команду сам, пишет строку «замерил: …» в историю тиков и при
+# `questions.enforce: true` (умолчание) вовсе не заводит строку вопроса.
+#: Команда замера — первый фрагмент в обратных кавычках абзаца вопроса: разобранный текст
+#: кавычки уже снял (`parse_question_line`), поэтому адрес — сырой блок `question_blocks`.
+QUESTION_COMMAND_RE = re.compile(r"`([^`\n]{1,200})`")
+#: Белый список первого токена: только чтение. `sha256sum`/`shasum` — хеш файла, `grep` —
+#: подсчёт и поиск, `git` — одна подкоманда ниже. Пайп, редирект и `sh -c` не исполняются:
+#: такой вопрос не измерим и заводится как обычный (стоп-сигнал постановки 10-S2B).
+QUESTION_MEASURE_PROGRAMS = ("sha256sum", "shasum", "grep", "git")
+#: У `git` разрешена одна подкоманда: остальные читают историю и состояние, но ответа на
+#: вопрос «равна ли копия выпуску» не дают, а разрешать весь `git` — это уже shell.
+QUESTION_MEASURE_GIT_SUBCOMMAND = "rev-parse"
+#: Символы, которых в команде быть не может: оболочка по ним разбирает строку, а движок
+#: исполняет argv без shell. Замер с ними — не замер.
+QUESTION_SHELL_CHARS = ("|", "&", ";", "<", ">", "$", "(", ")", "{", "}", "\n")
+#: Предел одного замера. Дольше — замер не удался, вопрос остаётся владельцу.
+QUESTION_MEASURE_TIMEOUT = 60
+#: Предел строки «замерил: …» в истории: та же длина, что у `detail` в `remember_action`.
+QUESTION_MEASURE_DETAIL = 200
+#: Ключ состояния плана с отметками исполненных замеров: `(шаг, текст вопроса)` → запись.
+#: Отметка нужна, чтобы повторный тик не исполнял команду снова и не писал вторую строку
+#: (`questions.enforce: true` не заводит строку вопроса — файла, по которому дедуплицировать,
+#: там нет).
+QUESTION_MEASURE_STATE_KEY = "question_measures"
 # Вариант с ценой: буква, скобка, текст. Буквы латинские и кириллические (`А)`, `Б)`),
 # но только буквы вариантов: иначе «и.т.д.» в тексте варианта стало бы вариантом.
 QUESTION_OPTION_RE = re.compile(r"(?<![А-Яа-яA-Za-z])([ABCDАБВГ])\s*[)\.]\s*")
 # Рекомендация — буква варианта; «рекомендации нет» — явный отказ от автовыбора.
-QUESTION_RECOMMEND_RE = re.compile(r"рекомендац\w*\s*:?\s*([А-Яа-яA-Za-z])(?![А-Яа-яA-Za-z])")
+# Регистр не важен, как у соседнего правила: маркер `рекомендаци\w*` в `parse_question_line`
+# ищется с `re.I`, автор пишет «Рекомендация» с большой буквы. Без флага маркер находился,
+# хвост отрезался, а буква не читалась — рекомендация молча терялась, автовыбор по таймауту
+# не срабатывал, вопрос стоял до ручного ответа (Q-1 плана 2 self-analyzer, 21.11.2026).
+QUESTION_RECOMMEND_RE = re.compile(r"рекомендац\w*\s*:?\s*([А-Яа-яA-Za-z])(?![А-Яа-яA-Za-z])", re.I)
 QUESTION_NO_RECOMMEND_RE = re.compile(r"рекомендац\w*\s*(?:нет|отсутствует|—|-|:?\s*$)", re.I)
 # Автовыбор рекомендации по таймауту (план 8, S5 п.5): секунды, 0 — выключить. Время вопроса
 # живёт в состоянии плана (`questions: {"Q-1": {"asked_at", "notified_at"}}`), а не в
@@ -2105,6 +2136,127 @@ def parse_question_lines(text) -> list[dict]:
     return found
 
 
+def parse_question_blocks(text) -> list[tuple[list[str], dict]]:
+    """Пары «сырой абзац вопроса — разобранная запись» (S2B плана 10).
+
+    Разбор тот же, что у `parse_question_lines` (второго парсера нет), но абзац остаётся
+    рядом с записью: команда замера ищется в сыром тексте, а `parse_question_line` кавычки
+    снимает — по разобранному тексту замер не найти.
+    """
+    found: list[tuple[list[str], dict]] = []
+    for block in question_blocks(text):
+        parsed = parse_question_line(" ".join(block))
+        if parsed:
+            found.append((block, parsed))
+    return found
+
+
+def question_measure_argv(block) -> list[str] | None:
+    """`argv` команды замера из абзаца вопроса; `None` — вопрос не измерим (S2B плана 10).
+
+    Правило постановки: команда — первый фрагмент в обратных кавычках абзаца, первый токен
+    которого в белом списке (`sha256sum`, `shasum`, `grep`, `git rev-parse`). Форму выбирает
+    белый список, а не текст находки: пайп, редирект, `sh -c` и `python -c` не исполняются —
+    такой вопрос заводится как обычный. «Версия из манифеста» отдельного способа не имеет:
+    это `grep` по `plugin.yaml`/`version.txt`.
+    """
+    text = " ".join(block or [])
+    for span in QUESTION_COMMAND_RE.findall(text):
+        try:
+            argv = shlex.split(span, posix=True)
+        except ValueError:            # незакрытая кавычка внутри фрагмента
+            continue
+        if not argv or argv[0] not in QUESTION_MEASURE_PROGRAMS:
+            continue
+        if any(char in token for token in argv for char in QUESTION_SHELL_CHARS):
+            return None                # оболочка не участвует: команда не измерима
+        if argv[0] == "git" and (len(argv) < 3
+                                or argv[1] != QUESTION_MEASURE_GIT_SUBCOMMAND):
+            return None
+        return argv
+    return None
+
+
+def measure_question(p: Paths, block) -> dict | None:
+    """Замер вопроса: `{"command", "ok", "detail"}`; `None` — команды замера нет (S2B).
+
+    Исполнение — `_run` (argv без shell, `shlex.split`, `cwd` проекта, таймаут 60 с), одна
+    точка подмены в тестах. Замер удался, если код возврата 0 и в объединённом выводе есть
+    непустой текст: чтение без ответа — не ответ. Строка истории нужна и при неудаче:
+    владелец видит, что команду страж пробовал и почему ответа нет.
+    """
+    argv = question_measure_argv(block)
+    if not argv:
+        return None
+    command = " ".join(argv)
+    try:
+        done = _run(argv, cwd=Path(p.cfg.repo), timeout=QUESTION_MEASURE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"command": command, "ok": False,
+                "detail": f"замер не удался: «{command}» — таймаут {QUESTION_MEASURE_TIMEOUT} с"}
+    except OSError:
+        return {"command": command, "ok": False,
+                "detail": f"замер не удался: «{command}» — не запустилась"}
+    output = " ".join(f"{_text_of(done.stdout)} {_text_of(done.stderr)}".split())
+    if int(done.returncode or 0) != 0:
+        return {"command": command, "ok": False,
+                "detail": f"замер не удался: «{command}» — код {done.returncode}"}
+    if not output:
+        return {"command": command, "ok": False,
+                "detail": f"замер не удался: «{command}» — пустой вывод"}
+    detail = f"замерил: «{command}» → «{output}»"
+    return {"command": command, "ok": True, "detail": detail[:QUESTION_MEASURE_DETAIL]}
+
+
+def questions_enforce(p: Paths) -> bool:
+    """`questions.enforce` из живого конфига проекта: умолчание `true` (S2B плана 10).
+
+    Ключ читается в движке (`p.cfg.state` — сырой конфиг, слитый с умолчаниями), а не в
+    `config.py`: `config` — файл закрытого шага S2. Значение не `bool` — умолчание `true`:
+    опечатка владельца не должна молча превращать правило в замер (это факт отчёта, а не
+    WARNING в stdout конвейера).
+    """
+    raw = getattr(p.cfg, "state", None) or {}
+    section = (raw.get("questions") or {}) if isinstance(raw, dict) else {}
+    value = section.get("enforce") if isinstance(section, dict) else None
+    return value if isinstance(value, bool) else True
+
+
+def question_measure_key(step_id: str, text: str) -> str:
+    """Ключ отметки замера: шаг и текст вопроса без лишних пробелов."""
+    return f"{str(step_id or '').strip().upper()}|{' '.join(str(text or '').split())}"
+
+
+def question_measure(p: Paths, step_id: str, text: str, block, state: dict) -> dict | None:
+    """Замер вопроса с отметкой в состоянии плана: один замер на пару (шаг, текст).
+
+    Отметка живёт в том же словаре `state`, который `register_questions` сохраняет
+    `save_state`: второй `load_state`/`save_state` затёр бы снимок тика. На пути
+    `questions.enforce: true` строки вопроса не заводится и общего сохранения не происходит,
+    поэтому отметку сохраняет сам замер — иначе следующий тик исполнил бы команду снова.
+    """
+    if not isinstance(state, dict):
+        return None
+    key = question_measure_key(step_id, text)
+    marks = state.get(QUESTION_MEASURE_STATE_KEY)
+    marks = dict(marks) if isinstance(marks, dict) else {}
+    if key in marks:
+        mark = marks[key]
+        return {"command": str(mark.get("command") or ""), "ok": bool(mark.get("ok")),
+                "detail": str(mark.get("detail") or "")}
+    measured = measure_question(p, block)
+    if measured is None:
+        return None
+    marks[key] = dict(measured, at=time.strftime("%d.%m.%Y %H:%M:%S"))
+    state[QUESTION_MEASURE_STATE_KEY] = marks
+    append_history(p.cfg, {"ts": time.time(), "at": marks[key]["at"], "plan": p.plan_id,
+                           "step": step_id, "action": "measure", "duration_s": 0.0,
+                           "detail": measured["detail"], "commit": "", "stale": False,
+                           "cause": ""})
+    save_state(p, state)
+    return measured
+
+
 def step_questions(path, step_id: str = "") -> list[dict]:
     """Открытые вопросы шага (или все открытые, если шаг не задан). Порядок — как в файле."""
     want = str(step_id or "").strip().upper()
@@ -2247,6 +2399,11 @@ def register_questions(p: Paths, ctx: dict, state: dict | None = None) -> list[d
     Уже записанный обрезанный вопрос приводится к полному тексту на месте (см.
     `_question_truncated_prefix`): до правки разбора вопрос обрывался на первом переносе,
     и в файле лежал кусок без вариантов и рекомендации. Второй строки при этом не заводится.
+
+    Вопрос с командой замера (S2B плана 10) страж исполняет сам: `questions.enforce: true`
+    (умолчание) — строка вопроса не заводится вовсе, владельцу остаётся строка истории
+    «замерил: …»; `false` — правило понижено до замера, вопрос остаётся владельцу. Неудачный
+    замер ничего не отменяет: вопрос заводится как обычный, а причина неудачи — в истории.
     """
     step = ctx.get("next")
     if not step or ctx.get("step_questions_error"):
@@ -2257,8 +2414,12 @@ def register_questions(p: Paths, ctx: dict, state: dict | None = None) -> list[d
     pairs = {(_question_pair_key(item)) for item in current}
     fresh: list[dict] = []
     migrated: list[dict] = []
+    # Замер пишет отметку в снимок состояния тика: своего `load_state` у него нет.
+    enforce = questions_enforce(p)
+    if not isinstance(state, dict):
+        state = ctx.get("state") if isinstance(ctx.get("state"), dict) else None
     for text in step_report_texts(p, step, ctx.get("cards") or []):
-        for parsed in parse_question_lines(text):
+        for block, parsed in parse_question_blocks(text):
             item = dict(parsed, step=sid, status=QUESTION_OPEN, answer="")
             pair = _question_pair_key(item)
             if pair in pairs:
@@ -2271,7 +2432,10 @@ def register_questions(p: Paths, ctx: dict, state: dict | None = None) -> list[d
                 pairs.add(_question_pair_key(target))
                 migrated.append(target)
                 continue
+            measured = question_measure(p, sid, item["text"], block, state)
             pairs.add(pair)
+            if measured is not None and measured.get("ok") and enforce:
+                continue                  # измеримый вопрос не заводится: ответ в истории
             fresh.append(item)
     if migrated:
         write_questions(path, current, p.plan_id)
@@ -2827,8 +2991,10 @@ def plan_review_card_body(p: Paths, plan_rel: str, report_rel: str, profile: str
         f"- Файл: `{plan_findings_rel(p)}`; шапка таблицы — `{findings_table([])[0]}`.",
         "- Открытые ID (`открыто`) закрыть фактом или подтвердить, новые находки добавлять",
         "  строками с новым F-N; закрытые повторно не поднимаются. Блокирует вердикт только",
-        "  статус `открыто`: класс (`замысел`, `двусмысленность`, `формат-стража`,",
-        "  `гейт-исполнение`, `стиль`) выбирает маршрут находки, а не вердикт.",
+        "  `открыто` вместе с держащим классом: `замысел`, `двусмысленность` и `гейт-исполнение`",
+        "  держат; `стиль` и `формат-стража` не держат даже при `открыто` — они остаются строками",
+        "  реестра и маршрутом правки не становятся (мелкое — строка, а не круг правок;",
+        "  «подробность» — имя, порядок слов — пометка внутри строки `стиль`, а не отдельный класс).",
         "",
         *plan_review_freeze_lines(round_no),
         "РЕЕСТР СЕЙЧАС",
@@ -5072,16 +5238,27 @@ def effective_plan_verdict(ctx: dict) -> dict | None:
     только распознанный вердикт отчёта (`APPROVE`/`REQUEST_CHANGES`): `NONE`/`AMBIGUOUS`
     остаются как есть, иначе нечитаемый отчёт «лечился» бы чистым реестром.
 
-    Ключи: `verdict` — действующий, `report` — из отчёта, `open` — ID со статусом
-    `открыто` в порядке файла, `total` — строк в реестре, `registry` — файл реестра есть,
-    `discrepancy` — действующий вердикт расходится с отчётом, `error` — реестр не читается.
+    Порог подробности (S2B плана 10): вердикт держит строка со статусом `открыто` **и**
+    держащим классом — конъюнкция, а не пересчёт статусов. Класс берётся из колонки «Класс»
+    и той же таблицы, что у реестра постановки (`PROMPT_FINDING_STATUS`): `стиль` и
+    `формат-стража` не держат никогда, `замысел`, `двусмысленность` и `гейт-исполнение`
+    держат. Строка `стиль` со `открыто` остаётся в реестре и в карточке правок, но круг
+    правок не заказывает и `max_fix_rounds` не тратит (план 9: три круга из трёх — про
+    формулировку). Неизвестный класс считается держащим: незнание не прощает находку.
+
+    Ключи: `verdict` — действующий, `report` — из отчёта, `open` — блокирующие ID в порядке
+    файла (их и называет причина решения), `total` — строк в реестре, `registry` — файл
+    реестра есть, `discrepancy` — действующий вердикт расходится с отчётом, `error` —
+    реестр не читается.
     """
     report = str((ctx.get("plan_review_verdict") or {}).get("verdict") or "")
     if not report:
         return None
     rows = ctx.get("plan_findings") or []
     open_ids = [str(item.get("id") or "") for item in rows
-                if str(item.get("status") or "") == "открыто"]
+                if str(item.get("status") or "") == "открыто"
+                and PROMPT_FINDING_STATUS.get(str(item.get("kind") or ""), "открыто")
+                == "открыто"]
     registry = bool(ctx.get("plan_findings_exists"))
     known = report in ("APPROVE", "REQUEST_CHANGES")
     verdict = ("REQUEST_CHANGES" if open_ids else "APPROVE") if (registry and known) else report
