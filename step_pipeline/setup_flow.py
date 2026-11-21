@@ -656,7 +656,7 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
     else:
         ensure_cron_all(driver, project, log, skip=False,
                         enabled=bool((cfg.get("notify") or {}).get("enabled")))
-        tick = "cron-джобы проверены (страж, команды бота, автообновление)"
+        tick = "cron-джобы проверены (страж, команды бота, автообновление, смотритель)"
     if trust:
         failed = trust_roles(list(dict.fromkeys(roles_from_config(cfg) + [scout])), project, log)
         tail = ("доверие ролям оформлено" if not failed
@@ -1132,6 +1132,7 @@ def ensure_cron_all(driver: str, project: Path, log: Log, *, skip: bool,
     ensure_commands_cron(driver, project, log, skip=False, enabled=enabled,
                          skipped=commands_skipped)
     ensure_update_cron(driver, project, log, skip=False)
+    ensure_keeper_cron(driver, project, log, skip=False)
 
 
 def ensure_cron(driver: str, project: Path, log: Log, *, skip: bool) -> None:
@@ -1299,6 +1300,127 @@ def ensure_update_cron(driver: str, project: Path, log: Log, *, skip: bool) -> N
 def update_cron_command(driver: str, project: Path) -> str:
     return (f'hermes -p {driver} cron create "{UPDATE_CRON}" --name "{UPDATE_JOB}" '
             f'--no-agent --script pipeline_update.py --deliver local --workdir "{project}"')
+
+
+#: Часовой обход смотрителя: минута 5 — вне тика стража (`*/10`), поэтому обход и тик
+#: не встречаются на одном `tick.lock`.
+KEEPER_CRON = "5 * * * *"
+KEEPER_JOB = "План: смотритель (конвейер)"
+KEEPER_SCRIPT = '''# -*- coding: utf-8 -*-
+"""Часовой обход смотрителя: скан симптомов, починки белого списка, карточка, эскалация.
+
+Джоба `--no-agent`: модели в ней нет вообще — пустой обход это одна строка в лог, а
+модель будится только карточкой на борде (`--skill pipeline-keeper`). Скрипт — тонкая
+обёртка: решение о паузе, предохранителях и карточке принимает `keeper_heal.py`
+движка проекта, здесь только запуск.
+"""
+import os
+import runpy
+import sys
+from pathlib import Path
+
+ENGINE_SCRIPT = "keeper_heal.py"
+
+
+def _setup_stdio():
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is None:
+            continue
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def find_engine():
+    """Модуль движка в копии проекта: `PIPELINE_REPO`, рабочий каталог, потом профиль."""
+    candidates = []
+    repo = os.environ.get("PIPELINE_REPO")
+    if repo:
+        candidates.append(Path(repo) / ".pipeline" / ENGINE_SCRIPT)
+    candidates.append(Path.cwd() / ".pipeline" / ENGINE_SCRIPT)
+    candidates.append(Path(__file__).resolve().parents[1] / ".pipeline" / ENGINE_SCRIPT)
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def find_plugin():
+    """Каталог установленного плагина: рядом с профилем, иначе в ~/.hermes."""
+    here = Path(__file__).resolve()
+    candidates = [here.parents[1] / "plugins" / "step_pipeline",
+                  Path.home() / ".hermes" / "plugins" / "step_pipeline"]
+    for cand in candidates:
+        if (cand / "keeper_heal.py").is_file() or (cand / "engine" / "keeper_heal.py").is_file():
+            return cand
+    return None
+
+
+def main():
+    _setup_stdio()
+    engine = find_engine()
+    if engine is None:
+        print("pipeline_keeper: в проекте нет .pipeline/keeper_heal.py — обход не пошёл",
+              file=sys.stderr)
+        return 0
+    argv = [str(engine), "--hourly"]
+    plugin = find_plugin()
+    if plugin is not None:
+        argv += ["--plugin-dir", str(plugin)]
+    sys.argv = argv
+    try:
+        runpy.run_path(str(engine), run_name="__main__")
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def install_keeper_script(driver: str) -> Path:
+    """Положить скрипт обхода в `profiles/<профиль>/scripts/` (cron берёт только оттуда)."""
+    scripts = proj.profile_dir(driver) / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    target = scripts / "pipeline_keeper.py"
+    target.write_text(KEEPER_SCRIPT, encoding="utf-8")
+    return target
+
+
+def ensure_keeper_cron(driver: str, project: Path, log: Log, *, skip: bool) -> None:
+    """Cron-джоба смотрителя: no-agent, раз в час, доставка local.
+
+    Заводится вместе со стражем, иначе «смотритель раз в час» означал бы «пока
+    открыта панель». Обход идёт в режиме dry-run, пока владелец не положит
+    `state/keeper.on`: заводить джобу и разрешать починки — разные решения.
+    """
+    if skip:
+        log.warn("смотритель не заведён (--no-cron)")
+        return
+    install_keeper_script(driver)
+    listing = proj.run_hermes("-p", driver, "cron", "list")
+    if KEEPER_JOB in (listing.stdout or ""):
+        log.ok("cron-джоба смотрителя уже есть (скрипт обновлён)")
+        return
+    res = proj.run_hermes("-p", driver, "cron", "create", KEEPER_CRON,
+                          "--name", KEEPER_JOB, "--no-agent",
+                          "--script", "pipeline_keeper.py",
+                          "--deliver", "local",
+                          "--workdir", str(project))
+    if res.returncode == 0:
+        log.ok(f"cron-джоба смотрителя создана ({KEEPER_CRON}, раз в час)")
+    else:
+        log.warn(f"cron смотрителя: {(res.stderr or res.stdout or '').strip()[:300]}")
+        log.warn("завести вручную: " + keeper_cron_command(driver, project))
+
+
+def keeper_cron_command(driver: str, project: Path) -> str:
+    return (f'hermes -p {driver} cron create "{KEEPER_CRON}" --name "{KEEPER_JOB}" '
+            f'--no-agent --script pipeline_keeper.py --deliver local --workdir "{project}"')
 
 
 COMMANDS_JOB = "План: бот команды (конвейер)"
