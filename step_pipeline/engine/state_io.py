@@ -87,13 +87,9 @@ def _payload(what: str) -> dict:
             "what": what}
 
 
-def holder(state_dir: Path, name: str = LOCK_NAME) -> dict | None:
-    """Полезная нагрузка чужой блокировки (для сообщений «тик идёт (pid …, с …)»).
-
-    `name` — имя файла блокировки: у тика `tick.lock`, у часового обхода смотрителя
-    свой (`keeper.lock`) — иначе обход, сняв мёртвый замок тика, потерял бы собственный.
-    """
-    path = Path(state_dir) / name
+def holder(state_dir: Path) -> dict | None:
+    """Полезная нагрузка чужой блокировки (для сообщений «тик идёт (pid …, с …)»)."""
+    path = Path(state_dir) / LOCK_NAME
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
@@ -102,11 +98,11 @@ def holder(state_dir: Path, name: str = LOCK_NAME) -> dict | None:
 
 
 def acquire(state_dir: Path, what: str = "tick", wait: float | None = None,
-            stale_after: float | None = None, name: str = LOCK_NAME) -> Lock | None:
+            stale_after: float | None = None) -> Lock | None:
     """Взять блокировку каталога состояния. `None` — блокировка живая и чужая."""
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
-    path = state_dir / name
+    path = state_dir / LOCK_NAME
     wait = WAIT if wait is None else float(wait)
     stale_after = STALE_AFTER if stale_after is None else float(stale_after)
     deadline = time.monotonic() + max(0.0, wait)
@@ -116,7 +112,7 @@ def acquire(state_dir: Path, what: str = "tick", wait: float | None = None,
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
-            current = holder(state_dir, name)
+            current = holder(state_dir)
             # Нечитаемый файл блокировки — тоже протухший: иначе тик встанет навсегда.
             if took_over:
                 return None          # гонку за протухшую блокировку проиграли
@@ -149,7 +145,7 @@ def release(lock: Lock | None) -> None:
     if lock is None:
         return
     path = Path(lock.path)
-    current = holder(path.parent, path.name)
+    current = holder(path.parent)
     if not current:
         return
     if int(current.get("pid") or 0) != int(lock.payload.get("pid") or 0):
