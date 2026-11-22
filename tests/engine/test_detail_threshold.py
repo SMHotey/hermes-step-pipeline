@@ -343,10 +343,15 @@ def test_repo_plan_registries_have_no_blocking_style():
     Тот же вопрос глазами дал бы вакуумный зелёный, поэтому тест доказывает, что файлы
     прочитаны: множество путей непусто, а строк-находок столько же, сколько даёт подсчёт
     строк таблицы по тексту файлов (независимо от `load_findings`).
+
+    В дереве без реестров (чистый клон: `docs/reviews/` лежит в `.gitignore`) проверка
+    неприменима и пропускается с причиной — провал там краснил `main` на ровном месте.
     """
     root = Path(__file__).resolve().parents[2]
     files = sorted(root.glob("docs/reviews/plan-*-findings.md"))
-    assert files, "реестры плана не найдены: проверка была бы вакуумной"
+    if not files:
+        pytest.skip("реестры плана — артефакт прогона конвейера (docs/reviews в .gitignore), "
+                    "в чистом клоне их нет")
 
     raw_rows = 0
     rows: list[dict] = []
