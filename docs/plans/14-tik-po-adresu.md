@@ -9,8 +9,9 @@
 > Планы-смежники: 6-S3 (жест «Тик» в панели), 6-S5A (кнопки действий в строке плана),
 > 6-S8B (статус раскатки в реестре), 8-S2A (постановка без адресов). Общие файлы:
 > `step_pipeline/engine/gate.py` (у 6-S3 через «ui_server.act_tick», у 8-S2A — рядом),
-> `step_pipeline/ui_server.py` (6-S3, 6-S5A). Пересечение адресное: S1 трогает только ветку
-> `--run` с адресом, S2 — жест панели; строки карточек и постановок не правятся.
+> `step_pipeline/ui_server.py` (6-S3, 6-S5A). Пересечение адресное: S1 — ветка `--run` с
+> адресом, `incident` и `resolve_paths`; S2 — `plan_view` и `act_tick`; строки карточек и
+> постановок не правятся.
 
 Конституция: docs/CONSTITUTION.md, 10 пунктов. План отвечает: п.1 (план файлом в git),
 п.2 (у закрытого шага дата, коммит, прогоны), п.3 (у каждого шага стоп-сигнал), п.4 (бюджет
@@ -65,8 +66,8 @@
   «gate.py:6500» (ветка `--run` с адресом), «gate.py:6089» (`tick` — эталон), прецедент
   15.11.2026 10:43 по плану 6.
 - Файл: `step_pipeline/engine/gate.py`, `step_pipeline/engine/registry.py`,
-  `tests/engine/test_tick_address.py` (новый), `tests/engine/test_registry.py`,
-  `tests/engine/test_gate_cli.py` (если ветка `--run` проверяется там).
+  `tests/engine/test_tick_address.py` (новый), `tests/engine/test_config_registry.py`,
+  `tests/engine/test_tick.py` (ветка `--run`).
 - Что сделать:
   1. «registry.driven_default_id(cfg)» — первый ведомый план по номеру; нет ведомых —
      `PlanNotFound` с текстом «ни один план не ведётся: driven_plans пуст или не совпал».
@@ -75,9 +76,13 @@
      hermes pipeline config --set driven_plans '[\"...\", \"N\"]'» и код 2. При `--json` —
      тот же отказ объектом `{"ok": false, "error": ..., "driven": false}`, без стоп-флага
      и без уведомления.
-  3. `incident()`: фолбэк `plan_id = plan_id or registry.default_plan_id(cfg)` заменить на
+  3. `resolve_paths` (его зовёт `main` до развилки): безадресный `--run` через
+     `driven_default_id` не идёт — при `driven_plans: []` остаётся код 0 и ничего не
+     делает; `PlanNotFound` — только командам, которым адрес нужен. Тест: «`driven_plans:
+     []` + `--run` без адреса → код 0, действий ноль».
+  4. `incident()`: фолбэк `plan_id = plan_id or registry.default_plan_id(cfg)` заменить на
      `driven_default_id`, чтобы инцидентный стоп не писался плану вне ведения.
-  4. Докстринг «registry.default_plan_id» дополнить: функция про «план для чтения», тик
+  5. Докстринг «registry.default_plan_id» дополнить: функция про «план для чтения», тик
      ходит через `driven_default_id`.
 - Прогон: `python -m pytest tests/engine/test_tick_address.py -m "not slow"` → exit 0, «passed»; таймаут 900
 - Тесты/гейты: `python -m pytest tests/engine/test_tick_address.py` → все пункты
@@ -85,39 +90,42 @@
   `--status`/`--resume` неведо́мого — работают; `driven_plans` пуст — `driven_default_id`
   даёт `PlanNotFound`).
 - Риск: normal
+- Стоп: отказ требует трогать безадресный тик или ломает старт плана из панели (`plans_api`) — стоп, доклад.
 - Готово = новый тест зелёный, `python -m pytest tests/engine/` зелёный, `ruff check .`
-  чистый, на живом проекте `python .pipeline/gate.py --plan 6 --run` отвечает отказом, а
-  `python .pipeline/gate.py --status --plan 6` показывает состояние.
+  чистый, на живом проекте `python .pipeline/gate.py --plan <вне driven_plans> --run`
+  отвечает отказом, а `--status --plan <тот же>` показывает состояние.
 - Важно: не трогать ветку `--run` без адреса и `tick()` — там правило уже верное; не
   убирать фолбэк `--stop`/`--resume` (Допущение 3); не менять формат состояния плана.
 
 ### S2. Панель и бот не обещают работу неведо́мому плану (1 дн) `pipeline`
 
-- Цель: кнопка «Тик» в строке плана видна только у ведомого плана, у неведо́мого на её
-  месте — причина и команда включения; серверный жест `act_tick` отвечает отказом движка в
-  том же виде, что и остальные жесты, и не выглядит поломкой.
-- Замер основания: «ui_server.act_tick» («ui_server.py:312») передаёт план из запроса;
-  вкладка «Планы» перечисляет все планы с полем `driven` (`plans_rows`); `GET
-  /api/projects` отдаёт то же поле в строке проекта.
-- Файл: `step_pipeline/ui_server.py`, `step_pipeline/ui/index.html`,
-  `step_pipeline/plans_api.py` (если жест тика переезжает туда же, к остальным),
-  `tests/test_ui_server.py`.
+- Цель: `#btn-tick` (тикает выбранный план) у плана вне ведения гаснет с причиной и
+  командой включения; `act_tick` по нему движок не зовёт и отвечает 400; подсказку отдаёт
+  движок полем `command` действия `drive`; строку плана не трогать — у неё уже
+  «Запустить» (маршрут /api/plan/start), и это верно: жест добавляет номер в `driven_plans`.
+- Замер основания: `act_tick` зовёт `--run` по плану из запроса («ui_server.py:317»);
+  `#btn-tick` тикает выбранный план («index.html:3666») и гаснет по `tick_available` из
+  `_overview` («snapshot.py:629», страница — «index.html:2107»); вид `tick` в строке бывает
+  только у стопа-инцидента («gate.py:8815»), у `drive` `command` пустая («gate.py:8854»).
+- Файл: `step_pipeline/engine/gate.py` (`plan_view`), `step_pipeline/snapshot.py`
+  (`_overview`), `step_pipeline/ui_server.py` (`act_tick`), `tests/test_ui_server.py`,
+  `tests/test_preview.py`.
 - Что сделать:
-  1. `act_tick`: если запрос адресует план с `driven: false` — не звать движок, ответить
-     `{"ok": false, "error": "план N не в driven_plans …"}` с кодом 400; страница печатает
-     причину в ленте действий, как для остальных отказов.
-  2. «index.html»: у строки плана с `driven: false` кнопка «Тик» заменена подсказкой
-     «план не ведётся — включить: hermes pipeline config --set driven_plans …»; у ведо́мого
-     поведение прежнее.
-  3. Проверить, что предпросмотр (`preview`) и вкладка «Обзор» не зовут `act_tick` вовсе:
-     в предпросмотре действия запрещены (инвариант).
+  1. `plan_view`: у вида `drive` заполнить `command` — `hermes pipeline config --set
+     driven_plans '[<живой список>, "N"]'`; причина — та же `NOT_DRIVEN_REASON`.
+  2. `_overview`: у выбранного плана с `driven: false` — `tick_available: false` и
+     `tick_disabled_reason` из причины строки и поля command действия; `#btn-tick` гаснет
+     и объясняет причину. В предпросмотре проверить, что `act_tick` не зовётся.
+  3. `act_tick`: при `driven: false` (по `driven_plans` проекта, без запуска движка) вернуть
+     `{"ok": false, "error": …}` с причиной и командой — 400 панель отдаёт сама.
 - Прогон: `python -m pytest tests/test_ui_server.py -m "not slow"` → exit 0, «passed»; таймаут 900
 - Тесты/гейты: `python -m pytest tests/test_ui_server.py` → зелёный, плюс два новых:
   жест тика по неведо́мому плану — 400 и без запуска движка (счётчик запусков), по
   ведо́мому — 200 и один запуск.
 - Риск: normal
-- Готово = в браузере на живом проекте кнопка «Тик» у плана 6 отсутствует с объяснением,
-  у ведо́мого плана 8 работает; тесты зелёные.
+- Стоп: подсказка требует правки разметки вкладки дальше `#btn-tick` — стоп, доклад.
+- Готово = в браузере на живом проекте `#btn-tick` у плана вне `driven_plans` погашен с
+  причиной и командой включения, у ведо́мого плана тикает; тесты зелёные.
 - Важно: не менять разметку вкладки «Планы» дальше кнопки тика; не трогать жесты
   `--stop`/`--resume`/`--delete` (`plans_api`), у них своя защита.
 
@@ -141,6 +149,8 @@
 - Тесты/гейты: полный `python -m pytest` → зелёный; `ruff check .`; `hermes plugins
   validate step_pipeline`; `hermes pipeline doctor` на проекте без находок.
 - Риск: normal
+- Стоп: CI на теге красный после второй попытки или релиз не создан после пуша тега —
+  стоп, доклад владельцу с выводом `gh`, релиз руками не добивать.
 - Готово = тег и релиз в origin, плагин и копия движка в проекте называют новую версию,
   CI зелёный на main и на теге.
 - Важно: `driven_plans` и `profiles` в проектах не трогать — это ключи владельца.
