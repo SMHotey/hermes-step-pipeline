@@ -173,3 +173,52 @@ def test_overview_tick_consequence_and_stop(tmp_path: Path, monkeypatch, bare_pr
                    'id="ov-badge"', 'id="ov-waiting"', 'id="ov-rounds"', 'id="ov-prompt"',
                    'id="ov-risk"', "tick_label"):
         assert anchor in html
+
+
+def test_overview_dims_tick_for_plan_outside_driven(tmp_path: Path, monkeypatch):
+    """План вне ведения: «Обзор» гасит «Тик» причиной и командой включения (план 14, S2).
+
+    Текст тот же, которым ответит адресный тик: причина строки плана («не в driven_plans»)
+    плюс готовая команда — её собирает движок (`driven_command`), панель не пересказывает.
+    Отказ адресный: у ведо́мого плана кнопка остаётся доступной.
+    """
+    # Без этого снимок читает НАСТОЯЩУЮ борду профиля, и чужие карточки меняют обзор (D11).
+    monkeypatch.setenv("PIPELINE_KANBAN_DB", str(tmp_path / "kanban-empty.db"))
+    root = install_project(tmp_path / "not-driven", board="nd-board")
+    second = root / "docs" / "plans" / "2-second.md"
+    second.write_text(SECOND_PLAN, encoding="utf-8")
+    cfg = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
+    cfg["driven_plans"] = ["1"]
+    (root / "pipeline.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                                        encoding="utf-8")
+    snapshot.clear_cache()
+
+    ov = snapshot.snapshot(root, plan="2")["overview"]
+    assert ov["tick_available"] is False
+    assert "не в driven_plans" in ov["tick_disabled_reason"]
+    assert "hermes pipeline config --set driven_plans" in ov["tick_disabled_reason"]
+    command = ov["tick_disabled_reason"].split("включить: ", 1)[1]
+    assert command == "hermes pipeline config --set driven_plans '[\"1\", \"2\"]'"
+    assert '"2"' in command
+
+    snapshot.clear_cache()
+    driven = snapshot.snapshot(root, plan="1")["overview"]
+    assert driven["tick_available"] is True
+    assert driven["tick_disabled_reason"] == ""
+
+    # Закрытый план вне ведения гаснет так же (живой случай: все планы вне ведения закрыты):
+    # тик по нему всё равно откажет, а причина у строки закрытого плана говорит о закрытости.
+    second.write_text(SECOND_PLAN.replace(
+        "| 01.11.2026 | S1 (Первый шаг) | abc1234 | ревью APPROVE | ЗАКРЫТ |",
+        "| 01.11.2026 | S1 (Первый шаг) | abc1234 | ревью APPROVE | ЗАКРЫТ |\n"
+        "| 01.11.2026 | S2 (Второй шаг) | def5678 | ревью APPROVE | ЗАКРЫТ |"),
+        encoding="utf-8")
+    snapshot.clear_cache()
+    closed = snapshot.snapshot(root, plan="2")["overview"]
+    assert closed["tick_available"] is False
+    assert closed["tick_disabled_reason"] == ov["tick_disabled_reason"]
+
+    # Подсказку кнопки страница берёт из поля снимка, а не собирает текст сама.
+    html = (PLUGIN / "ui" / "index.html").read_text(encoding="utf-8")
+    assert "tick.title = tickAllowed ? (ov.tick_label || \"Тик\") : " \
+           "(ov.tick_disabled_reason || \"\")" in html

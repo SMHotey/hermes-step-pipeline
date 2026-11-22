@@ -21,7 +21,8 @@ import pytest
 PLUGIN = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from helpers import KANBAN_SCHEMA, install_project, run_gate, stub_cards, complete_card  # noqa: E402
+from helpers import (KANBAN_SCHEMA, _write_approval, install_project, run_gate,  # noqa: E402
+                     stub_cards, complete_card)
 import panel_pause  # noqa: E402
 import project  # noqa: E402
 import snapshot  # noqa: E402
@@ -3295,3 +3296,134 @@ def test_snapshot_carries_round_cause_of_step(server):
     _status, empty = get(server["url"] + "/api/snapshot")
     blank = empty["overview"]["rounds_cause"]
     assert (blank["rounds"], blank["median_min"], blank["open"]) == (0, None, 0)
+
+
+# ── тик по адресу слушается ведения (план 14, S2) ──
+
+
+def set_driven(root: Path, value) -> None:
+    """`driven_plans` проекта: ключ владельца, тест его только читает.
+
+    Значение бывает строкой («1,2» — так его пишет мастер установки) и списком: обе формы
+    движок читает по-своему, и панель обязана видеть ту же.
+    """
+    path = root / "pipeline.json"
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    cfg["driven_plans"] = value
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def drop_driven(root: Path) -> None:
+    """Вернуть проект в состояние мастера: ключа `driven_plans` в файле нет."""
+    path = root / "pipeline.json"
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    cfg.pop("driven_plans", None)
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def tick_command(text: str) -> str:
+    """Команда включения из текста отказа: всё после «включить: »."""
+    return text.split("включить: ", 1)[1]
+
+
+def tick_runs(calls: list) -> list:
+    """Только запуски тика: снимок после действия зовёт другие подкоманды движка."""
+    return [call for call in calls if call[1:3] == ("gate.py", "--run")]
+
+
+def test_tick_refused_for_plan_outside_driven(server, monkeypatch):
+    """Тик по плану вне ведения: 400 с причиной и командой, движок не запускается.
+
+    Тот же текст гасит кнопку «Тик» в «Обзоре» и лежит подсказкой в строке плана — иначе
+    панель обещала бы работу, которую адресный тик отказал бы делать (план 14, S1).
+    """
+    set_driven(server["root"], ["1"])
+    # План 2 утверждаем: иначе строка плана доходит до «утвердить план», а не до «не ведётся».
+    _write_approval(server["root"], add_plan(server["root"], "Второй", steps=1), plan_id="2")
+    snapshot.clear_cache()
+    calls = engine_counter(monkeypatch)
+
+    status, data = post(server["url"], {"action": "tick", "plan": "2"})
+    assert status == 400 and data["ok"] is False
+    assert "не в driven_plans" in data["error"]
+    assert calls == [], "отказ обязан быть решением панели, без запуска движка"
+    # Команда включения: живой список ведения плюс запрошенный номер в конце.
+    command = tick_command(data["error"])
+    assert command.startswith("hermes pipeline config --set driven_plans '")
+    assert json.loads(command.split("'")[1]) == ["1", "2"]
+
+    # Строка плана несёт ту же команду, а «Обзор» гасит кнопку тем же текстом.
+    plans = json.loads(run_gate(server["root"], "--plans", "--json").stdout)
+    row = next(r for r in plans if str(r["id"]) == "2")
+    assert row["action"]["kind"] == "drive"
+    assert row["action"]["command"] == command
+    _status, snap_data = get(server["url"] + "/api/snapshot?plan=2")
+    overview = snap_data["overview"]
+    assert overview["tick_available"] is False
+    assert overview["tick_disabled_reason"] == data["error"]
+
+
+def test_tick_on_driven_plan_runs_engine_once(server, monkeypatch):
+    """Тик по ведомому плану: 200 и ровно один запуск `--run`; снимок считается отдельно."""
+    set_driven(server["root"], ["1"])
+    calls = engine_counter(monkeypatch)
+    status, data = post(server["url"], {"action": "tick", "plan": "1"})
+    assert status == 200 and data["ok"] is True
+    assert len(tick_runs(calls)) == 1
+    assert tick_runs(calls)[0][1:5] == ("gate.py", "--run", "--plan", "1")
+
+
+def test_tick_unknown_plan_still_asks_engine(server, monkeypatch):
+    """Опечатка в номере — не отказ панели: «план не найден» отвечает движок.
+
+    Порядок проверок движка: неизвестный номер получает «план не найден», а не совет
+    «включить в driven_plans» — панель повторяет его, а не подменяет своим отказом.
+    """
+    calls = engine_counter(monkeypatch)
+    status, data = post(server["url"], {"action": "tick", "plan": "99"})
+    assert status == 400 and data["ok"] is False
+    assert len(tick_runs(calls)) == 1, "неизвестный номер проверяет движок, а не панель"
+    text = f"{data.get('stdout') or ''}\n{data.get('stderr') or ''}"
+    assert "не найден" in text
+    assert "driven_plans" not in text
+
+
+def test_tick_refusal_reads_string_driven_plans(server, monkeypatch):
+    """`driven_plans` строкой («12»): движок итерирует её посимвольно — план 1 ведом.
+
+    Композер считает так же (`config.load`), а не делит строку по запятым: с `split(",")`
+    элементом был бы «12», и план 1 получил бы ложный отказ, которого движок не даёт.
+    """
+    set_driven(server["root"], "12")
+    calls = engine_counter(monkeypatch)
+    status, data = post(server["url"], {"action": "tick", "plan": "1"})
+    assert status == 200 and data["ok"] is True
+    assert len(tick_runs(calls)) == 1
+
+
+def test_tick_respects_env_driven_plans(server, monkeypatch):
+    """Ведение берётся из того окружения, что получит движок: `PIPELINE_PLANS` сильнее файла.
+
+    Первая половина — переменная окружения панели (её видит и `config.load`), вторая — `.env`
+    профиля драйвера (её видит только подпроцесс): снимок читает тот же источник
+    (`proj.engine_env`), поэтому отказ и тик не расходятся.
+    """
+    set_driven(server["root"], [])
+
+    monkeypatch.setenv("PIPELINE_PLANS", "1")
+    status, data = post(server["url"], {"action": "tick", "plan": "1"})
+    assert status == 200 and data["ok"] is True, data
+    snapshot.clear_cache()
+
+    monkeypatch.delenv("PIPELINE_PLANS", raising=False)
+    monkeypatch.setattr(project, "profile_env", lambda root: {"PIPELINE_PLANS": "1"})
+    status, data = post(server["url"], {"action": "tick", "plan": "1"})
+    assert status == 200 and data["ok"] is True, data
+
+
+def test_tick_without_driven_key_is_driven(server):
+    """Ключа `driven_plans` нет (состояние мастера): ведение по умолчанию — `["*"]`."""
+    drop_driven(server["root"])
+    snapshot.clear_cache()
+    status, data = post(server["url"], {"action": "tick", "plan": "1"})
+    assert status == 200 and data["ok"] is True

@@ -146,7 +146,14 @@ def test_plan_outside_driven_list_is_not_driven(tmp_path: Path, hermes_stub: Pat
     assert row["state_label"] == "не ведётся"
     assert row["reason"] == gate.NOT_DRIVEN_REASON
     assert row["action"]["kind"] == "drive"
-    assert row["action"]["command"] == ""
+    # Подсказка строки — та же команда включения, которой отказывает адресный тик:
+    # живой `driven_plans` плюс номер в конце (S2 плана 14).
+    command = row["action"]["command"]
+    assert command.startswith("hermes pipeline config --set driven_plans '")
+    assert json.loads(command.split("'")[1]) == ["2", "1"]
+    assert command == gate.driven_command(config_mod.load(root), "1")
+    assert gate.not_driven_refusal(config_mod.load(root), "1").endswith(
+        "включить: " + command)
 
 
 def test_closed_plan_ignores_stop_file(stand):

@@ -315,7 +315,19 @@ def _run_engine(state: State, *args: str, timeout: int = 900) -> dict:
 
 
 def act_tick(state: State, payload: dict) -> dict:
+    """Тик выбранного плана; план вне ведения отказывается до запуска движка.
+
+    Условие проверяет сборщик `snapshot.tick_refusal` — тот же порядок (`normalize` →
+    `registry.get` → `driven_ids`) и тот же текст, что у ветки `--run --plan` в движке:
+    иначе панель обещала бы работу, которую движок отказывается делать, и заводила бы
+    карточки неведо́мому плану. `None` — прежний путь: движок отвечает сам. Код 400 панель
+    ставит по `ok: false`; префикс «ошибка: » движка в тексте не повторяем — страница
+    показывает поле `error` тостом.
+    """
     plan = str(payload.get("plan") or "").strip()
+    refusal = snap.tick_refusal(state.project, plan) if plan else None
+    if refusal:
+        return {"ok": False, "error": refusal}
     extra = ["--plan", plan] if plan else []
     result = _run_engine(state, "--run", *extra)
     result["snapshot"] = snap.snapshot(state.project, plan or None)

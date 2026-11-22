@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import sqlite3
@@ -566,6 +567,62 @@ def _plan_stopped(row: dict) -> bool:
     return state == "stopped" if state else bool(row.get("stop"))
 
 
+def _engine_parts() -> tuple[Any, Any, Any] | None:
+    """Конфигурация, страж и реестр движка для сборщика отказа — импорт ленивый.
+
+    `engine/gate.py` тянет за собой весь движок (≈1 с), а нужен он только когда у
+    выбранного плана есть признак «вне ведения»: панель платит за импорт один раз в
+    процессе (модули кэшируются), CLI и предпросмотр — не платят вовсе.
+    """
+    try:
+        from .engine import config as engine_config
+        from .engine import gate as engine_gate
+        from .engine import registry as engine_registry
+    except ImportError:  # pragma: no cover - движка рядом нет: отказ не собирается
+        return None
+    return engine_config, engine_gate, engine_registry
+
+
+def tick_refusal(root: Path, plan_id: str) -> str | None:
+    """Строка отказа тику по адресу плана вне ведения — или `None`, когда отказывать не за что.
+
+    Порядок проверок повторяет ветку `--run --plan` движка: номер плана (`normalize`),
+    наличие плана с журналом (`registry.get`), ведение (`registry.driven_ids`) и только
+    потом готовый текст (`gate.not_driven_refusal`). Поэтому панель отказывает ровно тем
+    планам, которым откажет `--run --plan`: опечатка в номере остаётся «план не найден»
+    от движка, а не советом «включить в driven_plans». Движок подпроцессом не зовётся —
+    конфигурация и каталог планов читаются в процессе панели (критерий «не больше 20
+    запусков движка в минуту» про подпроцесс).
+
+    `None` — ведение вопроса не поднимает: план ведётся, номера нет среди планов с
+    распознанным журналом, `pipeline.json` не читается или движка рядом нет. Тогда
+    действует прежний путь: `--run` ответит сам.
+    """
+    parts = _engine_parts()
+    if parts is None:
+        return None
+    engine_config, engine_gate, engine_registry = parts
+    try:
+        cfg = engine_config.load(root)
+    except engine_config.ConfigError:
+        return None
+    # `PIPELINE_PLANS` движок получает из окружения подпроцесса (`proj.engine_env`: окружение
+    # панели плюс `.env` профиля драйвера), а `config.load` читает только `os.environ`.
+    # Значение берём там же, где движок; пустое — «как в файле» (правило `config._env_list`).
+    raw = str(proj.engine_env(root).get("PIPELINE_PLANS") or "")
+    from_env = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if from_env:
+        cfg = dataclasses.replace(cfg, driven=from_env)
+    try:
+        want = engine_registry.normalize(plan_id)
+        engine_registry.get(cfg, want)
+        if want in engine_registry.driven_ids(cfg):
+            return None
+    except engine_registry.PlanNotFound:
+        return None
+    return engine_gate.not_driven_refusal(cfg, want)
+
+
 def _overview(root: Path, cfg: dict, out: dict) -> dict:
     """Экран «Обзор»: что произойдёт при Тик — подпись, причина, доступность, простой, прогресс.
 
@@ -631,12 +688,22 @@ def _overview(root: Path, cfg: dict, out: dict) -> dict:
         tick_available = False
         disabled_reason = ("предпросмотр — только чтение: поставь конвейер в проект "
                            "(`hermes pipeline setup`)")
-    elif stop:
-        tick_available = False
-        where = f" (с {stop['at']})" if stop["at"] else ""
-        disabled_reason = (f"стоп-флаг ({stop['kind']}): "
-                           f"{stop['reason'] or 'причина не записана'}{where}; снять: "
-                           f"кнопка «Продолжить» или `python .pipeline/gate.py --resume`")
+    else:
+        # План вне ведения важнее стопа: снятый стоп адресный тик всё равно не пустит
+        # (движок отказывает, S1), поэтому кнопка объясняет ведение. Признак берётся из
+        # строки плана (его считает страж), текст — из сборщика движка: у закрытого плана
+        # причина строки говорит о закрытости, и пересказывать её как причину отказа нельзя.
+        refusal = (tick_refusal(root, plan_id)
+                   if (chosen or {}).get("driven") is False else "")
+        if refusal:
+            tick_available = False
+            disabled_reason = refusal
+        elif stop:
+            tick_available = False
+            where = f" (с {stop['at']})" if stop["at"] else ""
+            disabled_reason = (f"стоп-флаг ({stop['kind']}): "
+                               f"{stop['reason'] or 'причина не записана'}{where}; снять: "
+                               f"кнопка «Продолжить» или `python .pipeline/gate.py --resume`")
 
     # Простой читается из состояния плана (`waiting_since` пишет сторож), а не из карточки:
     # карточка живёт минуты, простой — часы.

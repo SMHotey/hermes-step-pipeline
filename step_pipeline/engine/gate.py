@@ -8769,19 +8769,30 @@ NOT_DRIVEN_REASON = "не в driven_plans — конвейер его не ве�
 TICK_ACTION_TEXT = "устранить причину и запустить тик"
 
 
+def driven_command(cfg: config_mod.Config, plan_id: str) -> str:
+    """Команда включения плана в ведение: живой `driven_plans` плюс запрошенный номер.
+
+    Список в команде — `driven_plans` проекта как есть плюс номер в конце; значение
+    `hermes pipeline config --set` читает через `json.loads`, отсюда двойные кавычки
+    внутри одинарных. Собирается в одной функции, потому что строку читают двое: текст
+    отказа адресному тику (`not_driven_refusal`) и поле `command` действия `drive` строки
+    плана (`plan_view`) — панель показывает её подсказкой кнопки «Тик» у плана вне ведения
+    (S2 плана 14). Вторая копия формы разошлась бы с первой молча.
+    """
+    want = registry.normalize(plan_id)
+    payload = json.dumps([*cfg.driven, want], ensure_ascii=False)
+    return f"hermes pipeline config --set driven_plans '{payload}'"
+
+
 def not_driven_refusal(cfg: config_mod.Config, plan_id: str) -> str:
     """Текст отказа тику по адресу плана вне ведения — с командой включения.
 
     Содержит `NOT_DRIVEN_REASON` дословно: тем же текстом панель подписывает строку
-    плана, поэтому движок и страница говорят об одном плане одинаково. Список в команде —
-    живой `driven_plans` проекта как есть плюс запрошенный номер в конце; значение
-    `hermes pipeline config --set` читает через `json.loads`, отсюда двойные кавычки
-    внутри одинарных. Собирается в одной функции: панель (S2 плана 14) берёт ту же строку.
+    плана, поэтому движок и страница говорят об одном плане одинаково. Команда
+    включения — `driven_command`: та же строка отдаётся полем `command` действия `drive`.
     """
     want = registry.normalize(plan_id)
-    payload = json.dumps([*cfg.driven, want], ensure_ascii=False)
-    return (f"план {want} {NOT_DRIVEN_REASON}; включить: "
-            f"hermes pipeline config --set driven_plans '{payload}'")
+    return (f"план {want} {NOT_DRIVEN_REASON}; включить: {driven_command(cfg, want)}")
 
 
 def _cron_command(cfg: config_mod.Config) -> str:
@@ -8869,7 +8880,10 @@ def plan_view(cfg: config_mod.Config, p: Paths, driven: set[str], cron_ok: bool)
         action = {"kind": "approve", "text": "утвердить план",
                   "command": f"hermes pipeline plan --accept {p.plan_id}"}
     elif state == "not-driven":
-        action = {"kind": "drive", "text": "добавить план в driven_plans", "command": ""}
+        # Подсказка — та же команда, которой отказывает адресный тик (`driven_command`):
+        # у плана вне ведения панель гасит «Тик» и объясняет, чем план включить (S2 плана 14).
+        action = {"kind": "drive", "text": "добавить план в driven_plans",
+                  "command": driven_command(cfg, p.plan_id)}
     elif step and not stop and not hold and not cron_ok:
         action = {"kind": "cron", "text": "включить джобу стража", "command": _cron_command(cfg)}
     else:
