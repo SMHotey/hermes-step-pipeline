@@ -71,6 +71,14 @@ def normalize(plan_id: object) -> str:
 
 
 def default_plan_id(cfg: config_mod.Config) -> str:
+    """Номер плана, который открывают, чтобы прочитать состояние.
+
+    Берётся `default_plan` из конфига, иначе — наименьший номер среди планов с
+    распознанным журналом. Эту функцию зовут `--status`, `--stop`, `--resume`,
+    `resolve_paths` и обход панели: вопрос «какой план показать» — не то же самое, что
+    «какому плану служит тик». Тик ходит через `driven_default_id`: «план для чтения» и
+    «первый ведомый план» — разные ответы, и подменять один другим нельзя.
+    """
     if cfg.default_plan:
         return normalize(cfg.default_plan)
     found = sorted(discover(cfg), key=lambda s: int(s.id))
@@ -273,6 +281,20 @@ def driven_ids(cfg: config_mod.Config) -> tuple[str, ...]:
 def driven_specs(cfg: config_mod.Config) -> list[PlanSpec]:
     allowed = set(driven_ids(cfg))
     return [spec for spec in specs(cfg) if spec.id in allowed]
+
+
+def driven_default_id(cfg: config_mod.Config) -> str:
+    """Первый по номеру план, который конвейер ведёт: `--run` и инцидентный стоп идут сюда.
+
+    Фолбэк берётся из `driven_specs`, а не из `cfg.driven`: номер в списке ведения без
+    файла плана с журналом (опечатка, удалённый черновик) ведомым не становится, и стоп
+    не ушёл бы в несуществующий план. `default_plan` здесь не участвует — это «план для
+    чтения» (см. `default_plan_id`), а не «план, которому служит тик».
+    """
+    driven = sorted(driven_specs(cfg), key=lambda spec: int(spec.id))
+    if not driven:
+        raise PlanNotFound("ни один план не ведётся: driven_plans пуст или не совпал")
+    return driven[0].id
 
 
 def get(cfg: config_mod.Config, plan_id: object) -> PlanSpec:

@@ -9,6 +9,7 @@ import pytest
 
 import config as config_mod
 import registry
+from engine_kit import make_project
 
 
 def test_missing_config_is_error(tmp_path: Path):
@@ -82,6 +83,47 @@ def test_driven_plans_star_and_list(project: Path):
     data["driven_plans"] = []
     (project / "pipeline.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     assert registry.driven_ids(config_mod.load(project)) == ()
+
+
+def write_plan(root: Path, name: str, plan_id: int) -> Path:
+    """Положить в планы проекта ещё один план с журналом (иначе реестр его не увидит)."""
+    path = Path(root) / "docs" / "plans" / name
+    path.write_text(
+        f"# {plan_id}. Демо-план по адресу\n\nЦель: второй план проекта.\n\n"
+        "## Шаги\n\n"
+        f"### S1. Первый шаг {plan_id}-го плана (1 дн)\n\n"
+        "- Файл: `app/second.py`\n"
+        "- Готово = шаг есть\n\n"
+        "## Журнал выполнения\n\n"
+        "| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |\n"
+        "|---|---|---|---|---|\n"
+        "| — | S1 | — | — | открыт |\n",
+        encoding="utf-8")
+    return path
+
+
+def test_driven_default_id_is_first_driven(tmp_path: Path):
+    # Суть шага: «план для чтения» и «план, которому служит тик» — разные ответы.
+    root = make_project(tmp_path / "driven-default", driven_plans=["2"])
+    write_plan(root, "2-address.md", 2)
+    cfg = config_mod.load(root)
+    assert registry.driven_default_id(cfg) == "2"
+    assert registry.default_plan_id(cfg) == "1"
+
+
+def test_driven_default_id_with_star(tmp_path: Path):
+    root = make_project(tmp_path / "driven-star", driven_plans=["*"])
+    write_plan(root, "2-address.md", 2)
+    cfg = config_mod.load(root)
+    assert registry.driven_default_id(cfg) == "1"
+
+
+def test_driven_default_id_empty_raises(tmp_path: Path):
+    root = make_project(tmp_path / "driven-empty", driven_plans=[])
+    cfg = config_mod.load(root)
+    with pytest.raises(registry.PlanNotFound) as err:
+        registry.driven_default_id(cfg)
+    assert "ни один план не ведётся" in str(err.value)
 
 
 def test_unknown_plan_raises(project: Path):

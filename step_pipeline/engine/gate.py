@@ -8762,8 +8762,26 @@ STATE_LABELS = {"running": "идёт", "stopped": "остановлен",
 APPROVAL_LABELS = {"approved": "утверждён", "changed": "изменён после утверждения",
                    "missing": "не утверждён"}
 CRON_JOB_NAME = "План: страж шага (конвейер)"
-NOT_DRIVEN_REASON = "план не в driven_plans — конвейер его не ведёт"
+# Причина строки плана в состоянии «не ведётся». Тот же текст — телом отказа адресному
+# тику (`not_driven_refusal`): номер плана ставит движок, поэтому ведущего слова «план»
+# в константе нет — иначе отказ «план 12 не в driven_plans …» перестал бы содержать её.
+NOT_DRIVEN_REASON = "не в driven_plans — конвейер его не ведёт"
 TICK_ACTION_TEXT = "устранить причину и запустить тик"
+
+
+def not_driven_refusal(cfg: config_mod.Config, plan_id: str) -> str:
+    """Текст отказа тику по адресу плана вне ведения — с командой включения.
+
+    Содержит `NOT_DRIVEN_REASON` дословно: тем же текстом панель подписывает строку
+    плана, поэтому движок и страница говорят об одном плане одинаково. Список в команде —
+    живой `driven_plans` проекта как есть плюс запрошенный номер в конце; значение
+    `hermes pipeline config --set` читает через `json.loads`, отсюда двойные кавычки
+    внутри одинарных. Собирается в одной функции: панель (S2 плана 14) берёт ту же строку.
+    """
+    want = registry.normalize(plan_id)
+    payload = json.dumps([*cfg.driven, want], ensure_ascii=False)
+    return (f"план {want} {NOT_DRIVEN_REASON}; включить: "
+            f"hermes pipeline config --set driven_plans '{payload}'")
 
 
 def _cron_command(cfg: config_mod.Config) -> str:
@@ -9369,7 +9387,7 @@ def incident(cfg: config_mod.Config, args: argparse.Namespace, exc: BaseExceptio
     plan_id = getattr(exc, "plan_id", None) or (args.plan or None)
     p: Paths | None = None
     try:
-        plan_id = plan_id or registry.default_plan_id(cfg)
+        plan_id = plan_id or registry.driven_default_id(cfg)
         p = resolve_paths(cfg, plan_id)
         plan_id = p.plan_id
     except Exception:  # noqa: BLE001 - путей нет: записывать некуда, причина остаётся в stderr
@@ -9551,6 +9569,25 @@ def main(argv: list[str] | None = None) -> int:
                          or not commands_enabled(cfg)) else 1
 
         try:
+            # Адресный тик слушается ведения (план 14, S1): номер вне `driven_plans` получает
+            # отказ до разрешения путей — без лока, состояния, карточек и стоп-флага. Порядок
+            # проверок: сначала существование плана (иначе опечатка получала бы совет
+            # «включить в driven_plans»), потом ведение. Команды владельца (`--stop`,
+            # `--resume`, `--answer`, `--hold`/`--unhold`) не ограничиваются (Допущение 3):
+            # смотреть состояние и снимать стоп конвейер не запрещает.
+            if (args.run and args.plan is not None
+                    and not (args.stop is not None or args.resume or args.answer
+                             or args.hold or args.unhold)):
+                want = registry.normalize(args.plan)
+                registry.get(cfg, want)      # неизвестный номер — прежний «план не найден»
+                if want not in registry.driven_ids(cfg):
+                    text = not_driven_refusal(cfg, want)
+                    if args.json:
+                        print(json.dumps({"ok": False, "error": text, "driven": False,
+                                          "plan_id": want}, ensure_ascii=False, indent=2))
+                    else:
+                        print(f"ошибка: {text}", file=sys.stderr)
+                    return 2
             p = resolve_paths(cfg, args.plan)
         except registry.PlanNotFound as exc:
             print(f"ошибка: {exc}", file=sys.stderr)
