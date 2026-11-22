@@ -42,15 +42,23 @@ kanban.default_assignee: <driver>
 skills.trusted_project_dirs: [<корень проекта>]   # иначе --skill не прелоадится
 ```
 
-Профили `prompter` и `reviewer` создаются клоном с `agent.reasoning_effort: max`
-(или `high`, если модель дорогая) и своими скиллами:
+Профили ролей — свои у каждого проекта: имя `<проект>-<роль>` (`doorsystem-prompter`).
+Общее имя вроде `prompter` нельзя брать на два проекта: замок
+`kanban.max_in_progress_per_profile: 1` держится на профиль, поэтому второй проект встаёт
+в очередь за первым (60–110 минут на постановку). Скиллы при этом не смешиваются и без
+разделения: роли приходят из `<проект>/.hermes/skills`, карточка несёт рабочее дерево.
+С 0.40.0 умолчание в `setup` считается от имени проекта, явно указанный чужой профиль
+`setup` не принимает (код 2 с рецептом), а `doctor` предупреждает о дележе.
 
 ```
-hermes profile create prompter --clone-from <driver> --description "Постановщик: контекст шага → промт"
-hermes profile create reviewer --clone-from <driver> --description "Ревьюер: независимая проверка шага"
-hermes -p prompter config set agent.reasoning_effort max
-hermes -p reviewer config set agent.reasoning_effort max
+hermes profile create <проект>-prompter --clone-from <driver> --description "Постановщик: контекст шага → промт"
+hermes profile create <проект>-reviewer --clone-from <driver> --description "Ревьюер: независимая проверка шага"
+hermes -p <проект>-prompter config set agent.reasoning_effort max
+hermes -p <проект>-reviewer config set agent.reasoning_effort max
 ```
+
+Доверие проекту новому профилю оформляет `hermes pipeline setup --project <корень> --upgrade`
+(без него воркер падает на старте); `init --trust-dir` для этого не нужен.
 
 Уровень рассуждений не переключают на ходу: он живёт в конфиге одноролевого профиля,
 а не в переменной сессии. Возврат к `high` «после роли» запрещён — упавший воркер
@@ -77,7 +85,7 @@ hermes -p reviewer config set agent.reasoning_effort max
 Постановка (ручной заказ, если нужно поторопить промптера):
 
 ```
-hermes kanban --board <борда> create "Промт: <план> <шаг>" --assignee prompter \
+hermes kanban --board <борда> create "Промт: <план> <шаг>" --assignee <проект>-prompter \
   --tenant plan --workspace "dir:<корень>" \
   --skill pipeline-prompter --skill agent-prompt-authoring --max-runtime 45m
 ```
