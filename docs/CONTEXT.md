@@ -550,7 +550,7 @@ hermes pipeline setup --project ПУТЬ --telegram-token ТОКЕН --telegram-
   тик из панели отработал по плану 6, которого в `driven_plans` нет, и завёл карточку
   `t_bf94837c`. Ведение обходили две ветки: `gate.resolve_paths` подставлял план по
   умолчанию, а `registry.default_plan_id` брал **наименьший номер среди всех** планов, а не
-  первый ведомый. Выпущено в `0.39.0`: `registry.driven_default_id` выбирает первый ведомый
+  первый ведомый. Выпущено в `0.40.0`: `registry.driven_default_id` выбирает первый ведомый
   план (пустое ведение — `PlanNotFound`); `gate.not_driven_refusal` и `gate.driven_command`
   отказывают адресному тику кодом 2 и печатают команду включения — одна строка на двух
   потребителей (отказ и подсказка строки плана); `snapshot.tick_refusal` и
