@@ -68,8 +68,8 @@ def test_setup_copies_engine_roles_and_config(tmp_path: Path, fake_hermes):
 
     cfg = json.loads((target / "pipeline.json").read_text(encoding="utf-8"))
     assert cfg["board"] == "shopboard"
-    assert cfg["profiles"] == {"driver": "shop", "prompter": "prompter",
-                               "reviewer": "reviewer", "scout": "scout",
+    assert cfg["profiles"] == {"driver": "shop", "prompter": "shop-prompter",
+                               "reviewer": "shop-reviewer", "scout": "shop-scout",
                                "keeper": ""}
     assert cfg["notify"]["enabled"] is False
     assert cfg["notify"]["token_env"] == setup_flow.TOKEN_ENV
@@ -448,7 +448,8 @@ def test_setup_trusts_all_role_profiles(tmp_path: Path, fake_hermes):
                                      no_trust=False))
     assert code == 0
     calls = _trust_calls(fake_hermes)
-    assert [call[1] for call in calls] == ["shop", "prompter", "reviewer", "scout"]
+    assert [call[1] for call in calls] == ["shop", "shop-prompter", "shop-reviewer",
+                                           "shop-scout"]
     for call in calls:
         assert call == ("-p", call[1], "skills", "trust", str(target.resolve()))
 
@@ -704,10 +705,10 @@ def test_setup_smoke_creates_card_for_each_role(tmp_path: Path, monkeypatch, cap
     creates = [call for call in calls if "--idempotency-key" in call]
     assert len(creates) == 3
     cfg = json.loads((target / "pipeline.json").read_text(encoding="utf-8"))
-    expected = {"shop": cfg["skills"]["step"], "prompter": cfg["skills"]["prompt"],
-                "reviewer": cfg["skills"]["review"]}
+    expected = {"shop": cfg["skills"]["step"], "shop-prompter": cfg["skills"]["prompt"],
+                "shop-reviewer": cfg["skills"]["review"]}
     roles = [call[call.index("--assignee") + 1] for call in creates]
-    assert roles == ["shop", "prompter", "reviewer"]
+    assert roles == ["shop", "shop-prompter", "shop-reviewer"]
     for call in creates:
         role = call[call.index("--assignee") + 1]
         assert call[call.index("--workspace") + 1] == f"dir:{Path(target).as_posix()}"
@@ -722,15 +723,15 @@ def test_setup_smoke_failure_prints_cause_and_repair(tmp_path: Path, monkeypatch
     target = tmp_path / "shop"
     target.mkdir()
     _smoke_env(monkeypatch, tmp_path,
-               {"shop": "done", "prompter": "blocked", "reviewer": "done"},
-               {"prompter": "Unknown skill(s): pipeline-prompter"})
+               {"shop": "done", "shop-prompter": "blocked", "shop-reviewer": "done"},
+               {"shop-prompter": "Unknown skill(s): pipeline-prompter"})
     code = setup_flow.run_setup(args(project=str(target), board="shopboard", driver="shop",
                                      no_profiles=False, no_cron=False, no_smoke=False))
     out = capsys.readouterr().out
     assert code == 3
     assert "смоук: 2 из 3" in out
     assert "Unknown skill(s): pipeline-prompter" in out
-    assert f'починка: hermes -p prompter skills trust "{target.resolve()}"' in out
+    assert f'починка: hermes -p shop-prompter skills trust "{target.resolve()}"' in out
 
 
 def test_setup_smoke_skipped_by_flag_or_without_profiles(tmp_path: Path,

@@ -344,6 +344,19 @@ def collect(project: Path, plan: str = "", *, with_lint: bool = True,
                         f'hermes -p {role} skills trust "{project}"')
     if not untrusted:
         notes.append(f"доверие: проект доверен всем ролям ({', '.join(roles)})")
+    # Один профиль — один проект: общий профиль роли держит шаги двух проектов в очереди
+    # (`max_in_progress_per_profile: 1`), поэтому дележ — предупреждение с именем соседа.
+    shared_profiles = setup_flow.role_profile_conflicts(
+        project, dict(cfg.get("profiles") or {}))
+    for role, profile, owner in shared_profiles:
+        report.warnings.append(
+            f"профиль {role} «{profile}» обслуживает ещё проект {owner} — шаги двух проектов "
+            f"встанут в очередь; свой профиль: {setup_flow.role_profile_default(project, role)}")
+    if not shared_profiles:
+        own = ", ".join(f"{role}={value}" for role, value in
+                        sorted((cfg.get("profiles") or {}).items())
+                        if role in setup_flow.ROLE_PROFILE_KEYS and value)
+        notes.append(f"профили ролей: у проекта свои ({own or 'не заданы'})")
     # Ключ должен быть сохранён в профиле: под демоном шлюза запись `env:*` выпадает
     # из ротации (`No usable credentials found for provider`), а в интерактивной
     # сессии та же запись работает — зелёная установка с мёртвым конвейером.

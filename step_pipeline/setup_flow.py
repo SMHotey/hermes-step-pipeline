@@ -1846,9 +1846,22 @@ def run_setup(args) -> int:
     profiles = existing.get("profiles") or {}
     driver = (getattr(args, "driver", "") or profiles.get("driver")
               or os.environ.get("HERMES_PROFILE") or "default")
-    prompter = getattr(args, "prompter", "") or profiles.get("prompter") or "prompter"
-    reviewer = getattr(args, "reviewer", "") or profiles.get("reviewer") or "reviewer"
-    scout = getattr(args, "scout", "") or profiles.get("scout") or SCOUT_ROLE_DEFAULT
+    prompter = (getattr(args, "prompter", "") or profiles.get("prompter")
+                or role_profile_default(project, "prompter"))
+    reviewer = (getattr(args, "reviewer", "") or profiles.get("reviewer")
+                or role_profile_default(project, "reviewer"))
+    scout = (getattr(args, "scout", "") or profiles.get("scout")
+             or role_profile_default(project, "scout"))
+    # Один профиль — один проект: общий `prompter` на два проекта держит их шаги
+    # в очереди (CONTEXT §8). Проверка до записи конфига, чтобы не оставить следов.
+    shared = role_profile_conflicts(project, {"prompter": prompter, "reviewer": reviewer,
+                                              "scout": scout})
+    for role, profile, owner in shared:
+        log.warn(f"профиль {role} «{profile}» уже обслуживает проект {owner}: роли не делятся — "
+                 f"свой профиль называется {role_profile_default(project, role)} "
+                 f"(--{role} {role_profile_default(project, role)})")
+    if shared:
+        return 2
     log.step("── Проект ──")
     log.ok(f"борда {board}, роли: {driver} (исполнитель), {prompter}, {reviewer}, "
            f"разведка {scout}")
@@ -1978,6 +1991,74 @@ def env_values(profile: str) -> dict[str, str]:
     return proj.read_env_file(env_path(profile))
 
 
+ROLE_PROFILE_KEYS = ("prompter", "reviewer", "scout")
+
+
+def role_profile_default(project: Path, role: str) -> str:
+    """Профиль роли по умолчанию — `<проект>-<роль>`, а не общее слово.
+
+    Общее имя (`prompter`, `reviewer`) на два проекта — это замок
+    `kanban.max_in_progress_per_profile: 1` на двоих: пока один проект пишет
+    постановку, второй стоит в очереди (CONTEXT §8). Поэтому умолчание считается
+    от имени проекта, а не берётся из воздуха.
+    """
+    return f"{proj.slug(Path(project).name)}-{role}"
+
+
+def registry_projects() -> list[tuple[str, Path]]:
+    """Проекты реестра панели: `(имя, корень)`. Битый или отсутствующий реестр — пусто.
+
+    Реестр читается напрямую: `proj` не умеет отдавать записи без отсева по
+    существованию каталога, а проверке дележа нужны все записи как есть.
+    """
+    path = proj.projects_file()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    items = raw.get("projects") if isinstance(raw, dict) else raw
+    out: list[tuple[str, Path]] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        root = item.get("root") or item.get("path")
+        if not root or not str(root).strip():
+            continue
+        root_path = Path(str(root)).expanduser().resolve()
+        name = str(item.get("name") or "").strip() or root_path.name
+        out.append((name, root_path))
+    return out
+
+
+def role_profile_conflicts(project: Path, profiles: dict[str, str]) -> list[tuple[str, str, str]]:
+    """`(роль, профиль, чужой проект)`: профиль роли уже обслуживает другой проект.
+
+    Роли-профили не делятся между проектами (CONTEXT §8, допущение 8 плана 17).
+    Общие роли (`pipeline-keeper`, `pipeline-orchestrator`, `pipeline-observer`)
+    живут вне `profiles` и сюда не попадают. Реестр панели — первый источник,
+    соседние каталоги — запасной: проект без записи в реестре тоже должен считаться.
+    """
+    here = Path(project).expanduser().resolve()
+    candidates = [(name, root) for name, root in registry_projects() if root != here]
+    if not candidates:
+        candidates = [(item.name, item.resolve()) for item in sorted(here.parent.glob("*/"))
+                      if item.is_dir() and item.resolve() != here
+                      and (item / proj.MARKER).is_file()]
+    out: list[tuple[str, str, str]] = []
+    for role in ROLE_PROFILE_KEYS:
+        profile = str(profiles.get(role) or "").strip()
+        if not profile:
+            continue
+        for name, root in candidates:
+            if not (root / proj.MARKER).is_file():
+                continue                    # в каталоге нет конвейера — делить нечего
+            theirs = (proj.read_config(root).get("profiles") or {}).get(role)
+            if str(theirs or "").strip() == profile:
+                out.append((role, profile, name))
+                break
+    return out
+
+
 def setup_defaults(project: Path) -> dict[str, str]:
     """Значения формы мастера по умолчанию: конфиг проекта важнее свежих догадок."""
     project = Path(project).expanduser().resolve()
@@ -1986,9 +2067,9 @@ def setup_defaults(project: Path) -> dict[str, str]:
     return {
         "board": existing.get("board") or proj.slug(project.name),
         "driver": profiles.get("driver") or os.environ.get("HERMES_PROFILE") or "default",
-        "prompter": profiles.get("prompter") or "prompter",
-        "reviewer": profiles.get("reviewer") or "reviewer",
-        "scout": profiles.get("scout") or SCOUT_ROLE_DEFAULT,
+        "prompter": profiles.get("prompter") or role_profile_default(project, "prompter"),
+        "reviewer": profiles.get("reviewer") or role_profile_default(project, "reviewer"),
+        "scout": profiles.get("scout") or role_profile_default(project, "scout"),
     }
 
 
@@ -2150,6 +2231,14 @@ def _perform_step(project: Path, step: str, cfg: dict[str, Any], given: dict[str
         prompter = str(profiles.get("prompter") or prompter)
         reviewer = str(profiles.get("reviewer") or reviewer)
         scout = str(profiles.get("scout") or scout)
+
+    shared = role_profile_conflicts(project, {"prompter": prompter, "reviewer": reviewer,
+                                              "scout": scout})
+    if shared and step in ("project", "profiles"):
+        role, profile, owner = shared[0]
+        log.warn(f"профиль {role} «{profile}» уже обслуживает проект {owner}: роли не делятся — "
+                 f"свой профиль называется {role_profile_default(project, role)}")
+        return False, f"профиль {role} «{profile}» уже обслуживает проект {owner}"
 
     if step == "project":
         # D8: только предмет шага. Уведомления не выключаем, борду не создаём,

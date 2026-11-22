@@ -207,8 +207,8 @@ def test_project_step_installs_engine_roles_and_config(stub, tmp_path: Path):  #
     assert (root / "docs" / "plans").is_dir()
     cfg = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
     assert cfg["board"] == "shop"
-    assert cfg["profiles"] == {"driver": "shop", "prompter": "prompter",
-                               "reviewer": "reviewer", "scout": "scout",
+    assert cfg["profiles"] == {"driver": "shop", "prompter": "shop-prompter",
+                               "reviewer": "shop-reviewer", "scout": "shop-scout",
                                "keeper": ""}
     assert cfg["notify"]["enabled"] is False
 
@@ -264,7 +264,8 @@ def test_profiles_and_cron_steps_call_existing_setup(stub, tmp_path: Path):   # 
 
     trust_calls = [call for call in stub.calls
                    if call[0] == "-p" and call[2:4] == ("skills", "trust")]
-    assert {call[1] for call in trust_calls} == {"shop", "prompter", "reviewer", "scout"}
+    assert {call[1] for call in trust_calls} == {"shop", "full-prompter", "full-reviewer",
+                                                "full-scout"}
     assert all(call[4] == str(root) for call in trust_calls)
 
     # Имена ролей — из конфига, а не из формы: иначе зелёный шаг с чужими именами
