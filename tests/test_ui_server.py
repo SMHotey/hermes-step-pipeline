@@ -28,6 +28,15 @@ import project  # noqa: E402
 import snapshot  # noqa: E402
 import ui_server  # noqa: E402
 
+# Терпение клиента к ответу панели, секунды. Сервер отвечает после двух-трёх запусков
+# движка подпроцессом (снимок, сводка реестра, проверки), а на загруженной машине один
+# запуск идёт секунды: 20 с хватало только на простаивающий хост, и прогон шага под
+# нагрузкой падал `TimeoutError` на `/api/checks`, `/api/projects` и `/api/events`
+# (прогоны 14-S2, F03). Это терпение теста, а не утверждение о поведении панели:
+# ожидание кончается сразу, как только пришёл ответ, а таймаут остаётся границей
+# «сервер не ответил вовсе».
+REQUEST_TIMEOUT = 120.0
+
 
 @pytest.fixture(autouse=True)
 def clean_cache():
@@ -50,13 +59,14 @@ def server(tmp_path: Path, hermes_stub: Path):
         yield {"url": url, "root": root, "db": hermes_stub, "httpd": httpd,
                "state": httpd.RequestHandlerClass.state}
     finally:
-        httpd.shutdown()
-        httpd.server_close()
+        # `close_server` ставит флаг жизни: поток событий этого сервера не переживает
+        # тест и не запускает движок в счётчиках соседних (F03 прогонов 14-S2).
+        ui_server.close_server(httpd)
 
 
 def get(url: str) -> tuple[int, dict]:
     try:
-        with urllib.request.urlopen(url, timeout=20) as response:
+        with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
@@ -69,7 +79,7 @@ def post(url: str, payload: dict, headers: dict | None = None) -> tuple[int, dic
                                      headers={"Content-Type": "application/json",
                                               **(headers or {})})
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
@@ -97,13 +107,13 @@ def get_raw(url: str, headers: dict | None = None) -> tuple[int, dict, bytes]:
     """GET с заголовками: 304 приходит HTTPError'ом с пустым телом. Заголовки — в нижнем регистре."""
     request = urllib.request.Request(url, headers=headers or {})
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read()
 
 
-def open_events(url: str, timeout: float = 30.0) -> dict:
+def open_events(url: str, timeout: float = REQUEST_TIMEOUT) -> dict:
     """Открыть поток событий в потоке-демоне и копить разобранные кадры (строки `data:`).
 
     Тайм-аут сокета длинный: сервер молчит между кадрами (пинг раз в 10 с), а терпение
@@ -1042,7 +1052,9 @@ def test_snapshot_carries_ui_version(server):
 def test_events_frame_carries_ui_version(server):
     """SSE-кадр собирается тем же путём: иначе версия «?» на живой панели."""
     url = server["url"] + "/api/events"
-    with urllib.request.urlopen(url, timeout=10) as res:
+    # Первый кадр — полная сборка снимка (движок подпроцессом), поэтому терпение то же,
+    # что у обычного запроса: 10 с хватало только на простаивающий хост (F03 прогонов 14-S2).
+    with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as res:
         buf: list[str] = []
         while len(buf) < 200:
             line = res.readline().decode("utf-8", "replace")
@@ -1360,8 +1372,7 @@ def running(root: Path, **kwargs):
         try:
             yield f"http://127.0.0.1:{httpd.server_address[1]}", httpd
         finally:
-            httpd.shutdown()
-            httpd.server_close()
+            ui_server.close_server(httpd)
 
     return manager()
 

@@ -91,7 +91,9 @@ def test_preview_ui_blocks_actions(tmp_path: Path):
         payload = json.loads(body.decode("utf-8"))
         assert payload["ok"] is False
         assert "предпросмотр" in payload["error"]
-        with urlopen(f"{url}/api/snapshot", timeout=20) as response:
+        # Снимок в предпросмотре тоже запускает движок подпроцессом: 20 с хватало только
+        # на простаивающий хост, под нагрузкой запрос падал TimeoutError (F03 прогонов 14-S2).
+        with urlopen(f"{url}/api/snapshot", timeout=120) as response:
             data = json.loads(response.read().decode("utf-8"))
         assert data["preview"] is True
     finally:

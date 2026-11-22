@@ -1907,8 +1907,8 @@ class Handler(BaseHTTPRequestHandler):
         """Строки планов проекта для панели: одна точка формы строки (план 6 S2).
 
         Источник — движок (`gate.py --plans`): в обычном режиме через кэш
-        `panel_pause.plans` (`PLANS_TTL` 5 с), поэтому за один запрос страницы движок
-        поднимается не больше раза на проект. Предпросмотр берёт движок плагина
+        `panel_pause.plans` (отпечаток источников плюс `PLANS_TTL`), поэтому за один
+        запрос страницы движок поднимается не больше раза на проект. Предпросмотр берёт движок плагина
         (`proj.ENGINE_SRC`) и кэш не трогает: чужой проект не должен задерживаться в
         памяти панели. Строки кэша не мутируются — каждая строка панели новая копия,
         иначе дописанные поля копились бы в общем кэше паузы.
@@ -2322,8 +2322,17 @@ class Handler(BaseHTTPRequestHandler):
             self._event_frame(body)
             self._deliver_frame(state, body)
             started = last_ping = time.monotonic()
+            closing = getattr(self.server, "closing", None)
             while time.monotonic() - started < EVENTS_MAX_SECONDS:
-                time.sleep(EVENTS_POLL)
+                # Закрытый сервер не держит поток: `close_server` ставит флаг, и ожидание
+                # выходит сразу. Без флага поток доживал свои EVENTS_MAX_SECONDS после остановки
+                # сервера и пересобирал снимок по чужому изменению файлов — запуски движка
+                # попадали в счётчики соседних тестов (F03 прогонов 14-S2).
+                if closing is not None:
+                    if closing.wait(EVENTS_POLL):
+                        break
+                else:
+                    time.sleep(EVENTS_POLL)
                 now = time.monotonic()
                 current = snap.fingerprint(state.project, plan, state.preview,
                                            state.board)
@@ -3074,7 +3083,24 @@ def make_server(project: Path, host: str = "127.0.0.1", port: int = 8770,
                     "_extra_projects": list(extra_projects or [])})
     server = ThreadingHTTPServer((host, port), handler)
     setattr(server, "state", state)   # состояние первого проекта — для фоновых сторожей
+    # Флаг жизни сервера: длинные обработчики (поток событий) ждут его внутри цикла и
+    # выходят сразу после `close_server`, а не доживают свой срок.
+    setattr(server, "closing", threading.Event())
     return server
+
+
+def close_server(server) -> None:
+    """Остановить сервер целиком: флаг для фоновых обработчиков, затем сокет.
+
+    `shutdown()` перестаёт принимать соединения, но уже начатый поток событий живёт
+    свои EVENTS_MAX_SECONDS и может пересобирать снимок — то есть запускать движок уже
+    после того, как сервер закрыли (F03 прогонов 14-S2). Поэтому сначала флаг.
+    """
+    closing = getattr(server, "closing", None)
+    if closing is not None:
+        closing.set()
+    server.shutdown()
+    server.server_close()
 
 
 def serve(project: Path, host: str = "127.0.0.1", port: int = 8770,
