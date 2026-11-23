@@ -636,6 +636,25 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
         log.ok(f"движок и роли уже актуальны ({now})")
     quarantine_stale_plugins(log)
     cfg = proj.read_config(project)
+    # Паузы работы не сбрасываются обновлением движка (владелец 23.11.2026): своё значение
+    # остаётся как есть, а проект без окон получает ТЕКУЩИЕ значения владельца из реестра —
+    # иначе после смены шаблона плагина проект молча терял бы паузы.
+    quiet = cfg.get("quiet_hours")
+    if isinstance(quiet, dict) and quiet.get("windows"):
+        windows = ", ".join(f"{w.get('from')}–{w.get('to')}" for w in quiet["windows"]
+                            if isinstance(w, dict))
+        state = "включены" if quiet.get("enabled") else "выключены"
+        log.ok(f"паузы работы сохранены как есть: {state} ({windows})")
+    else:
+        inherited = proj.registry_pause()
+        if inherited:
+            cfg["quiet_hours"] = inherited
+            proj.write_config(project, cfg)
+            windows = ", ".join(f"{w['from']}–{w['to']}" for w in inherited["windows"])
+            log.ok(f"паузы работы выставлены по текущим значениям владельца: "
+                   f"{'включены' if inherited.get('enabled') else 'выключены'} ({windows})")
+        else:
+            log.ok("паузы работы не заданы ни в проекте, ни в реестре — не трогаю")
     # Однократное заполнение списка legacy-планов — единственная запись конфига в этом
     # обновлении: иначе проект, поставленный до этой версии, навсегда остался бы без Л23.
     ensure_plans_legacy(project, log)
@@ -665,8 +684,8 @@ def upgrade(project: Path, log: Log, *, trust: bool = True) -> int:
         log.warn("доверие проекту не оформлялось (--no-trust)")
         tail = "доверие ролям пропущено (--no-trust)"
     log.step(f"── Движок: {was} → {now}, роли: {len(roles.refreshed)} обновлено. "
-             f"Конфиг не тронут, кроме однократного заполнения plans.legacy; "
-             f"telegram не тронут; {tick}; {tail} ──")
+             f"Конфиг не тронут, кроме однократного заполнения plans.legacy и пауз работы "
+             f"из реестра; telegram не тронут; {tick}; {tail} ──")
     return 0
 
 
@@ -793,6 +812,15 @@ def build_config(project: Path, board: str, driver: str, prompter: str, reviewer
     for key, value in (previous.items() if isinstance(previous, dict) else ()):
         profiles.setdefault(key, value)
     cfg["profiles"] = profiles
+    # Паузы работы (23.11.2026): проект без своих окон получает ТЕКУЩИЕ значения владельца
+    # из реестра, а не умолчание шаблона. Своё значение не переписывается никогда — ни при
+    # установке, ни при обновлении движка; `enabled: false` с непустыми окнами — осознанное
+    # «паузы выключены», его тоже не трогаем.
+    quiet = cfg.get("quiet_hours")
+    if not isinstance(quiet, dict) or not quiet.get("windows"):
+        inherited = proj.registry_pause()
+        if inherited:
+            cfg["quiet_hours"] = inherited
     notify = dict(cfg.get("notify") or {})
     notify.update({"token_env": TOKEN_ENV, "chat_env": CHAT_ENV,
                "owner_env": OWNER_ENV, "dialog": {"enabled": True}})
