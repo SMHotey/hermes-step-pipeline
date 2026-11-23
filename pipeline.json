@@ -6,7 +6,7 @@
   "max_fix_rounds_high": 6,
   "max_actions": 2,
   "step_runs": {
-    "budget": 3600,
+    "budget": 4500,
     "timeout": 240
   },
   "max_plan_growth": {
