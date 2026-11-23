@@ -5,6 +5,10 @@
   "max_fix_rounds": 3,
   "max_fix_rounds_high": 6,
   "max_actions": 2,
+  "step_runs": {
+    "budget": 3600,
+    "timeout": 240
+  },
   "max_plan_growth": {
     "percent": 10,
     "chars_per_finding": 400,
@@ -93,7 +97,8 @@
     "enabled": true,
     "token_env": "STEP_PIPELINE_TELEGRAM_BOT_TOKEN",
     "chat_env": "STEP_PIPELINE_TELEGRAM_CHAT_ID",
-    "prefix": ""
+    "prefix": "",
+    "answer_timeout": 3600
   },
   "quiet_hours": {
     "enabled": true,
