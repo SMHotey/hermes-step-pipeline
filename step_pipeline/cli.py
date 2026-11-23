@@ -86,6 +86,11 @@ def build_parser(sp: argparse.ArgumentParser) -> None:
     keeper.add_argument("--json", action="store_true", help="машинный вывод")
     keeper.set_defaults(handler=cmd_keeper)
 
+    watchdog = sub.add_parser(
+        "watchdog", help="сторож: один проход по всем конвейерам реестра (тик + починки)")
+    watchdog.add_argument("--json", action="store_true", help="машинный вывод")
+    watchdog.set_defaults(handler=cmd_watchdog)
+
     ui = sub.add_parser("ui", help="локальный UI с визуализацией конвейера")
     ui.add_argument("--project", default="")
     ui.add_argument("--port", type=int, default=0)
@@ -261,6 +266,26 @@ def cmd_run(args) -> int:
     if res.returncode != 0:
         print((res.stderr or "").strip(), file=sys.stderr)
     return res.returncode
+
+
+def cmd_watchdog(args) -> int:
+    """Один проход сторожа по всем конвейерам реестра: тик, починки, отчёт.
+
+    Живёт в плагине, а не в профиле: один и тот же код запускают крон (`--script` на
+    `step_pipeline/watchdog.py`) и человек из CLI. `--json` печатает состояние без эмодзи,
+    чтобы его можно было разбирать машинно.
+    """
+    from . import watchdog as wd
+
+    if getattr(args, "json", False):
+        import json as _json
+
+        pairs = []
+        for name, path in wd.projects():
+            pairs.append({"project": name, "root": path})
+        print(_json.dumps({"projects": pairs}, ensure_ascii=False))
+        return 0
+    return wd.main()
 
 
 def cmd_keeper(args) -> int:
