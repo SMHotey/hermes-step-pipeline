@@ -135,6 +135,51 @@ def read_projects(path: Path | str | None = None) -> list[dict[str, Any]]:
             for _index, _item, project_id, root, name in _displayed_entries(raw)]
 
 
+def registry_pause(path: Path | str | None = None) -> dict[str, Any] | None:
+    """Общие паузы работы по расписанию из реестра проектов (`pause` верхнего уровня).
+
+    Зачем: установка и обновление движка пишут `pipeline.json` из шаблона плагина, а в
+    шаблоне пауз нет (`enabled: false`, окон ноль). Владелец 23.11.2026: паузы не должны
+    сбрасываться к умолчаниям плагина — проект, у которого своих окон ещё нет, обязан
+    получить ТЕКУЩИЕ значения владельца. Источник — одна запись на все проекты:
+    `{"pause": {"enabled": bool, "windows": [{"from": "HH:MM", "to": "HH:MM"}, ...]}}`.
+
+    Возвращает нормализованный словарь или `None`, если записи нет или она битая: пустой
+    ответ означает «наследовать нечего», и шаблон плагина остаётся в силе.
+    """
+    try:
+        source = Path(path).expanduser() if path is not None else projects_file()
+        data = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    block = data.get("pause")
+    if not isinstance(block, dict):
+        return None
+    raw = block.get("windows")
+    windows: list[dict[str, str]] = []
+    for item in raw if isinstance(raw, list) else ():
+        if not isinstance(item, dict):
+            continue
+        start = str(item.get("from") or "").strip()
+        end = str(item.get("to") or "").strip()
+        if not _is_hhmm(start) or not _is_hhmm(end) or start == end:
+            continue
+        windows.append({"from": start, "to": end})
+    if not windows:
+        return None
+    return {"enabled": bool(block.get("enabled", True)), "windows": windows[:2]}
+
+
+def _is_hhmm(value: str) -> bool:
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", value or "")
+    if not match:
+        return False
+    hours, minutes = int(match.group(1)), int(match.group(2))
+    return 0 <= hours <= 23 and 0 <= minutes <= 59
+
+
 def _read_registry_raw(path: Path | str | None = None) -> tuple[dict[str, Any] | None, list]:
     """Сырой реестр: контейнер (`None` — форма-список) и список записей.
 
