@@ -33,17 +33,27 @@ import time
 from pathlib import Path
 
 
-def _hermes_home() -> Path:
+def _root_home() -> Path:
+    """Корень установки Hermes, а не профиль: отчёт сторожа принадлежит установке.
+
+    В кроне `HERMES_HOME` привязан к профилю (`<корень>/profiles/<имя>`); писать отчёт туда
+    значит снова привязать сторожа к профилю — ровно то, от чего уходим. Поэтому профильный
+    путь схлопывается до корня, а сам корень берётся из `HERMES_HOME` (если он не профиль),
+    иначе — из `LOCALAPPDATA`/`~/.hermes`.
+    """
     env = os.environ.get("HERMES_HOME")
     if env:
-        return Path(env)
+        path = Path(env)
+        if path.parent.name == "profiles":
+            return path.parent.parent
+        return path
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
         return Path(base) / "hermes"
     return Path.home() / ".hermes"
 
 
-HERMES_HOME = _hermes_home()
+HERMES_HOME = _root_home()
 HERMES = HERMES_HOME / "hermes-agent" / "venv" / "Scripts" / "hermes.exe"
 if not HERMES.exists():
     _found = shutil.which("hermes")
@@ -66,6 +76,11 @@ def projects() -> list[tuple[str, str]]:
     сторож его видит, ничего не ставя в самом проекте.
     """
     path = Path(os.environ.get("PIPELINE_PROJECTS_FILE") or (HERMES_HOME / "projects.json"))
+    if not path.exists():
+        # Проект мог положить реестр в свой профиль — читаем его, но корень в приоритете.
+        fallback = Path(os.environ.get("HERMES_HOME") or "") / "projects.json"
+        if fallback.exists():
+            path = fallback
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

@@ -65,3 +65,18 @@ def test_report_paths_do_not_belong_to_profile() -> None:
     assert "profiles" not in wd.REPORT.parts
     assert wd.LOG.name == "pipeline_watchdog.log"
     assert wd.REPORT.name == "pipeline_status.md"
+
+
+def test_root_home_collapses_profile(monkeypatch, tmp_path: Path) -> None:
+    """В кроне `HERMES_HOME` — это профиль; отчёт всё равно уходит в корень установки."""
+    root = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "pipeline"))
+
+    assert wd._root_home() == root.resolve()
+
+
+def test_root_home_keeps_plain_home(monkeypatch, tmp_path: Path) -> None:
+    plain = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(plain))
+
+    assert wd._root_home() == plain
