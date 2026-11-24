@@ -400,13 +400,17 @@ def read_rows(path) -> list[dict]:
     return rows
 
 
-def _card_runs(db, card_id: str) -> list[dict]:
+def card_runs(db, card_id: str) -> list[dict]:
     """Прогоны карточки из `task_runs`; колонки — только те, что есть в борде.
 
     Состав колонок в бордах разных версий разный (`profile`, `error`,
     `max_runtime_seconds` появились позже), поэтому список читается через
     `PRAGMA table_info`, как в `snapshot._card_runs`. Нет таблицы или базы — пустой
     список: метрика не имеет права валить тик.
+
+    Имя публичное с 17-S3: тем же разбором пользуется снимок убитой попытки
+    (`gate.collect_kill_snapshot`) — окно событий лога должно считаться одним кодом,
+    иначе метрика и снимок показывали бы разные инструменты.
     """
     path = Path(db)
     if not path.is_file():
@@ -452,7 +456,7 @@ def record(cfg, kanban_db, plan_id, step_id, cards, now=None) -> int:
         card_id = str(card.get("id") or "")
         if not card_id:
             continue
-        runs = _card_runs(kanban_db, card_id)
+        runs = card_runs(kanban_db, card_id)
         for attempt, run in enumerate(runs, start=1):
             run_id = str(run.get("id") or "")
             if not run_id or run_id in known:

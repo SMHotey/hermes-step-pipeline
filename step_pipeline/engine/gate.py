@@ -2864,12 +2864,299 @@ def method_rule_lines(p: Paths, step: dict) -> list[str]:
         return []
 
 
+# ───────────────── снимок убитой по лимиту попытки (план 17, S3) ─────────────────
+
+#: Файл снимков проекта: ключ — `<план>:<шаг>`, значение — запись `collect_kill_snapshot`.
+KILL_SNAPSHOT_NAME = "kill_snapshot.json"
+#: Сколько секунд даётся `git status` и `git diff --stat`. Дольше — снимок собирается по
+#: списку «Файл:» шага: обход большого дерева не должен тратить время шага.
+KILL_SNAPSHOT_GIT_TIMEOUT = 10
+#: Сколько путей печатать в одном списке снимка; остальные — строкой «ещё N файлов».
+KILL_SNAPSHOT_PATHS = 20
+#: Сколько последних инструментов попытки попадает в снимок.
+KILL_SNAPSHOT_TOOLS = 3
+
+
+def kill_snapshot_path(cfg) -> Path:
+    """Файл снимков проекта — рядом с метрикой попыток и историей тиков."""
+    return Path(cfg.state_dir) / KILL_SNAPSHOT_NAME
+
+
+def load_kill_snapshots(p: Paths) -> dict:
+    """Снимки плана; файла нет или он битый — пустой словарь, а не исключение."""
+    try:
+        data = json.loads(Path(kill_snapshot_path(p.cfg)).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_kill_snapshot(p: Paths, entry: dict) -> None:
+    """Положить снимок шага в файл по ключу `<план>:<шаг>` (новая запись заменяет старую)."""
+    if not isinstance(entry, dict) or not str(entry.get("step") or ""):
+        return
+    data = load_kill_snapshots(p)
+    data[f"{p.plan_id}:{entry['step']}"] = entry
+    state_io.save_json(Path(kill_snapshot_path(p.cfg)), data)
+
+
+def kill_snapshot_entry(p: Paths, step_id: str) -> dict | None:
+    """Снимок шага плана: запись или `None` (ключа нет или там не словарь)."""
+    entry = load_kill_snapshots(p).get(f"{p.plan_id}:{str(step_id or '')}")
+    return entry if isinstance(entry, dict) else None
+
+
+def _kill_path_of(raw: str) -> str:
+    """Путь из строки `git status --porcelain`: переименование даёт новый путь, кавычки сняты."""
+    path = str(raw or "").strip()
+    if " -> " in path:
+        path = path.rsplit(" -> ", 1)[-1].strip()
+    if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+        path = path[1:-1]
+    return path
+
+
+def _kill_snapshot_git(p: Paths) -> dict | None:
+    """`changed`/`created`/`stat` по рабочему дереву; `None` — git не ответил (Д5).
+
+    `core.quotepath=off` — чтобы путь с не-ASCII не приходил escape-последовательностью:
+    снимок читает человек и следующая модель, а не только git.
+    """
+    base = ["git", "-c", "core.quotepath=off"]
+    try:
+        status = _run(base + ["status", "--porcelain"], Path(p.repo),
+                      timeout=KILL_SNAPSHOT_GIT_TIMEOUT)
+        stat = _run(base + ["diff", "--stat"], Path(p.repo),
+                    timeout=KILL_SNAPSHOT_GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if status.returncode != 0:
+        return None
+    changed: list[str] = []
+    created: list[str] = []
+    for line in (status.stdout or "").splitlines():
+        if len(line) < 4:
+            continue
+        code = line[:2]
+        path = _kill_path_of(line[3:])
+        if not path:
+            continue
+        (created if code == "??" else changed).append(path)
+    stat_lines = ([ln.strip() for ln in (stat.stdout or "").splitlines() if ln.strip()]
+                  if stat.returncode == 0 else [])
+    return {"changed": changed, "created": created, "stat": "\n".join(stat_lines[:5])}
+
+
+def _kill_snapshot_window(p: Paths, card: dict, row: dict) -> tuple[float, float]:
+    """Окно событий лога для снимка — по тому же правилу, что окно метрики (Д4).
+
+    Сначала запись прогона (по `run_id` строки метрики) с допуском `WINDOW_PAD`; нет
+    записи — нижняя граница по метке старта карточки, верхняя по метке строки; нет и
+    меток — весь лог. Одна попытка не должна показывать инструменты соседней.
+    """
+    run: dict = {}
+    run_id = str(row.get("run_id") or "")
+    if run_id:
+        card_id = str(card.get("id") or row.get("card") or "")
+        for item in step_metrics.card_runs(p.kanban_db, card_id):
+            if str(item.get("id") or "") == run_id:
+                run = item
+                break
+    started = _as_int(run.get("started_at"), 0)
+    ended = _as_int(run.get("ended_at"), 0)
+    if started:
+        high = (float(ended) + step_metrics.WINDOW_PAD) if ended else float("inf")
+        return float(started) - step_metrics.WINDOW_PAD, high
+    low, high = float("-inf"), float("inf")
+    card_start = _as_int(card.get("started_at"), 0)
+    if card_start:
+        low = float(card_start)
+    stamp = _as_float(row.get("ts"), 0.0)
+    if stamp:
+        high = stamp
+    return low, high
+
+
+def collect_kill_snapshot(p: Paths, card: dict, row: dict, step: dict | None = None) -> dict:
+    """Снимок убитой по лимиту попытки: файлы, метрика, последние инструменты (Д1).
+
+    Источник файлов — рабочее дерево проекта. `git status` дольше
+    `KILL_SNAPSHOT_GIT_TIMEOUT` секунд, git не ответил или вернул ненулевой код — снимок
+    собирается по списку «Файл:» шага (стоп-сигнал шага: большое дерево не обходим).
+    Снимок не заменяет коммит: правки остаются в дереве, а запись говорит следующей
+    попытке, что именно уже лежит на диске.
+    """
+    card = card if isinstance(card, dict) else {}
+    row = row if isinstance(row, dict) else {}
+    step = step if isinstance(step, dict) else {}
+    git_part = _kill_snapshot_git(p)
+    if git_part is None:
+        git_part = {"changed": [str(item) for item in (step.get("files") or []) if str(item)],
+                    "created": [], "stat": ""}
+        source = "step_files"
+    else:
+        source = "git"
+    role = str(row.get("role") or card.get("assignee") or "")
+    low, high = _kill_snapshot_window(p, card, row)
+    log_path = step_metrics.agent_log(role)
+    try:
+        text = (Path(log_path).read_text(encoding="utf-8", errors="replace")
+                if log_path else "")
+    except OSError:
+        text = ""
+    tools = [event for event in step_metrics.parse_events(text)
+             if event.get("kind") == "tool"
+             and low <= _as_float(event.get("ts"), 0.0) <= high]
+    recent = [{"name": str(item.get("name") or ""),
+               "ms": _as_int(item.get("ms"), 0),
+               "timeout": bool(item.get("timeout"))}
+              for item in tools[-KILL_SNAPSHOT_TOOLS:]]
+    stamp = _as_float(row.get("ts"), 0.0) or time.time()
+    return {
+        "plan": str(p.plan_id),
+        "step": str(step.get("id") or row.get("step") or ""),
+        "card": str(card.get("id") or row.get("card") or ""),
+        "run_id": str(row.get("run_id") or ""),
+        "attempt": _as_int(row.get("attempt"), 0),
+        "ts": stamp,
+        "at": str(row.get("at") or "") or time.strftime("%d.%m.%Y %H:%M:%S",
+                                                        time.localtime(stamp)),
+        "source": source,
+        "changed": list(git_part["changed"]),
+        "created": list(git_part["created"]),
+        "stat": str(git_part.get("stat") or ""),
+        "tools": recent,
+        # Строка метрики целиком — контракт S4: решение о повторе сравнивает условия
+        # двух попыток, и снимок обязан нести те же числа.
+        "metrics": dict(row),
+        "commented": False,
+        "comment_at": "",
+    }
+
+
+def _kill_duration(ms) -> str:
+    """Длительность по-русски: до минуты секунды, до часа минуты, дальше `ч` и `мин`."""
+    seconds = max(0.0, _as_float(ms, 0.0) / 1000.0)
+    if seconds < 60:
+        return f"{seconds:.1f}".replace(".", ",") + " с"
+    total = int(round(seconds / 60.0))
+    if total < 60:
+        return f"{seconds / 60.0:.1f}".replace(".", ",") + " мин"
+    hours, minutes = divmod(total, 60)
+    return f"{hours} ч {minutes} мин"
+
+
+def _kill_path_lines(title: str, items: list[str]) -> list[str]:
+    """Строки списка путей: первый — с подписью, дальше с отступом; хвост — счётчиком."""
+    shown = items[:KILL_SNAPSHOT_PATHS]
+    lines = [f"- {title}: {path}" if index == 0 else f"  {path}"
+             for index, path in enumerate(shown)]
+    if len(items) > KILL_SNAPSHOT_PATHS:
+        lines.append(f"  ещё {len(items) - KILL_SNAPSHOT_PATHS} файлов не показаны")
+    return lines
+
+
+def kill_snapshot_text(entry: dict) -> str:
+    """Блок «Продолжай с этого»: что на диске, чем занята была попытка; `""` — нет записи.
+
+    Битым считается не словарь, запись без номера шага, с неизвестным источником или с
+    не-списками файлов: в тело карточки и в комментарий такая запись не попадает вовсе
+    (Д6) — лучше пустой блок, чем половина снимка, по которой начнут «продолжать».
+    """
+    if not isinstance(entry, dict):
+        return ""
+    if not str(entry.get("step") or ""):
+        return ""
+    if entry.get("source") not in ("git", "step_files"):
+        return ""
+    if not isinstance(entry.get("changed"), list) or not isinstance(entry.get("created"), list):
+        return ""
+    metrics = entry.get("metrics") if isinstance(entry.get("metrics"), dict) else {}
+    limit = _as_int(metrics.get("limit_s"), 0)
+    killed = f"попытка убита по лимиту {limit} с" if limit else "попытка убита по лимиту"
+    lines = [f"Продолжай с этого ({killed}, снимок {entry.get('at') or '—'}):"]
+    changed = [str(item) for item in entry.get("changed") or [] if str(item)]
+    created = [str(item) for item in entry.get("created") or [] if str(item)]
+    if entry.get("source") == "step_files":
+        lines.append(f"- git не ответил за {KILL_SNAPSHOT_GIT_TIMEOUT} с: файлы шага "
+                     "по списку «Файл:»")
+        lines += [f"  {path}" for path in changed[:KILL_SNAPSHOT_PATHS]]
+        if len(changed) > KILL_SNAPSHOT_PATHS:
+            lines.append(f"  ещё {len(changed) - KILL_SNAPSHOT_PATHS} файлов не показаны")
+    elif not changed and not created:
+        lines.append("- файлов нет: git не показал ни изменённых, ни новых файлов")
+    else:
+        if changed:
+            lines += _kill_path_lines("изменено", changed)
+        if created:
+            lines += _kill_path_lines("создано (git не отслеживает)", created)
+    stat_lines = [ln.strip() for ln in str(entry.get("stat") or "").splitlines() if ln.strip()]
+    if stat_lines:
+        lines.append(f"- diff: {stat_lines[0]}")
+        lines += [f"  {line}" for line in stat_lines[1:]]
+    if metrics:
+        lines.append(
+            "- метрика попытки: вызовов модели {calls}, модель {model}, инструменты {tools},"
+            " таймаутов {timeouts}, стена {wall}".format(
+                calls=_as_int(metrics.get("calls"), 0),
+                model=_kill_duration(metrics.get("model_ms")),
+                tools=_kill_duration(metrics.get("tools_total_ms")),
+                timeouts=_as_int(metrics.get("tool_timeouts"), 0),
+                wall=_kill_duration(metrics.get("wall_ms"))))
+    else:
+        lines.append("- метрика попытки: строки метрики нет")
+    tools = [item for item in (entry.get("tools") or []) if isinstance(item, dict)]
+    if tools:
+        lines.append("- последние инструменты: " + ", ".join(
+            f"{item.get('name') or '—'} {_kill_duration(item.get('ms'))}"
+            for item in tools))
+    else:
+        lines.append("- последние инструменты: событий инструментов в логе нет")
+    lines += [
+        "- что делать: эти файлы уже на диске — прочитай их и продолжай с этого места,"
+        " а не начинай заново;",
+        "  снимок не заменяет коммит и не отменяет правок исполнителя.",
+    ]
+    return "\n".join(lines)
+
+
+def kill_snapshot_comment(entry: dict) -> str:
+    """Текст комментария в карточку: адрес попытки в заголовке плюс сам блок снимка."""
+    text = kill_snapshot_text(entry)
+    if not text:
+        return ""
+    metrics = entry.get("metrics") if isinstance(entry.get("metrics"), dict) else {}
+    limit = _as_int(metrics.get("limit_s"), 0)
+    return (f"СНИМОК УБИТОЙ ПОПЫТКИ — шаг {entry.get('step') or '—'},"
+            f" карточка {entry.get('card') or '—'}, прогон {entry.get('run_id') or '—'},"
+            f" лимит {limit or '—'} с."
+            f"\n\n{text}")
+
+
+def continuation_block_lines(p: Paths, step: dict) -> list[str]:
+    """Блок «Продолжай с этого» для тела карточки шага (17-S3).
+
+    Печатается, только если снимок есть и шаг ещё не закрыт в журнале: после закрытия
+    запись — история, а не инструкция. Битый снимок карточку не отменяет: шаг важнее.
+    """
+    try:
+        step_id = str(step.get("id") or "")
+        if not step_id or journal_closed(p, step_id):
+            return []
+        text = kill_snapshot_text(kill_snapshot_entry(p, step_id) or {})
+        return [*text.splitlines(), ""] if text else []
+    except Exception as exc:  # noqa: BLE001 - тело карточки не имеет права падать
+        config_mod.debug_note("kill_snapshot_body", exc)
+        return []
+
+
 def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
     plan_id = p.plan_id
     plan_rel = p.cfg.rel(Path(p.plan_file))
     lines = [f"ШАГ ПЛАНА {plan_id} {step['id']} — {step['title']}", ""]
     if prompt:
         lines += [f"ПОСТАНОВКА (прочитать ПЕРВОЙ, до кода): `{prompt}`", ""]
+    lines += continuation_block_lines(p, step)      # ← 17-S3: продолжение с места убийства
     lines += [f"Цель: {step.get('goal', '')}", "", "Файлы (править/создавать):"]
     lines += [f"- {f}" for f in step.get("files") or []]
     lines += ["", "Гейты (запустить и показать фактический результат):"]
@@ -6587,6 +6874,81 @@ def report_stalls(p: Paths, ctx: dict) -> int:
     return sent
 
 
+def _killed_metric_row(p: Paths, step_id: str, card_ids: set[str]) -> dict:
+    """Последняя строка метрики «убит по лимиту» по карточкам шага; `{}` — такой нет (Д1)."""
+    rows = [row for row in step_metrics.read_rows(step_metrics.metrics_path(p.cfg))
+            if isinstance(row, dict)
+            and str(row.get("plan") or "") == str(p.plan_id)
+            and str(row.get("step") or "") == step_id
+            and str(row.get("killed_by") or "") == "runtime"
+            and str(row.get("card") or "") in card_ids]
+    return max(rows, key=lambda item: _as_float(item.get("ts"), 0.0)) if rows else {}
+
+
+def _killed_card_by_error(cards: list[dict]) -> dict | None:
+    """Запасной путь Д2: прогонов в борде нет — лимит берётся из ошибки самой карточки.
+
+    Тем же шаблоном, что и метрика (`step_metrics.LIMIT_TEXT_RE`): два разбора одной
+    строки лимита разошлись бы, и снимок не появился бы там, где метрика его видит.
+    """
+    for card in cards:
+        text = " ".join(str(card.get(name) or "")
+                        for name in ("error", "result", "summary"))
+        if step_metrics.LIMIT_TEXT_RE.search(text):
+            return card
+    return None
+
+
+def kill_snapshot_hook(p: Paths, ctx: dict, say=None) -> dict | None:
+    """Снимок убитой по лимиту попытки: файл состояния и комментарий в карточку (Д3).
+
+    Тик не останавливается и вердикт не меняет: снимок нужен следующей попытке, а не
+    решению стража. Комментарий уходит один раз на пару «карточка + прогон» — отметка
+    `commented` живёт в `kill_snapshot.json`, поэтому повторный тик по той же попытке
+    молчит (Д4). Отказ комментария отметку не ставит: следующий тик дошлёт.
+    `say` принят для единообразия с прочими побочными действиями — владельцу о снимке
+    не сообщаем: тик уже сказал своё о смерти попытки.
+    """
+    del say              # уведомление владельцу — не дело снимка (см. docstring)
+    try:
+        step = ctx.get("next") or {}
+        step_id = str(step.get("id") or "")
+        if not step_id:
+            return None
+        cards = card_of(ctx.get("cards") or [], "step")
+        ids = {str(card.get("id") or "") for card in cards if card.get("id")}
+        row = _killed_metric_row(p, step_id, ids)
+        card: dict = {}
+        if row:
+            card = next((item for item in cards
+                         if str(item.get("id") or "") == str(row.get("card") or "")), {})
+            if not card:
+                # Борда прочитана не полностью: адрес попытки берём из строки метрики.
+                card = {"id": row.get("card"), "assignee": row.get("role") or ""}
+        else:
+            card = _killed_card_by_error(cards) or {}
+        if not card.get("id"):
+            return None
+        pair = (str(card.get("id") or ""), str(row.get("run_id") or ""))
+        entry = kill_snapshot_entry(p, step_id)
+        if entry and (str(entry.get("card") or ""), str(entry.get("run_id") or "")) == pair:
+            if entry.get("commented"):
+                return None          # эта попытка уже отмечена: второй комментарий не нужен
+            sent = _comment(p, pair[0], kill_snapshot_comment(entry))
+        else:
+            entry = collect_kill_snapshot(p, card, row, step=step)
+            write_kill_snapshot(p, entry)
+            sent = _comment(p, pair[0], kill_snapshot_comment(entry))
+        if sent:
+            entry["commented"] = True
+            entry["comment_at"] = time.strftime("%d.%m.%Y %H:%M:%S")
+            write_kill_snapshot(p, entry)
+        return entry
+    except Exception as exc:  # noqa: BLE001 - снимок не имеет права валить тик
+        config_mod.debug_note("kill_snapshot", exc)
+        return None
+
+
 def _comment(p: Paths, card_id: str, text: str) -> bool:
     """Комментарий в карточку борды. Отказ — предупреждение `[comment]`, не исключение (S2)."""
     # Тело уходит одной строкой: обёртка CLI `.cmd` на Windows режет командную строку по
@@ -8050,6 +8412,14 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         report_stalls(p, ctx)
     except Exception as exc:  # noqa: BLE001 - отметка о методе не имеет права валить тик
         config_mod.debug_note("tool_stall", exc)
+    # Снимок убитой по лимиту попытки (план 17, S3): файлы на диске, числа метрики и
+    # последние инструменты уходят комментарием в карточку и блоком «Продолжай с этого»
+    # в тело следующей попытки. Решение стража снимок не меняет (Д3) — шаг, убитый по
+    # лимиту, останавливает конвейер своим ходом, а не снимком.
+    try:
+        kill_snapshot_hook(p, ctx, say_raw)
+    except Exception as exc:  # noqa: BLE001 - снимок не имеет права валить тик
+        config_mod.debug_note("kill_snapshot", exc)
     if closed:
         return result
 
