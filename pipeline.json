@@ -10,6 +10,10 @@
     "budget": 4500,
     "timeout": 240
   },
+  "tools": {
+    "stall_seconds": 300,
+    "stall_repeats": 2
+  },
   "max_plan_growth": {
     "percent": 10,
     "chars_per_finding": 400,

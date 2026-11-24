@@ -50,6 +50,10 @@
     "timeout": 120,
     "budget": 600
   },
+  "tools": {
+    "stall_seconds": 300,
+    "stall_repeats": 2
+  },
   "max_actions": 1,
   "runtimes": {
     "step": "3h",

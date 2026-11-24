@@ -27,6 +27,8 @@ from pathlib import Path
 
 import state_io
 
+import config as config_mod
+
 METRICS_NAME = "metrics.jsonl"
 # Предел файла по строкам, как у истории тиков (`gate.HISTORY_MAX_LINES`): разрезанная
 # строка JSONL — битая строка, поэтому режем по границам строк, а последняя запись
@@ -188,8 +190,98 @@ def _most_common(values: list[str]) -> str:
     return best
 
 
+def stall_thresholds(cfg=None) -> tuple[int, int]:
+    """Пороги залипания инструмента: `(seconds, repeats)` из `cfg.tools` (17-S2, §7).
+
+    Единственное место, где порог читается: без `cfg` (или без ключа) — умолчания из
+    `config.DEFAULTS["tools"]`. Своих чисел модуль не держит, иначе порог из `pipeline.json`
+    подменялся бы молча, а карточка говорила бы одно, страж считал другое.
+    """
+    tools = getattr(cfg, "tools", None)
+    if not isinstance(tools, dict) or not tools:
+        tools = config_mod.DEFAULTS.get("tools") or {}
+    seconds = _int(tools.get("stall_seconds"))
+    repeats = _int(tools.get("stall_repeats"))
+    defaults = config_mod.DEFAULTS["tools"]
+    return (seconds or int(defaults["stall_seconds"]),
+            repeats or int(defaults["stall_repeats"]))
+
+
+def _stall_empty() -> dict:
+    return {"stall": False, "tool": "", "calls": 0, "s": 0, "timeouts": 0}
+
+
+def stall_of(tool_events, seconds: int | None = None,
+             repeats: int | None = None) -> dict:
+    """Признак залипания по событиям инструментов окна попытки (Д1, Д4, 17-S2 П1).
+
+    Залипание — не «один длинный вызов», а метод: `repeats` вызовов одного инструмента
+    подряд, каждый не короче `seconds` (Д4: вызов другого инструмента отрезок рвёт), либо
+    вызов, упавший по таймауту — тогда порог не нужен. Названный инструмент — тот из
+    залипших, у которого суммарное время в окне больше; при равенстве побеждает чей признак
+    раньше в логе, иначе порядок решал бы словарь, а не лог.
+
+    `seconds`/`repeats` по умолчанию берутся из `stall_thresholds()`: чисел порога в модуле
+    нет. Пустой список событий (и список без залипаний) — `stall: false` и нули.
+    """
+    if seconds is None or repeats is None:
+        default_seconds, default_repeats = stall_thresholds()
+        seconds = default_seconds if seconds is None else seconds
+        repeats = default_repeats if repeats is None else repeats
+    events = [event for event in (tool_events or [])
+              if isinstance(event, dict) and str(event.get("kind") or "tool") == "tool"]
+    if not events:
+        return _stall_empty()
+    slow_ms = max(1, int(seconds)) * 1000
+    span = max(1, int(repeats))
+    names = [str(event.get("name") or "") for event in events]
+    times = [_int(event.get("ms")) for event in events]
+    timeouts = [bool(event.get("timeout")) for event in events]
+    first: dict[str, int] = {}
+    for index, name in enumerate(names):
+        if not name or name in first:
+            continue
+        if timeouts[index]:
+            first[name] = index
+            continue
+        run_ms = times[index:index + span]
+        if (len(run_ms) == span and all(item >= slow_ms for item in run_ms)
+                and len(set(names[index:index + span])) == 1):
+            first[name] = index
+    if not first:
+        return _stall_empty()
+    totals: dict[str, int] = {}
+    for name, ms in zip(names, times):
+        if name in first:
+            totals[name] = totals.get(name, 0) + ms
+    tool = min(first, key=lambda name: (-totals[name], first[name]))
+    return {"stall": True,
+            "tool": tool,
+            "calls": sum(1 for name in names if name == tool),
+            "s": int(totals[tool] / 1000),
+            "timeouts": sum(1 for index, name in enumerate(names)
+                            if name == tool and timeouts[index])}
+
+
+CARD_KEY_PREFIX = "planloop"
+
+
+def card_kind(key) -> str:
+    """Вид карточки из ключа идемпотентности: `step`, `fix`, `review` и прочие (Д6).
+
+    Ключ — `planloop:<план>:<шаг>:<вид>[:<номер>]`, вид стоит сразу после шага, а номер
+    круга или попытки — хвостом. Ключ чужой формы или пустой — пустая строка, а не догадка:
+    правило метода адресуется только карточкам шага и правок.
+    """
+    parts = str(key or "").split(":")
+    if len(parts) >= 4 and parts[0] == CARD_KEY_PREFIX:
+        return parts[3]
+    return ""
+
+
 def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: int = 1,
-                now=None, log_path=None) -> dict:
+                now=None, log_path=None, stall_seconds: int | None = None,
+                stall_repeats: int | None = None) -> dict:
     """Одна запись метрики по одной попытке шага (ключи — контракт панели и шага S4).
 
     Окно разбора — от `started_at` до `ended_at` прогона с допуском `WINDOW_PAD` (Д4):
@@ -246,12 +338,16 @@ def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: 
     limit_s = _int(run.get("max_runtime_seconds")) or (
         int(limit_event["limit_s"]) if limit_event is not None else 0)
     source = "agent.log" if events else "none"
+    # Залипание (17-S2): порог приходит из конфигурации (`record`), а прямой вызов без него
+    # берёт умолчания через `stall_thresholds()` — строка одного вида, кто бы её ни писал.
+    stall = stall_of(tools, stall_seconds, stall_repeats)
     return {
         "ts": stamp,
         "at": time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(stamp)),
         "plan": str(plan_id or ""),
         "step": str(step_id or ""),
         "card": str(card.get("id") or ""),
+        "card_kind": card_kind(card.get("key")),
         "attempt": int(attempt or 1),
         "run_id": str(run.get("id") or ""),
         "role": str(run.get("profile") or card.get("assignee") or ""),
@@ -263,6 +359,11 @@ def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: 
         "tools_ms": tools_ms,
         "tools_total_ms": sum(tools_ms.values()),
         "tool_timeouts": sum(1 for event in tools if event["timeout"]),
+        "stall": bool(stall["stall"]),
+        "stall_tool": stall["tool"],
+        "stall_calls": stall["calls"],
+        "stall_s": stall["s"],
+        "stall_timeouts": stall["timeouts"],
         "wall_ms": wall_ms,
         "killed_by": killed_by,
         "limit_s": limit_s,
@@ -341,6 +442,9 @@ def record(cfg, kanban_db, plan_id, step_id, cards, now=None) -> int:
     """
     path = metrics_path(cfg)
     known = {str(row.get("run_id") or "") for row in read_rows(path)}
+    # Порог залипания читается один раз на тик, а не на строку: значения — из конфигурации
+    # проекта, и все строки одного заказа должны мериться одинаково (17-S2).
+    stall_seconds, stall_repeats = stall_thresholds(cfg)
     pending: list[dict] = []
     for card in cards or []:
         if not isinstance(card, dict):
@@ -357,7 +461,9 @@ def record(cfg, kanban_db, plan_id, step_id, cards, now=None) -> int:
                 continue          # прогон идёт: строки ещё нет, числа не сложены
             role = str(run.get("profile") or card.get("assignee") or "")
             pending.append(attempt_row(plan_id, step_id, card, run, attempt,
-                                       now=now, log_path=agent_log(role)))
+                                       now=now, log_path=agent_log(role),
+                                       stall_seconds=stall_seconds,
+                                       stall_repeats=stall_repeats))
             known.add(run_id)
     if not pending:
         return 0

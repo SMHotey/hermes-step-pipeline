@@ -603,6 +603,7 @@ cron 5 * * * *  →  scripts/pipeline_keeper.py (профиль-драйвер, 
 | `quiet_hours` | `{enabled:false, windows:[]}` | пауза по расписанию: до двух окон локального времени `ЧЧ:ММ`, окно через полночь; в окне тик выходит с кодом 0 и не делает действий |
 | `runtimes` | `step 3h`, `review 150m`, `prompt 45m` (+ `scout`, `plan_review`, `plan_fix`, `keeper 30m`) | лимиты карточек |
 | `watchdog` | `heartbeat_fresh_minutes 30`, `card_deadline_hours 12` | предел ожидания карточки: возраст последнего события, после которого страж останавливается и зовёт владельца; `0` — проверка выключена |
+| `tools` | `stall_seconds 300`, `stall_repeats 2` | порог залипания инструмента: вызов не короче `stall_seconds`, `stall_repeats` таких подряд — залипание; мусор — `ConfigError` |
 | `kanban.tenant` | `plan` | tenant карточек |
 | `git` | `commit:true, push:true` | коммит и пуш при закрытии |
 | `notify` | `enabled:false` | `token_env`, `chat_env`, `prefix`, `watchdog_hours`, `digest_at`, `answer_timeout`, `commands{enabled,wait}`, `dialog{...}` |

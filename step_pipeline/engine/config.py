@@ -109,6 +109,12 @@ DEFAULTS: dict = {
     # снимает не `--resume`, а новый коммит (sha меняется) или решение владельца.
     # В `pipeline.json` проекта ключ не пишется вовсе: умолчание живёт в коде.
     "step_runs": {"timeout": 120, "budget": 600},
+    # Залипание инструмента (план 17, S2): в журнале метрики отмечается попытка, где один
+    # инструмент шёл `stall_seconds` секунд в `stall_repeats` вызовах подряд (или упал по
+    # таймауту). Отметка — комментарий в карточку и строка «ПРАВИЛО МЕТОДА» следующей
+    # карточке шага; шаг при этом не останавливается. Мусор в полях — `ConfigError`:
+    # молчаливая подмена умолчанием скрыла бы, что порог владельца не действует.
+    "tools": {"stall_seconds": 300, "stall_repeats": 2},
     "runtimes": {"step": "3h", "review": "150m", "prompt": "45m"},
     # Смотритель и страж: один порог «висит» на двоих (план 10, S2). Возраст карточки —
     # от последнего события карточки, а не от `waiting_since` стража; `running` со свежим
@@ -351,6 +357,36 @@ def _step_runs(value: object) -> dict:
     return out
 
 
+def _tools(value: object) -> dict:
+    """Порог залипания инструмента (план 17, S2): `stall_seconds` и `stall_repeats`.
+
+    Форма — как у `_step_runs`, и это осознанно (Д3 постановки 17-S2): у порога нет
+    значения-выключателя (`0` секунд означало бы «залипло всё»), а тихая подмена умолчанием
+    скрыла бы от владельца, что его настройка не действует. Мусор — `ConfigError` с именем
+    поля, а не `WARNING`: порог читает и карточка, и комментарий стража.
+    """
+    default = DEFAULTS["tools"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict):
+        raise ConfigError(f"tools должен быть объектом JSON, получено: {value!r}")
+    out = dict(default)
+    unknown = sorted(str(key) for key in value if key not in default)
+    if unknown:
+        raise ConfigError(f"tools: неизвестные поля {unknown}, "
+                          f"допустимы {sorted(default)}, получено: {value!r}")
+    for key in ("stall_seconds", "stall_repeats"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ConfigError(f"tools.{key} должен быть целым числом, получено: {raw!r}")
+        if raw < 1:
+            raise ConfigError(f"tools.{key} должен быть ≥ 1, получено: {raw!r}")
+        out[key] = raw
+    return out
+
+
 def _watchdog_number(value: object, default: int) -> int | None:
     """Целое ≥ 0 из настройки: строка из цифр и целое `1.0` годятся, `bool` — нет.
 
@@ -540,6 +576,7 @@ class Config:
     max_stale_rebuilds: int
     max_plan_growth: dict
     step_runs: dict
+    tools: dict
     watchdog: dict
     quiet_hours: dict
     step_runtime: str
@@ -747,6 +784,7 @@ def load(repo: Path | str | None = None) -> Config:
         max_stale_rebuilds=_stale_rebuilds(raw.get("max_stale_rebuilds")),
         max_plan_growth=_plan_growth(raw.get("max_plan_growth")),
         step_runs=_step_runs(raw.get("step_runs")),
+        tools=_tools(raw.get("tools")),
         watchdog=_watchdog(raw.get("watchdog")),
         quiet_hours=_quiet_hours(raw.get("quiet_hours")),
         step_runtime=str(runtimes.get("step") or "3h"),

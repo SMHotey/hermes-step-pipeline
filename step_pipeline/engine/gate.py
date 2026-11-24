@@ -2807,6 +2807,63 @@ def execution_check_lines(p: Paths, step: dict) -> list[str]:
     return lines
 
 
+def stall_line(row: dict) -> str:
+    """Строка «инструмент залип» по строке журнала метрики; пусто, если залипания нет.
+
+    Владельцу и исполнителю нужны четыре числа: какой инструмент, сколько вызовов, сколько
+    суммарно секунд и сколько из них упали по таймауту (17-S2, Д2). Формат — один, потому
+    что его читают двое: комментарий стража (`report_stalls`) и карточка шага.
+    """
+    if not isinstance(row, dict) or not row.get("stall"):
+        return ""
+    tool = row.get("stall_tool") or "—"
+    return (f"инструмент залип: {tool},"
+            f" вызовов {_as_int(row.get('stall_calls'), 0)},"
+            f" суммарно {_as_int(row.get('stall_s'), 0)} с,"
+            f" таймаутов {_as_int(row.get('stall_timeouts'), 0)}")
+
+
+#: Сколько отметок `stall_reported` держать в состоянии плана. Помним только хвост: отметка
+#: нужна, чтобы не повторять комментарий по тому же прогону (Д7), а не как отчёт.
+STALL_KEEP = 20
+
+
+def method_rule_lines(p: Paths, step: dict) -> list[str]:
+    """Блок «ПРАВИЛО МЕТОДА» для тела карточки, если прошлая попытка залипла (Д6, 17-S2).
+
+    Источник — последняя по времени строка метрики этого шага по карточке шага или правок:
+    залипание в карточке ревью или разведки ничего не говорит о следующей работе. Нет строк
+    или залипания нет — пустой список, тело карточки остаётся прежним дословно.
+    """
+    try:
+        cfg = getattr(p, "cfg", None)
+        plan_id, step_id = str(p.plan_id or ""), str(step.get("id") or "")
+        if cfg is None or not plan_id or not step_id:
+            return []
+        rows = [row for row in step_metrics.read_rows(step_metrics.metrics_path(cfg))
+                if str(row.get("plan") or "") == plan_id
+                and str(row.get("step") or "") == step_id
+                and str(row.get("card_kind") or "") in ("step", "fix")]
+        if not rows:
+            return []
+        line = stall_line(max(rows, key=lambda item: _as_float(item.get("ts"), 0.0)))
+        if not line:
+            return []
+        seconds, _repeats = step_metrics.stall_thresholds(cfg)
+        return [
+            "ПРАВИЛО МЕТОДА",
+            f"- прошлая попытка: {line}.",
+            "- собирать файл целой записью (`write_file`), а не десятками мелких правок:",
+            "  правка в залипшем инструменте стоит секунд, которых в шаге нет.",
+            f"- если инструмент снова идёт дольше {seconds} с — менять метод и писать об этом",
+            "  в карточке, а не ждать таймаута: ожидание стоит тех же секунд.",
+            "",
+        ]
+    except Exception as exc:  # noqa: BLE001 - тело карточки не имеет права падать
+        config_mod.debug_note("method_rule", exc)
+        return []
+
+
 def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
     plan_id = p.plan_id
     plan_rel = p.cfg.rel(Path(p.plan_file))
@@ -2824,8 +2881,10 @@ def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
     lines += [f"- {r}" for r in step.get("read") or []]
     if step.get("notes"):
         lines += ["", f"Важно: {step['notes']}"]
+    # 17-S2: прошлая попытка залипла в инструменте — карточка говорит, чем метод менять.
+    lines += [""]
+    lines += method_rule_lines(p, step)
     lines += [
-        "",
         "ЖЁСТКИЕ ПРАВИЛА",
         "- Работать только по этому шагу, не расширять объём и не начинать следующий.",
         "- Существующие тесты не удалять и не ослаблять; новые — happy path + границы + интеграция.",
@@ -6491,6 +6550,43 @@ def status_text(ctx: dict, decision: dict) -> str:
 
 # ───────────────────────────── побочные действия ─────────────────────────────
 
+
+def report_stalls(p: Paths, ctx: dict) -> int:
+    """Сказать в карточки шага о залипших инструментах по журналу метрики; вернуть число.
+
+    Тик не останавливается (§4 п.2): залипание — довод сменить метод, а не повод встать.
+    Комментарий уходит один раз на прогон: отметка `run_id` живёт в состоянии плана
+    (`stall_reported`), поэтому повторный тик по той же строке молчит (Д7). Шага нет или
+    состояния нет — молчим: адресовать находку некуда.
+    """
+    step = ctx.get("step") or ctx.get("next") or {}
+    step_id = str(step.get("id") or "")
+    state = ctx.get("state")
+    if not step_id or not isinstance(state, dict):
+        return 0
+    reported = [str(item) for item in (state.get("stall_reported") or [])]
+    sent = 0
+    for row in step_metrics.read_rows(step_metrics.metrics_path(p.cfg)):
+        if not isinstance(row, dict) or not row.get("stall"):
+            continue
+        if (str(row.get("plan") or "") != str(p.plan_id)
+                or str(row.get("step") or "") != step_id):
+            continue
+        run_id = str(row.get("run_id") or "")
+        card_id = str(row.get("card") or "")
+        if not run_id or not card_id or run_id in reported:
+            continue
+        # Отметка ставится и при отказе CLI: иначе недоступная борда превратила бы
+        # залипание в поток попыток на каждом тике, а причина уже в stderr (`[comment]`).
+        _comment(p, card_id, stall_line(row))
+        reported.append(run_id)
+        sent += 1
+    if sent:
+        state["stall_reported"] = reported[-STALL_KEEP:]
+        save_state(p, state)
+    return sent
+
+
 def _comment(p: Paths, card_id: str, text: str) -> bool:
     """Комментарий в карточку борды. Отказ — предупреждение `[comment]`, не исключение (S2)."""
     # Тело уходит одной строкой: обёртка CLI `.cmd` на Windows режет командную строку по
@@ -7947,6 +8043,13 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                             str(current_step.get("id") or ""), ctx.get("cards") or [])
     except Exception as exc:  # noqa: BLE001 - замер не имеет права валить тик
         config_mod.debug_note("step_metrics", exc)
+    # Залипание инструмента (план 17, S2): строка метрики с залипанием уходит комментарием в
+    # карточку шага один раз на прогон. Как и замер, это не решение стража — сбой записи в
+    # борду вердикт не меняет и тик не валит.
+    try:
+        report_stalls(p, ctx)
+    except Exception as exc:  # noqa: BLE001 - отметка о методе не имеет права валить тик
+        config_mod.debug_note("tool_stall", exc)
     if closed:
         return result
 
