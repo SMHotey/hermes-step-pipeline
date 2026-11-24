@@ -527,6 +527,30 @@ def test_events_stream_first_frame_is_snapshot(server):
 
 
 @pytest.mark.slow
+def test_events_stream_rebuilds_at_most_once_per_window(server, monkeypatch):
+    """Поток не пересобирает снимок чаще `EVENTS_MIN_BUILD`: залп правок — один кадр.
+
+    Иначе на работающем конвейере (источники меняются чаще, чем собирается снимок) поток
+    превращался в непрерывную очередь сборок и панель переставала отвечать.
+    """
+    monkeypatch.setattr(ui_server, "EVENTS_MIN_BUILD", 3.0)
+    calls = engine_counter(monkeypatch)
+    event = open_events(server["url"] + "/api/events?plan=1")
+    try:
+        assert wait_frames(event, 1, limit=20.0), f"первый кадр не пришёл: {event['errors']}"
+        stop = server["root"] / ".pipeline" / "state" / "plan_1_stop.json"
+        for reason in ("первый", "второй", "третий"):     # окно не истекло — пересборка одна
+            stop.write_text(json.dumps({"kind": "owner", "reason": reason}, ensure_ascii=False),
+                            encoding="utf-8")
+            time.sleep(0.2)
+        pushed = wait_event_frame(event, lambda frame: frame["stop"] is True, limit=20.0)
+        assert pushed is not None, f"кадр со стоп-флагом не пришёл: {event['errors']}"
+        assert len(calls) == 6, f"залп правок дал {len(calls)} запусков движка вместо шести"
+    finally:
+        close_events(event)
+
+
+@pytest.mark.slow
 def test_events_stream_pushes_on_change(server, monkeypatch):
     calls = engine_counter(monkeypatch)
     event = open_events(server["url"] + "/api/events?plan=1")
@@ -1542,6 +1566,97 @@ def test_plans_cache_prevents_second_engine_launch(tmp_path: Path, hermes_stub: 
         status, _data = get(url + "/api/projects")
         assert status == 200
         assert len(calls) == 4
+
+
+def test_snapshot_shares_plans_cache_with_projects(tmp_path: Path, hermes_stub: Path,
+                                                   isolated_hermes_home: Path, monkeypatch):
+    """Снимок и сводка реестра делят один `--plans`: на страницу движок поднимается раз.
+
+    До правки снимок запускал `gate.py --plans` своим путём, мимо кэша паузы: одна
+    загрузка страницы поднимала движок дважды, а каждый кадр потока — снова. На живом
+    проекте это десятки секунд на запрос и очередь на замке сборки.
+    """
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    calls = engine_counter(monkeypatch)
+    panel_pause.clear_cache()
+    with running(alpha) as (url, _httpd):
+        assert get(url + "/api/snapshot")[0] == 200
+        status, data = get(url + "/api/projects")
+        assert status == 200 and data["projects"], data
+    plans_calls = [call for call in calls
+                   if len(call) > 1 and call[1] == "gate.py" and "--plans" in call]
+    assert len(plans_calls) == 1, f"`--plans` поднят {len(plans_calls)} раз вместо одного"
+
+
+def test_panel_snapshot_lives_by_fingerprint_not_by_ttl(project: Path, monkeypatch):
+    """Панель держит снимок до своего срока, агент без `max_age` — видит правку сразу.
+
+    Страница опрашивает сервер раз в 30 с, поток переподключается раз в 25 с; при прежнем
+    сроке 2.5 с каждый вопрос стоил полной сборки, хотя источники не менялись.
+    """
+    builds: list[int] = []
+    real = snapshot._build_snapshot
+
+    def counting(*args, **kwargs):
+        builds.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(snapshot, "_build_snapshot", counting)
+    monkeypatch.setattr(snapshot, "CACHE_TTL", 0.0)      # «обычный» срок истёк
+    snapshot._CACHE.clear()
+    snapshot.snapshot(project)
+    assert len(builds) == 1
+    snapshot.snapshot(project, max_age=60)               # отпечаток тот же — сборки нет
+    assert len(builds) == 1
+    # Источники поменялись: отпечаток снимает запись у всех, срок тут ни при чём.
+    plan = project / "docs" / "plans" / "1-demo.md"
+    plan.write_text(plan.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    snapshot.snapshot(project, max_age=60)
+    assert len(builds) == 2, "правка обязана быть видна на следующем запросе"
+
+
+def test_snapshot_serves_stale_while_another_build_is_in_flight(project: Path, monkeypatch):
+    """Панель не ждёт чужую сборку: одна сборка на ключ, остальные получают прошлый снимок.
+
+    Раньше сборка шла под общим замком: заклинившая (движок ждёт борду или чужой процесс)
+    держала замок, и панель переставала отвечать вовсе — 24.11.2026 `/api/snapshot` не
+    отвечал минутами при живом `/api/health`. Агент без `max_age` по-прежнему ждёт свежий
+    ответ, панель — нет.
+    """
+    snapshot._CACHE.clear()
+    started = threading.Event()
+    release = threading.Event()
+    builds: list[int] = []
+
+    def fake_build(*args, **kwargs):
+        number = len(builds) + 1
+        builds.append(number)
+        if number > 1:                       # вторая сборка «висит», как заклинившая
+            started.set()
+            release.wait(timeout=30.0)
+        return {"plans": [], "marker": number}
+
+    monkeypatch.setattr(snapshot, "_build_snapshot", fake_build)
+    monkeypatch.setattr(snapshot, "BUILD_WAIT_SECONDS", 5.0)
+    assert snapshot.snapshot(project)["marker"] == 1        # прогрев кэша
+    plan = project / "docs" / "plans" / "1-demo.md"
+    plan.write_text(plan.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    builder = threading.Thread(target=lambda: snapshot.snapshot(project), daemon=True)
+    builder.start()
+    assert started.wait(timeout=10.0), "сборщик не стартовал"
+
+    began = time.monotonic()
+    stale = snapshot.snapshot(project, max_age=60)          # панель: прошлый снимок
+    waited = time.monotonic() - began
+    assert stale["marker"] == 1, "панель получила чужую сборку вместо прошлого снимка"
+    assert waited < 3.0, f"панель ждала сборку {waited:.1f} с"
+    assert len(builds) == 2, "ключ собрали дважды: второго сборщика быть не должно"
+
+    release.set()
+    builder.join(timeout=15.0)
+    assert snapshot.snapshot(project)["marker"] == 2        # агент: свежий ответ из кэша
+    assert len(builds) == 2
 
 
 def test_registry_entry_without_pipeline_is_installed_false(tmp_path: Path, hermes_stub: Path,

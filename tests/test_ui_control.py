@@ -6,10 +6,12 @@ import json
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import helpers  # noqa: F401  (загружает плагин и алиасы)
 import project as proj
+import pytest
 import ui_control
 
 
@@ -101,6 +103,29 @@ def test_run_helper_decodes_with_replace():
                    timeout=60)
     assert isinstance(res.stdout, str)
     assert "\ufffd" in res.stdout
+
+
+def test_run_timeout_does_not_wait_for_grandchildren(tmp_path: Path):
+    """Таймаут обязан кончаться `TimeoutExpired`, даже если потомок держит наши пайпы.
+
+    Регресс 24.11.2026: `subprocess.run(timeout=…)` на Windows убивал процесс, а потом
+    бесконечно ждал читающие потоки — дескриптор вывода остался у внука (`gate.py` сам
+    поднимает `next_step.py` и `hermes`). Один такой вызов держал поток панели двадцать
+    минут, и `/api/snapshot` перестал отвечать при живом `/api/health`.
+    """
+    script = tmp_path / "spawn.py"
+    script.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "print('готов', flush=True)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    began = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        proj.run([sys.executable, str(script)], timeout=2)
+    waited = time.monotonic() - began
+    assert waited < 20, f"таймаут ждал пайпы внука {waited:.1f} с"
 
 
 def test_ui_control_goes_through_project_helper():

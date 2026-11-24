@@ -275,6 +275,8 @@ DEFAULT_FIX_ROUNDS_HIGH = 6
 LAST_ACTIONS_KEPT = 20
 # История тиков: файл в каталоге состояния, пределы ротации и окно метрик (план 2, S3).
 HISTORY_NAME = "history.jsonl"
+# Секунд: сколько ждать пайпы уже убитого процесса-ребёнка (см. `_run`).
+KILL_WAIT_SECONDS = 5.0
 HISTORY_MAX_LINES = 2000
 HISTORY_MAX_BYTES = 512 * 1024
 METRICS_DAYS = 7
@@ -472,8 +474,27 @@ def history_path(cfg: config_mod.Config) -> Path:
 
 def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 120,
          env: dict | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=str(cwd or Path.cwd()), capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout, env=env)
+    """Внешняя команда с таймаутом, который не ждёт чужие пайпы вечно.
+
+    `subprocess.run(timeout=…)` на Windows убивает процесс, а затем ждёт читающие потоки —
+    бесконечно, если дескриптор вывода остался у кого-то из потомков (движок сам поднимает
+    `next_step.py` и `hermes`). Заклинившая команда обязана кончаться `TimeoutExpired`.
+    """
+    empty = ""
+    proc = subprocess.Popen(cmd, cwd=str(cwd or Path.cwd()), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                            errors="replace", env=env)
+    out, err = empty, empty
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            out, err = proc.communicate(timeout=KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass                          # потомок держит пайпы: не ждём его вечно
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err) from None
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def _hermes() -> str:

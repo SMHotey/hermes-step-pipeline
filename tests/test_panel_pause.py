@@ -81,6 +81,43 @@ def test_pause_all_stops_every_open_plan(project: Path, hermes_stub: Path):
     assert state["projects"][0]["stopped_plans"] == ["1"]
 
 
+def test_plans_build_is_single_flight_per_project(project: Path, monkeypatch):
+    """Две одновременные просьбы о строках планов поднимают движок один раз.
+
+    Сторож паузы сверяет стоп-флаги раз в 10 с, вкладки панели спрашивают снимок — без
+    дедупликации каждый вызов запускал свой `gate.py --plans`, и на живом проекте панель
+    тонула в очереди сборок (24.11.2026: `/api/snapshot` не отвечал минутами).
+    """
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[int] = []
+
+    def slow_engine(*args, **kwargs):
+        calls.append(1)
+        started.set()
+        release.wait(timeout=30.0)
+        return [{"id": "1", "next": "S1", "state": "running"}]
+
+    monkeypatch.setattr(proj, "engine_json", slow_engine)
+    panel_pause.clear_cache()
+    results: list[list[dict]] = []
+    builder = threading.Thread(target=lambda: results.append(panel_pause.plans(project)),
+                               daemon=True)
+    builder.start()
+    assert started.wait(timeout=10.0), "сборка не началась"
+    # Второй проситель: прошлых строк нет — ждёт чужую сборку, а не запускает свою.
+    waiter = threading.Thread(target=lambda: results.append(panel_pause.plans(project)),
+                              daemon=True)
+    waiter.start()
+    time.sleep(0.3)
+    assert len(calls) == 1, f"движок подняли {len(calls)} раз вместо одного"
+    release.set()
+    builder.join(timeout=15.0)
+    waiter.join(timeout=15.0)
+    assert len(results) == 2 and all(row[0]["id"] == "1" for row in results)
+    assert len(calls) == 1
+
+
 def test_state_is_recomputed_from_registry(project: Path):
     """Подпись кнопки после перезагрузки страницы: считается из флагов, а не из памяти."""
     assert panel_pause.state(rows(project))["all_stopped"] is False

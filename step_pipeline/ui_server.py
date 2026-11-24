@@ -179,6 +179,21 @@ PANEL_HEADER_VALUE = "1"
 EVENTS_POLL = 0.5
 EVENTS_PING_SECONDS = 10
 EVENTS_MAX_SECONDS = 25
+# Секунд: не чаще одной пересборки снимка на поток событий. Цикл проверяет отпечаток раз в
+# `EVENTS_POLL` (0.5 с), а сборка стоит три запуска движка: на работающем конвейере источник
+# меняется чаще, чем успевает собраться снимок, и поток превращался в непрерывную очередь
+# сборок — панель переставала отвечать (24.11.2026: `/api/projects` 80 с, `/api/snapshot`
+# больше пяти минут). Изменение при этом не теряется: отпечаток не «съедается», кадр уходит
+# на ближайшем витке после паузы.
+EVENTS_MIN_BUILD = 3.0
+# Секунд: сколько живёт собранный снимок, если отпечаток источников не сходится. Страница
+# опрашивает сервер раз в 30 с, поток событий переподключается раз в 25 с — сборка (три
+# запуска движка, секунды) дороже, чем перерыв между вопросами, поэтому при прежних 2.5 с
+# каждый кадр и каждый опрос строили снимок заново, и панель стояла в очереди на замке
+# сборки. Изменение источников по-прежнему видно сразу: кэш снимает отпечаток, а не только
+# срок. Сроки в тексте («простой», время попытки) могут отставать на минуту — страница
+# тикает ими сама (`tickTimes`).
+SNAPSHOT_MAX_AGE = 60.0
 
 # Уведомления панели (план 3 S10). Это не канал Telegram из `pipeline.json`: здесь только
 # то, что всплывает в браузере и зеркалится в уже настроенный канал.
@@ -2246,7 +2261,7 @@ class Handler(BaseHTTPRequestHandler):
         state = state or self.state
         if state.preview or _installed(state.project):
             data = snap.snapshot(state.project, plan, preview=state.preview,
-                                 board=state.board)
+                                 board=state.board, max_age=SNAPSHOT_MAX_AGE)
         else:
             data = _missing_snapshot(state)
         # Короткая форма проверок для бейджа: прогон запускает вкладка «Проверки», здесь
@@ -2321,7 +2336,7 @@ class Handler(BaseHTTPRequestHandler):
             body = self._snapshot_with_version(plan, state)
             self._event_frame(body)
             self._deliver_frame(state, body)
-            started = last_ping = time.monotonic()
+            started = last_ping = last_build = time.monotonic()
             closing = getattr(self.server, "closing", None)
             while time.monotonic() - started < EVENTS_MAX_SECONDS:
                 # Закрытый сервер не держит поток: `close_server` ставит флаг, и ожидание
@@ -2337,11 +2352,14 @@ class Handler(BaseHTTPRequestHandler):
                 current = snap.fingerprint(state.project, plan, state.preview,
                                            state.board)
                 if current != stamp:
-                    stamp = current
-                    body = self._snapshot_with_version(plan, state)
-                    self._event_frame(body)
-                    self._deliver_frame(state, body)
-                    last_ping = now
+                    # Пересборка — не чаще EVENTS_MIN_BUILD: отпечаток остаётся прежним,
+                    # поэтому изменение не теряется и кадр уходит на следующем витке.
+                    if now - last_build >= EVENTS_MIN_BUILD:
+                        stamp = current
+                        body = self._snapshot_with_version(plan, state)
+                        self._event_frame(body)
+                        self._deliver_frame(state, body)
+                        last_build = last_ping = now
                 elif now - last_ping >= EVENTS_PING_SECONDS:
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()

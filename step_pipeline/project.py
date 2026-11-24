@@ -570,17 +570,41 @@ def python_exe(project: Path) -> str:
     return sys.executable
 
 
+# Секунд: сколько ждать пайпы уже убитого ребёнка. На Windows `subprocess.run(timeout=…)`
+# убивает процесс, а потом ждёт читающие потоки — и ждёт бесконечно, если дескриптор
+# вывода остался у кого-то из потомков (движок сам запускает `next_step.py` и `hermes`).
+# 24.11.2026 из-за этого один `gate.py --plans` держал поток панели двадцать минут при
+# готовом ответе на `/api/health`.
+KILL_WAIT_SECONDS = 5.0
+
+
 def run(cmd: list[str], *, cwd: str | Path | None = None, timeout: int = 180,
         env: dict[str, str] | None = None, text: bool = True) -> subprocess.CompletedProcess:
     """Запустить внешнюю команду: по умолчанию UTF-8 с errors="replace".
 
     text=False — байтовый вывод: нужен там, где содержимое не текст (tasklist).
+
+    Таймаут убивает процесс и НЕ ждёт его пайпы дольше `KILL_WAIT_SECONDS`: заклинившая
+    команда обязана кончаться `TimeoutExpired`, а не висеть потоком панели. Вывод,
+    который успел прийти, кладётся в исключение.
     """
-    kwargs: dict[str, Any] = {"cwd": str(cwd) if cwd else None, "capture_output": True,
-                              "timeout": timeout, "env": env}
+    empty = "" if text else b""
+    kwargs: dict[str, Any] = {"cwd": str(cwd) if cwd else None, "env": env,
+                              "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
     if text:
         kwargs.update(text=True, encoding="utf-8", errors="replace")
-    return subprocess.run(cmd, **kwargs)
+    proc = subprocess.Popen(cmd, **kwargs)
+    out, err = empty, empty
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            out, err = proc.communicate(timeout=KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass                      # потомок держит пайпы: не ждём его вечно
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err) from None
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 NOTIFY_ENV_PREFIX = "STEP_PIPELINE_TELEGRAM_"

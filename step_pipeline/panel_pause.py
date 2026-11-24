@@ -47,6 +47,13 @@ NO_STEP = ("", "—", "None")
 STOP_TIMEOUT = 1900
 
 _PLANS_CACHE: dict[Path, tuple[tuple, float, list[dict]]] = {}
+# Сборки «в пути» на проект: ключ → событие. Без этого сторож паузы (сверка раз в 10 с) и
+# каждая вкладка панели запускали СВОЙ `gate.py --plans`: один прогон на 17 планах стоит
+# секунды, и параллельные сборки складывались в очередь — 24.11.2026 `/api/snapshot` не
+# отвечал минутами при живом `/api/health`, а в процессах висело по три-шесть движков.
+_INFLIGHT: dict[Path, threading.Event] = {}
+# Секунд: сколько ждать чужую сборку, прежде чем перепроверить кэш.
+BUILD_WAIT_SECONDS = 90.0
 _CACHE_LOCK = threading.Lock()
 
 
@@ -81,26 +88,43 @@ def plans(root: Path) -> list[dict]:
     или строка журнала видны сразу, а не через `PLANS_TTL`. Сбой движка не глотается:
     вызывающий кладёт текст ошибки в состояние проекта, иначе панель молчала бы о
     нечитаемом проекте.
+
+    Сборка на проект идёт в одиночку (`_INFLIGHT`): сторож паузы и вкладки панели просят
+    строки одновременно, а `gate.py --plans` — это процесс на секунды. Кто пришёл вторым,
+    получает прошлые строки, если они есть, иначе ждёт чужую сборку.
     """
     root = Path(root)
-    now = time.monotonic()
-    stamp = _stamp(root)
-    with _CACHE_LOCK:
-        hit = _PLANS_CACHE.get(root)
-        hit_ok = (hit is not None and stamp is not None and hit[0] == stamp
-                  and now - hit[1] <= PLANS_TTL)
-        if hit_ok:
-            return hit[2]
-    data = proj.engine_json(root, "gate.py", "--plans", timeout=90)
-    rows = [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
-    with _CACHE_LOCK:
-        # Отпечаток снят ДО запуска движка: если файлы поменялись, пока он работал, метка
-        # не совпадёт и следующий вызов соберёт строки заново. Метка времени — после
-        # запуска: на медленной машине разбор плана занимает секунды, и запись со временем
-        # «до» съедала TTL ещё до того, как строки появлялись (панель поднимала движок
-        # дважды на запрос).
-        _PLANS_CACHE[root] = (stamp, time.monotonic(), rows)
-    return rows
+    while True:
+        stamp = _stamp(root)
+        now = time.monotonic()
+        with _CACHE_LOCK:
+            hit = _PLANS_CACHE.get(root)
+            if (hit is not None and stamp is not None and hit[0] == stamp
+                    and now - hit[1] <= PLANS_TTL):
+                return hit[2]
+            flight = _INFLIGHT.get(root)
+            if flight is None:
+                flight = _INFLIGHT[root] = threading.Event()
+                break                       # эту сборку делаем сами
+            previous = hit[2] if hit is not None else None
+        if previous is not None:
+            return previous                 # прошлые строки лучше второго движка
+        flight.wait(timeout=BUILD_WAIT_SECONDS)
+    try:
+        data = proj.engine_json(root, "gate.py", "--plans", timeout=90)
+        rows = [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+        with _CACHE_LOCK:
+            # Отпечаток снят ДО запуска движка: если файлы поменялись, пока он работал,
+            # метка не совпадёт и следующий вызов соберёт строки заново. Метка времени —
+            # после запуска: на медленной машине разбор плана занимает секунды, и запись
+            # со временем «до» съедала TTL ещё до того, как строки появлялись (панель
+            # поднимала движок дважды на запрос).
+            _PLANS_CACHE[root] = (stamp, time.monotonic(), rows)
+        return rows
+    finally:
+        with _CACHE_LOCK:
+            _INFLIGHT.pop(root, None)
+        flight.set()
 
 
 def open_plans(plan_rows: list[dict]) -> list[dict]:

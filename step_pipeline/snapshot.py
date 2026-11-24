@@ -103,6 +103,17 @@ _DEFAULT_STEP_ID = r"(?P<id>[A-Za-z]{1,4}\d+[A-Za-z]?(?:-\d+)?)"
 # Кэш процесса: ключ → (время сборки по monotonic, отпечаток источников, снимок).
 _CACHE: dict[tuple, tuple[float, tuple, dict]] = {}
 _CACHE_LOCK = threading.RLock()
+# Сборки «в пути»: ключ → событие, которое выставят, когда сборка закончится. Даёт «одна
+# сборка на ключ» без общего замка на время сборки: замок держится только на словарях,
+# иначе одна заклинившая сборка (движок ждёт борду или чужой процесс) останавливала бы
+# всю панель — 24.11.2026 `gate.py --plans` соседнего проекта провисел двадцать минут, и
+# `/api/snapshot` перестал отвечать вовсе.
+_INFLIGHT: dict[tuple, threading.Event] = {}
+# Номер поколения: `clear_cache` его поднимает, чтобы сборка, начатая до сброса, не легла
+# в кэш с устаревшими данными.
+_GENERATION = 0
+# Секунд: сколько ждать чужую сборку прежде чем перепроверить кэш.
+BUILD_WAIT_SECONDS = 30.0
 
 
 def _ro(path: Path) -> sqlite3.Connection | None:
@@ -397,9 +408,22 @@ def fingerprint(root: Path, plan: str | None = None, preview: bool = False,
 
 
 def clear_cache() -> None:
-    """Очистить кэш снимков: тестам для изоляции, действиям — как страховка после записи."""
+    """Очистить кэш снимков: тестам для изоляции, действиям — как страховка после записи.
+
+    Заодно снимается кэш строк планов (`panel_pause.plans`): снимок берёт их оттуда, и
+    после жеста панели (или правки `cron.json`, которого нет в отпечатке) старая строка
+    иначе пережила бы сброс и панель показала бы прошлое действие. Импорт ленивый —
+    `panel_pause` импортирует этот модуль.
+    """
+    global _GENERATION
     with _CACHE_LOCK:
         _CACHE.clear()
+        _GENERATION += 1
+    try:
+        from . import panel_pause
+    except ImportError:          # pragma: no cover - ручной запуск файлом
+        import panel_pause  # type: ignore[no-redef]
+    panel_pause.clear_cache()
 
 
 def _prompt_file(root: Path, cfg: dict, plan_id, step_id) -> Path | None:
@@ -1809,8 +1833,7 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
         "errors": [],
     }
     try:
-        out["plans"] = proj.engine_json(root, "gate.py", "--plans", engine_dir=engine_dir,
-                                        extra_env=extra_env) or []
+        out["plans"] = _plans_rows(root, preview, engine_dir, extra_env)
     except Exception as exc:                                    # noqa: BLE001 - показываем в UI
         out["errors"].append(f"планы: {exc}")
     # Черновики читаются без движка: панель показывает их рядом с планами, чтобы
@@ -1907,34 +1930,90 @@ def _build_snapshot(root: Path, plan: str | None, preview: bool, board: str | No
     return out
 
 
+def _plans_rows(root: Path, preview: bool, engine_dir: Path | None,
+                extra_env: dict[str, str]) -> list[dict]:
+    """Строки `gate.py --plans` для снимка: в обычном режиме — из кэша паузы панели.
+
+    Один и тот же дорогой запуск движка нужен и сводке реестра (`panel_pause.plans`), и
+    снимку: без общей записи панель поднимала движок дважды на одну загрузку страницы, а
+    каждая сборка снимка стоила секунды и повторялась на каждый кадр потока. Кэш паузы
+    снимается отпечатком источников (`PLANS_TTL` — только страховка), поэтому свежесть
+    строк не хуже прежней.
+
+    Предпросмотр идёт своим путём: там движок плагина и свои переменные окружения, чужой
+    проект в кэше панели не удерживается. Импорт ленивый — `panel_pause` импортирует этот
+    модуль, и на верхнем уровне получился бы цикл.
+    """
+    if preview:
+        data = proj.engine_json(root, "gate.py", "--plans", engine_dir=engine_dir,
+                                extra_env=extra_env) or []
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+    from . import panel_pause
+    return panel_pause.plans(root)
+
+
 def snapshot(project: Path | str | None = None, plan: str | None = None,
-             preview: bool = False, board: str | None = None) -> dict:
+             preview: bool = False, board: str | None = None,
+             max_age: float | None = None) -> dict:
     """Полный снимок: конфиг, планы, шаги, карточки, журнал, решение стража.
 
     *preview* — читать проект, в котором конвейер не установлен: движок берётся из
     плагина, конфиг — умолчания (борду можно задать явно). Ничего не пишется.
 
-    Ответ кэшируется по ключу (проект, план, предпросмотр, борда) на CACHE_TTL секунд и
-    сбрасывается, как только изменился отпечаток источников. Сборка идёт под замком с
-    двойной проверкой: два одновременных запроса не запускают движок дважды. Наружу
-    отдаётся мелкая копия — вызывающий дописывает `log`/`plan_mode`/`ok`, кэш не мутирует.
+    Ответ кэшируется по ключу (проект, план, предпросмотр, борда) и сбрасывается, как
+    только изменился отпечаток источников. Сборка идёт в одиночку на ключ (`_INFLIGHT`):
+    два одновременных запроса не запускают движок дважды, но и не стоят в очереди за
+    сборкой — панель на время чужой сборки получает прошлый снимок. Наружу отдаётся
+    мелкая копия — вызывающий дописывает `log`/`plan_mode`/`ok`, кэш не мутирует.
+
+    *max_age* — сколько секунд живёт запись с тем же отпечатком источников. По умолчанию
+    `CACHE_TTL` (2.5 с): этого хватает агенту и тестам. Панель передаёт свой срок (см.
+    `ui_server.SNAPSHOT_MAX_AGE`): иначе каждый её кадр и каждый опрос страницы пересобирали
+    снимок с нуля, хотя источники не менялись.
     """
     root = Path(project).resolve() if project else proj.find_project()
     key = (str(root), str(plan or ""), bool(preview), str(board or ""))
+    limit = CACHE_TTL if max_age is None else max(0.0, float(max_age))
     stamp = fingerprint(root, plan, preview, board)
-    with _CACHE_LOCK:
-        cached = _CACHE.get(key)
-        if cached is not None:
-            built, cached_stamp, value = cached
-            if cached_stamp == stamp and time.monotonic() - built <= CACHE_TTL:
-                return dict(value)
+    while True:
+        with _CACHE_LOCK:
+            cached = _CACHE.get(key)
+            if cached is not None:
+                built, cached_stamp, value = cached
+                if cached_stamp == stamp and time.monotonic() - built <= limit:
+                    return dict(value)
+            else:
+                value = None
+            flight = _INFLIGHT.get(key)
+            if flight is None:
+                flight = _INFLIGHT[key] = threading.Event()
+                generation = _GENERATION
+                break                       # эту сборку делаем сами
+            stale = dict(value) if value is not None else None
+        # Сборку делает кто-то другой. Панель прошлым снимком отвечает сразу: иначе одна
+        # заклинившая сборка (движок ждёт борду или чужой процесс) держала бы замок и
+        # страница не отвечала бы вовсе — так и случилось 24.11.2026, когда `gate.py
+        # --plans` соседнего проекта провисел двадцать минут. Агент и тесты ждут: им нужен
+        # свежий ответ, а не прошлый.
+        if stale is not None and max_age is not None:
+            return stale
+        flight.wait(timeout=BUILD_WAIT_SECONDS)
+    try:
         result = _build_snapshot(root, plan, preview, board)
-        _CACHE[key] = (time.monotonic(), stamp, result)
-        if len(_CACHE) > CACHE_LIMIT:
-            extra = len(_CACHE) - CACHE_LIMIT
-            for stale in sorted(_CACHE, key=lambda item: _CACHE[item][0])[:extra]:
-                _CACHE.pop(stale, None)
+        with _CACHE_LOCK:
+            # Сброс кэша во время сборки (`clear_cache`) — результат уже не про те файлы,
+            # что на диске: в кэш его не кладём, но вызывающему отдаём.
+            if generation == _GENERATION:
+                _CACHE[key] = (time.monotonic(), stamp, result)
+                if len(_CACHE) > CACHE_LIMIT:
+                    extra = len(_CACHE) - CACHE_LIMIT
+                    for stale in sorted(_CACHE, key=lambda item: _CACHE[item][0])[:extra]:
+                        _CACHE.pop(stale, None)
         return dict(result)
+    finally:
+        with _CACHE_LOCK:
+            _INFLIGHT.pop(key, None)
+        flight.set()
 
 
 if __name__ == "__main__":  # ручная проверка: python -m plugin.snapshot <проект>
