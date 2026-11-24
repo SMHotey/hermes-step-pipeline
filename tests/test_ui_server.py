@@ -3438,3 +3438,42 @@ def test_tick_without_driven_key_is_driven(server):
     snapshot.clear_cache()
     status, data = post(server["url"], {"action": "tick", "plan": "1"})
     assert status == 200 and data["ok"] is True
+
+
+def test_step_card_shows_metrics_text(server):
+    """Карточка шага показывает строку метрики попыток (план 17, S1).
+
+    Панель читает журнал сама (`state/metrics.jsonl`), движок в неё не импортируется:
+    поэтому проверяется ровно то, что видит владелец — числа фаз и одна строка-сводка,
+    а у карточки без строк журнала ключи на месте и пустые.
+    """
+    seed_tasks(server["db"], [
+        {"id": "t_met001", "title": "шаг S1", "status": "done", "assignee": "driver",
+         "idempotency_key": "planloop:1:S1:step", "completed_at": int(time.time())},
+        {"id": "t_met002", "title": "шаг S2", "status": "running", "assignee": "driver",
+         "idempotency_key": "planloop:1:S2:step"},
+    ])
+    state = server["root"] / ".pipeline" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    rows = [{"ts": time.time(), "at": "24.11.2026 00:30:00", "plan": "1", "step": "S1",
+             "card": "t_met001", "attempt": 1, "run_id": "11", "role": "driver",
+             "model": "deepseek-v4.1-flash", "calls": 2, "in": 3000, "out": 300,
+             "model_ms": 12500, "tools_ms": {"terminal": 308320, "patch": 4000},
+             "tools_total_ms": 312320, "tool_timeouts": 1, "wall_ms": 75000,
+             "killed_by": "none", "limit_s": 0, "source": "agent.log", "log": "agent.log"}]
+    (state / "metrics.jsonl").write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8")
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S1")
+    assert status == 200 and data["ok"]
+    card = data["cards"][0]
+    assert card["metrics"]["model_ms"] == 12500
+    assert card["metrics"]["tools_ms"] == {"terminal": 308320, "patch": 4000}
+    assert "модель" in card["metrics_text"] and "terminal" in card["metrics_text"]
+    assert "таймаутов 1" in card["metrics_text"]
+
+    status, data = get(server["url"] + "/api/step?plan=1&id=S2")
+    assert status == 200 and data["ok"]
+    empty = data["cards"][0]
+    assert empty["metrics"] == {} and empty["metrics_text"] == ""

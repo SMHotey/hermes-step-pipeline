@@ -68,6 +68,7 @@ ACTION_LABELS = {"create_step": "шаг", "create_prompt": "постановка
 
 # ─── лента действий (план 3 S9): история тиков из `state/history.jsonl` ───
 HISTORY_FILE = "history.jsonl"      # файл истории пишет страж, панель только читает
+METRICS_FILE = "metrics.jsonl"      # журнал попыток шага пишет страж (17-S1), панель читает
 EVENTS_LIMIT = 200                  # строк ленты в снимке: свежие сверху
 CARD_ID_RE = re.compile(r"t_[0-9a-f]{6,}")     # карточка в тексте действия
 EVENT_FLAGS = {"stop": "bad", "create_fix": "warn"}   # подсветка строки ленты (D4)
@@ -522,6 +523,117 @@ def _duration(seconds) -> str:
     if minutes:
         return f"{minutes} мин"
     return "меньше минуты"
+
+
+def _fmt_ms(ms) -> str:
+    """Время метрики по-русски: «12,5 с» до минуты, «5,2 мин» до часа, дальше «1 ч 4 мин».
+
+    Формат — требование шага 17-S1 к строке карточки; панель его только печатает, поэтому
+    правило живёт здесь, а не в разметке.
+    """
+    try:
+        seconds = max(0.0, float(ms) / 1000.0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds < 60:
+        return f"{seconds:.1f}".replace(".", ",") + " с"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}".replace(".", ",") + " мин"
+    total = int(round(seconds / 60))
+    return f"{total // 60} ч {total % 60} мин"
+
+
+def _metric_int(value) -> int:
+    """Целое из поля строки метрики; мусор и `None` — ноль, а не исключение."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _metrics_by_card(root: Path) -> dict[str, list[dict]]:
+    """Строки `state/metrics.jsonl` по номеру карточки (17-S1).
+
+    Движок в панель не импортируется (D5 стража), поэтому файл читается здесь своим
+    разбором: JSONL, битые и чужие строки пропускаются. Нет файла, каталога или строки
+    без карточки — пустой словарь: экран отвечает на вопрос «что было», а не падает.
+    """
+    path = proj.state_dir(Path(root)) / METRICS_FILE
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    result: dict[str, list[dict]] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        card_id = str(row.get("card") or "")
+        if card_id:
+            result.setdefault(card_id, []).append(row)
+    return result
+
+
+def _metrics_summary(rows: list[dict]) -> dict:
+    """Свод метрики по карточке шага: попытки, фазы, имена инструментов, чем кончилась.
+
+    Суммы — по всем попыткам карточки: вопрос экрана «сколько шаг стоил», а не «сколько
+    стоила последняя попытка». `killed_by` — из последней строки: это исход последней
+    попытки, и он один на карточку.
+    """
+    if not rows:
+        return {}
+    tools: dict[str, int] = {}
+    for row in rows:
+        pairs = row.get("tools_ms") if isinstance(row.get("tools_ms"), dict) else {}
+        for name, value in pairs.items():
+            tools[str(name)] = tools.get(str(name), 0) + _metric_int(value)
+    last = rows[-1]
+    return {
+        "attempts": len(rows),
+        "model_ms": sum(_metric_int(row.get("model_ms")) for row in rows),
+        "tools_ms": tools,
+        "tools_total_ms": sum(tools.values()),
+        "tool_timeouts": sum(_metric_int(row.get("tool_timeouts")) for row in rows),
+        "wall_ms": sum(_metric_int(row.get("wall_ms")) for row in rows),
+        "killed_by": str(last.get("killed_by") or "none"),
+    }
+
+
+def _metrics_text(summary: dict) -> str:
+    """Одна строка метрики для карточки шага; свода нет — пустая строка.
+
+    Состав — контракт шага 17-S1: `попыток N` (когда попыток больше одной), время модели,
+    время инструментов с тремя самыми дорогими именами, число таймаутов (когда не ноль) и
+    чем кончилась последняя попытка.
+    """
+    if not summary:
+        return ""
+    parts: list[str] = []
+    attempts = _metric_int(summary.get("attempts"))
+    if attempts > 1:
+        parts.append(f"попыток {attempts}")
+    parts.append(f"модель {_fmt_ms(summary.get('model_ms'))}")
+    tools = summary.get("tools_ms") if isinstance(summary.get("tools_ms"), dict) else {}
+    top = sorted(((str(name), _metric_int(value)) for name, value in tools.items()),
+                 key=lambda item: -item[1])[:3]
+    named = ", ".join(f"{name} {_fmt_ms(ms)}" for name, ms in top if ms > 0)
+    total = f"инструменты {_fmt_ms(summary.get('tools_total_ms'))}"
+    parts.append(f"{total} ({named})" if named else total)
+    timeouts = _metric_int(summary.get("tool_timeouts"))
+    if timeouts:
+        parts.append(f"таймаутов {timeouts}")
+    killed = str(summary.get("killed_by") or "")
+    if killed == "runtime":
+        parts.append("убита по лимиту")
+    elif killed == "review":
+        parts.append("остановлена ревью")
+    return ", ".join(parts)
 
 
 def _plan_state(root: Path, plan_id) -> dict:
@@ -1544,6 +1656,9 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
     # Карточки — запросом по префиксу ключа: окно «последние N задач» теряло старый шаг.
     raw_cards = cards(db, limit=100, key_prefix=prefix)
     runs = _card_runs(db, [str(card.get("id") or "") for card in raw_cards])
+    # Метрика попыток шага (17-S1): файл журнала читается один раз на экран, строки
+    # раскладываются по карточкам. Нет файла — пустой словарь, ключи карточек на месте.
+    metric_rows = _metrics_by_card(root)
     times = _step_times(raw_cards, runs, now)
     stages = _stages(raw_cards, runs, cfg, times, now)
     step_cards: list[dict] = []
@@ -1552,6 +1667,7 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
         result = _clip_chars(str(card.get("result") or ""), CARD_TEXT_LIMIT)
         shown_comments = comments(db, card_id)
         total_comments = comments_total(db, card_id)
+        card_metrics = _metrics_summary(metric_rows.get(card_id) or [])
         step_cards.append({"id": card_id, "title": str(card.get("title") or ""),
                            "status": str(card.get("status") or ""),
                            "assignee": str(card.get("assignee") or ""),
@@ -1560,6 +1676,9 @@ def step_detail(project: Path | str | None = None, plan_id: str | int = "",
                            "result_truncated": result["truncated"],
                            "completed_at": card.get("completed_at"),
                            "attempts": _attempts(card, runs.get(card_id) or [], now),
+                           # Метрика попыток (17-S1): числа фаз и одна строка для карточки.
+                           "metrics": card_metrics,
+                           "metrics_text": _metrics_text(card_metrics),
                            "comments": shown_comments,
                            "comments_note": (f"показаны первые {len(shown_comments)} "
                                              f"комментариев, всего {total_comments}"

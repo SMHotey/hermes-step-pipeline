@@ -167,7 +167,7 @@ ENGINE_FILES = ("__init__.py", "analyze.py", "approval.py", "check_task_prompt.p
                 "config.py", "gate.py", "keeper_heal.py", "keeper_scan.py", "next_step.py",
                 "plan_cycle.py",
                 "plan_lint.py", "registry.py", "scout_report.py", "state_io.py",
-                "step_card.py", "tick.py")
+                "step_card.py", "step_metrics.py", "tick.py")
 
 # Режимы ревью постановки: иное значение в pipeline.json — ошибка конфигурации, а не
 # молчаливое «auto»: владелец должен узнать, что его настройка не подействовала.

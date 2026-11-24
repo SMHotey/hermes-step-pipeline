@@ -1,0 +1,9 @@
+2026-11-20 10:00:00,000 INFO [20261120_083507_d71afc] agent.conversation_loop: API call #1: model=deepseek-v4.1-flash provider=opencode-go in=1000 out=100 total=1100 latency=10.0s cache=0/1000 (0%) id=gw-aaa
+2026-11-20 10:00:05,000 INFO [20261120_083507_d71afc] agent.tool_executor: tool terminal completed (5.00s, 100 chars)
+2026-11-20 10:00:20,000 INFO [20261120_083507_d71afc] agent.conversation_loop: API call #2: model=deepseek-v4.1-flash provider=opencode-go in=2000 out=200 total=2200 latency=2.5s cache=0/2000 (0%) id=gw-bbb
+2026-11-20 10:00:21,000 INFO [20261120_083507_d71afc] agent.tool_executor: tool patch completed (0.50s, 10 chars)
+2026-11-20 10:00:25,000 WARNING [20261120_083507_d71afc] agent.tool_executor: Tool patch returned error (3.50s): {"success": false, "error": "old_string not found"}
+2026-11-20 10:00:26,000 WARNING agent.deadline: [deadline] 'terminal.wait:LocalEnvironment' timed out after 302.0s; worker abandoned
+2026-11-20 10:00:27,000 WARNING agent.tool_executor: Tool terminal returned error (303.18s): {"output": "[Command timed out after 300s]", "exit_code": 124}
+2026-11-20 10:00:30,000 INFO agent.tool_executor: tool terminal completed (0.14s, 467 chars)
+2026-11-20 10:01:15,000 ERROR kanban runtime: elapsed 5491s > limit 3600s

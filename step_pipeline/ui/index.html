@@ -2482,6 +2482,7 @@ function renderStep(data) {
       <div class="row1"><span class="title">${esc(card.title)}</span>
         <span class="pill ${cls}">${esc(card.status)}</span></div>
       <div class="muted mono">${esc(card.key)} · ${esc(card.id)}</div>
+      ${card.metrics_text ? `<div class="muted mono">${esc(card.metrics_text)}</div>` : ""}
       ${card.result ? `<div class="res"><pre>${esc(card.result)}</pre></div>
         ${card.result_note ? `<div class="clip">${esc(card.result_note)}</div>` : ""}`
                     : `<div class="muted">результата нет</div>`}

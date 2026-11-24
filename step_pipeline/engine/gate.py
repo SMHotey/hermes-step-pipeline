@@ -107,6 +107,7 @@ import plan_cycle  # noqa: E402 - гейт корректировки плана
 import next_step  # noqa: E402 - шаги плана: проверка номера в ручном допуске
 import check_task_prompt  # noqa: E402 - форма постановки: спека high-шага (8-S2B)
 import state_io  # noqa: E402 - атомарная запись состояния и блокировка тика
+import step_metrics  # noqa: E402 - метрика попытки шага: время по фазам (план 17, S1)
 
 # ──────────────────── целостность движка ────────────────────
 # Проект работает на КОПИИ движка в `.pipeline/`. Если движок правили в плагине,
@@ -7936,6 +7937,16 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
     if not execute:
         result["metrics"] = history_metrics(p.cfg)
         return result
+    # Метрика попытки шага (план 17, S1): завершённые прогоны карточек текущего шага
+    # ложатся строкой в `state/metrics.jsonl`. Сбой замера вердикт не меняет и тик не
+    # валит: числа нужны владельцу, а решение страж принимает по вердикту и файлам.
+    # `ctx["cards"]` и шаг уже собраны `build_ctx` — второго запроса к борде нет.
+    try:
+        current_step = ctx.get("step") or ctx.get("next") or {}
+        step_metrics.record(p.cfg, p.kanban_db, plan_id,
+                            str(current_step.get("id") or ""), ctx.get("cards") or [])
+    except Exception as exc:  # noqa: BLE001 - замер не имеет права валить тик
+        config_mod.debug_note("step_metrics", exc)
     if closed:
         return result
 
