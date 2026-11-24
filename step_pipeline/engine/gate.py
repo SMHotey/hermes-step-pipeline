@@ -6888,12 +6888,20 @@ def _killed_metric_row(p: Paths, step_id: str, card_ids: set[str]) -> dict:
 def _killed_card_by_error(cards: list[dict]) -> dict | None:
     """Запасной путь Д2: прогонов в борде нет — лимит берётся из ошибки самой карточки.
 
+    Признак — карточка шага в статусе из `gate.TERMINAL`, кроме `done` (постановка 17-S3,
+    П3 п. 3). Статус проверяется до сверки текста: строка лимита остаётся в
+    `last_failure_error` и после перезапуска (`running` — попытка ещё живёт) и после
+    закрытия (`done` — продолжать нечего), и снимок «продолжай с этого» в них был бы
+    ложью: в первом случае работа идёт, во втором шаг закончен.
     Тем же шаблоном, что и метрика (`step_metrics.LIMIT_TEXT_RE`): два разбора одной
     строки лимита разошлись бы, и снимок не появился бы там, где метрика его видит.
+    Поля — `error` и `result`: `summary` в признаке постановки нет.
     """
     for card in cards:
-        text = " ".join(str(card.get(name) or "")
-                        for name in ("error", "result", "summary"))
+        status = str(card.get("status") or "")
+        if status not in TERMINAL or status == "done":
+            continue
+        text = " ".join(str(card.get(name) or "") for name in ("error", "result"))
         if step_metrics.LIMIT_TEXT_RE.search(text):
             return card
     return None

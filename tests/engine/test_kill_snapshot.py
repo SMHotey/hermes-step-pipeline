@@ -428,6 +428,25 @@ def test_card_error_alone_starts_the_snapshot(stand: Path, hermes_stub: Path,
     assert entry["card"] == "t_step01" and entry["source"] == "git"
 
 
+@pytest.mark.parametrize("status", ["running", "done"])
+def test_limit_text_on_live_or_closed_card_writes_nothing(stand: Path, hermes_stub: Path,
+                                                          no_logs: Path,
+                                                          status: str) -> None:
+    """Текст лимита на живой или закрытой карточке — не признак Д2: снимка и комментария нет.
+
+    Обратная сторона запасного пути: `last_failure_error` переживает и перезапуск
+    (`running` — работа идёт), и закрытие (`done` — продолжать нечего), поэтому статус
+    проверяется до сверки текста (постановка 17-S3, П3 п. 3, Д2).
+    """
+    make_repo(stand)
+    seed_killed(hermes_stub, status=status, runs=False)
+
+    gate.run_gate(paths(stand), notify_fn=lambda text: None)
+
+    assert not snapshot_file(stand).is_file()
+    assert comments(hermes_stub) == []
+
+
 def test_status_probe_changes_nothing(stand: Path, hermes_stub: Path,
                                       no_logs: Path) -> None:
     """`execute=False` не пишет ни снимка, ни строки метрики, ни комментария (Д7)."""
