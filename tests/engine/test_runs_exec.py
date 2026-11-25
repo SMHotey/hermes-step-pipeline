@@ -249,6 +249,89 @@ def test_python_token_uses_engine_python(project: Path, hermes_stub: Path):
     assert gate.run_step_runs(p, next_step_dict(project))["green"] == 1
 
 
+# ─────────────── цепочка `&&` и обёртки Windows в первом токене ───────────────
+#
+# Находка 4-S1 проекта self-analyzer: пункт «- Прогон: `npm --prefix web ci && npm
+# --prefix web run build`» не запускался вовсе — `FileNotFoundError [WinError 2]`.
+# Причин две, и обе в движке: `npm` на Windows — `*.cmd`-обёртка (CreateProcess
+# дописывает только `.exe`), а `&&` после `shlex.split` уезжал аргументом в `npm`.
+
+CMD_AND_OK = 'python -c "print(1)" && python -c "print(2)"'
+CMD_AND_RED = ('python -c "import sys; sys.exit(1)" && '
+               'python -c "open(\'mark.txt\',\'a\').write(\'x\')"')
+CMD_AND_QUOTED = 'python -c "print(\'a && b\')"'
+CMD_NO_SUCH = "no_such_command_s2_42 --version"
+
+
+def test_segments_split_on_and_only(project: Path, hermes_stub: Path):
+    """`runs_segments`: `&&` — разделитель, `&&` в кавычках — аргумент, пустых нет."""
+    p = stand(project, hermes_stub, [f"- Прогон: `{CMD_OK}` → exit 0"])
+    py = gate._python(p)
+
+    assert gate.runs_segments(p, CMD_AND_OK) == [[py, "-c", "print(1)"],
+                                                [py, "-c", "print(2)"]]
+    assert gate.runs_segments(p, CMD_AND_QUOTED) == [[py, "-c", "print('a && b')"]]
+    assert gate.runs_segments(p, "&& &&") == []
+
+
+def test_and_chain_runs_both_commands(project: Path, hermes_stub: Path):
+    """`a && b`: обе команды исполнены, код строки — код последней, строка — дословно."""
+    p = stand(project, hermes_stub, [f"- Прогон: `{CMD_AND_OK}` → exit 0"])
+
+    proof = gate.run_step_runs(p, next_step_dict(project))
+
+    row = proof["runs"][0]
+    assert (row["outcome"], row["code"]) == ("green", 0)
+    assert "1" in row["tail"] and "2" in row["tail"]
+    assert row["command"] == CMD_AND_OK
+
+
+def test_and_chain_stops_after_red(project: Path, hermes_stub: Path):
+    """Первая команда красная — вторая не исполняется, код строки — код первой."""
+    p = stand(project, hermes_stub, [f"- Прогон: `{CMD_AND_RED}` → exit 0"])
+
+    proof = gate.run_step_runs(p, next_step_dict(project))
+
+    row = proof["runs"][0]
+    assert (row["outcome"], row["code"]) == ("red", 1)
+    assert not (project / MARKER).exists()
+
+
+def test_first_token_resolves_through_path(project: Path, hermes_stub: Path,
+                                           monkeypatch: pytest.MonkeyPatch):
+    """Первый токен разворачивается как его нашла бы оболочка: `npm` → `npm.cmd`.
+
+    `CreateProcess` дописывает к имени только `.exe`, поэтому `*.cmd`-обёртка Windows
+    без разворота не запускалась (`WinError 2`). Разворот идёт через `shutil.which`,
+    то есть по `PATH` и `PATHEXT`, — ровно как у человека в `cmd`.
+    """
+    p = stand(project, hermes_stub, [f"- Прогон: `{CMD_NO_SUCH}` → exit 0"])
+    asked: list[str] = []
+
+    def which(token: str) -> str:
+        asked.append(token)
+        return "/opt/node/bin/npm.cmd" if token == "npm" else ""
+
+    monkeypatch.setattr(gate.shutil, "which", which)
+
+    assert gate.runs_argv(p, "npm --prefix web ci") == ["/opt/node/bin/npm.cmd",
+                                                       "--prefix", "web", "ci"]
+    assert asked == ["npm"]
+    # Нет файла — токен остаётся дословно: имя команды пришло из плана (D8).
+    assert gate.runs_argv(p, CMD_NO_SUCH)[0] == "no_such_command_s2_42"
+
+
+def test_missing_command_is_red_without_code(project: Path, hermes_stub: Path):
+    """Команды нет в `PATH` — красный прогон с `code: null`, а не исключение тика."""
+    p = stand(project, hermes_stub, [f"- Прогон: `{CMD_NO_SUCH}` → exit 0"])
+
+    proof = gate.run_step_runs(p, next_step_dict(project))
+
+    row = proof["runs"][0]
+    assert (row["outcome"], row["code"]) == ("red", None)
+    assert "не запустился" in str(row.get("reason") or "")
+
+
 # ─────────────────────── кэш, бюджет, повторные тики ───────────────────────
 
 

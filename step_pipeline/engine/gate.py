@@ -1243,19 +1243,71 @@ def runs_proof_for(p: Paths, step_id: str, sha: str) -> dict | None:
     return proof if proof is not None else load_runs_proof(p, step_id, head_commit(p))
 
 
+def _runs_exe(token: str) -> str:
+    """Первый токен прогона — так, как его нашла бы оболочка: `shutil.which` по `PATH`.
+
+    На Windows `npm`, `npx`, `yarn`, `gradle` — это `*.cmd`-обёртки в `PATH`, а
+    `CreateProcess` дописывает к имени только `.exe`: строка «- Прогон» вида
+    `npm --prefix web ci` падала `FileNotFoundError [WinError 2]`, хотя человек ту же
+    строку в `cmd` исполняет. `which` читает `PATHEXT` и отдаёт полный путь с
+    расширением, обёртка запускается напрямую — оболочка для этого не нужна (D1).
+
+    Файла нет — токен остаётся дословно, и прогон краснеет по-настоящему: имя команды
+    пришло из строки плана (D8), а не из движка.
+    """
+    return shutil.which(token) or token
+
+
 def runs_argv(p: Paths, command: str) -> list[str]:
-    """`argv` прогона: строка плана режется `shlex.split` в posix-режиме, `shell` не
-    участвует (D1): поведение `cmd.exe` и `sh` на одной строке различается, а план
-    обязан давать один и тот же результат на любой машине.
+    """`argv` одной команды прогона: строка плана режется `shlex.split` в posix-режиме,
+    `shell` не участвует (D1): поведение `cmd.exe` и `sh` на одной строке различается, а
+    план обязан давать один и тот же результат на любой машине.
 
     Первый токен `python`/`python3` заменяется на интерпретатор движка (D2): голый
     `python` в PATH — чужой venv, а строки «- Прогон» почти всегда начинаются с него.
-    Другие имена не подставляются: `ruff` в PATH нет, и это строка плана (D8).
+    Остальные имена разворачиваются по `PATH` (`_runs_exe`): без этого `*.cmd`-обёртки
+    Windows не запускаются вовсе.
     """
-    argv = shlex.split(str(command or ""), posix=True)
+    return _runs_argv_of(p, shlex.split(str(command or ""), posix=True))
+
+
+def _runs_argv_of(p: Paths, tokens: list[str]) -> list[str]:
+    """`argv` одной команды из готовых токенов: первый токен — интерпретатор и `PATH`.
+
+    Отдельно от `runs_argv`, потому что цепочка `a && b` — это несколько команд в одной
+    строке плана, и разворот первого токена нужен КАЖДОЙ из них: иначе `python ... &&
+    python ...` исполнил бы вторую половину чужим `python` из `PATH`.
+    """
+    argv = list(tokens)
     if argv and argv[0] in ("python", "python3"):
         argv[0] = _python(p)
+    if argv:
+        argv[0] = _runs_exe(argv[0])
     return argv
+
+
+#: Разделитель команд внутри одной строки «Прогон»: вторая команда идёт только после
+#: успеха первой. `&&` — единственный фрагмент оболочки, который ведёт себя одинаково в
+#: `cmd.exe` и `sh`, поэтому движок разбирает его сам и оболочку не поднимает (D1).
+RUNS_AND = "&&"
+
+
+def runs_segments(p: Paths, command: str) -> list[list[str]]:
+    """Команды одной строки «Прогон»: `a && b` — два `argv`, исполняются по порядку.
+
+    Режется по СЛОВАМ, а не по тексту: `&&` внутри кавычек остаётся аргументом
+    (`python -c "print('a && b')"`), иначе строка плана ломала бы чужую команду.
+    Пустые сегменты (`a &&`, `&& b`) отбрасываются: оболочка ругается на них синтаксисом,
+    а прогону нужен код возврата, а не текст разбора. Ни одного сегмента — пустой список,
+    и прогон краснеет «не запустился», как на пустой команде.
+    """
+    segments: list[list[str]] = [[]]
+    for token in shlex.split(str(command or ""), posix=True):
+        if token == RUNS_AND:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return [_runs_argv_of(p, segment) for segment in segments if segment]
 
 
 def _seconds_text(seconds: float) -> str:
@@ -1340,8 +1392,10 @@ def run_step_runs(p: Paths, step: dict) -> dict | None:
 
     Первым читается доказательство текущего sha: файл есть — возвращается он как есть и
     НЕ запускается ни одной команды (F03, тест 7). Иначе прогоны идут по порядку списка
-    `step["runs"]` в корне проекта: `argv` собирает `runs_argv` (без `shell`, D1), вывод
-    читается в UTF-8 с `errors="replace"`, stdout и stderr склеиваются, хвост — 2000
+    `step["runs"]` в корне проекта: `argv` собирают `runs_argv`/`runs_segments` (без
+    `shell`, D1), цепочка `a && b` идёт по порядку и встаёт на первом ненулевом коде
+    (код строки — код последней исполненной команды), вывод читается в UTF-8 с
+    `errors="replace"`, stdout и stderr склеиваются, хвост — 2000
     символов. Исход каждого прогона — строка доказательства: `green`, `red`, `timeout`
     либо `skipped` (бюджет, D5), плюс код возврата, секунды и хвост.
 
@@ -1384,25 +1438,41 @@ def run_step_runs(p: Paths, step: dict) -> dict | None:
                          "value": str(run.get("value") or ""), "outcome": "skipped",
                          "code": None, "seconds": 0.0, "tail": ""})
             continue
-        argv = runs_argv(p, command)
+        segments = runs_segments(p, command)
         started = time.monotonic()
+        deadline = started + timeout
         code: int | None = None
         output = ""
         timed_out = False
-        try:
-            res = subprocess.run(argv, cwd=str(Path(p.repo)), capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace",
-                                 timeout=timeout)
-            code = int(res.returncode)
-            output = (res.stdout or "") + (res.stderr or "")
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            output = f"таймаут {timeout} с\n{_run_tail(_text_of(exc.stdout))}" \
-                     f"{_text_of(exc.stderr)}"
-        except OSError as exc:
-            # Команды нет или интерпретатор не запустился: красный прогон с `code: null`
-            # и текстом ошибки в хвосте, а не исключение — тик обязан дойти до решения.
-            output = f"{type(exc).__name__}: {exc}"
+        for argv in segments:
+            # Таймаут пункта «Прогон» считается на всю цепочку `&&`, а не на каждый её шаг:
+            # иначе `a && b` держал бы шаг вдвое дольше объявленного в плане.
+            left = deadline - time.monotonic()
+            if left <= 0:
+                timed_out = True
+                code = None
+                output += f"\nтаймаут {timeout} с"
+                break
+            try:
+                res = subprocess.run(argv, cwd=str(Path(p.repo)), capture_output=True,
+                                     text=True, encoding="utf-8", errors="replace",
+                                     timeout=left)
+                code = int(res.returncode)
+                output += (res.stdout or "") + (res.stderr or "")
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                code = None
+                output += f"таймаут {timeout} с\n{_run_tail(_text_of(exc.stdout))}" \
+                          f"{_text_of(exc.stderr)}"
+                break
+            except OSError as exc:
+                # Команды нет или интерпретатор не запустился: красный прогон с `code: null`
+                # и текстом ошибки в хвосте, а не исключение — тик обязан дойти до решения.
+                code = None
+                output += f"{type(exc).__name__}: {exc}"
+                break
+            if code != 0:
+                break          # `&&`: следующая команда идёт только после успеха этой
         seconds = round(time.monotonic() - started, 3)
         spent += seconds
         outcome, reason = runs_outcome(run, code, output, timed_out)

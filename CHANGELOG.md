@@ -3,6 +3,23 @@
 Формат: [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — semver.
 Ломающее изменение поведения движка или формата `pipeline.json` — минимум минор.
 
+## 0.42.4 — 25.11.2026
+
+**Прогон с цепочкой `&&` и `*.cmd`-обёрткой запускается.** Строка «- Прогон: `npm --prefix
+web ci && npm --prefix web run build`» плана 4 проекта self-analyzer не запускалась вовсе:
+красный прогон за 0.4 с, `FileNotFoundError [WinError 2]`. Причин две, и обе в движке.
+
+- `runs_argv` разворачивает первый токен через `shutil.which` (`PATH` и `PATHEXT`):
+  `CreateProcess` дописывает к имени только `.exe`, поэтому `npm`/`npx`/`yarn` на Windows
+  (`*.cmd`) не находились, хотя человек ту же строку в `cmd` исполняет. Оболочки это не
+  поднимает — D1 в силе.
+- `runs_segments`: `a && b` — две команды, вторая идёт только после успеха первой; код
+  строки — код последней исполненной, таймаут считается на всю цепочку. Режется по СЛОВАМ
+  (`shlex.split`), поэтому `&&` внутри кавычек остаётся аргументом.
+- Тесты: `test_runs_exec.py::test_segments_split_on_and_only`,
+  `::test_and_chain_runs_both_commands`, `::test_and_chain_stops_after_red`,
+  `::test_first_token_resolves_through_path`, `::test_missing_command_is_red_without_code`.
+
 ## 0.42.3 — 25.11.2026
 
 **Панель читает реестр установки, а не пустой профильный.** Панель, запущенная из профиля
