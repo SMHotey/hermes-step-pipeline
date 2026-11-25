@@ -2191,15 +2191,23 @@ class Handler(BaseHTTPRequestHandler):
     def _pause_view(self, state: State) -> dict:
         """Состояние кнопки паузы: память сторожа, до первого расчёта — только маркер.
 
+        Жест один на весь реестр, поэтому состояние жеста живёт на состоянии сервера, а
+        не вкладки: считает его `prime_pause_state` и сторож `watch_pause`. Читать здесь
+        `state.pause` выбранного проекта нельзя — у соседних проектов это состояние
+        создаётся на первом обращении и пусто всегда, и вкладка чужого проекта показывала
+        «остановлены не все планы: нет данных» при живой паузе (25.11.2026).
+
         Снимок за движком не ходит: `gate.py --plans` — это процесс на проект, а панель
         держит бюджет запусков (тесты `snapshot_cache_*` считают их штуками). В рабочей
         панели состояние считает `serve` до старта сервера и дальше сторож каждые
         `PAUSE_WATCH` секунд; здесь остаётся дешёвая выжимка из маркера, чтобы кнопка
-        не врала о самом жесте («пауза запрошена»), пока расчёта ещё нет.
+        не врала о самом жесте («пауза запрошена»), пока расчёта ещё нет. Признак
+        `pending: True` говорит экрану, что это ещё не расчёт, а ожидание.
         """
-        with state.pause_lock:
-            info = dict(state.pause) if state.pause else {}
-            working = bool(state.pause_pending)
+        owner = getattr(getattr(self, "server", None), "state", None) or state
+        with owner.pause_lock:
+            info = dict(owner.pause) if owner.pause else {}
+            working = bool(owner.pause_pending)
         if info:
             info["working"] = working
             return info

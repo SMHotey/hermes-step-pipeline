@@ -400,7 +400,6 @@ def read_pause() -> dict[str, Any]:
     raw = container.get(PAUSE_KEY) if isinstance(container, dict) else None
     if not isinstance(raw, dict) or not raw:
         return out
-    out["active"] = True
     out["reason"] = str(raw.get("reason") or "")
     for key in ("requested_at", "completed_at", "notified_at"):
         value = raw.get(key)
@@ -416,6 +415,11 @@ def read_pause() -> dict[str, Any]:
                 "name": str(data.get("name") or project_id),
                 "plans": ([str(plan) for plan in plans]
                           if isinstance(plans, (list, tuple)) else [])}
+    # Жест — это время запроса и остановленные планы, а не сам факт ключа в реестре.
+    # Остаток без них (след доставки от `panel_pause.mark`, старые записи) паузой не
+    # считается: иначе панель вечно показывала «пауза запрошена, но остановлены не все
+    # планы», хотя останавливать было нечего (25.11.2026, «нет данных» в плашке).
+    out["active"] = bool(out["requested_at"]) or bool(out["projects"])
     return out
 
 

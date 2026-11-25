@@ -237,10 +237,18 @@ def _raw(marker: dict) -> dict:
 
 
 def mark(**fields: Any) -> dict:
-    """Дописать поля в маркер паузы (время полной остановки, отметка доставки)."""
-    marker = _raw(proj.read_pause())
-    if not marker:
-        return proj.read_pause()
+    """Дописать поля в маркер паузы (время полной остановки, отметка доставки).
+
+    Отметку ставит сторож доставки, а жест к этому моменту могли уже снять («Запустить
+    всё» в соседней вкладке). Поэтому писать некуда, если жеста в реестре нет: раньше
+    проверялось `if not marker`, а `read_pause` всегда возвращает словарь с полями —
+    и отметка создавала маркер из ничего (`requested_at: 0`, `projects: {}`), по которому
+    панель потом вечно считала паузу запрошенной (25.11.2026).
+    """
+    current = proj.read_pause()
+    if not current.get("active"):
+        return current
+    marker = _raw(current)
     marker.update(fields)
     try:
         return proj.write_pause(marker)

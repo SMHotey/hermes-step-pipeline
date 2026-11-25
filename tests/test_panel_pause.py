@@ -219,6 +219,36 @@ def test_write_pause_wants_container(tmp_path: Path, isolated_hermes_home: Path)
     assert proj.read_pause()["active"] is False
 
 
+def test_marker_without_gesture_is_not_pause(isolated_hermes_home: Path):
+    """След доставки без времени и планов — не пауза: иначе плашка висит вечно.
+
+    Такой остаток появлялся, когда «Запустить всё» снимал жест между проверкой маркера
+    и отметкой доставки: в реестре оставался ключ `pause` с `requested_at: 0` и пустыми
+    проектами, а панель показывала «пауза запрошена, но остановлены не все планы».
+    """
+    proj.projects_file().write_text(json.dumps(
+        {"projects": [], "pause": {"requested_at": 0.0, "requested_at_text": "",
+                                   "reason": "", "projects": {},
+                                   "completed_at": 1795428106.9,
+                                   "notified_at": 1795428106.9}},
+        ensure_ascii=False), encoding="utf-8")
+
+    marker = proj.read_pause()
+
+    assert marker["active"] is False
+    assert marker["notified_at"] == 1795428106.9       # отметка читается, но паузой не считается
+
+
+def test_mark_does_not_invent_marker(isolated_hermes_home: Path):
+    """Отметка доставки не создаёт маркер там, где жеста не было."""
+    proj.projects_file().write_text(json.dumps({"projects": []}), encoding="utf-8")
+
+    marker = panel_pause.mark(notified_at=123.0, completed_at=123.0)
+
+    assert marker["active"] is False
+    assert "pause" not in json.loads(proj.projects_file().read_text(encoding="utf-8"))
+
+
 # ── панель: действие, снимок и разметка ──
 
 @pytest.fixture()
@@ -338,3 +368,46 @@ def test_index_pause_and_autostart_markup():
                    '$("autostart").onchange = (event) => toggleAutostart(event.target.checked)',
                    "renderPause(data.pause)", "renderAutostart(data.autostart)"):
         assert anchor in html, anchor
+
+
+def test_banner_waits_for_pause_state_instead_of_no_data():
+    """Плашка различает «ещё считается» и «останавливать нечего».
+
+    «нет данных» владелец видел при живой паузе: снимок отдавал ожидание расчёта, а
+    экран считал это ответом (25.11.2026).
+    """
+    html = (PLUGIN / "step_pipeline" / "ui" / "index.html").read_text(encoding="utf-8")
+
+    assert "pause.pending" in html
+    assert "Пауза: состояние ещё считается" in html
+    assert "останавливать нечего" in html
+    assert '|| "нет данных"' not in html
+
+
+def test_pause_state_is_registry_wide_across_tabs(tmp_path: Path, hermes_stub: Path):
+    """Вкладка чужого проекта показывает жест реестра, а не пустое состояние проекта.
+
+    Жест один на реестр и считается сторожем на состоянии сервера; пока снимок читал
+    `state.pause` выбранного проекта, соседние вкладки показывали «нет данных».
+    """
+    first = install_project(tmp_path / "alpha", board="pauseboard")
+    extra = install_project(tmp_path / "beta", board="pauseboard")
+    httpd = ui_server.make_server(first, port=0, extra_projects=[str(extra)])
+    handler = httpd.RequestHandlerClass
+    info = {"active": True, "all_stopped": False, "all_paused": False,
+            "projects": [], "running": [], "unstopped": ["alpha"],
+            "requested_at": 1.0, "requested_at_text": "25.11.2026 13:01:46",
+            "completed_at": 0.0, "notified": False, "reason": "",
+            "working": False, "error": ""}
+    with handler.state.pause_lock:
+        handler.state.pause = info
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        _, snap = get(url + "/api/snapshot?project=beta")
+    finally:
+        ui_server.close_server(httpd)
+
+    assert snap["project_id"] == "beta"
+    assert snap["pause"]["unstopped"] == ["alpha"]
+    assert snap["pause"].get("pending") is None

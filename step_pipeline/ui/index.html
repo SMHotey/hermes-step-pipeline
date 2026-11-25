@@ -1725,11 +1725,19 @@ function renderPause(info) {
     banner.hidden = false;
     banner.className = "pause-banner wait";
     banner.textContent = "Пауза: ждём закрытия текущего шага" + (waiting ? " — " + waiting : "");
-  } else if (pause.active) {
+  } else if (pause.pending) {
+    // Жест ещё не посчитан: сторож обходит проекты (это процесс движка на каждый), поэтому
+    // «нет данных» было бы неправдой — данных ещё нет, а не «все остановлены».
     banner.hidden = false;
     banner.className = "pause-banner wait";
-    banner.textContent = "Пауза запрошена, но остановлены не все планы: "
-      + ((pause.unstopped || []).join(", ") || "нет данных");
+    banner.textContent = "Пауза: состояние ещё считается — сторож обходит проекты";
+  } else if (pause.active) {
+    const unstopped = pause.unstopped || [];
+    banner.hidden = false;
+    banner.className = "pause-banner wait";
+    banner.textContent = unstopped.length
+      ? "Пауза запрошена, но остановлены не все планы: " + unstopped.join(", ")
+      : "Пауза запрошена: останавливать нечего — открытых планов нет";
   } else {
     banner.hidden = true;
     banner.textContent = "";
