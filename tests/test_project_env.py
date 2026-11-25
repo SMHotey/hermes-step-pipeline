@@ -180,3 +180,34 @@ def test_hermes_bin_honours_override(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("HERMES_BIN", "/свой/путь/hermes")
 
     assert project_mod.hermes_bin() == "/свой/путь/hermes"
+
+
+def test_projects_file_prefers_install_root_over_profile(tmp_path: Path, monkeypatch):
+    """Панель внутри профиля читает реестр установки, а не свой пустой.
+
+    Живой случай 25.11.2026: панель DoorSystem, запущенная из профиля `pipeline`, знала
+    только DoorSystem — `HERMES_HOME` указывал на `profiles/pipeline`, а там
+    `{"projects": []}`. В корневом реестре при этом четыре конвейера.
+    """
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "pipeline"
+    profile.mkdir(parents=True)
+    (root / "projects.json").write_text(
+        json.dumps({"projects": [{"id": "a", "root": str(tmp_path)}]}), encoding="utf-8")
+    (profile / "projects.json").write_text('{"projects": []}', encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.delenv("PIPELINE_PROJECTS_FILE", raising=False)
+
+    assert project_mod.install_home() == root
+    assert project_mod.projects_file() == root / "projects.json"
+
+
+def test_projects_file_falls_back_to_profile_without_root_registry(tmp_path: Path,
+                                                                   monkeypatch):
+    """Нет реестра установки — реестр профиля остаётся рабочим (свежая установка)."""
+    profile = tmp_path / "hermes" / "profiles" / "pipeline"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.delenv("PIPELINE_PROJECTS_FILE", raising=False)
+
+    assert project_mod.projects_file() == profile / "projects.json"

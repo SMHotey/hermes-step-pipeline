@@ -2241,9 +2241,14 @@ class Handler(BaseHTTPRequestHandler):
             value = default
         return max(1, min(value, 5000))
 
-    def _snapshot_with_version(self, plan: str | None, state: State | None = None) -> bytes:
-        """Снимок + версия UI: панель показывает, что именно ей отдал сервер."""
-        body = self._snapshot_body(plan, state)
+    def _snapshot_with_version(self, plan: str | None, state: State | None = None,
+                              ttl: float | None = SNAPSHOT_MAX_AGE) -> bytes:
+        """Снимок + версия UI: панель показывает, что именно ей отдал сервер.
+
+        *ttl* — срок жизни кэша для запроса. `None` — ждать свежий ответ (так делает поток
+        событий: кадр с изменением обязан нести изменённые данные, а не прошлые).
+        """
+        body = self._snapshot_body(plan, state, ttl=ttl)
         try:
             data = json.loads(body.decode("utf-8"))
         except ValueError:
@@ -2252,7 +2257,8 @@ class Handler(BaseHTTPRequestHandler):
         data["ui_sha"] = ui_sha()
         return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
-    def _snapshot_body(self, plan: str | None, state: State | None = None) -> bytes:
+    def _snapshot_body(self, plan: str | None, state: State | None = None,
+                       ttl: float | None = SNAPSHOT_MAX_AGE) -> bytes:
         """Тело ответа `/api/snapshot`: снимок + журнал сервера + режим планировщика + ok.
 
         Проект реестра без `.pipeline` получает 200 и пустую форму с объяснением (D9):
@@ -2261,7 +2267,7 @@ class Handler(BaseHTTPRequestHandler):
         state = state or self.state
         if state.preview or _installed(state.project):
             data = snap.snapshot(state.project, plan, preview=state.preview,
-                                 board=state.board, max_age=SNAPSHOT_MAX_AGE)
+                                 board=state.board, max_age=ttl)
         else:
             data = _missing_snapshot(state)
         # Короткая форма проверок для бейджа: прогон запускает вкладка «Проверки», здесь
@@ -2333,7 +2339,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             stamp = snap.fingerprint(state.project, plan, state.preview,
                                      state.board)
-            body = self._snapshot_with_version(plan, state)
+            # Поток событий ждёт свежий снимок (`ttl=None`): кадр, отправленный как «изменение»,
+            # обязан нести изменённые данные. С прошлым снимком изменение терялось — поток
+            # запоминал отпечаток и больше не пересобирал (регресс 25.11.2026,
+            # `test_tick_pushes_event_with_new_card`).
+            body = self._snapshot_with_version(plan, state, ttl=None)
             self._event_frame(body)
             self._deliver_frame(state, body)
             started = last_ping = last_build = time.monotonic()
@@ -2356,7 +2366,7 @@ class Handler(BaseHTTPRequestHandler):
                     # поэтому изменение не теряется и кадр уходит на следующем витке.
                     if now - last_build >= EVENTS_MIN_BUILD:
                         stamp = current
-                        body = self._snapshot_with_version(plan, state)
+                        body = self._snapshot_with_version(plan, state, ttl=None)
                         self._event_frame(body)
                         self._deliver_frame(state, body)
                         last_build = last_ping = now

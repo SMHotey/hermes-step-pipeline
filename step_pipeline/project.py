@@ -78,10 +78,32 @@ def hermes_home() -> Path:
     return base
 
 
+def install_home() -> Path:
+    """Корень установки Hermes: профильный путь схлопывается (как в `watchdog._root_home`).
+
+    `HERMES_HOME` в кроне и в панели, запущенной из профиля, указывает на
+    `<корень>/profiles/<имя>`; всё, что принадлежит установке (реестр проектов, отчёт
+    сторожа), живёт в корне.
+    """
+    home = hermes_home()
+    return home.parent.parent if home.parent.name == "profiles" else home
+
+
 def projects_file() -> Path:
-    """Реестр проектов панели: env `PIPELINE_PROJECTS_FILE`, иначе `<home профиля>/projects.json`."""
+    """Реестр проектов панели: env `PIPELINE_PROJECTS_FILE`, иначе реестр установки.
+
+    Сначала `<корень>/projects.json`; профильный файл — только если в корне его нет.
+    Иначе панель, запущенная внутри профиля, читает свой (обычно пустой) реестр и
+    показывает один проект: так 25.11.2026 панель DoorSystem на 8771 знала только
+    DoorSystem, хотя в корневом реестре четыре конвейера.
+    """
     env = os.environ.get("PIPELINE_PROJECTS_FILE")
-    return Path(env).expanduser() if env else hermes_home() / "projects.json"
+    if env:
+        return Path(env).expanduser()
+    root_file = install_home() / "projects.json"
+    if root_file.is_file():
+        return root_file
+    return hermes_home() / "projects.json"
 
 
 def _displayed_entries(raw: list) -> list[tuple[int, dict[str, Any], str, Path, str]]:
