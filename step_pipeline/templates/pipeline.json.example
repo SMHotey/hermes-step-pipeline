@@ -54,6 +54,11 @@
     "stall_seconds": 300,
     "stall_repeats": 2
   },
+  "runtime_guard": {
+    "enabled": true,
+    "escalations": 2,
+    "factor": 1.5
+  },
   "max_actions": 1,
   "runtimes": {
     "step": "3h",

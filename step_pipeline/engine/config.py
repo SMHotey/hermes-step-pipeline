@@ -115,6 +115,13 @@ DEFAULTS: dict = {
     # карточке шага; шаг при этом не останавливается. Мусор в полях — `ConfigError`:
     # молчаливая подмена умолчанием скрыла бы, что порог владельца не действует.
     "tools": {"stall_seconds": 300, "stall_repeats": 2},
+    # Защита от цикла (план 17, S4): повтор убитой по лимиту попытки разрешён только
+    # с эскалацией — лимит новой карточки в `factor` раз больше убитого; второй подряд
+    # при тех же условиях — стоп владельцу. `enabled` — выключатель владельца,
+    # `escalations` — потолок подъёмов на шаг (0 — не поднимать вовсе, только стоп).
+    # Умолчание в коде — «включено»; в `pipeline.json` проекта ключ может быть выключен
+    # (замер 17-S4: 6 из 7 убийств по лимиту — первые для своих шагов).
+    "runtime_guard": {"enabled": True, "escalations": 2, "factor": 1.5},
     "runtimes": {"step": "3h", "review": "150m", "prompt": "45m"},
     # Смотритель и страж: один порог «висит» на двоих (план 10, S2). Возраст карточки —
     # от последнего события карточки, а не от `waiting_since` стража; `running` со свежим
@@ -387,6 +394,51 @@ def _tools(value: object) -> dict:
     return out
 
 
+def _runtime_guard(value: object) -> dict:
+    """Правило «повтор только с изменением условий» (план 17, S4): выключатель, потолок, множитель.
+
+    Форма — как у `_tools` (Д6 постановки 17-S4): неизвестное поле и мусор в значении дают
+    `ConfigError` с именем поля, а не тихое умолчание. Выключатель здесь — решение владельца
+    (в этом проекте он выключен по замеру), и подмена его умолчанием скрыла бы, что правило
+    снова работает; множитель ≤ 1.0 означал бы «повтор с тем же лимитом», то есть ровно ту
+    петлю, ради которой правило и заведено.
+    """
+    default = DEFAULTS["runtime_guard"]
+    if value is None:
+        return dict(default)
+    if not isinstance(value, dict):
+        raise ConfigError(f"runtime_guard должен быть объектом JSON, получено: {value!r}")
+    out = dict(default)
+    unknown = sorted(str(key) for key in value if key not in default)
+    if unknown:
+        raise ConfigError(f"runtime_guard: неизвестные поля {unknown}, "
+                          f"допустимы {sorted(default)}, получено: {value!r}")
+    enabled = value.get("enabled")
+    if enabled is not None:
+        if not isinstance(enabled, bool):
+            raise ConfigError(f"runtime_guard.enabled должен быть true или false, "
+                              f"получено: {enabled!r}")
+        out["enabled"] = enabled
+    escalations = value.get("escalations")
+    if escalations is not None:
+        if isinstance(escalations, bool) or not isinstance(escalations, int):
+            raise ConfigError(f"runtime_guard.escalations должен быть целым числом, "
+                              f"получено: {escalations!r}")
+        if escalations < 0:
+            raise ConfigError(f"runtime_guard.escalations должен быть ≥ 0, "
+                              f"получено: {escalations!r}")
+        out["escalations"] = escalations
+    factor = value.get("factor")
+    if factor is not None:
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+            raise ConfigError(f"runtime_guard.factor должен быть числом, получено: {factor!r}")
+        if float(factor) <= 1.0:
+            raise ConfigError(f"runtime_guard.factor должен быть больше 1.0, "
+                              f"получено: {factor!r}")
+        out["factor"] = float(factor)
+    return out
+
+
 def _watchdog_number(value: object, default: int) -> int | None:
     """Целое ≥ 0 из настройки: строка из цифр и целое `1.0` годятся, `bool` — нет.
 
@@ -577,6 +629,7 @@ class Config:
     max_plan_growth: dict
     step_runs: dict
     tools: dict
+    runtime_guard: dict
     watchdog: dict
     quiet_hours: dict
     step_runtime: str
@@ -785,6 +838,7 @@ def load(repo: Path | str | None = None) -> Config:
         max_plan_growth=_plan_growth(raw.get("max_plan_growth")),
         step_runs=_step_runs(raw.get("step_runs")),
         tools=_tools(raw.get("tools")),
+        runtime_guard=_runtime_guard(raw.get("runtime_guard")),
         watchdog=_watchdog(raw.get("watchdog")),
         quiet_hours=_quiet_hours(raw.get("quiet_hours")),
         step_runtime=str(runtimes.get("step") or "3h"),

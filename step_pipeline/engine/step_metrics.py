@@ -18,7 +18,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -63,6 +65,19 @@ LIMIT_RE = re.compile(
 
 # Текст ошибки прогона, которым борда говорит «убит по лимиту».
 LIMIT_TEXT_RE = re.compile(r"elapsed\s+\d+s\s*>\s*limit\s+\d+s")
+
+#: Файл состояния правила «повтор только с изменением условий» (план 17, S4): ключ
+#: `<план>:<шаг>`, поля записи — `step`, `card`, `limit_s`, `prev_limit_s`,
+#: `escalations`, `at`. Пишет его применение (`gate.escalate_attempt`), читает — `record`
+#: для метки `escalated`; путь объявлен здесь, чтобы у писателя и читателя было одно
+#: имя файла, а не два литерала.
+RUNTIME_GUARD_NAME = "runtime_guard.json"
+#: Тела у карточки нет — по образцу `gate.INPUT_ABSENT` (та же строка `absent`).
+BODY_ABSENT = "absent"
+#: Заголовок блока «ПРАВИЛО МЕТОДА», который S2 кладёт в тело следующей карточки шага.
+#: По нему строка метрики отмечает `method`: признак идёт в отчёт и в причину стопа,
+#: но счёт условий не сбрасывает (Д5 постановки 17-S4).
+METHOD_MARK = "ПРАВИЛО МЕТОДА"
 
 
 def _epoch(stamp: str) -> float:
@@ -279,9 +294,57 @@ def card_kind(key) -> str:
     return ""
 
 
+def planned_limit(limit_s, factor: float = 1.5) -> int:
+    """Лимит повтора: `ceil(factor × лимита убитой)` с округлением вверх до минуты (Д3).
+
+    Одна формула на заказ повтора (`gate`) и на проверку условий (`same_conditions`):
+    две разошлись бы, и эскалация перестала бы узнавать собственный лимит — правило
+    крутило бы подъёмы или, наоборот, не срабатывало никогда. Лимита нет (`0`) или
+    множитель неположительный — `0`: из нуля плановый лимит не выводится (Д5).
+    """
+    try:
+        base = float(limit_s or 0)
+        mult = float(factor)
+    except (TypeError, ValueError):
+        return 0
+    if base <= 0 or mult <= 0:
+        return 0
+    return int(math.ceil(base * mult / 60.0)) * 60
+
+
+def same_conditions(prev, cur, factor: float = 1.5) -> tuple[bool, list[str]]:
+    """Условия двух последних попыток шага не менялись (Д5 постановки 17-S4).
+
+    Первая часть ответа — только про модель и плановый лимит: это они решают, крутит ли
+    правило эскалацию или останавливает шаг. Лимит сравнивается не с лимитом предыдущей
+    строки, а с тем, что эскалация запланировала от него (`planned_limit`): повтор всегда
+    получает лимит в `factor` раз больше, и «два лимита равны» не наступило бы никогда.
+
+    Вторая часть — человеческие названия различий для отчёта и уведомления. Тело карточки
+    и «правило метода» в списке есть, но первую часть не сбрасывают: тело следующей попытки
+    меняет сам конвейер (S2 и S3), и ключ на теле либо не срабатывал бы, либо крутился.
+    """
+    prev = prev if isinstance(prev, dict) else {}
+    cur = cur if isinstance(cur, dict) else {}
+    diffs: list[str] = []
+    model_same = str(prev.get("model") or "") == str(cur.get("model") or "")
+    if not model_same:
+        diffs.append("модель")
+    planned = planned_limit(prev.get("limit_s"), factor)
+    limit_same = bool(planned) and _int(cur.get("limit_s")) == planned
+    if not limit_same:
+        diffs.append("лимит")
+    if str(prev.get("body_sha") or "") != str(cur.get("body_sha") or ""):
+        diffs.append("тело карточки")
+    if bool(prev.get("method")) != bool(cur.get("method")):
+        diffs.append("правило метода")
+    return (model_same and limit_same), diffs
+
+
 def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: int = 1,
                 now=None, log_path=None, stall_seconds: int | None = None,
-                stall_repeats: int | None = None) -> dict:
+                stall_repeats: int | None = None,
+                escalated_cards: set[str] | None = None) -> dict:
     """Одна запись метрики по одной попытке шага (ключи — контракт панели и шага S4).
 
     Окно разбора — от `started_at` до `ended_at` прогона с допуском `WINDOW_PAD` (Д4):
@@ -291,6 +354,11 @@ def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: 
     `killed_by` считается по записи прогона (Д2): `runtime` — исход `timed_out` или текст
     `elapsed Ns > limit Ms`, `review` — исход `changes_requested`, иначе `none`. Строка
     лимита в логе — запасной путь, когда у прогона нет исхода.
+
+    Условия попытки для правила 17-S4 лежат в той же строке (Д5): `body_sha` — sha256 тела
+    карточки (`absent`, если тела нет), `method` — в теле есть блок «ПРАВИЛО МЕТОДА», и
+    `escalated` — карточка заказана эскалацией. `escalated` приходит АРГУМЕНТОМ
+    (`escalated_cards`), а не чтением файла: у строки нет `cfg`, и на диск она не ходит.
     """
     card = card if isinstance(card, dict) else {}
     run = run if isinstance(run, dict) else {}
@@ -341,6 +409,9 @@ def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: 
     # Залипание (17-S2): порог приходит из конфигурации (`record`), а прямой вызов без него
     # берёт умолчания через `stall_thresholds()` — строка одного вида, кто бы её ни писал.
     stall = stall_of(tools, stall_seconds, stall_repeats)
+    body = str(card.get("body") or "")
+    body_sha = hashlib.sha256(body.encode("utf-8")).hexdigest() if body else BODY_ABSENT
+    escalated = str(card.get("id") or "") in {str(item) for item in (escalated_cards or ())}
     return {
         "ts": stamp,
         "at": time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(stamp)),
@@ -348,7 +419,10 @@ def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: 
         "step": str(step_id or ""),
         "card": str(card.get("id") or ""),
         "card_kind": card_kind(card.get("key")),
+        "body_sha": body_sha,
+        "method": METHOD_MARK in body,
         "attempt": int(attempt or 1),
+        "escalated": escalated,
         "run_id": str(run.get("id") or ""),
         "role": str(run.get("profile") or card.get("assignee") or ""),
         "model": _most_common([event["model"] for event in api]),
@@ -375,6 +449,36 @@ def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: 
 def metrics_path(cfg) -> Path:
     """Журнал метрики проекта: `<state_dir>/metrics.jsonl` (рядом с историей тиков)."""
     return Path(cfg.state_dir) / METRICS_NAME
+
+
+def runtime_guard_path(cfg) -> Path:
+    """Файл эскалаций проекта: `<state_dir>/runtime_guard.json` (Д7 постановки 17-S4)."""
+    return Path(cfg.state_dir) / RUNTIME_GUARD_NAME
+
+
+def read_runtime_guard(cfg) -> dict:
+    """Записи эскалаций; файла нет или он битый — пустой словарь, а не исключение.
+
+    Тот же принцип, что у журнала метрики (Д5): замер не имеет права валить тик.
+    """
+    try:
+        data = json.loads(runtime_guard_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def escalated_cards(cfg) -> set[str]:
+    """id карточек, заказанных эскалацией, — источник метки `escalated` (Д7).
+
+    Читается ОДИН раз на тик в `record` (у него есть `cfg`): строка метрики про эскалацию
+    из себя самой ничего не знает — эскалированная попытка это ДРУГАЯ карточка.
+    """
+    cards: set[str] = set()
+    for entry in read_runtime_guard(cfg).values():
+        if isinstance(entry, dict) and entry.get("card"):
+            cards.add(str(entry["card"]))
+    return cards
 
 
 def read_rows(path) -> list[dict]:
@@ -449,6 +553,9 @@ def record(cfg, kanban_db, plan_id, step_id, cards, now=None) -> int:
     # Порог залипания читается один раз на тик, а не на строку: значения — из конфигурации
     # проекта, и все строки одного заказа должны мериться одинаково (17-S2).
     stall_seconds, stall_repeats = stall_thresholds(cfg)
+    # Метка эскалации — тоже один раз на тик (17-S4, Д7): файл состояния читает `record`
+    # (у него есть `cfg`), а строка метрики получает готовое множество id.
+    escalated = escalated_cards(cfg)
     pending: list[dict] = []
     for card in cards or []:
         if not isinstance(card, dict):
@@ -467,7 +574,8 @@ def record(cfg, kanban_db, plan_id, step_id, cards, now=None) -> int:
             pending.append(attempt_row(plan_id, step_id, card, run, attempt,
                                        now=now, log_path=agent_log(role),
                                        stall_seconds=stall_seconds,
-                                       stall_repeats=stall_repeats))
+                                       stall_repeats=stall_repeats,
+                                       escalated_cards=escalated))
             known.add(run_id)
     if not pending:
         return 0

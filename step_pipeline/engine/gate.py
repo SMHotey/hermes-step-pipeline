@@ -802,10 +802,15 @@ def read_cards(p: Paths, key_prefix: str) -> list[dict]:
             # `created_at`/`started_at` нужны проверке свежести отчёта
             # (`_report_written_after`), но набор колонок борды от версии к версии разный:
             # берём их такой записью, какая есть, вместо падения на «no such column».
+            # С 17-S4 здесь же читаются тело карточки и её лимит: правило «повтор только
+            # с изменением условий» берёт `body` для хеша условий, а `max_runtime_seconds`
+            # остаётся справкой о карточке (лимит убитой берётся из строки метрики).
             have = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
             extra = "".join(
                 f", COALESCE({name}, 0) AS {name}"
-                for name in ("created_at", "started_at") if name in have)
+                for name in ("created_at", "started_at", "max_runtime_seconds") if name in have)
+            if "body" in have:
+                extra += ", COALESCE(body, '') AS body"
             cur = con.execute(
                 f"""SELECT id, title, status, assignee, idempotency_key, completed_at,
                           COALESCE(result,'') AS result,
@@ -830,7 +835,9 @@ def read_cards(p: Paths, key_prefix: str) -> list[dict]:
              "result": r["result"], "summary": summaries.get(str(r["id"]), ""),
              "error": r["last_failure_error"],
              "created_at": int(r.get("created_at") or 0),
-             "started_at": int(r.get("started_at") or 0)} for r in rows]
+             "started_at": int(r.get("started_at") or 0),
+             "body": str(r.get("body") or ""),
+             "max_runtime_seconds": int(r.get("max_runtime_seconds") or 0)} for r in rows]
 
 
 def card_status(p: Paths, card_id: str, key: str) -> str:
@@ -4579,6 +4586,33 @@ def collector(p: Paths, step: str | None = None) -> dict:
     return json.loads(res.stdout)
 
 
+def step_attempts(p: Paths, step_id: str, cards: list[dict] | None = None) -> list[dict]:
+    """Строки журнала метрики этого шага в порядке появления, со статусом карточки (17-S4).
+
+    Источник условий для правила «повтор только с изменением условий» — журнал метрики
+    (Д4 постановки), а не борда и не `last_failure_error`: в строке уже есть модель, лимит,
+    исход и залипание, и один носитель не даёт второму разбору разойтись с первым.
+
+    Статус карточки добавляется из `ctx["cards"]`: «повтор ещё идёт» и «убитая попытка
+    терминальна» из одной строки журнала не вывести, а `decide` остаётся чистой функцией.
+    Строки идут в порядке файла (запись — дописывание), фильтр — план и шаг: у шага бывает
+    несколько карточек, и строки соседнего шага в счёт не идут.
+    """
+    rows: list[dict] = []
+    for row in step_metrics.read_rows(step_metrics.metrics_path(p.cfg)):
+        if not isinstance(row, dict):
+            continue
+        if (str(row.get("plan") or "") != str(p.plan_id)
+                or str(row.get("step") or "") != str(step_id or "")):
+            continue
+        rows.append(dict(row))
+    status = {str(card.get("id") or ""): str(card.get("status") or "")
+              for card in (cards or []) if isinstance(card, dict)}
+    for row in rows:
+        row["status"] = status.get(str(row.get("card") or ""), "")
+    return rows
+
+
 def build_ctx(p: Paths) -> dict:
     state = load_state(p)
     ctx: dict = {"state": state, "stop": load_stop(p), "hold": list(state.get("hold_steps") or []),
@@ -4678,6 +4712,9 @@ def build_ctx(p: Paths) -> dict:
                    # берётся разобранным из конфига: второго разбора в `decide` нет.
                    watchdog=dict(getattr(p.cfg, "watchdog", None) or {}),
                    stuck_cards=[], card_deadline_reported=str(state.get("card_deadline_reported") or ""),
+                   # 17-S4: правило повтора не должно падать на сбое сборщика — ключи есть,
+                   # строк попыток не видно, и правило молчит (сравнивать нечего).
+                   attempts=[], runtime_guard=dict(getattr(p.cfg, "runtime_guard", None) or {}),
                    retro_rel="", retro_missing=False)
         return ctx
     step = pkg.get("next")
@@ -4691,6 +4728,10 @@ def build_ctx(p: Paths) -> dict:
     ctx["verdict"] = verdict_of(p, step["id"]) if step else None
     ctx["journal_closed"] = bool(step) and journal_closed(p, step["id"])
     ctx["cards"] = read_cards(p, f"planloop:{p.plan_id}:{step['id']}:") if step else []
+    # Правило «повтор только с изменением условий» (17-S4): настройка и строки попыток
+    # шага кладутся в `ctx` — решение получает только его, файлов и конфигурации не читает.
+    ctx["runtime_guard"] = dict(getattr(p.cfg, "runtime_guard", None) or {})
+    ctx["attempts"] = step_attempts(p, str(step["id"]), ctx["cards"]) if step else []
     ctx["prev_cards"] = (read_cards(p, f"planloop:{p.plan_id}:{ctx['prev_closed']}:")
                          if ctx.get("prev_closed") else [])
     # 13-S1: закрытие «с замечаниями» — штатное состояние при вердикте REQUEST_CHANGES.
@@ -4972,6 +5013,159 @@ def _legit_idle_wait(base: dict) -> bool:
     return any(bool(base.get(flag)) for flag in IDLE_WAIT_FLAGS)
 
 
+#: Номер попытки в хвосте ключа карточки: `planloop:17:S4:step:2`.
+KEY_NUMBER_RE = re.compile(r":(\d+)$")
+
+
+def guard_settings(ctx: dict) -> dict:
+    """Настройка правила 17-S4: умолчания кода поверх `ctx["runtime_guard"]`.
+
+    В решении настройка приходит из `build_ctx` (конфигурация проекта). Синтетические
+    `ctx` тестов ключа не имеют вовсе — умолчания кода и есть их настройка, и правило
+    на пустом `attempts` всё равно молчит.
+    """
+    settings = dict(config_mod.DEFAULTS["runtime_guard"])
+    raw = ctx.get("runtime_guard")
+    if isinstance(raw, dict):
+        settings.update(raw)
+    return settings
+
+
+def _escalations_done(cards: list[dict]) -> int:
+    """Сколько подъёмов лимита у шага уже сделано: карточки вида с номером в ключе ≥ 2.
+
+    Считается по борде (Д1 постановки 17-S4), а не по файлу состояния: `decide` чистая и
+    на диск не ходит. Поле `attempt` строки метрики для номера не годится — это ординал
+    прогонов карточки, он считает и прогоны по квоте.
+    """
+    total = 0
+    for card in cards:
+        match = KEY_NUMBER_RE.search(str(card.get("key") or ""))
+        if match and int(match.group(1)) >= 2:
+            total += 1
+    return total
+
+
+def _attempt_numbers(rows: list[dict], cards: list[dict]) -> list[str]:
+    """Числа владельцу: одна строка на попытку — время, лимит, модель, залипший инструмент.
+
+    Время переводится единственным штатным переводчиком (`_seconds_text`) от `wall_ms`
+    строки: поля `wall_s` в контракте строки нет. Отсутствующее число пишется словом «—»,
+    а не нулём: ноль читался бы как «попытка мгновенная».
+    """
+    order = {str(card.get("id") or ""): index + 1 for index, card in enumerate(cards)}
+    lines: list[str] = []
+    for row in rows:
+        card_id = str(row.get("card") or "")
+        number = order.get(card_id) or _as_int(row.get("attempt"), 0)
+        wall = _as_float(row.get("wall_ms"), 0.0) / 1000.0
+        limit_s = _as_int(row.get("limit_s"), 0)
+        model = str(row.get("model") or "") or "—"
+        tool = str(row.get("stall_tool") or "")
+        stuck = f"{tool} ({_as_int(row.get('stall_s'), 0)} с)" if tool else "—"
+        lines.append(
+            f"попытка {number or '—'}: карточка {card_id or '—'}, прогон "
+            f"{str(row.get('run_id') or '') or '—'}, "
+            f"{_seconds_text(wall) if wall else '—'} при лимите {limit_s or '—'} с, "
+            f"модель {model}, залипший инструмент {stuck}")
+    return lines
+
+
+def runtime_guard_decision(ctx: dict) -> dict | None:
+    """Правило «повтор убитой по лимиту попытки требует изменения условий» (17-S4, П5).
+
+    Зачем: 20.11.2026 шаг 2-S6 перезапускался дважды подряд без изменения модели, лимита и
+    постановки — каждая попытка начиналась с нуля и упиралась в тот же предел. Цена одной
+    попытки — около часа времени и полный контекст модели.
+
+    Место правила — в `decide` МЕЖДУ `_decide_base` и веткой `if stop:`: строка убитой
+    попытки попадает в журнал в конце тика убийства, а на тике, где правило её читает,
+    `ctx["stop"]` уже несёт инцидентный стоп. Ниже ветки `if stop:` базовый `stop`
+    превращается в `idle` с инцидентом, и правило убитую карточку не увидело бы никогда.
+
+    Ключуется состоянием, а не именем базового действия: вид карточки последней строки
+    (`step` или `prompt`), строка убита по лимиту, новейшая карточка вида — её карточка и
+    она терминальна. Три исхода: повтор уже заказан (`idle`, инцидент снимается), эскалация
+    лимита (`escalate_attempt`) и стоп владельцу (дважды подряд при тех же условиях либо
+    исчерпан потолок подъёмов). Флага `clear_incident` у эскалации нет: `run_gate` на нём
+    гасит стоп и пересчитывает решение, а пересчёт на том же состоянии заказа теряет (Д10).
+    """
+    settings = guard_settings(ctx)
+    if not settings.get("enabled"):
+        return None
+    step = ctx.get("next") or {}
+    step_id = str(step.get("id") or "")
+    attempts = [row for row in (ctx.get("attempts") or []) if isinstance(row, dict)]
+    if not step_id or not attempts:
+        return None
+    if step_id.upper() in {str(item).upper() for item in (ctx.get("hold") or [])}:
+        # Ручной допуск владельца сильнее правила: шаг остановлен его решением, и заказывать
+        # повтор поверх него значило бы спорить с владельцем.
+        return None
+    last = attempts[-1]
+    if str(last.get("killed_by") or "") != "runtime":
+        return None
+    kind = str(last.get("card_kind") or "")
+    if kind not in RETRY_OWNED_KINDS:
+        return None
+    limit_s = _as_int(last.get("limit_s"), 0)
+    if limit_s <= 0:
+        return None          # из нуля плановый лимит не выводится (Д5)
+    cards = card_of(ctx.get("cards") or [], kind)
+    if not cards:
+        return None
+    newest = cards[-1]
+    numbers = _attempt_numbers(attempts, cards)
+    if str(newest.get("status") or "") not in TERMINAL:
+        # Повтор уже заказан и идёт: второго заказа нет, а инцидент снимается сразу —
+        # пересчёт на этом состоянии даёт тот же `idle`, терять нечего (Д10).
+        return {"action": "idle", "step": step_id, "clear_incident": True,
+                "reason": (f"повтор уже заказан: карточка {newest.get('id')} "
+                           f"({newest.get('status')}), попытка убита по лимиту — "
+                           f"ждём её исхода")}
+    if str(newest.get("id") or "") != str(last.get("card") or ""):
+        # Повтор закрылся, а строки его прогона в журнале ещё нет: её допишет следующий тик.
+        return None
+    factor = float(settings.get("factor") or 1.5)
+    cap = _as_int(settings.get("escalations"), 0)
+    escalations = _escalations_done(cards)
+    prev = attempts[-2] if len(attempts) > 1 else None
+    diffs: list[str] = []
+    if prev is not None:
+        same, diffs = step_metrics.same_conditions(prev, last, factor)
+        if same and bool(last.get("escalated")):
+            model = str(last.get("model") or "") or "—"
+            return {"action": "stop", "step": step_id, "kind": "owner",
+                    "reason": (f"дважды убит по лимиту, условия не менялись: шаг {step_id}, "
+                               f"карточка {newest.get('id')}"),
+                    "details": "\n".join(numbers + [
+                        f"условия повтора совпали: модель {model} та же, лимит {limit_s} с — "
+                        f"ровно тот, что выдала эскалация; повтор без смены модели или "
+                        f"лимита снова упрётся в тот же предел;",
+                        f"подъёмов лимита сделано: {escalations} из {cap} "
+                        f"(`runtime_guard.escalations`);",
+                        "что сделать: сменить модель или поднять лимит шага, разобрать метод "
+                        "(названный залипший инструмент), снять стоп после решения"])}
+    if escalations >= cap:
+        changed = ", ".join(diffs) or "не названы"
+        return {"action": "stop", "step": step_id, "kind": "owner",
+                "reason": (f"потолок подъёмов лимита исчерпан ({escalations} из {cap}): "
+                           f"шаг {step_id} снова убит по лимиту"),
+                "details": "\n".join(numbers + [
+                    f"подъёмов лимита сделано: {escalations} из {cap} "
+                    f"(`runtime_guard.escalations`) — поднимать больше некуда;",
+                    f"что менялось между попытками: {changed};",
+                    "что сделать: разобрать метод шага и постановку, поднять лимит роли "
+                    "в `pipeline.json` или сменить модель; снять стоп после решения"])}
+    attempt = 2 + escalations
+    new_limit = step_metrics.planned_limit(limit_s, factor)
+    return {"action": "escalate_attempt", "step": step_id, "kind": kind,
+            "card": str(newest.get("id") or ""), "attempt": attempt,
+            "limit_s": new_limit, "numbers": numbers,
+            "reason": (f"попытка {attempt} после убийства по лимиту: {limit_s} с → "
+                       f"{new_limit} с (×{factor}), карточка {newest.get('id')}")}
+
+
 def decide(ctx: dict) -> dict:
     """Чистое решение по состоянию: одно действие (или ожидание). Без побочных эффектов.
 
@@ -4982,6 +5176,13 @@ def decide(ctx: dict) -> dict:
     if stop and stop_kind(stop) == "owner":
         return {"action": "idle", "reason": f"стоп-флаг владельца: {stop.get('reason', '')}"}
     base = _decide_base(ctx)
+    # Защита от цикла (17-S4, П5): правило стоит МЕЖДУ базой и веткой `if stop:`. Ниже
+    # этой ветки базовый `stop` превращается в `idle` с инцидентом, и убитую по лимиту
+    # карточку правило не увидело бы никогда; выше — видит и эскалирует. Стоп владельца
+    # по-прежнему сильнее: его отсекает первая ветка `decide`.
+    guard = runtime_guard_decision(ctx)
+    if guard:
+        return guard
     if stop:
         if base["action"] == "stop":
             return {"action": "idle", "incident": True,
@@ -7048,6 +7249,58 @@ def kill_snapshot_hook(p: Paths, ctx: dict, say=None) -> dict | None:
         return None
 
 
+# ───────────────── правило повтора после убийства (план 17, S4) ─────────────────
+
+
+def write_runtime_guard(p: Paths, entry: dict) -> None:
+    """Записать метку эскалации шага в `state/runtime_guard.json` (Д7 постановки 17-S4).
+
+    Ключ — `<план>:<шаг>`, запись заменяет прежнюю: у шага в работе одна последняя
+    эскалация. Файл читают двое — `step_metrics.record` (метка `escalated` строки) и
+    отчёты; решение стража его не читает вовсе.
+    """
+    if not isinstance(entry, dict) or not str(entry.get("step") or ""):
+        return
+    data = step_metrics.read_runtime_guard(p.cfg)
+    data[f"{p.plan_id}:{entry['step']}"] = entry
+    state_io.save_json(step_metrics.runtime_guard_path(p.cfg), data)
+
+
+def escalate_comment(decision: dict) -> str:
+    """Комментарий в карточку убитой попытки: почему повтор и с каким лимитом (П6).
+
+    Числа — те же строки, что уходят владельцу в стоп (Д9): один текст на две адресации,
+    чтобы исполнитель и владелец читали одни и те же секунды.
+    """
+    lines = [f"попытка убита по лимиту — заказан повтор с повышенным лимитом "
+             f"{decision.get('limit_s') or '—'} с (попытка {decision.get('attempt') or '—'}):"]
+    lines += [str(item) for item in (decision.get("numbers") or [])]
+    return "\n".join(lines)
+
+
+def block_attempt_card(p: Paths, card_id: str) -> bool:
+    """Заблокировать убитую карточку, если борда оставила её в `ready`/`todo` (П6).
+
+    `blocked` не трогаем (её статус — уже запись о попытке), карточку в работе не
+    блокируем никогда. Отказ CLI — предупреждение в stderr, а не остановка тика: заказ
+    повтора всё равно уйдёт следующей строкой.
+    """
+    if not card_id:
+        return False
+    cmd = [_hermes(), "kanban", "--board", p.cfg.board, "block", card_id,
+           "попытка убита по лимиту, повтор — карточкой с повышенным лимитом"]
+    try:
+        res = _run(cmd, Path(p.repo), timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[block] не удалось блокировать {card_id}: {str(exc)[:300]}", file=sys.stderr)
+        return False
+    if res.returncode != 0:
+        out = ((res.stdout or "") + (res.stderr or "")).strip()
+        print(f"[block] не удалось блокировать {card_id}: {out[:300]}", file=sys.stderr)
+        return False
+    return True
+
+
 def _comment(p: Paths, card_id: str, text: str) -> bool:
     """Комментарий в карточку борды. Отказ — предупреждение `[comment]`, не исключение (S2)."""
     # Тело уходит одной строкой: обёртка CLI `.cmd` на Windows режет командную строку по
@@ -7091,6 +7344,26 @@ def _card_visible(p: Paths, card_id: str, key: str) -> bool:
     return False
 
 
+#: Виды карточек, повтор которых принадлежит стражу, а не борде (17-S4, Д2). У видов
+#: с номером-кругом (`review`, `fix`, `promptfix`…) номер в ключе значит круг, а не
+#: попытку, и авто-повтор борды у них остаётся прежним.
+RETRY_OWNED_KINDS = ("step", "prompt")
+
+
+def _no_retries(p: Paths, key: str) -> bool:
+    """Заказывать ли карточку с `--max-retries 0` (правило 17-S4, Д2).
+
+    Борда перезапускает убитую по лимиту карточку через 0–9 с, и тик стража (10 минут) в
+    этот зазор не попадает: «поднять лимит перед повтором» решением стража невозможно.
+    С нулём первое убийство сразу даёт `blocked`, и повтор становится решением стража —
+    карточкой с эскалированным лимитом. Флаг ставится в единственном месте, где строится
+    команда заказа, и только видам `step`/`prompt` при включённом ключе: выключенный ключ
+    возвращает прежнее поведение целиком.
+    """
+    guard = getattr(p.cfg, "runtime_guard", None) or {}
+    return bool(guard.get("enabled")) and step_metrics.card_kind(key) in RETRY_OWNED_KINDS
+
+
 def _create_card(p: Paths, title: str, body: str, assignee: str, key: str,
                  skills: tuple[str, ...], parent: str | None = None,
                  max_runtime: str | None = None) -> str | None:
@@ -7103,6 +7376,8 @@ def _create_card(p: Paths, title: str, body: str, assignee: str, key: str,
            "--workspace", f"dir:{Path(p.repo).as_posix()}",
            "--idempotency-key", key,
            "--max-runtime", max_runtime or p.cfg.step_runtime]
+    if _no_retries(p, key):
+        cmd += ["--max-retries", "0"]
     for skill in skills:
         cmd += ["--skill", skill]
     if parent:
@@ -8644,6 +8919,68 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         reason = decision.get("reason", "")
         say("⏸ " + reason)
         result.update(applied=True, detail=reason)
+        return result
+    if action == "escalate_attempt":
+        # Повтор убитой по лимиту попытки (17-S4, П6): та же карточка вида, но с лимитом
+        # в `factor` раз больше и с меткой эскалации в состоянии. Ключ — вид плюс номер
+        # попытки (Д1): номер в ключе значит попытку, а не круг правок.
+        step = ctx.get("next") or {}
+        step_id = str(step.get("id") or "")
+        kind = str(decision.get("kind") or "")
+        attempt = _as_int(decision.get("attempt"), 2)
+        limit_s = _as_int(decision.get("limit_s"), 0)
+        cards = card_of(ctx.get("cards") or [], kind)
+        killed = cards[-1] if cards else {}
+        killed_id = str(killed.get("id") or decision.get("card") or "")
+        numbers = [str(item) for item in (decision.get("numbers") or [])]
+        # 1) Убитая карточка остаётся blocked; ready/todo блокируем, иначе борда подхватит
+        #    её сама и повтор пойдёт с прежним лимитом — ровно та петля, ради которой правило.
+        if str(killed.get("status") or "") in ("ready", "todo"):
+            block_attempt_card(p, killed_id)
+        key = f"planloop:{plan_id}:{step_id}:{kind}:{attempt}"
+        if kind == "step":
+            assignee, _why = assignee_or_stop(step)
+            if assignee is None:
+                return result
+            title = f"[план {plan_id} {step_id} попытка {attempt}] {step.get('title', '')}"
+            body = step_card_body(p, step, prompt_rel(p, step_id))
+            skills = p.cfg.step_skills
+        else:
+            assignee = p.cfg.prompter
+            title = (f"[постановка {plan_id} {step_id} попытка {attempt}] "
+                     f"{step.get('title', '')}")
+            body = prompt_order_body(p, step)
+            skills = p.cfg.prompt_skills
+        cid = create_card(p, title, body, assignee, key, skills,
+                          max_runtime=f"{limit_s // 60}m" if limit_s else None)
+        if reused_card(cid, key, f"повтор {step_id}"):
+            return result
+        if not cid:
+            reason = (f"повтор шага {step_id} не заказан: карточку {key} создать не удалось, "
+                      f"карточка убитой попытки {killed_id} осталась blocked")
+            write_stop(p, reason, "gate", kind="incident")
+            result.update(applied=True, detail=reason)
+            touch("stop:escalate")
+            say("⛔ " + reason)
+            return result
+        # 2) Числа — комментарием в убитую карточку ПОСЛЕ успешного заказа: без них
+        #    исполнитель повтора не узнает, за что получил повышенный лимит, а до заказа
+        #    они повторялись бы на каждом тике, пока карточку не удаётся создать. Отказ
+        #    комментария — предупреждение (`[comment]` в stderr), не остановка тика.
+        if killed_id and numbers:
+            _comment(p, killed_id, escalate_comment(decision))
+        # 3) Метка эскалации — после заказа: `step_metrics.record` помечает `escalated`
+        #    именно эту карточку, и до её появления метке нечего означать (Д7).
+        write_runtime_guard(p, {
+            "step": step_id, "card": cid, "limit_s": limit_s,
+            "prev_limit_s": _as_int((ctx.get("attempts") or [{}])[-1].get("limit_s"), 0),
+            "escalations": max(attempt - 2, 0),
+            "at": time.strftime("%d.%m.%Y %H:%M:%S")})
+        result.update(applied=True,
+                      detail=f"повтор {step_id} ({kind}): карточка {cid}, лимит {limit_s} с")
+        touch(f"escalate_attempt:{cid}")
+        say(f"🔁 шаг {step_id}: попытка {attempt} после убийства по лимиту — "
+            f"карточка {cid}, лимит {limit_s} с")
         return result
     if action == "create_step":
         step = decision["data"]

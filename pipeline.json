@@ -14,6 +14,11 @@
     "stall_seconds": 300,
     "stall_repeats": 2
   },
+  "runtime_guard": {
+    "enabled": false,
+    "escalations": 2,
+    "factor": 1.5
+  },
   "max_plan_growth": {
     "percent": 10,
     "chars_per_finding": 400,
