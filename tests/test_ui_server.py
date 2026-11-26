@@ -3086,6 +3086,53 @@ def test_notify_telegram_mirrors_feed(tmp_path: Path, hermes_stub: Path,
     assert calls == []
 
 
+def test_first_frame_marks_history_and_second_frame_silent(
+        tmp_path: Path, hermes_stub: Path, isolated_hermes_home: Path, monkeypatch):
+    """Первый кадр потока «только помечает» историю: вторым кадром она не уходит в Telegram.
+
+    Симптом 26.11.2026 (gapaudit): открыл проект в панели — в Telegram посыпались
+    «шаг закрыт: APPROVE» о шагах, закрытых неделю назад, по одному в NOTIFY_GAP секунд.
+    Отметки доставки живут в памяти, а первый кадр ставил только `notify_primed`, сами
+    события не помечая, — второй кадр считал их новыми.
+    """
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    notify_registry(isolated_hermes_home, [
+        {"id": "alpha", "name": "Альфа", "root": str(alpha),
+         "notify": {"enabled": True, "events": ["step_closed"]}}])
+    cfg = json.loads((alpha / "pipeline.json").read_text(encoding="utf-8"))
+    cfg["notify"] = {**(cfg.get("notify") or {}), "enabled": True}
+    (alpha / "pipeline.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                                        encoding="utf-8")
+    now = int(time.time())
+    write_history({"root": alpha}, [
+        {"ts": now - 86400, "plan": "1", "step": "T9", "action": "close_step",
+         "detail": "шаг 1-T9 закрыт", "commit": "aaa1111"}])
+    calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(ui_server.telegram, "send_message",
+                        lambda token, chat, text, **__: calls.append((token, chat, text)))
+    monkeypatch.setattr(ui_server.proj, "profile_env", lambda root: {
+        "STEP_PIPELINE_TELEGRAM_BOT_TOKEN": "token-тест",
+        "STEP_PIPELINE_TELEGRAM_CHAT_ID": "42"})
+
+    state = ui_server.State(alpha, project_id="alpha", name="Альфа")
+    frame = json.dumps({"notify": ui_server.notify_feed(state, "1")}).encode("utf-8")
+    ui_server.Handler._deliver_frame(None, state, frame)       # первый кадр: только пометка
+    assert calls == [], "история ушла в Telegram первым кадром"
+
+    ui_server.Handler._deliver_frame(None, state, frame)       # второй кадр: те же события
+    assert calls == [], "история ушла в Telegram вторым кадром"
+
+    # Новое событие после пометки доставляется как обычно — фикс не глушит канал.
+    write_history({"root": alpha}, [
+        {"ts": now - 86400, "plan": "1", "step": "T9", "action": "close_step",
+         "detail": "шаг 1-T9 закрыт", "commit": "aaa1111"},
+        {"ts": now - 30, "plan": "1", "step": "T8", "action": "close_step",
+         "detail": "шаг 1-T8 закрыт", "commit": "bbb2222"}])
+    fresh = json.dumps({"notify": ui_server.notify_feed(state, "1")}).encode("utf-8")
+    ui_server.Handler._deliver_frame(None, state, fresh)
+    assert len(calls) == 1 and "T8" in calls[0][2]
+
+
 def test_index_notify_screen_markup():
     """Экран «Уведомления»: выключатель, разрешение браузера, строки, тест и история (§4.4)."""
     html = index_html()

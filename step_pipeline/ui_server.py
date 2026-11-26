@@ -1612,6 +1612,26 @@ def _read_deliveries(root: Path) -> list[dict]:
     return list(reversed(rows[-NOTIFY_LIMIT:]))
 
 
+def notify_mark(state: State, feed: dict | None) -> int:
+    """Пометить события кадра доставленными, ничего не отправляя.
+
+    Нужно первому кадру потока (D7): история проекта к моменту открытия панели уже
+    была, и отправлять её в Telegram нечего. Второй поток панели (профиль, вкладка)
+    видит свежие события по пустым отметкам — истории там нет.
+    """
+    if not isinstance(feed, dict):
+        return 0
+    now = time.time()
+    marked = 0
+    with state.lock:
+        for event in feed.get("events") or []:
+            key = str(event.get("key") or "")
+            if key and key not in state.notified:
+                state.notified[key] = now
+                marked += 1
+    return marked
+
+
 def notify_deliver(state: State, feed: dict | None) -> list[dict]:
     """Зеркалить события в Telegram — одна точка доставки, вызывается из `_events` (D8).
 
@@ -2310,18 +2330,24 @@ class Handler(BaseHTTPRequestHandler):
     def _deliver_frame(self, state: State, body: bytes) -> None:
         """Зеркало кадра в Telegram: первый кадр потока только помечает (D7).
 
-        Иначе каждое открытие панели заново всплывало бы старые события. Ошибка доставки
-        живёт в журнале сервера и поток не рвёт.
+        Помечаются сами события кадра, а не один признак «кадр прошёл»: иначе следующий
+        кадр считал историю проекта новой и выкладывал её в Telegram по одному сообщению
+        в `NOTIFY_GAP` секунд (26.11.2026: открытие проекта в панели дало полсотни
+        сообщений о шагах, закрытых неделю назад). Ошибка доставки живёт в журнале
+        сервера и поток не рвёт.
         """
-        if not state.notify_primed:
-            state.notify_primed = True
-            return
         try:
             data = json.loads(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
+            state.notify_primed = True
+            return
+        feed = data.get("notify") or {}
+        if not state.notify_primed:
+            state.notify_primed = True
+            notify_mark(state, feed)
             return
         try:
-            notify_deliver(state, data.get("notify") or {})
+            notify_deliver(state, feed)
         except Exception as exc:                                # noqa: BLE001
             state.note(f"уведомления: {type(exc).__name__}: {exc}")
 
