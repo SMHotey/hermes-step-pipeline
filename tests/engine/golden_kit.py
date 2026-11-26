@@ -37,6 +37,11 @@ SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
 DATE_RE = re.compile(r"\b20\d\d-\d\d-\d\d[T ]\d\d:\d\d(:\d\d)?\b")
 RU_DATE_RE = re.compile(r"\b\d\d\.\d\d\.20\d\d\b")
 CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{6,}\b")
+# Длительность прогона в строке-счётчике (`Прогоны: 1/1, 0 с`, `Прогоны: 2/2, 1 мин 5 с`):
+# это время стенда, а не решение стража. В эталонных кейсах план 9 (S3) с прогонами секунды
+# менялись бы от машины к машине, и golden краснел бы на исправном коде — маскируются
+# длительность и её единица, а счётчик N/M остаётся контрактом.
+RUNS_SECONDS_RE = re.compile(r"(Прогоны: \d+/\d+), (?:\d+ мин )?\d+ с")
 
 
 def load_case(case_dir: Path) -> dict:
@@ -225,6 +230,7 @@ def _normalize(text: object, root: Path) -> str:
     value = value.replace("\\", "/")
     value = CARD_ID_RE.sub("<card>", value)
     value = SHA_RE.sub("<sha>", value)
+    value = RUNS_SECONDS_RE.sub(r"\1, <сек>", value)
     value = RU_DATE_RE.sub("<date>", value)
     return DATE_RE.sub("<time>", value)
 

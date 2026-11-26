@@ -325,6 +325,11 @@ FINDING_SECTION_WORD = "наход"
 FINDING_CLOSED_WORD = "закрыт"
 FINDING_LABEL_RE = re.compile(r"^\[([^\[\]]{1,120})\]")
 FINDING_SUBLABEL_SEP = "/"
+# Код находки (план 9, S3): метка F01…F09 в тексте пункта раздела находок. До S4 это
+# единственный признак «находка с кодом»: закрытый словарь кодов и проверка кода вне
+# словаря появляются шагом S4, а блокировка шага — уже здесь. Границы слова: `F06x` и
+# `AF06` кодом не считаются, регистр приводится к верхнему.
+FINDING_CODE_RE = re.compile(r"(?<![0-9A-Za-z])F0[1-9](?![0-9])")
 # Текст строки реестра плана для замечания, принятого при закрытии шага (§4.3): класс
 # ревью остаётся в тексте меткой, класс строки — из словаря реестра, статус — не держит.
 REMARK_KIND = "стиль"
@@ -5469,6 +5474,160 @@ def runs_gate_decision(ctx: dict, step: dict, fixes: list[dict],
                         "`state/runs` решением владельца.")}
 
 
+def prefetch_close_decision(ctx: dict, sid: str) -> dict | None:
+    """Предполётная проверка постановки N+1 перед закрытием шага (правило 1, D8).
+
+    Одно место на два пути закрытия: прежний (вердикт разобран) и новый (закрытие по
+    прогонам). Тексты и форма решения прежние — `close_block_reason`, `create_prompt` с
+    `after_close`, `idle` с `close_blocked`; шаг без заказанной постановки N+1 не
+    закрывается ни по вердикту, ни по прогонам.
+
+    `None` — проверка не действует: префетч выключен, постановка обязательной не объявлена,
+    следующего шага нет либо его постановка уже на месте.
+    """
+    nxt = ctx.get("next_step")
+    if not (ctx.get("prefetch") and ctx.get("require_prompt") and nxt
+            and ctx.get("next_prompt") is None):
+        return None
+    reason = close_block_reason(sid, nxt["id"])
+    orders = card_of(ctx.get("next_cards") or [], "prompt")
+    if orders:
+        return {"action": "idle", "step": sid, "reason": reason, "close_blocked": True,
+                "detail": f"карточка заказа {orders[-1]['id']}"}
+    return {"action": "create_prompt", "step": nxt["id"], "data": nxt,
+            "after_close": True, "reason": reason}
+
+
+def _code_findings_decision(ctx: dict, sid: str, step: dict, verdict: dict | None,
+                            fixes: list, parent: str | None) -> dict | None:
+    """Находка с кодом держит шаг: круг правок до лимита, потом стоп (S3, D6 и D10).
+
+    Одна функция на три места, где иначе вернулся бы `close_step`: новый путь закрытия и две
+    прежние ветви вердикта (`APPROVE`, `REQUEST_CHANGES`). Логика реестра не копируется:
+    предел кругов тот же `step_fix_limit`, нумерация та же `len(fixes) + 1`, `None` — кодов
+    в отчёте нет, и закрытие идёт прежним путём.
+
+    Отчёт читается по пути из вердикта, а `verdict` приходит `None`, когда отчёта нет вовсе:
+    прямое `verdict["path"]` уронило бы решение. Нечитаемый отчёт — пустой список кодов:
+    закрытие по прогонам отчёта не требует (D3), и «нет отчёта» не равно «нет кодов».
+    """
+    path = (verdict or {}).get("path")
+    codes = report_finding_codes_at(path)
+    if not codes:
+        return None
+    named = ", ".join(codes)
+    limit = step_fix_limit(ctx, step)
+    if len(fixes) >= limit:
+        classes = report_finding_classes_at(path) if path else {}
+        found = int(classes.get("labeled") or 0) + int(classes.get("unlabeled") or 0)
+        return {"action": "stop", "step": sid,
+                "reason": (f"находка с кодом шага {sid} ({named}): находок в отчёте {found}, "
+                           f"израсходовано кругов правок {len(fixes)} при пределе {limit} "
+                           f"(класс риска: {step.get('risk') or 'normal'})"),
+                "details": "\n".join([
+                    f"Код в тексте находки держит шаг при любом риске и при любом вердикте: "
+                    f"найдено {named}.",
+                    "Что делать (выбери одно):",
+                    "  1) закрыть находку правкой, закрыть её строку реестра фактом, "
+                    "запустить тик — ревью пойдёт заново;",
+                    "  2) если находка уже закрыта правкой — переписать отчёт ревью под "
+                    "фактическое состояние, запустить тик;",
+                    "  3) поднять `max_fix_rounds` (или `max_fix_rounds_high`) в "
+                    "`pipeline.json` — цена: больше кругов исполнителя без человека.",
+                    "Стоп инцидентный: снимется сам, как только находок с кодом не станет.",
+                ])}
+    return {"action": "create_fix", "step": sid, "data": step, "round": len(fixes) + 1,
+            "parent": parent, "cause": f"находка с кодом: {named}",
+            "reason": (f"находка с кодом шага {sid}: {named} — круг правок "
+                       f"{len(fixes) + 1} из {limit}")}
+
+
+# ANCHOR:закрытие — стабильная ссылка для спеки и ревью
+def close_policy_decision(ctx: dict, sid: str, step: dict, verdict: dict | None,
+                          fixes: list, parent: str | None) -> dict | None:
+    """Одно место решения о закрытии шага (план 9, S3): прогон и коммит — основание.
+
+    Вердикт ревью — ВТОРОЕ условие, а не единственное: у шага с пунктом «Прогон» закрытие
+    держится на зелёных прогонах и коммите шага, и для риска `normal`/`high` к ним
+    добавляется допуск (`APPROVE` либо принятие с замечаниями). Для риска `low` вердикта
+    может не быть вовсе — вторые руки там машинный прогон гейта, а не ревьюер (п.7
+    конституции). Находка с кодом держит шаг при любом риске: послабление не касается
+    находок.
+
+    Порядок проверок (D9 постановки) и что он значит:
+
+    1. битый реестр шага или открытые строки реестра — `None`: дальше решают прежние ветви
+       (`_step_findings_error_stop`, `_step_registry_decision`). Закрытия по прогонам при
+       открытых находках не бывает;
+    2. у шага нет пункта «Прогон» — `None`: legacy-план ведёт себя слово в слово как раньше
+       (признак нового правила — наличие прогонов, а не риск и не `plans.legacy`);
+    3. доказательства прогонов нет — действие `step_runs`: прогоны исполняет `run_gate` в
+       этом же тике и решение пересчитывается (D4). Стопом это было бы стеной, которую
+       владельцу нечем снять после законного нового коммита;
+    4. доказательство есть, но прогоны красные либо бюджет исчерпан — решение
+       `runs_gate_decision` как есть (D5): круг правок, стоп по лимиту или стоп по бюджету;
+    5. не заказана постановка N+1 — её решение (D8): закрытия без постановки не бывает;
+    6. находка с кодом — `_code_findings_decision` (D6, D10);
+    7. вердикта нет, он `NONE` или `AMBIGUOUS` — закрытие по прогонам для риска `low`, стоп
+       для `normal` и `high` (D3). Ветви `APPROVE`/`REQUEST_CHANGES` здесь не разбираются:
+       функция либо вернула своё решение, либо `None`, и тогда вердикт разбирают прежние ветви.
+
+    Проверок формата отчёта и сверки вердикта с классами здесь нет намеренно (D9): отчёт на
+    этом пути — только источник кодов, а закрытие по прогонам не требует отчёта вовсе.
+    Цена названа прямо: у шага с «Прогоном» эта функция стоит перед прежними ветвями, и на
+    состоянии «APPROVE + блокирующая находка + код» печатается круг правок по коду, а не
+    стоп сверки классов — шаг при этом не закрывается, что и есть цель проверки.
+    """
+    # 1. Реестр шага: битый и открытые строки — не наше дело, прежние ветви решают точнее.
+    if ctx.get("step_findings_error"):
+        return None
+    if open_step_findings(ctx):
+        return None
+    # 2. Legacy: у шага без «Прогона» новое правило не включается вовсе.
+    if not (step or {}).get("runs"):
+        return None
+    # 3. Доказательства нет — прогоны идут в этом же тике (D4).
+    if not isinstance(ctx.get("step_runs"), dict):
+        return {"action": "step_runs", "step": sid, "data": step,
+                "reason": (f"прогоны шага {sid}: доказательства на этом коммите нет — "
+                           f"исполняю пункты «Прогон» и пересчитываю решение")}
+    # 4. Красный прогон, бюджет и лимит кругов — те же решения, что у S2 (D5).
+    runs = runs_gate_decision(ctx, step, fixes, parent or "")
+    if runs:
+        return runs
+    # 5. Постановка N+1 (D8) — до кода: без неё шаг не закрыть ни по прогонам, ни по вердикту.
+    prefetch = prefetch_close_decision(ctx, sid)
+    if prefetch:
+        return prefetch
+    # 6. Находка с кодом держит шаг при любом риске (D6, D10).
+    coded = _code_findings_decision(ctx, sid, step, verdict, fixes, parent)
+    if coded:
+        return coded
+    # 7. Допуск по риску: без вердикта закрывается только `low`.
+    kind = str((verdict or {}).get("verdict") or "NONE").upper()
+    if verdict is not None and kind not in ("NONE", "AMBIGUOUS"):
+        return None                    # APPROVE/REQUEST_CHANGES — прежние ветви
+    risk = str(step.get("risk") or "normal").strip().lower()
+    if risk == "low":
+        proof = ctx["step_runs"]
+        return {"action": "close_step", "step": sid, "data": step,
+                "verdict": verdict or {}, "runs_only": True,
+                "commit": str(proof.get("sha") or ""),
+                "journal_closed": ctx.get("journal_closed")}
+    return {"action": "stop", "step": sid, "kind": "incident",
+            "reason": (f"шаг {sid}: нет APPROVE (риск {risk}), прогоны зелёные — закрытие "
+                       f"по прогонам без вердикта только для риска low"),
+            "details": "\n".join([
+                "Прогоны шага зелёные, но допуск по риску не получен.",
+                "Что делать (выбери одно):",
+                "  1) заказать ревью шага и получить вердикт APPROVE (либо принятие с "
+                "замечаниями) — прежний путь закрытия;",
+                "  2) переписать строку «- Риск:» шага на `low`, если вторые руки ему и "
+                "правда не нужны — цена: риск шага понижен владельцем, не исполнителем.",
+                "Стоп инцидентный: снимется сам, как только появится вердикт APPROVE.",
+            ])}
+
+
 def _decide_base(ctx: dict) -> dict:
     """Решение без учёта стоп-флага."""
     step = ctx.get("next")
@@ -5668,6 +5827,13 @@ def _decide_base(ctx: dict) -> dict:
                 "reason": f"ревью {sid} упало ({last_review['status']}): {detail}"}
 
     verdict = ctx.get("verdict")
+    # Новый путь закрытия (план 9, S3) — ПЕРВЫМ в ветви вердикта и до стопов «отчёта нет» и
+    # «вердикт не распознан»: у шага с пунктом «Прогон» закрытие держится на прогоне и
+    # коммите, а у риска low отчёта может не быть вовсе. Родитель карточки правок по коду —
+    # карточка шага (F18): прежние вызовы `runs_gate_decision` вешают её там же.
+    policy = close_policy_decision(ctx, sid, step, verdict, fixes, last_step["id"])
+    if policy:
+        return policy
     if verdict is None:
         prefix = ctx.get("review_prefix") or "?"
         return {"action": "stop", "step": sid,
@@ -5699,19 +5865,18 @@ def _decide_base(ctx: dict) -> dict:
                                            last_review["id"])
         if registry:
             return registry
-        nxt = ctx.get("next_step")
+        # Находка с кодом держит шаг и при APPROVE (S3, D10): стопы и решение реестра выше,
+        # а здесь шаг иначе закрылся бы. Отчёта может не быть — функция читает путь через
+        # `(verdict or {}).get("path")`.
+        coded = _code_findings_decision(ctx, sid, step, verdict, fixes, last_review["id"])
+        if coded:
+            return coded
         # Правило 1: шаг не считается выполненным, пока нет постановки N+1. Гейт живёт
         # в решении, а не в отказе `apply` (D10): иначе каждый тик давал бы повторный
         # `applied=False` и съедал единственное действие, ничего не заказывая.
-        if (ctx.get("prefetch") and ctx.get("require_prompt") and nxt
-                and ctx.get("next_prompt") is None):
-            reason = close_block_reason(sid, nxt["id"])
-            orders = card_of(ctx.get("next_cards") or [], "prompt")
-            if orders:
-                return {"action": "idle", "step": sid, "reason": reason, "close_blocked": True,
-                        "detail": f"карточка заказа {orders[-1]['id']}"}
-            return {"action": "create_prompt", "step": nxt["id"], "data": nxt,
-                    "after_close": True, "reason": reason}
+        prefetch = prefetch_close_decision(ctx, sid)
+        if prefetch:
+            return prefetch
         return {"action": "close_step", "step": sid, "data": step, "verdict": verdict,
                 "journal_closed": ctx.get("journal_closed")}
     # Сверка вердикта с классами находок (13-S1, §4.2). Порядок обязателен: ошибки формата —
@@ -5741,6 +5906,11 @@ def _decide_base(ctx: dict) -> dict:
     if registry:
         return registry
     if classes["blocking"] == 0:
+        # Находка с кодом держит шаг и здесь (S3, D10): замечания без блокирующего класса
+        # иначе приняли бы шаг, а код — это признак работы, а не стиля.
+        coded = _code_findings_decision(ctx, sid, step, verdict, fixes, last_review["id"])
+        if coded:
+            return coded
         # Круга нет: замечания без блокирующего класса шаг не держат. Шаг принимается, а
         # замечания не теряются — `run_gate` дописывает их в реестр находок плана (§4.3).
         return {"action": "close_step", "step": sid, "data": step, "verdict": verdict,
@@ -7028,6 +7198,45 @@ def report_finding_classes_at(path) -> dict:
     except (OSError, ValueError):
         text = None
     return report_finding_classes(text)
+
+
+def report_finding_codes(text) -> list[str]:
+    """Коды находок отчёта (`F01`…`F09`) — список без дублей, порядок как в отчёте (S3).
+
+    Ищутся в пунктах раздела находок тем же разбором `scan_report_findings`, что и классы:
+    второй шаблон области завёл бы второй ответ на вопрос «что считается находкой».
+    Нечитаемый отчёт и отсутствие раздела — пустой список, а не исключение: у шага, который
+    закрывается прогоном, отчёта может не быть вовсе (D3 постановки 9-S3).
+
+    Закрытого словаря кодов здесь нет намеренно — он появляется шагом S4. До него блокирует
+    сама метка: код в тексте находки означает «находка с кодом», и такая находка держит шаг
+    при любом риске.
+    """
+    if text is None:
+        return []
+    _section, items = scan_report_findings(text)
+    codes: list[str] = []
+    for item in items:
+        for code in FINDING_CODE_RE.findall(str(item.get("text") or "")):
+            code = code.upper()
+            if code not in codes:
+                codes.append(code)
+    return codes
+
+
+def report_finding_codes_at(path) -> list[str]:
+    """Коды находок по файлу отчёта: `None`, нечитаемый файл и не-путь — пустой список.
+
+    Путь приходит из `verdict.get("path")`, а при закрытии по прогонам вердикта нет — `None`
+    здесь штатный вход, а не ошибка вызова: `Path(None)` дал бы `TypeError` и уронил решение.
+    """
+    if not path:
+        return []
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError, TypeError):
+        return []
+    return report_finding_codes(text)
 
 
 def report_remarks(text) -> list[dict]:
@@ -8877,7 +9086,8 @@ def poll_commands(cfg: config_mod.Config, wait: int = 0, max_updates: int = 10) 
     return result
 
 
-def _evidence(p: Paths, verdict: dict, remarks: int = 0, step_id: str = "") -> str:
+def _evidence(p: Paths, verdict: dict, remarks: int = 0, step_id: str = "",
+              runs_only: bool = False, risk: str = "") -> str:
     """Четвёртая колонка журнала: чем шаг доказан.
 
     `remarks` > 0 — шаг принят с замечаниями (13-S1): вердикт `REQUEST_CHANGES`, блокирующих
@@ -8890,7 +9100,21 @@ def _evidence(p: Paths, verdict: dict, remarks: int = 0, step_id: str = "") -> s
     У шага без пунктов «Прогон» файла доказательства нет, и golden-эталон держит именно
     такой шаг. Красный или исчерпанный по бюджету прогон сюда не попадает: такой шаг до
     журнала не доходит.
+
+    `runs_only` (план 9, S3) — закрытие по прогонам без вердикта: доказательство — прогон и
+    коммит шага, отчёта ревью нет вовсе (`verdict` пуст). Ветка стоит ПЕРВОЙ и не читает
+    `verdict["path"]`: обращение к пустому словарю здесь не стиль, а условие
+    работоспособности — `KeyError` уронил бы закрытие, ради которого шаг и делался. Текст
+    один на все места (D7): счётчик `runs_counter`, затем «; вердикта нет — риск » и риск
+    шага. Строки APPROVE и «принято с замечаниями» не меняются.
     """
+    if runs_only:
+        sha = str((verdict or {}).get("commit") or "")
+        counter = runs_counter(runs_proof_for(p, step_id, sha)) if step_id else ""
+        risk = str(risk or "low").strip().lower()
+        if counter:
+            return f"{counter}; вердикта нет — риск {risk}"
+        return f"прогоны шага не найдены; вердикта нет — риск {risk}"
     commit = f"коммит `{verdict['commit']}`" if verdict.get("commit") else "коммит не указан"
     report = p.cfg.rel(Path(verdict["path"]))
     runs_suffix = ""
@@ -9117,6 +9341,36 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
             decision = decide(ctx)
             result["decision"] = decision
             result["status"] = status_text(ctx, decision)
+    # Фаза прогонов закрытия (план 9, S3, D4): у шага с «Прогоном» решение о закрытии может
+    # потребовать прогона, которого ещё нет, — тогда прогоны идут здесь, в этом же тике, и
+    # решение пересчитывается. Фаза исполняет прогоны ОДИН раз: повторное `step_runs` на том
+    # же sha значит, что доказательство не появилось, и это стоп, а не второй круг запусков
+    # (иначе сломанный прогон крутился бы на каждом тике).
+    if decision.get("action") == "step_runs" and ctx.get("next"):
+        runs_step = ctx["next"]
+        runs_id = str(runs_step.get("id") or "")
+        reason = ""
+        try:
+            runs_proof = run_step_runs(p, runs_step)
+        except (GateError, OSError, subprocess.SubprocessError) as exc:
+            reason = f"прогоны шага {runs_id} не исполнены: {type(exc).__name__}: {exc}"
+        else:
+            if isinstance(runs_proof, dict):
+                ctx["step_runs"] = runs_proof
+                decision = decide(ctx)
+                result["decision"] = decision
+                result["status"] = status_text(ctx, decision)
+                if decision.get("action") == "step_runs":
+                    reason = (f"прогоны шага {runs_id}: доказательства нет и после "
+                              f"исполнения — второго прогона на том же sha не будет")
+            else:
+                reason = (f"прогоны шага {runs_id}: пункт «Прогон» не разобран, "
+                          f"доказательство не записано")
+        if reason:
+            decision = {"action": "stop", "step": runs_id, "kind": "incident",
+                        "reason": reason}
+            result.update(decision=decision, applied=True, detail=reason,
+                          status=status_text(ctx, decision))
     action = decision["action"]
     if action == "idle":
         # Простой виден только здесь (и в tick), поэтому и записывается здесь.
@@ -9706,7 +9960,9 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 f"но карточку возврата создать не удалось")
         return result
     if action == "close_step":
-        step, verdict = decision["data"], decision["verdict"]
+        step, verdict = decision["data"], decision.get("verdict") or {}
+        runs_only = bool(decision.get("runs_only"))
+        risk = str(step.get("risk") or "normal").strip().lower()
         nxt = ctx.get("next_step")
         # Защитная проверка гейта (D10): решение такое состояние уже отсекает, но гонка
         # (постановку убрали между тиками) не должна закрыть шаг без постановки N+1.
@@ -9714,11 +9970,16 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 and ctx.get("next_prompt") is None):
             result.update(applied=False, detail=close_block_reason(step["id"], nxt["id"]))
             return result
-        commit = verdict.get("commit") or ""
+        # Коммит закрытия (S3, D2): у закрытия по вердикту — из отчёта ревью, у закрытия по
+        # прогонам вердикта нет, и коммит берётся из доказательства прогона (решение несёт
+        # `sha`, на котором прогоны исполнялись).
+        commit = verdict.get("commit") or str(decision.get("commit") or "")
         if commit:
             exists = _run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], Path(p.repo))
             if exists.returncode != 0:
-                reason = (f"ревью {step['id']} APPROVE ссылается на несуществующий коммит "
+                source = ("доказательство прогона шага" if runs_only
+                          else f"ревью {step['id']} APPROVE")
+                reason = (f"{source} ссылается на несуществующий коммит "
                           f"{commit} — конвейер остановлен")
                 write_stop(p, reason, "gate")
                 result.update(applied=True, detail=reason)
@@ -9727,7 +9988,8 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 return result
         remarks = int(decision.get("remarks") or 0)
         added = append_journal_row(p, step["id"], step["title"], commit,
-                                   _evidence(p, verdict, remarks, step["id"]))
+                                   _evidence(p, verdict, remarks, step["id"],
+                                             runs_only=runs_only, risk=risk))
         if added and remarks:
             # Замечания не теряются (13-S1, §4.3): строки реестра — ПОСЛЕ журнала (он —
             # единственное доказательство закрытия) и ДО коммита (реестр входит в тот же
@@ -9742,13 +10004,23 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
                 touch("stop:findings")
                 say("⛔ " + reason)
                 return result
-        files = [p.cfg.rel(Path(p.plan_file)), _report_rel(p, step["id"])]
+        # Отчёт ревью входит в коммит только если он ЕСТЬ (S3, D2): при закрытии по прогонам
+        # отчёта нет, а `git add` на отсутствующий путь возвращает 128 и навсегда вешает
+        # коммит шага в `pending_commit`.
+        files = [p.cfg.rel(Path(p.plan_file))]
+        report_path = Path(verdict["path"]) if verdict.get("path") else None
+        if report_path is not None and report_path.is_file():
+            files.append(p.cfg.rel(report_path))
         if remarks and plan_findings_path(p).is_file():
             files.append(plan_findings_rel(p))
-        subject = (f"docs(plan): закрыт шаг {step['id']} плана {plan_id} "
-                   f"(принято с замечаниями, находок вне блокирующих: {remarks})"
-                   if remarks else
-                   f"docs(plan): закрыт шаг {step['id']} плана {plan_id} (ревью APPROVE)")
+        if runs_only:
+            subject = (f"docs(plan): закрыт шаг {step['id']} плана {plan_id} "
+                       f"(прогоны зелёные, вердикта нет — риск {risk})")
+        elif remarks:
+            subject = (f"docs(plan): закрыт шаг {step['id']} плана {plan_id} "
+                       f"(принято с замечаниями, находок вне блокирующих: {remarks})")
+        else:
+            subject = f"docs(plan): закрыт шаг {step['id']} плана {plan_id} (ревью APPROVE)"
         ok, detail = commit_fn(p, files, subject)
         tail = (f"; принято с замечаниями, находок вне блокирующих: {remarks}"
                 if remarks else "")
@@ -9759,8 +10031,12 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         result["commit"] = match.group(1) if match else commit
         touch(f"close_step:{step['id']}")
         if ok:
-            closing = (f"принято с замечаниями, находок вне блокирующих: {remarks}"
-                       if remarks else f"ревью APPROVE, коммит {detail}")
+            if runs_only:
+                closing = f"прогоны зелёные, вердикта нет — риск {risk}, коммит {detail}"
+            elif remarks:
+                closing = f"принято с замечаниями, находок вне блокирующих: {remarks}"
+            else:
+                closing = f"ревью APPROVE, коммит {detail}"
             # Строка прогона (план 9, S2) — та же, что в журнале и в карточке: владелец
             # читает её в момент закрытия, а не из файла журнала.
             counter = runs_counter(runs_proof_for(p, step["id"], commit))
@@ -10464,8 +10740,11 @@ def tick(cfg: config_mod.Config, execute: bool = True,
             result = run_gate(p, execute=execute, ctx=ctx)
             duration = round(time.monotonic() - started, 3)
             last_decision = result.get("decision") or decision
-            entry = {"plan": spec.id, "action": str(decision.get("action") or ""),
-                     "step": _step_of(decision), "applied": bool(result.get("applied")),
+            # Действие в записи — применённое, а не выбранное до `run_gate`: фаза прогонов
+            # (план 9) может пересчитать решение в том же тике, и «step_runs: журнал:
+            # добавлена строка» описывало бы не то, что произошло.
+            entry = {"plan": spec.id, "action": str(last_decision.get("action") or ""),
+                     "step": _step_of(last_decision), "applied": bool(result.get("applied")),
                      "detail": str(result.get("detail") or "")}
             actions.append(entry)
             if key:
