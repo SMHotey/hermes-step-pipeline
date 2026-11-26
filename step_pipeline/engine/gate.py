@@ -1189,6 +1189,33 @@ def head_commit(p: Paths) -> str:
 RUNS_DIR_NAME = "runs"
 #: Хвост вывода прогона в доказательстве и в карточке правок (2000 символов, S2).
 RUN_TAIL_CHARS = 2000
+#: Запас авто-бюджета прогонов шага над суммой объявленных таймаутов (план 17, S5):
+#: полтора объявленных таймаута — прежняя величина сторожа (`watchdog.fix_run_budget`),
+#: теперь она же умолчание движка.
+RUN_BUDGET_MARGIN = 1.5
+
+
+def runs_budget_limit(settings: dict, declared: list[dict]) -> int:
+    """Предел бюджета прогонов шага в секундах: заданное число или авто (17-S5).
+
+    Заданный `step_runs.budget` — главный: владелец, поставивший жёсткий предел, получает
+    ровно его. `None` (умолчание) — авто: `RUN_BUDGET_MARGIN × сумма объявленных таймаутов`
+    прогонов, у которых есть команда; таймаут строки — `run["timeout"]` либо
+    `step_runs.timeout`. Сумма, а не одиночный таймаут: замер 23.11.2026 был суммовым —
+    два честных прогона по 900 с при фиксированных 600 с, второй ушёл в `skipped`, и шаг
+    не закрывался. Число считается один раз и уходит в доказательство тем же, чем
+    проверялось исчерпание: второго пересчёта в решении нет.
+    """
+    raw = (settings or {}).get("budget")
+    if raw is not None:
+        return int(raw)
+    default_timeout = int((settings or {}).get("timeout") or 0)
+    total = 0
+    for run in declared or []:
+        if not isinstance(run, dict) or not str(run.get("command") or ""):
+            continue
+        total += int(run.get("timeout") or default_timeout)
+    return max(1, round(RUN_BUDGET_MARGIN * total))
 
 
 def runs_dir(p: Paths) -> Path:
@@ -1406,12 +1433,15 @@ def run_step_runs(p: Paths, step: dict) -> dict | None:
     символов. Исход каждого прогона — строка доказательства: `green`, `red`, `timeout`
     либо `skipped` (бюджет, D5), плюс код возврата, секунды и хвост.
 
-    Бюджет шага (`step_runs.budget`, 600 с по умолчанию) считается по времени,
-    потраченному В ЭТОМ вызове: кэш бюджет не ест. Признак `budget.exhausted` — факт
-    пропуска прогона (`skipped`), а не «потрачено ≥ лимита»: два зелёных прогона, чья
-    сумма перевалила за лимит, ничего не пропустили и обязаны вести в ревью
-    (находка 9-S2 F1). Исчерпанный бюджет молча не поднимается — `budget.exhausted`
-    в файле читает решение и превращает тик в инцидентный стоп (D5).
+    Бюджет шага (`step_runs.budget`) считается по времени, потраченному В ЭТОМ вызове:
+    кэш бюджет не ест. Заданное число — главное; `None` (умолчание, план 17, S5) — авто:
+    предел равен `RUN_BUDGET_MARGIN × сумме объявленных таймаутов прогонов шага`. Фиксированных
+    600 с больше нет: при честном прогоне на 1800 с они давали гарантированный стоп
+    (находка 14-S3, 23.11.2026). Признак `budget.exhausted` — факт пропуска прогона
+    (`skipped`), а не «потрачено ≥ лимита»: два зелёных прогона, чья сумма перевалила за
+    лимит, ничего не пропустили и обязаны вести в ревью (находка 9-S2 F1). Исчерпанный
+    бюджет молча не поднимается — `budget.exhausted` в файле читает решение и превращает
+    тик в инцидентный стоп (D5).
 
     У шага без пунктов «Прогон» — `None`: решению нечего читать, файл не создаётся.
     Команда, которая не запустилась, — красный прогон с `code: null`, а не исключение:
@@ -1430,7 +1460,7 @@ def run_step_runs(p: Paths, step: dict) -> dict | None:
                         f"HEAD` не отвечает, доказательство не записано",
                         plan_id=p.plan_id)
     settings = p.cfg.step_runs
-    limit = int(settings["budget"])
+    limit = runs_budget_limit(settings, declared)
     rows: list[dict] = []
     spent = 0.0
     for run in declared:
@@ -5176,6 +5206,12 @@ def decide(ctx: dict) -> dict:
     if stop and stop_kind(stop) == "owner":
         return {"action": "idle", "reason": f"стоп-флаг владельца: {stop.get('reason', '')}"}
     base = _decide_base(ctx)
+    # Бюджет попытки (17-S5, Д6): стоит ВЫШЕ правила S4 и выше ветки `if stop:`. Правило S4
+    # в штатном состоянии «идёт эскалированный повтор» отдаёт `idle` с `clear_incident`,
+    # и стоп бюджета ниже него был бы проглочен, а уже стоящий инцидент погашен.
+    budget = _budget_decision(ctx)
+    if budget:
+        return budget
     # Защита от цикла (17-S4, П5): правило стоит МЕЖДУ базой и веткой `if stop:`. Ниже
     # этой ветки базовый `stop` превращается в `idle` с инцидентом, и убитую по лимиту
     # карточку правило не увидело бы никогда; выше — видит и эскалирует. Стоп владельца
@@ -7166,6 +7202,175 @@ def report_stalls(p: Paths, ctx: dict) -> int:
     return sent
 
 
+# ───────────────── бюджет попытки по роли карточки (план 17, S5) ─────────────────
+# Потолок вызовов модели и токенов вывода живёт в `pipeline.json` (`budgets.<роль>`), а
+# проверяется здесь: идущая попытка считается на месте (`step_metrics.live_row`), решение
+# принимает `decide` по готовому `ctx["budget"]`, числа уходят комментарием в карточку.
+# Страж карточку не убивает и `max_runtime` не трогает: стоп останавливает конвейер, а
+# попытка продолжает жить своей жизнью.
+
+#: Вид карточки → роль потолка (`budgets.<роль>`). Роль — это вид карточки, а не профиль
+#: исполнителя: имя профиля владелец волен сменить, вид карточки — нет.
+BUDGET_CARD_ROLES = {
+    "step": "step", "fix": "step",
+    "prompt": "prompt", "promptfix": "prompt", "promptfix-stale": "prompt",
+    "promptreview": "prompt",
+    "review": "review", "rereview": "review",
+}
+
+#: Сколько отметок `budget_reported` держать в состоянии плана — как `STALL_KEEP`: отметка
+#: нужна, чтобы не повторять комментарий по тому же прогону, а не как отчёт.
+BUDGET_KEEP = 20
+
+
+def _open_card(ctx: dict) -> dict:
+    """Первая не терминальная карточка тика (`ctx["cards"]`, затем `ctx["prev_cards"]`).
+
+    Порядок именно такой: карточки текущего шага важнее карточек прошлого (`:rereview:`
+    живёт в `prev_cards`), а бюджет проверяется у той попытки, которая идёт сейчас.
+    """
+    for group in ("cards", "prev_cards"):
+        for card in ctx.get(group) or []:
+            if not isinstance(card, dict):
+                continue
+            if str(card.get("status") or "") in TERMINAL:
+                continue
+            if str(card.get("id") or ""):
+                return card
+    return {}
+
+
+def budget_probe(p: Paths, ctx: dict) -> dict:
+    """Живой счёт идущей попытки против потолков роли (Д5 постановки 17-S5).
+
+    Единственное место, где бюджет читает базу и лог: `decide` обязан остаться чистым.
+    Пустой словарь — считать нечего: `budgets` пуст, открытой карточки нет, роль карточки
+    в `budgets` не названа, открытого прогона нет. Иначе — числа попытки и `over`:
+    `calls` или `tokens` при переполнении, пустая строка — когда оба в пределах.
+    Пустой `over` значит «переполнения нет»: он не даёт ни стопа, ни комментария.
+    """
+    limits_all = p.cfg.budgets or {}
+    if not limits_all:
+        return {}
+    card = _open_card(ctx)
+    if not card:
+        return {}
+    kind = step_metrics.card_kind(card.get("key"))
+    role = BUDGET_CARD_ROLES.get(kind, "")
+    if not role:
+        return {}
+    limits = limits_all.get(role) or {}
+    if not limits:
+        return {}
+    row = step_metrics.live_row(p.kanban_db, card)
+    if not row:
+        return {}
+    calls = _as_int(row.get("calls"), 0)
+    out = _as_int(row.get("out"), 0)
+    max_calls = limits.get("max_calls")
+    max_out = limits.get("max_output_tokens")
+    over = ""
+    if max_calls and calls > int(max_calls):
+        over = "calls"
+    elif max_out and out > int(max_out):
+        over = "tokens"
+    return {"card": str(card.get("id") or ""), "kind": kind, "role": role,
+            "run_id": str(row.get("run_id") or ""), "attempt": _as_int(row.get("attempt"), 0),
+            "calls": calls, "out": out,
+            "max_calls": int(max_calls) if max_calls else None,
+            "max_output_tokens": int(max_out) if max_out else None,
+            "over": over}
+
+
+def budget_over_line(budget: dict) -> str:
+    """Первая строка стопа и комментария: «бюджет исчерпан: вызовов N из M» (или токены).
+
+    Одна формулировка на оба канала: владелец видит в карточке ровно то же, из-за чего
+    встал конвейер.
+    """
+    over = str((budget or {}).get("over") or "")
+    if over == "calls":
+        return (f"бюджет исчерпан: вызовов {budget.get('calls')} "
+                f"из {budget.get('max_calls')}")
+    if over == "tokens":
+        return (f"бюджет исчерпан: токенов вывода {budget.get('out')} "
+                f"из {budget.get('max_output_tokens')}")
+    return ""
+
+
+def budget_limit_key(budget: dict) -> str:
+    """Ключ конфига, который владельцу поднимать: `budgets.<роль>.<поле>`."""
+    role = str((budget or {}).get("role") or "")
+    field = "max_calls" if str((budget or {}).get("over") or "") == "calls" \
+        else "max_output_tokens"
+    return f"budgets.{role}.{field}"
+
+
+def _budget_decision(ctx: dict) -> dict | None:
+    """Стоп «попытка вышла за потолок роли» по готовому `ctx["budget"]` (Д6, 17-S5).
+
+    Файлов не читает — как и весь `decide`: проба (`budget_probe`) собрана `run_gate` до
+    решения. Стоп инцидентный: следующий тик увидит те же числа и оставит стоп, а когда
+    попытка закроется или числа уйдут под потолок — снимет его сам. `--resume` этот стоп
+    не снимает, и это сказано в диагностике: снимет только правка конфига или конец
+    попытки.
+    """
+    budget = ctx.get("budget") or {}
+    over = str(budget.get("over") or "")
+    if over not in ("calls", "tokens"):
+        return None
+    line = budget_over_line(budget)
+    step_id = str((ctx.get("next") or {}).get("id") or (ctx.get("step") or {}).get("id") or "")
+    key = budget_limit_key(budget)
+    return {
+        "action": "stop", "step": step_id, "kind": "incident", "budget": over,
+        "reason": (f"{line}: шаг {step_id or '—'}, роль {budget.get('role') or '—'}, "
+                   f"карточка {budget.get('card') or '—'}"),
+        "details": "\n".join([
+            f"потолок конфига: {key} = "
+            f"{budget.get('max_calls') if over == 'calls' else budget.get('max_output_tokens')};",
+            f"факт идущей попытки {budget.get('attempt')} (прогон {budget.get('run_id')}): "
+            f"вызовов {budget.get('calls')}, токенов вывода {budget.get('out')};",
+            "карточку страж не убивает и `max_runtime` не трогает: стоп держит конвейер, "
+            "попытка живёт своей жизнью;",
+            f"как снять: поднять `{key}` в `pipeline.json` или разобрать метод шага; пока "
+            f"попытка за потолком, `--resume` этот стоп не снимет",
+        ]),
+    }
+
+
+def budget_notice(p: Paths, ctx: dict, budget: dict) -> bool:
+    """Комментарий с числами в карточку идущей попытки; один раз на прогон (Д7, 17-S5).
+
+    Зовётся только при непустом `over`: проба ниже потолка не даёт ни комментария, ни
+    отметки — иначе здоровый прогон получил бы текст «бюджет исчерпан» и съел отметку.
+    Отметка `budget_reported` живёт в состоянии плана и ограничена хвостом `BUDGET_KEEP`,
+    поэтому повторный тик по тому же прогону молчит. Отказ борды — предупреждение
+    `[comment]`, а не исключение; отметка при отказе ставится, чтобы недоступная борда не
+    превратила стоп в поток попыток на каждом тике.
+    """
+    budget = budget if isinstance(budget, dict) else {}
+    over = str(budget.get("over") or "")
+    card_id = str(budget.get("card") or "")
+    run_id = str(budget.get("run_id") or "")
+    state = ctx.get("state")
+    if over not in ("calls", "tokens") or not card_id or not isinstance(state, dict):
+        return False
+    reported = [str(item) for item in (state.get("budget_reported") or [])]
+    if run_id and run_id in reported:
+        return False
+    text = (f"{budget_over_line(budget)}; попытка {budget.get('attempt')}, "
+            f"карточка {card_id} ({budget.get('kind') or '—'}), "
+            f"потолок {budget_limit_key(budget)}; стоп инцидентный: поднять потолок в "
+            f"`pipeline.json` или разобрать метод шага")
+    _comment(p, card_id, text)
+    if run_id:
+        reported.append(run_id)
+        state["budget_reported"] = reported[-BUDGET_KEEP:]
+        save_state(p, state)
+    return True
+
+
 def _killed_metric_row(p: Paths, step_id: str, card_ids: set[str]) -> dict:
     """Последняя строка метрики «убит по лимиту» по карточкам шага; `{}` — такой нет (Д1)."""
     rows = [row for row in step_metrics.read_rows(step_metrics.metrics_path(p.cfg))
@@ -8741,6 +8946,23 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         # чтобы новый вопрос держал шаг уже на этом тике; затем автовыбор рекомендации.
         register_questions(p, ctx)
         closed = sweep_questions(p.cfg, p, ctx, ctx.get("state"), say_raw)
+    if execute:
+        # Бюджет попытки (план 17, S5): живой счёт идущей попытки считается только на
+        # исполняющем тике — `--status` и панель логи не читают (это стоит времени), а
+        # решение по бюджету принимает `decide` по готовому `ctx["budget"]`.
+        try:
+            ctx["budget"] = budget_probe(p, ctx)
+        except Exception as exc:  # noqa: BLE001 - сбой замера не имеет права валить тик
+            config_mod.debug_note("budget", exc)
+            ctx["budget"] = {}
+        # Комментарий — только при переполнении: проба непустая и у попытки в пределах, и
+        # текст «бюджет исчерпан» такому прогону был бы ложью, а съеденная отметка
+        # оставила бы настоящий стоп без чисел.
+        if (ctx.get("budget") or {}).get("over"):
+            try:
+                budget_notice(p, ctx, ctx["budget"])
+            except Exception as exc:  # noqa: BLE001 - комментарий не валит тик
+                config_mod.debug_note("budget", exc)
     decision = decide(ctx)
     cleared = ""
     if execute and decision.get("clear_incident"):

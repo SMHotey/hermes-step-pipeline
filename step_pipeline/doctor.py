@@ -8,17 +8,18 @@ JSON'ом, поэтому проверки в браузере не могут �
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 try:
     from .engine import plan_lint
+    from .engine import config as engine_config
     from . import project as proj
     from . import setup_flow, snapshot as snap, telegram
 except ImportError:  # pragma: no cover - отладка файлом
     from engine import plan_lint  # type: ignore
+    import config as engine_config  # type: ignore
     import project as proj  # type: ignore
     import setup_flow  # type: ignore
     import snapshot as snap  # type: ignore
@@ -178,17 +179,15 @@ def notify_rows(project: Path, cfg: dict[str, Any], driver: str) -> tuple[list[s
 def runtime_seconds(value: object) -> int:
     """Длительность вида `3h`/`150m` в секундах (план 10, S2A); непонятное — 0.
 
-    Разбор короткий и свой: парсера в движке нет, а единственный потребитель —
-    предупреждение «предел ожидания меньше обычного шага» (`runtimes.step`). Мусор,
-    `0` и `0m` предупреждения не дают: диагностика не имеет права падать из-за единицы
-    измерения в чужом ключе. Понадобится третьему потребителю — переедет в движок.
+    Разбор переехал в движок (`config.parse_duration`, план 17, S5): потребителей стало
+    двое — эта диагностика и загрузка конфигурации, которой мусор в `runtimes` обязан
+    давать `ConfigError`. Второй парсер разошёлся бы с первым на первой же правке формата,
+    а диагностике падать запрещено: мусор, `0` и `0m` дают здесь `0` и предупреждения не
+    вызывают — иначе владелец увидел бы «предел ожидания меньше обычного шага» из-за
+    единицы измерения в чужом ключе.
     """
-    text = str(value or "").strip().lower()
-    match = re.fullmatch(r"(\d+)\s*([hm])", text)
-    if not match:
-        return 0
-    number = int(match.group(1))
-    return number * 3600 if match.group(2) == "h" else number * 60
+    seconds = engine_config.parse_duration(value)
+    return seconds if seconds and seconds > 0 else 0
 
 
 def cards_deadline_rows(db: Path, cfg: dict[str, Any]) -> tuple[list[str], list[str]]:

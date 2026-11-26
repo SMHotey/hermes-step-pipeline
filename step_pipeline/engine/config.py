@@ -107,8 +107,18 @@ DEFAULTS: dict = {
     # отсекает шаг карточкой правок, а не кругом ревью. `timeout` — предел одного прогона,
     # `budget` — суммарный бюджет шага: исчерпанный бюджет — инцидентный стоп, который
     # снимает не `--resume`, а новый коммит (sha меняется) или решение владельца.
+    # `budget: null` — авто (17-S5): полтора объявленных таймаута прогонов шага. Заданное
+    # число главнее авто, а фиксированного умолчания больше нет — 600 с при честном
+    # прогоне на 1800 с давали гарантированный стоп (находка 14-S3, 23.11.2026).
     # В `pipeline.json` проекта ключ не пишется вовсе: умолчание живёт в коде.
-    "step_runs": {"timeout": 120, "budget": 600},
+    "step_runs": {"timeout": 120, "budget": None},
+    # Потолки попытки по роли карточки (план 17, S5): сколько вызовов модели и токенов
+    # вывода допускается за одну попытку. Роли — `step`, `review`, `prompt` (в карточках
+    # `step`/`fix`, `review`/`rereview`, `prompt`/`promptfix`/`promptreview`). Роль не
+    # названа — потолка нет: умолчание не имеет права внезапно останавливать живые
+    # проекты. Превышение — инцидентный стоп с комментарием в карточку, а не ожидание
+    # таймаута борды.
+    "budgets": {},
     # Залипание инструмента (план 17, S2): в журнале метрики отмечается попытка, где один
     # инструмент шёл `stall_seconds` секунд в `stall_repeats` вызовах подряд (или упал по
     # таймауту). Отметка — комментарий в карточку и строка «ПРАВИЛО МЕТОДА» следующей
@@ -331,15 +341,41 @@ def _plan_growth(value: object) -> dict:
     return out
 
 
+_DURATION_RE = re.compile(r"(?P<number>\d+)\s*(?P<unit>[hm])")
+
+
+def parse_duration(value: object) -> int | None:
+    """Длительность вида `45m`, `270m`, `3h` в секундах; непонятное — `None`.
+
+    Читают двое: загрузка конфигурации (`runtimes.<роль>` обязан разбираться, мусор —
+    `ConfigError`) и диагностика (`doctor.runtime_seconds`, мусор — `0` и предупреждения
+    нет). Поэтому парсер не бросает исключений вовсе: диагностике падать запрещено, а
+    строгость проверки живёт в вызывающем. Регистр единицы и пробел перед ней не важны
+    (`3H`, `3 h`); число без единицы (`45`) длительностью не считается — именно на такой
+    записи владелец не отличит секунды от минут. `0m` разбирается в `0` секунд: форма
+    верная, а что значение негодное — решает `load`.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _DURATION_RE.fullmatch(value.strip().lower())
+    if match is None:
+        return None
+    number = int(match.group("number"))
+    return number * 3600 if match.group("unit") == "h" else number * 60
+
+
 def _step_runs(value: object) -> dict:
     """Прогоны шага (план 9, S2): `timeout` одного прогона и `budget` шага в секундах.
 
-    Умолчание — 120 с на прогон и 600 с на шаг: страж исполняет пункты «Прогон» сам,
-    до ревью, и это поведение по умолчанию — план обязан чем-то доказываться, а не
-    пересказом исполнителя. Мусор в `pipeline.json` — ошибка конфигурации, а не
-    молчаливое умолчание (тот же принцип, что у `_fix_rounds`): иначе владелец думает,
-    что поднял бюджет, а страж работает по прежнему лимиту. Отсутствующий ключ —
-    умолчание целиком; поля целые не меньше 1, неизвестные поля — тоже ошибка.
+    Умолчание — 120 с на прогон и авто-бюджет шага (`None`, план 17, S5): страж
+    исполняет пункты «Прогон» сам, до ревью, и это поведение по умолчанию — план обязан
+    чем-то доказываться, а не пересказом исполнителя. Мусор в `pipeline.json` — ошибка
+    конфигурации, а не молчаливое умолчание (тот же принцип, что у `_fix_rounds`): иначе
+    владелец думает, что поднял бюджет, а страж работает по прежнему лимиту.
+    Отсутствующий ключ — умолчание целиком; поля целые не меньше 1, неизвестные поля —
+    тоже ошибка. `budget: null` — законное значение «авто»: предел считается по
+    объявленным таймаутам прогонов шага (`gate.run_step_runs`). Фиксированного бюджета по
+    умолчанию нет: 600 с при честном прогоне на 1800 с — гарантированный стоп.
     """
     default = DEFAULTS["step_runs"]
     if value is None:
@@ -361,6 +397,88 @@ def _step_runs(value: object) -> dict:
         if raw < 1:
             raise ConfigError(f"step_runs.{key} должен быть ≥ 1, получено: {raw!r}")
         out[key] = raw
+    return out
+
+
+#: Роли, для которых `budgets` задаёт потолки попытки (план 17, S5): вид карточки
+#: сводится к роли в `gate.BUDGET_CARD_ROLES`, потолок ищется по роли. Разведка и
+#: карточки уровня плана сюда не входят: они лежат вне `ctx["cards"]`, и проверять их
+#: на тике нечем.
+BUDGET_ROLES = ("step", "review", "prompt")
+BUDGET_FIELDS = ("max_calls", "max_output_tokens")
+
+
+def _budgets(value: object) -> dict:
+    """Потолки попытки по роли карточки (план 17, S5): `{роль: {поле: число}}`.
+
+    Форма — как у `_tools` и `_runtime_guard`: неизвестная роль, неизвестное поле, мусор
+    в значении (в том числе `true`/`false`, `0` и отрицательное) дают `ConfigError` с
+    полным путём (`budgets.review.max_output_tokens`). Потолок `0` не значит «без
+    потолка»: отсутствие поля — вот это значит, а ноль означал бы «первый же вызов над
+    потолком» и останавливал бы любую попытку. Пустой раздел — прежнее поведение шага.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"budgets должен быть объектом JSON, получено: {value!r}")
+    out: dict[str, dict] = {}
+    for role, limits in value.items():
+        name = str(role).strip()
+        if name not in BUDGET_ROLES:
+            raise ConfigError(f"budgets: неизвестная роль {name!r}, допустимы "
+                              f"{list(BUDGET_ROLES)}, получено: {value!r}")
+        if limits is None:
+            continue
+        if not isinstance(limits, dict):
+            raise ConfigError(f"budgets.{name} должен быть объектом JSON, получено: {limits!r}")
+        block: dict[str, int] = {}
+        unknown = sorted(str(key) for key in limits if key not in BUDGET_FIELDS)
+        if unknown:
+            raise ConfigError(f"budgets.{name}: неизвестные поля {unknown}, допустимы "
+                              f"{list(BUDGET_FIELDS)}, получено: {limits!r}")
+        for field in BUDGET_FIELDS:
+            raw = limits.get(field)
+            if raw is None:
+                continue
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                raise ConfigError(f"budgets.{name}.{field} должен быть целым числом, "
+                                  f"получено: {raw!r}")
+            if raw < 1:
+                raise ConfigError(f"budgets.{name}.{field} должен быть ≥ 1, "
+                                  f"получено: {raw!r}")
+            block[field] = raw
+        if block:
+            out[name] = block
+    return out
+
+
+def _runtimes(value: object) -> dict[str, int]:
+    """Роль → секунды из раздела `runtimes` (план 17, S5).
+
+    Строки раздела уходят в аргумент борды (`--max-runtime`) как записаны, но движку они
+    нужны числом: по лимиту роли считается бюджет прогонов и объясняется стоп. Мусор —
+    `ConfigError` с полным именем ключа (`runtimes.step`), а не тихое умолчание: иначе
+    «три часа» доехало бы до борды строкой и стало ошибкой CLI вместо ошибки конфига.
+    Умолчания `step`/`review`/`prompt` остаются: раздел может называть только часть ролей.
+    """
+    default = DEFAULTS["runtimes"]
+    if value is None:
+        merged: dict = dict(default)
+    elif not isinstance(value, dict):
+        raise ConfigError(f"runtimes должен быть объектом JSON, получено: {value!r}")
+    else:
+        merged = dict(default)
+        merged.update(value)
+    out: dict[str, int] = {}
+    for role, raw in merged.items():
+        seconds = parse_duration(raw)
+        if seconds is None:
+            raise ConfigError(f"runtimes.{role}: ожидается длительность вида 45m или 3h, "
+                              f"получено: {raw!r}")
+        if seconds <= 0:
+            raise ConfigError(f"runtimes.{role}: ожидается длительность больше нуля, "
+                              f"получено: {raw!r}")
+        out[str(role)] = seconds
     return out
 
 
@@ -632,9 +750,13 @@ class Config:
     runtime_guard: dict
     watchdog: dict
     quiet_hours: dict
+    budgets: dict
     step_runtime: str
     review_runtime: str
     prompt_runtime: str
+    # Роль → секунды (17-S5): строки `runtimes` остаются как записаны (они уходят в
+    # аргумент борды), а разобранные значения живут здесь — по ним считаются бюджеты.
+    runtime_seconds: dict
     tenant: str
     git_commit: bool
     git_push: bool
@@ -841,9 +963,11 @@ def load(repo: Path | str | None = None) -> Config:
         runtime_guard=_runtime_guard(raw.get("runtime_guard")),
         watchdog=_watchdog(raw.get("watchdog")),
         quiet_hours=_quiet_hours(raw.get("quiet_hours")),
+        budgets=_budgets(raw.get("budgets")),
         step_runtime=str(runtimes.get("step") or "3h"),
         review_runtime=str(runtimes.get("review") or "150m"),
         prompt_runtime=str(runtimes.get("prompt") or "45m"),
+        runtime_seconds=_runtimes(runtimes),
         tenant=str((raw.get("kanban") or {}).get("tenant") or "plan"),
         git_commit=bool((raw.get("git") or {}).get("commit", True)),
         git_push=bool((raw.get("git") or {}).get("push", True)),

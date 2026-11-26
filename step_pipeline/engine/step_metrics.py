@@ -349,6 +349,8 @@ def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: 
 
     Окно разбора — от `started_at` до `ended_at` прогона с допуском `WINDOW_PAD` (Д4):
     строки без тега сессии внутри окна принимаются, соседние попытки в счёт не идут.
+    У открытого прогона (`started_at` без `ended_at`) верхняя граница — «сейчас» (17-S5):
+    иначе в счёт живой попытки попали бы строки следующей попытки из того же лога.
     Нет записи прогона — берётся весь лог: запасной путь для `killed_by` по строке лимита.
 
     `killed_by` считается по записи прогона (Д2): `runtime` — исход `timed_out` или текст
@@ -369,7 +371,9 @@ def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: 
     if started and ended:
         low, high = started - WINDOW_PAD, ended + WINDOW_PAD
     elif started:
-        low, high = started - WINDOW_PAD, float("inf")
+        # Открытая попытка кончается на «сейчас» (17-S5): иначе в живой счёт попали бы
+        # строки следующей попытки из того же `agent.log`, и бюджет увидел бы чужие вызовы.
+        low, high = started - WINDOW_PAD, stamp + WINDOW_PAD
     else:
         low, high = float("-inf"), float("inf")
     window = [event for event in events if low <= float(event["ts"]) <= high]
@@ -444,6 +448,40 @@ def attempt_row(plan_id, step_id, card: dict, run: dict | None = None, attempt: 
         "source": source,
         "log": str(log_path) if source == "agent.log" else "",
     }
+
+
+def live_row(kanban_db, card: dict, now=None, log_path=None) -> dict:
+    """Живой счёт идущей попытки: строка метрики «на месте», до её конца (17-S5).
+
+    `record` пишет только закрытые прогоны («прогон идёт: строки ещё нет»), значит бюджет
+    попытки на тике считать нечем — а стоп обязан прийти до того, как борда убьёт карточку
+    по `max_runtime`. Здесь тот же разбор, что у закрытой строки (`attempt_row`, окно
+    кончается на «сейчас»), и те же суммы: второй разбор `agent.log` в `gate.py` разошёлся
+    бы с первым на первой же правке формата лога.
+
+    Пустой словарь — открытого прогона нет (карточка ещё не началась, уже закрыта или
+    прогонов в борде не видно). В строке дополнительно `started_at` из записи прогона:
+    у `attempt_row` его нет (`ts` — момент замера), а вызывающему нужен возраст попытки.
+    На диск функция ничего не пишет и контракт строк `metrics.jsonl` не меняет.
+    """
+    card = card if isinstance(card, dict) else {}
+    card_id = str(card.get("id") or "")
+    if not card_id:
+        return {}
+    runs = card_runs(kanban_db, card_id)
+    open_run: dict | None = None
+    attempt = 0
+    for number, run in enumerate(runs, start=1):
+        if not _int(run.get("started_at")) or _int(run.get("ended_at")):
+            continue
+        open_run, attempt = run, number
+    if open_run is None:
+        return {}
+    role = str(open_run.get("profile") or card.get("assignee") or "")
+    path = log_path if log_path is not None else agent_log(role)
+    row = attempt_row("", "", card, open_run, attempt, now=now, log_path=path)
+    row["started_at"] = _int(open_run.get("started_at"))
+    return row
 
 
 def metrics_path(cfg) -> Path:

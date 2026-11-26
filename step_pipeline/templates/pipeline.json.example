@@ -47,8 +47,7 @@
   "max_fix_rounds_high": 6,
   "max_stale_rebuilds": 2,
   "step_runs": {
-    "timeout": 120,
-    "budget": 600
+    "timeout": 120
   },
   "tools": {
     "stall_seconds": 300,

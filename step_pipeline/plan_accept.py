@@ -199,14 +199,90 @@ def find_plan(project, plan_id) -> Path | None:
 def check_draft(project, draft) -> list[str]:
     """Ошибки черновика; пустой список — чисто.
 
-    Линтер, если он есть, — единственный источник проверок: свои мини-проверки нужны
-    только до шага 1-S8, иначе в проекте завелись бы два расходящихся линтера.
+    Линтер, если он есть, — единственный источник форматных проверок: свои мини-проверки
+    нужны только до шага 1-S8, иначе в проекте завелись бы два расходящихся линтера.
+
+    Исключение одно — бюджет прогонов (план 17, S5): линтер хвосты `таймаут N` намеренно
+    игнорирует («битый таймаут движок просто игнорирует»), а конфиг, который сам себе
+    противоречит, до шага доходить не должен. Поэтому проход `_budget_errors` идёт после
+    линтера (а без него — после `_fallback_errors`) и не заменяет его находок.
     """
     project = Path(project)
     draft = Path(draft)
     if plan_lint is not None:
-        return [str(problem) for problem in plan_lint.lint_project(project, str(draft)).problems]
-    return _fallback_errors(project, draft)
+        problems = [str(problem) for problem in plan_lint.lint_project(project, str(draft)).problems]
+    else:
+        problems = _fallback_errors(project, draft)
+    return problems + _budget_errors(project, draft)
+
+
+#: Хвост прогона: объявленный таймаут строки «Прогон» (§5 формата плана).
+_RUN_TIMEOUT_RE = re.compile(r"таймаут\s+(?P<seconds>\d+)")
+_RUN_LINE_RE = re.compile(r"^[-*+]\s*Прогон", re.IGNORECASE)
+
+
+def _budget_errors(project: Path, draft: Path) -> list[str]:
+    """Черновик против `step_runs.budget`: одиночный таймаут и сумма по шагу (17-S5).
+
+    Замер 23.11.2026 (план 14, S3): бюджет 600 с, а постановка объявила прогон с
+    таймаутом 1800 с — прогон ушёл в `timeout`, второй пункт в `skipped`, страж встал
+    инцидентом, и шаг нельзя было закрыть. Сумма проверяется наравне с одиночным
+    таймаутом: два честных прогона по 900 с дают тот же исход, что один на 1800 с.
+
+    Бюджет читается сырым словарём (`proj.read_config`): `plan --check` обязан печатать
+    ошибки черновика, а не падать на конфиге. Ключа нет или он `null` — ошибок нет: авто
+    по `gate.runs_budget_limit` противоречивым быть не может, оно считается по этим же
+    таймаутам.
+    """
+    cfg = proj.read_config(project)
+    budget = (cfg.get("step_runs") or {}).get("budget")
+    if budget is None:
+        return []
+    try:
+        limit = int(budget)
+    except (TypeError, ValueError):
+        return []
+    try:
+        lines = Path(draft).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    raw_regex = str(cfg.get("step_id_regex") or _STEP_ID_REGEX)
+    pattern = raw_regex if raw_regex.startswith("^") else "^" + raw_regex
+    try:
+        step_re = re.compile(pattern)
+    except re.error:
+        step_re = re.compile(_STEP_ID_REGEX)
+    errors: list[str] = []
+    step_id = ""
+    sums: dict[str, int] = {}
+    for line in lines:
+        heading = _HEADING_RE.match(line)
+        if heading:
+            found = step_re.search(heading.group("title"))
+            if found:
+                step_id = found.group("id").upper()
+                sums.setdefault(step_id, 0)
+            continue
+        if not _RUN_LINE_RE.match(line):
+            continue
+        declared = _RUN_TIMEOUT_RE.search(line)
+        if declared is None:
+            continue
+        seconds = int(declared.group("seconds"))
+        name = step_id or "—"
+        sums[name] = sums.get(name, 0) + seconds
+        if seconds > limit:
+            errors.append(
+                f"шаг {name}: таймаут прогона {seconds} с больше step_runs.budget={limit} с — "
+                f"прогон уйдёт в `skipped`, страж встанет на инциденте; поднять бюджет "
+                f"или снизить таймаут")
+    for name, total in sums.items():
+        if total > limit:
+            errors.append(
+                f"шаг {name}: сумма объявленных таймаутов прогонов {total} с больше "
+                f"step_runs.budget={limit} с — последние прогоны будут пропущены")
+    return errors
+
 
 
 def check_warnings(project, draft) -> list[str]:

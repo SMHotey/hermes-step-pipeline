@@ -7,8 +7,21 @@
   "max_stale_rebuilds": 4,
   "max_actions": 2,
   "step_runs": {
-    "budget": 4500,
     "timeout": 240
+  },
+  "budgets": {
+    "step": {
+      "max_calls": 400,
+      "max_output_tokens": 200000
+    },
+    "review": {
+      "max_calls": 150,
+      "max_output_tokens": 150000
+    },
+    "prompt": {
+      "max_calls": 200,
+      "max_output_tokens": 200000
+    }
   },
   "tools": {
     "stall_seconds": 300,

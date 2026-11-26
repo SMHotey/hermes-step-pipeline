@@ -309,6 +309,11 @@ def fix_run_budget(project: Path) -> str:
     `skipped`, страж выдал инцидент «бюджет прогонов исчерпан» и остановил план — шаг
     нельзя было закрыть, пока бюджет не поднят руками. Правило: бюджет не меньше суммы
     объявленных таймаутов с полуторным запасом (и не меньше суток/60).
+
+    Ключа `step_runs.budget` нет — законное «авто» (план 17, S5): движок сам считает
+    полтора объявленных таймаута шага, и файл не правится вовсе. Иначе сторож на
+    ближайшем часу вписал бы в конфиг фиксированное число и отменил авто-умолчание —
+    ровно ту находку, ради которой ключ и перестал быть числом.
     """
     cfg_path = project / "pipeline.json"
     try:
@@ -316,6 +321,8 @@ def fix_run_budget(project: Path) -> str:
         cfg = json.loads(raw)
     except (OSError, ValueError) as exc:
         return f"конфиг не прочитать: {exc}"
+    if (cfg.get("step_runs") or {}).get("budget") is None:
+        return ""
     plans_dir = project / "docs" / "plans"
     declared = 0
     max_timeout = 0
