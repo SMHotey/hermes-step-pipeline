@@ -325,12 +325,12 @@ FINDING_SECTION_WORD = "наход"
 FINDING_CLOSED_WORD = "закрыт"
 FINDING_LABEL_RE = re.compile(r"^\[([^\[\]]{1,120})\]")
 FINDING_SUBLABEL_SEP = "/"
-# Код находки (план 9, S3): метка F01…F09 в тексте пункта раздела находок. До S4 это
-# единственный признак «находка с кодом»: закрытый словарь кодов и проверка кода вне
-# словаря появляются шагом S4, а блокировка шага — уже здесь. Границы слова: `AF06` кодом
-# не считается. Регистр метки любой (`f06`, `F06`): `IGNORECASE` при поиске и приведение
-# к верхнему — иначе `code.upper()` ниже недостижим, и строчная метка пропускала бы шаг.
-FINDING_CODE_RE = re.compile(r"(?<![0-9A-Za-z])F0[1-9](?![0-9])", re.IGNORECASE)
+# Код находки (план 9, S3/S4): метка `F0x` в тексте пункта раздела находок. С S4 шаблон и
+# словарь берутся из `registry.py` (якорь ANCHOR:коды_находок) — второго вида кода в движке
+# нет. Шаблон широкий (`F10`, `F00`, `F0X` находятся), словарь фильтрует: код вне словаря
+# решением не считается, а называется линтером отчёта (`::report_unknown_codes`). Границы
+# слова и регистр — свойства шаблона: `AF06` кодом не считается, `f06` приводится к верхнему.
+FINDING_CODE_RE = registry.FINDING_CODE_RE
 # Текст строки реестра плана для замечания, принятого при закрытии шага (§4.3): класс
 # ревью остаётся в тексте меткой, класс строки — из словаря реестра, статус — не держит.
 REMARK_KIND = "стиль"
@@ -1240,6 +1240,189 @@ def head_commit(p: Paths) -> str:
     return res.stdout.strip().lower() if res.returncode == 0 else ""
 
 
+# ───────── коды находок шага: машинные проверки (план 9, S4) ─────────
+# Три кода словаря проверяются кодом, а не словом ревьюера: F01 — файлы коммита шага против
+# объявленных в плане, F02 — есть ли у шага пункт «Прогон», F03 — вывод красного прогона из
+# доказательства. Строки печатаются блоком в карточке правок и в карточке ревью и решения
+# шага не меняют: блокирующую силу F01 даёт следующий шаг плана (D6).
+
+#: Белый список F01 (D7): объявленные файлы шага плюс каталоги и файлы, которые шаг обязан
+#: менять вместе с поведением движка (`AGENTS.md`: версия манифеста и журнал изменений).
+F01_ALLOWED_PREFIXES = ("docs/", "tests/")
+F01_ALLOWED_FILES = ("CHANGELOG.md", "step_pipeline/plugin.yaml")
+#: Заголовок блока машинных проверок в карточках правок и ревью (S4, D6).
+MACHINE_CHECKS_HEADER = "МАШИННЫЕ ПРОВЕРКИ КОДОВ (гейт)"
+
+
+def commit_files(p: Paths, sha: str) -> list[str]:
+    """Файлы коммита шага: `git show --name-only --pretty=format:`, порядок git, без дублей.
+
+    Пустой sha, сбой git и «не репозиторий» — пустой список, а не исключение: проверка кодов
+    печатает «коммита нет» вместо того, чтобы ронять сборку карточки. Тело коммита в список
+    не попадает: `--pretty=format:` без значения оставляет только имена файлов.
+    """
+    name = str(sha or "").strip()
+    if not name:
+        return []
+    try:
+        res = _run(["git", "show", "--name-only", "--pretty=format:", name],
+                   Path(p.repo), timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if res.returncode != 0:
+        return []
+    files: list[str] = []
+    for line in _text_of(res.stdout).splitlines():
+        path = line.strip().replace("\\", "/")
+        if path and path not in files:
+            files.append(path)
+    return files
+
+
+def _f01_allowed(path: str, declared: list[str]) -> bool:
+    """Путь коммита закрыт объявленным файлом шага или белым списком D7."""
+    if path in F01_ALLOWED_FILES or path.startswith(F01_ALLOWED_PREFIXES):
+        return True
+    return any(path == item or path.startswith(item.rstrip("/") + "/") for item in declared)
+
+
+def _f01_declared(step: dict) -> list[str]:
+    """Объявленные файлы шага из пункта «Файл:» плана — нормализованные пути."""
+    out: list[str] = []
+    for item in step.get("files") or []:
+        path = str(item).strip().strip("`").replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        if path and path not in out:
+            out.append(path)
+    return out
+
+
+def step_file_offenders(p: Paths, step: dict, sha: str) -> list[str]:
+    """Файлы коммита вне объявленных файлов шага — находка F01 (D7).
+
+    Объявленный каталог закрывает вложенные пути (`app/` закрывает `app/models.py`), файл
+    закрывает только себя. Исключения D7 — `docs/`, `tests/`, `CHANGELOG.md` и
+    `step_pipeline/plugin.yaml`: манифест обязан меняться вместе с поведением движка, и
+    проверка, красящая собственный обязательный коммит, была бы выключена первым человеком.
+    Объявленных файлов нет — нарушителей тоже нет: сверять не с чем, а «всё постороннее»
+    обвиняло бы шаг, у которого список файлов в плане пуст.
+    """
+    declared = _f01_declared(step)
+    if not declared:
+        return []
+    offenders: list[str] = []
+    for path in commit_files(p, sha):
+        if _f01_allowed(path, declared) or path in offenders:
+            continue
+        offenders.append(path)
+    return offenders
+
+
+def _one_line(text, limit: int) -> str:
+    """Текст в одну строку карточки: пробелы схлопнуты, длинный хвост обрезан слева.
+
+    Режется начало, а не конец: в выводе прогона ошибка стоит последней, и карточке нужен
+    именно хвост (`RUN_TAIL_CHARS` уже отрезал начало доказательства).
+    """
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else "…" + flat[-limit:]
+
+
+def _checks_commit(p: Paths, step: dict, sha: str) -> str:
+    """Коммит для проверок F01/F03: из отчёта ревью, иначе HEAD (D8).
+
+    Отчёт ревью читается терпимо: битый вердикт — тот же HEAD, а не падение сборки карточки.
+    """
+    handle = str(sha or "").strip()
+    if handle:
+        return handle
+    try:
+        handle = str((verdict_at(review_path(p, step["id"])) or {}).get("commit") or "").strip()
+    except (OSError, ValueError, TypeError):
+        handle = ""
+    return handle or head_commit(p)
+
+
+def finding_code_checks(p: Paths, step: dict, sha: str = "") -> list[str]:
+    """Строки машинных проверок F01, F02, F03 для карточек — по строке на код (S4, D6–D8).
+
+    Каждая строка начинается кодом словаря (`F01 — …`): карточка их не перенумеровывает, а
+    исполнитель видит, какой код нашёлся машинно. Коммит берётся из отчёта ревью, иначе из
+    HEAD (D8); доказательство прогонов — по этому же sha, иначе `runs_proof_for`. Проверки
+    ничего не решают и строк в реестр не пишут: это доказательство, а не вердикт.
+    """
+    handle = _checks_commit(p, step, sha)
+    lines: list[str] = []
+    declared = _f01_declared(step)
+    if not handle:
+        lines.append("F01 — не проверено: коммита шага нет (git недоступен или sha пуст).")
+    elif not declared:
+        lines.append("F01 — не проверено: в плане не объявлено ни одного файла шага.")
+    else:
+        offenders = step_file_offenders(p, step, handle)
+        if offenders:
+            lines.append("F01 — правка вне объявленных файлов: "
+                         + ", ".join(f"`{path}`" for path in offenders))
+        else:
+            lines.append(f"F01 — файлов вне объявленных нет "
+                         f"({len(commit_files(p, handle))} файлов коммита).")
+    runs = [row for row in step.get("runs") or []
+            if isinstance(row, dict) and str(row.get("command") or "").strip()]
+    if runs:
+        lines.append(f"F02 — прогон на шаг объявлен: пунктов «Прогон» — {len(runs)}.")
+    else:
+        lines.append("F02 — нет прогона на шаг: пункта «Прогон» в плане нет.")
+    proof = load_runs_proof(p, step["id"], handle) if handle else None
+    if proof is None:
+        proof = runs_proof_for(p, step["id"], handle)
+    counter = runs_counter(proof)
+    if not counter:
+        lines.append("F03 — доказательства прогонов нет: страж ещё не исполнял пункты «Прогон».")
+        return lines
+    red = [row for row in proof.get("runs") or []
+           if isinstance(row, dict) and row.get("outcome") != "green"]
+    if not red:
+        lines.append(f"F03 — красных нет: {counter}.")
+        return lines
+    for row in red[:2]:
+        code = row.get("code")
+        where = f"код {code}" if code is not None else "без кода возврата"
+        reason = _one_line(row.get("reason") or row.get("outcome") or "", 120)
+        tail = _one_line(row.get("tail") or "", 240)
+        line = f"F03 — прогон `{row.get('command')}` красный ({where}): {reason}"
+        if tail:
+            line += f"; хвост вывода: {tail}"
+        lines.append(line)
+    if len(red) > 2:
+        # Хвост списка — в той же строке: блок карточки не растёт больше шести строк (D6).
+        lines[-1] += (f" (и ещё {len(red) - 2} красных из {int(proof.get('total') or 0)} —"
+                      f" см. доказательство прогонов)")
+    return lines
+
+
+def machine_code_block(p: Paths, step: dict, report_rel: str, sha: str = "") -> list[str]:
+    """Блок «МАШИННЫЕ ПРОВЕРКИ КОДОВ (гейт)» для карточек правок и ревью (S4, D4, D6).
+
+    Строки F01–F03 плюс строка линтера, если в отчёте назван код вне словаря: такой код
+    кодом не считается и шаг не держит, но молча пропущенная опечатка оставила бы находку
+    без силы. `gate.mode` = `off` печатает одну строку — выключатель нужен владельцу, когда
+    проверка мешает, а не когда её нет. В одной строке блока нет слов «коммит» и «сверять»
+    вместе: у ревьюера один образец ссылки на коммит — строка карточки ревью.
+    """
+    gate_cfg = p.cfg.state.get("gate")
+    mode = str((gate_cfg or {}).get("mode") if isinstance(gate_cfg, dict) else "on")
+    if mode.strip().lower() == "off":
+        return ["МАШИННЫЕ ПРОВЕРКИ КОДОВ: отключены (`gate.mode` = off)."]
+    lines = [MACHINE_CHECKS_HEADER, *finding_code_checks(p, step, sha)]
+    if report_rel:
+        unknown = report_unknown_codes_at(Path(p.repo) / report_rel)
+        if unknown:
+            lines.append("код вне словаря F01–F09: " + ", ".join(unknown)
+                         + " — кодом не считается, строка шаг не держит")
+    return lines
+
+
 # ───────────────── прогоны шага: исполнение стражем (план 9, S2) ─────────────────
 # Прогон — пункт «Прогон» шага, разобранный `next_step` в `StepRun`. Страж исполняет
 # прогоны ПЕРЕД ревью: красный прогон отсекает шаг карточкой правок с находкой F03 и не
@@ -1771,6 +1954,9 @@ ROUND_CAUSE_KEYS = {"блокирующая": "blocking", "значимая": "s
 # Статус строки — из класса находки: держит шаг только блокирующая.
 STEP_FINDING_STATUS = {"блокирующая": "открыто", "значимая": "не блокирует",
                        "стилистическая": "не блокирует"}
+# Статус блокирующей находки БЕЗ кода словаря (план 9, S4, D3): строка остаётся в реестре
+# с классом и текстом, но шаг не держит — код и есть машинно проверяемый дефект.
+STEP_FINDING_STATUS_UNCODED = "не блокирует"
 STEP_FINDING_ACTION = ("Закрыть находку правкой и ответить фактом "
                        "(адрес-символ или sha коммита)")
 
@@ -2124,9 +2310,12 @@ def step_finding_rows(text) -> list[dict]:
     """Находки отчёта ревью строками реестра шага: только пункты с непустым классом.
 
     Разбор отчёта — существующий `scan_report_findings` (D2): второй разбор метки класса
-    разошёлся бы с первым на живых отчётах. Статус строки — из класса находки, текст —
-    поле `body` (без метки), подметка (`[блокирующая/тест-недетерминирован]`) остаётся
-    в тексте в скобках: терять её нельзя, она называет вид блокирующей находки.
+    разошёлся бы с первым на живых отчётах. Статус строки — из класса находки и ведущего
+    кода словаря (план 9, S4, D3): `открыто` получает только блокирующая находка с кодом
+    `registry.FINDING_CODES`, остальные — `не блокирует`. Текст — поле `body` (без метки
+    класса, но с кодом: код живёт в тексте, а не в колонке), подметка
+    (`[блокирующая/тест-недетерминирован]`) остаётся в тексте в скобках: терять её нельзя,
+    она называет вид блокирующей находки.
     """
     _section, items = scan_report_findings(text)
     rows: list[dict] = []
@@ -2140,8 +2329,13 @@ def step_finding_rows(text) -> list[dict]:
         sublabel = str(item.get("sublabel") or "")
         if sublabel:
             body = f"{body} (подметка: {sublabel})"
+        # D3: шаг держит только блокирующая находка С кодом из словаря. Класс и текст
+        # сохраняются целиком — «тексты без кода остаются, но не блокируют» (план 9, S4).
+        code = registry.finding_code(body)
+        status = (STEP_FINDING_STATUS[kind] if code
+                  else STEP_FINDING_STATUS_UNCODED)
         rows.append({"kind": kind, "text": body, "action": STEP_FINDING_ACTION,
-                     "status": STEP_FINDING_STATUS[kind]})
+                     "status": status, "code": code})
     return rows
 
 
@@ -3794,6 +3988,20 @@ def prompt_order_body(p: Paths, step: dict) -> str:
 STEP_FINDINGS_UNREADABLE = "- реестр находок шага не читается: "
 
 
+def _step_registry_line(item: dict) -> str:
+    """Строка реестра шага для карточек: ведущий код и название перед текстом (D5, S4).
+
+    Код печатается один раз и одним местом: строку реестра строит эта функция, её же зовут
+    `step_registry_lines`, `open_step_findings_lines` и блок карточки правок. Строка без кода
+    печатается дословно как до S4 — префикс `- F1 (блокирующая): ` не меняется.
+    """
+    text = str(item.get("text") or "")
+    code = registry.finding_code(text)
+    head = f"{code} «{registry.finding_code_title(code)}» — " if code else ""
+    body = registry.finding_text(text) if code else text
+    return f"- {item.get('id')} ({item.get('kind')}): {head}{body} → {item.get('action')}"
+
+
 def step_registry_lines(p: Paths, step: dict, only_open: bool = False) -> list[str]:
     """Строки реестра шага для тела карточки; битый реестр — строкой с причиной (13-S2).
 
@@ -3812,8 +4020,7 @@ def step_registry_lines(p: Paths, step: dict, only_open: bool = False) -> list[s
         return ["- реестра ещё нет: первая находка создаёт файл с шапкой выше."]
     if only_open:
         rows = [item for item in rows if str(item.get("status") or "") == "открыто"]
-    return [f"- {item.get('id')} ({item.get('kind')}): {item.get('text')} → {item.get('action')}"
-            for item in rows]
+    return [_step_registry_line(item) for item in rows]
 
 
 def open_step_findings(ctx: dict) -> list[dict]:
@@ -3938,6 +4145,8 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
         "РЕЕСТР НАХОДОК ШАГА (обязательно)",
         f"- Файл: `{step_findings_rel(p, step['id'])}`; шапка таблицы — "
         f"`{findings_table([], STEP_FINDINGS_HEADER, STEP_FINDINGS_KEYS)[0]}`.",
+        "- Код находки — ведущий `F01`…`F09` из словаря (`registry.py#ANCHOR:коды_находок`):",
+        "  блокирующая находка без кода открытой строкой не становится и шаг не держит.",
         "- Блокирует вердикт только статус `открыто`: `закрыто` и `не блокирует` шаг не держат.",
         "- Открытый ID закрывается фактом в колонке «Что сделать»: "
         "`Закрыто: адрес-символ или sha правки`.",
@@ -3948,6 +4157,8 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
         "  отчёта, APPROVE с открытой строкой шаг не закроет.",
         "РЕЕСТР СЕЙЧАС",
         *step_registry_lines(p, step),
+        "",
+        *machine_code_block(p, step, report_rel),
         "",
         "Гейты шага (прогнать САМОСТОЯТЕЛЬНО, свои цифры):",
         *[f"- {g}" for g in step.get("gates") or []],
@@ -4505,6 +4716,9 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
         ]
     registry = step_findings_block(p, step)
     answer = fix_answer_block(p, step)
+    # Машинные проверки кодов (план 9, S4): после реестра и до формы ответа — исполнитель
+    # видит, что гейт нашёл сам, а не только что написал ревьюер.
+    checks = machine_code_block(p, step, report_rel)
     # Разбор классов отчёта (13-S3): разбор делает S1, второй не пишем — карточка печатает счёт.
     classes = report_finding_classes_at(Path(p.repo) / report_rel)
     classes_line = (f"Классы находок отчёта: блокирующих {classes['blocking']}, "
@@ -4520,6 +4734,7 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
         classes_line,
         "",
         *registry,
+        *checks,
         *answer,
         "ЧТО ДЕЛАТЬ",
         "- Исправить БЛОКИРУЮЩИЕ находки полностью; значимые — по существу (не косметикой).",
@@ -4554,7 +4769,8 @@ def runs_fix_card_body(p: Paths, step: dict, round_no: int, proof: dict,
                        max_rounds: int) -> str:
     """Карточка правок по красному прогону (план 9, S2, §4 п.7).
 
-    Находка F03 идёт текстом до S4 (коды в реестре вводит он): карточка обязана назвать
+    Находка F03 — код словаря шага (`registry.py#ANCHOR:коды_находок`, введён шагом S4):
+    карточка обязана назвать
     команду, ожидание, код возврата, секунды и хвост вывода, иначе исполнителю нечего
     чинить — «прогон красный» без вывода это догадка, а не находка. Отчёта ревью ещё нет,
     поэтому реестр находок шага НЕ заводится (`ensure_step_findings` не зовётся: строка
@@ -4577,7 +4793,7 @@ def runs_fix_card_body(p: Paths, step: dict, round_no: int, proof: dict,
         f"(sha `{sha or '—'}`)",
         runs_counter(proof),
         "",
-        "НАХОДКИ (F03 — метка обязательна: до S4 находка с кодом — это метка в тексте)",
+        "НАХОДКИ (F03 — код словаря: прогон красный)",
     ]
     red = [row for row in proof.get("runs") or []
            if isinstance(row, dict) and row.get("outcome") != "green"]
@@ -4612,9 +4828,10 @@ def runs_fix_card_body(p: Paths, step: dict, round_no: int, proof: dict,
         "- Тесты не ослаблять и не удалять; расширение объёма шага — находка.",
         "",
         "ВАЖНО",
-        "- До S4 «находка с кодом» — это метка F01–F09 в ТЕКСТЕ находки: блокирует",
-        "  наличие метки, а не её проверка. Закрытый словарь кодов и отказ на код вне",
-        "  словаря появятся в S4 — сейчас словаря нет и метка ни с чем не сверяется.",
+        "- С S4 «находка с кодом» — ведущая метка из словаря шага",
+        "  (`registry.py#ANCHOR:коды_находок`): код в ТЕКСТЕ строки держит шаг, а код вне",
+        "  словаря (`F10`) кодом не считается и называется линтером отчёта. F03 — код",
+        "  словаря «прогон красный», а не свободный текст карточки.",
         "- Номера в скобках по всему документу — из реестра находок шага и к метке",
         "  карточки не относятся; реестр шага здесь НЕ заводится (отчёта ревью ещё нет).",
         "",
@@ -7266,9 +7483,11 @@ def report_finding_codes(text) -> list[str]:
     Нечитаемый отчёт и отсутствие раздела — пустой список, а не исключение: у шага, который
     закрывается прогоном, отчёта может не быть вовсе (D3 постановки 9-S3).
 
-    Закрытого словаря кодов здесь нет намеренно — он появляется шагом S4. До него блокирует
-    сама метка: код в тексте находки означает «находка с кодом», и такая находка держит шаг
-    при любом риске.
+    С S4 словарь кодов берётся из `registry.FINDING_CODES`: найденное шаблоном
+    фильтруется словарём, поэтому `F10` (код вне словаря) здесь не возвращается и шаг им
+    не держится (D4). Место поиска не менялось: код ищется в ЛЮБОМ месте пункта, а не
+    только ведущим — находка ревьюера пишется `[класс] F0N адрес — …`, и отчёт с кодом
+    после адреса держит шаг (`tests/engine/test_close_policy.py`).
     """
     if text is None:
         return []
@@ -7277,9 +7496,44 @@ def report_finding_codes(text) -> list[str]:
     for item in items:
         for code in FINDING_CODE_RE.findall(str(item.get("text") or "")):
             code = code.upper()
-            if code not in codes:
+            if code in registry.FINDING_CODES and code not in codes:
                 codes.append(code)
     return codes
+
+
+def report_unknown_codes(text) -> list[str]:
+    """Коды вне словаря, названные в находках отчёта (`F10`, `F00`, `F0X`) — линтер (S4).
+
+    Широкий шаблон словаря находит токен, словарь его не подтверждает — такой код кодом не
+    считается и шаг не держит (D4), но молчать о нём нельзя: опечатка ревьюера оставила бы
+    находку без блокирующей силы. Порядок — как в отчёте, без дублей, в верхнем регистре;
+    нечитаемый отчёт и отсутствие раздела — пустой список, не исключение.
+    """
+    if text is None:
+        return []
+    _section, items = scan_report_findings(text)
+    unknown: list[str] = []
+    for item in items:
+        for token in registry.FINDING_CODE_RE.findall(str(item.get("text") or "")):
+            code = token.upper()
+            if code not in registry.FINDING_CODES and code not in unknown:
+                unknown.append(code)
+    return unknown
+
+
+def report_unknown_codes_at(path) -> list[str]:
+    """Коды вне словаря по файлу отчёта: нет пути, нечитаемый файл — пустой список.
+
+    Путь приходит из `verdict.get("path")`, а при закрытии по прогонам вердикта нет — `None`
+    здесь штатный вход, а не ошибка вызова (та же терпимость, что у `report_finding_codes_at`).
+    """
+    if not path:
+        return []
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError, TypeError):
+        return []
+    return report_unknown_codes(text)
 
 
 def report_finding_codes_at(path) -> list[str]:

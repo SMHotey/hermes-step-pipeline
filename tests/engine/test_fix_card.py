@@ -48,7 +48,7 @@ REPORT_BLOCKING = """## ВЕРДИКТ: REQUEST_CHANGES
 
 ## Находки
 
-- [блокирующая] `step_pipeline/engine/gate.py` — форма ответа не проверяется
+- [блокирующая] F04 `step_pipeline/engine/gate.py` — форма ответа не проверяется
 """
 
 F1_TEXT = "`step_pipeline/engine/gate.py` — форма ответа не проверяется"
