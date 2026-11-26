@@ -21,6 +21,7 @@ import pytest
 import check_task_prompt as ctk
 import config as config_mod
 import gate
+from test_check_prompt import GOOD
 
 #: Схема поддельной борды: у карточки есть `started_at` и `max_runtime_seconds`.
 #: Без них правило молчит, и стенд обязан их давать (`read_cards` берёт их, если есть).
@@ -165,6 +166,24 @@ def test_line_absent_or_prose_is_none():
     assert ctk.artifact_line("") is None
 
 
+def test_line_none_word_returns_value():
+    """Отказ (`Артефакт: нет`) — значение `"нет"`, а не `None`: иначе его не отличить от
+    забытой строки, и потребитель (`ARTIFACT_NONE_VALUES`) не узнает отказ."""
+    assert ctk.artifact_line("## Роль и цель\n\nАртефакт: нет\n") == "нет"
+    assert ctk.artifact_line("## Роль и цель\n\n- Артефакт: —\n") == "—"
+    assert "нет" in ctk.ARTIFACT_NONE_VALUES
+
+
+def test_line_takes_first_declaration():
+    """Две строки в блоке — ответ первая; проза на месте объявления не считается."""
+    two = ("## Роль и цель\n\nАртефакт: `docs/first.md`\n\nЕщё текст блока.\n"
+           "Артефакт: `docs/second.md`\n")
+    assert ctk.artifact_line(two) == "docs/first.md"
+    prose_first = ("## Роль и цель\n\nАртефакт шага — файл отчёта.\n\n"
+                   "Артефакт: `docs/second.md`\n")
+    assert ctk.artifact_line(prose_first) == "docs/second.md"
+
+
 # ───────────────────────── §4.2: предупреждение W2 ─────────────────────────
 
 def w2(text: str) -> tuple[str, str]:
@@ -185,6 +204,15 @@ def test_w2_passes_with_path_and_with_refusal():
     assert (level, ARTIFACT in message) == ("PASS", True)
     level, message = w2("## Роль и цель\n\nАртефакт: нет\n")
     assert level == "PASS" and "файла не создаёт" in message
+
+
+def test_w2_keeps_exit_code(tmp_path: Path, capsys):
+    """W2 — предупреждение, не провал: `main` на постановке без строки возвращает 0."""
+    path = tmp_path / "2026-11-26_1-S1_prompt.md"
+    path.write_text(GOOD, encoding="utf-8")
+    assert ctk.main([str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "WARN W2" in out and "ИТОГ: PASS" in out
 
 
 # ─────────────────────── §4.3: путь берётся из постановки ───────────────────────
@@ -222,6 +250,28 @@ def test_report_at_share_names_path_and_minutes(stand: Path):
     assert report is not None
     assert report["text"] == (f"артефакта нет: {ARTIFACT}, прошло 36 мин из 60")
     assert report["path"] == ARTIFACT and report["card"] == "t_art1"
+
+
+def test_report_silent_before_threshold(stand: Path):
+    """30 % и 59 % лимита — молчание; порог включительный, на 60 % проба уже говорит."""
+    write_prompt(stand)
+    p = paths(stand)
+    assert gate.artifact_first_report(p, ctx([live_card(started_ago=int(0.30 * LIMIT))])) is None
+    assert gate.artifact_first_report(p, ctx([live_card(started_ago=int(0.59 * LIMIT))])) is None
+    assert gate.artifact_first_report(p, ctx([live_card(started_ago=SHARE)])) is not None
+
+
+def test_report_uses_declared_path(stand: Path):
+    """Путь берётся из объявления, а не из первого файла «Что сделать»."""
+    declared = "docs/reviews/declared-first.md"
+    text = PROMPT.replace(f"`{ARTIFACT}`", f"`{declared}`")
+    text = text.replace("первый-из-списка.md", "docs/other-early.md")
+    text += "\n## 4. Что сделать\n\n- `docs/later.md` — второй кандидат\n"
+    write_prompt(stand, text)
+    report = gate.artifact_first_report(paths(stand), ctx([live_card(started_ago=SHARE)]))
+    assert report is not None and report["path"] == declared
+    assert "docs/other-early.md" not in report["text"]
+    assert "docs/later.md" not in report["text"]
 
 
 def test_report_silent_when_file_exists(stand: Path):
@@ -325,3 +375,19 @@ def test_tick_comments_and_decides_as_before(stand: Path, hermes_stub: Path):
     second = gate.run_gate(p, notify_fn=said.append)
     assert second["decision"]["action"] == first["decision"]["action"]
     assert len(artifact_comments(hermes_stub)) == 1
+
+
+def test_hook_failure_does_not_break_tick(stand: Path, hermes_stub: Path, monkeypatch):
+    """Исключение внутри хука тик не валит: обёртка `run_gate` ловит его, решение прежнее."""
+    write_prompt(stand)
+    seed_card(hermes_stub)
+    said: list[str] = []
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("хук сломан")
+
+    monkeypatch.setattr(gate, "artifact_first_hook", boom)
+    result = gate.run_gate(paths(stand), notify_fn=said.append)
+    assert result["decision"]["action"] == "idle", result["decision"]
+    assert artifact_comments(hermes_stub) == []
+    assert not any("артефакта нет" in text for text in said)
