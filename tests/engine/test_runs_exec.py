@@ -385,6 +385,43 @@ def test_budget_stops_remaining_runs(project: Path, hermes_stub: Path):
     assert "бюджет" in stop["reason"] and "1 из 2" in stop["reason"]
 
 
+def test_auto_budget_is_sum_of_declared_timeouts(project: Path, hermes_stub: Path):
+    """Ключа `budget` нет — предел в доказательстве равен 1.5 × (900 + 900) = 2700 с.
+
+    Находка F2 ревью 17-S5: связка `runs_budget_limit` → `run_step_runs` →
+    `proof["budget"]["limit"]` не проверялась нигде, хотя постановка §4.9 требует
+    именно этих чисел.
+    """
+    p = stand(project, hermes_stub,
+              [f"- Прогон: `{CMD_OK}` → exit 0; таймаут 900 сек",
+               f"- Прогон: `{CMD_OK}` → exit 0; таймаут 900 сек"])
+
+    proof = gate.run_step_runs(p, next_step_dict(project))
+
+    assert proof["budget"]["limit"] == 2700
+    assert [row["outcome"] for row in proof["runs"]] == ["green", "green"]
+    assert proof["budget"]["exhausted"] is False
+
+
+def test_explicit_budget_one_skips_second_run(project: Path, hermes_stub: Path):
+    """`step_runs.budget: 1` — предел ровно 1 с, второй прогон `skipped`.
+
+    Находка F2 ревью 17-S5: заданное число доходит до доказательства как есть, а не
+    пересчитывается авто-формулой.
+    """
+    p = stand(project, hermes_stub,
+              [f"- Прогон: `{CMD_SLOW}` → exit 0; таймаут 900 сек",
+               f"- Прогон: `{CMD_MARK}` → exit 0; таймаут 900 сек"],
+              budget=1)
+
+    proof = gate.run_step_runs(p, next_step_dict(project))
+
+    assert proof["budget"]["limit"] == 1
+    assert [row["outcome"] for row in proof["runs"]] == ["green", "skipped"]
+    assert proof["budget"]["exhausted"] is True
+    assert not (project / MARKER).exists()
+
+
 def test_all_green_over_budget_orders_review(project: Path, hermes_stub: Path):
     """Сумма прогонов перевалила за лимит, но ничего не пропущено — ревью, а не стоп.
 

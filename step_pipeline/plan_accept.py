@@ -44,6 +44,15 @@ try:
 except ImportError:  # pragma: no cover - отладка файлом, движка рядом нет
     engine_approval = None  # type: ignore
 
+try:
+    # Разбор пункта «Прогон» — один на двоих (находка F1 ревью 17-S5): бюджет сверяется
+    # тем же разбором, которым движок читает прогоны. Своя регулярка не видела форм
+    # `таймаут: 1800`, `Таймаут 1800 сек`, переноса хвоста на вторую строку и пункта без
+    # буллета — черновик проходил `plan --check` и ломал шаг на прогоне.
+    from .engine import next_step as engine_next_step
+except ImportError:  # pragma: no cover - отладка файлом, движка рядом нет
+    engine_next_step = None  # type: ignore
+
 _PLANS_DEFAULT = "docs/plans"
 _APPROVAL_NAME = "plan_{}_approval.json"
 # Номер плана в имени файла — как engine/registry.py:30.
@@ -216,11 +225,6 @@ def check_draft(project, draft) -> list[str]:
     return problems + _budget_errors(project, draft)
 
 
-#: Хвост прогона: объявленный таймаут строки «Прогон» (§5 формата плана).
-_RUN_TIMEOUT_RE = re.compile(r"таймаут\s+(?P<seconds>\d+)")
-_RUN_LINE_RE = re.compile(r"^[-*+]\s*Прогон", re.IGNORECASE)
-
-
 def _budget_errors(project: Path, draft: Path) -> list[str]:
     """Черновик против `step_runs.budget`: одиночный таймаут и сумма по шагу (17-S5).
 
@@ -229,11 +233,20 @@ def _budget_errors(project: Path, draft: Path) -> list[str]:
     инцидентом, и шаг нельзя было закрыть. Сумма проверяется наравне с одиночным
     таймаутом: два честных прогона по 900 с дают тот же исход, что один на 1800 с.
 
+    Разбор прогона — движковский, а не свой (находка F1 ревью 17-S5): пункт собирается
+    `next_step.section_blocks` (склейка продолжений строки, метка `прогон*`), таймаут
+    берётся из `next_step._parse_run(...).timeout`. Своя построчная регулярка не видела
+    форм, которые движок чтит (`таймаут: 1800`, `Таймаут 1800 сек`, перенос хвоста на
+    вторую строку, пункт без буллета), — линт-чистый черновик давал ноль ошибок и ломал
+    шаг на прогоне. Прогон, которого не разбирает движок, не считается и здесь.
+
     Бюджет читается сырым словарём (`proj.read_config`): `plan --check` обязан печатать
     ошибки черновика, а не падать на конфиге. Ключа нет или он `null` — ошибок нет: авто
     по `gate.runs_budget_limit` противоречивым быть не может, оно считается по этим же
     таймаутам.
     """
+    if engine_next_step is None:  # pragma: no cover - движка рядом нет, сверять нечем
+        return []
     cfg = proj.read_config(project)
     budget = (cfg.get("step_runs") or {}).get("budget")
     if budget is None:
@@ -253,36 +266,47 @@ def _budget_errors(project: Path, draft: Path) -> list[str]:
     except re.error:
         step_re = re.compile(_STEP_ID_REGEX)
     errors: list[str] = []
-    step_id = ""
-    sums: dict[str, int] = {}
+    # Тело плана режется заголовками шагов: прогоны считаются по шагу, а не по файлу.
+    # Раздел шага кончается на заголовке того же или более высокого уровня — как его
+    # режет движок (`registry.section_end`), иначе прогон соседнего раздела попал бы
+    # в сумму чужого шага.
+    sections: list[tuple[str, list[str]]] = [("", [])]
+    level = 0
     for line in lines:
         heading = _HEADING_RE.match(line)
         if heading:
+            depth = len(heading.group("hashes"))
             found = step_re.search(heading.group("title"))
             if found:
-                step_id = found.group("id").upper()
-                sums.setdefault(step_id, 0)
-            continue
-        if not _RUN_LINE_RE.match(line):
-            continue
-        declared = _RUN_TIMEOUT_RE.search(line)
-        if declared is None:
-            continue
-        seconds = int(declared.group("seconds"))
+                sections.append((found.group("id").upper(), []))
+                level = depth
+                continue
+            if level and depth <= level:
+                sections.append(("", []))
+                level = 0
+                continue
+        sections[-1][1].append(line)
+    for step_id, body in sections:
         name = step_id or "—"
-        sums[name] = sums.get(name, 0) + seconds
-        if seconds > limit:
-            errors.append(
-                f"шаг {name}: таймаут прогона {seconds} с больше step_runs.budget={limit} с — "
-                f"прогон уйдёт в `skipped`, страж встанет на инциденте; поднять бюджет "
-                f"или снизить таймаут")
-    for name, total in sums.items():
+        total = 0
+        for label, text, _full in engine_next_step.section_blocks(body):
+            if not label.startswith("прогон"):
+                continue
+            run = engine_next_step._parse_run(text)
+            if run is None or run.timeout is None:
+                continue
+            seconds = run.timeout
+            total += seconds
+            if seconds > limit:
+                errors.append(
+                    f"шаг {name}: таймаут прогона {seconds} с больше step_runs.budget={limit} с — "
+                    f"прогон уйдёт в `skipped`, страж встанет на инциденте; поднять бюджет "
+                    f"или снизить таймаут")
         if total > limit:
             errors.append(
                 f"шаг {name}: сумма объявленных таймаутов прогонов {total} с больше "
                 f"step_runs.budget={limit} с — последние прогоны будут пропущены")
     return errors
-
 
 
 def check_warnings(project, draft) -> list[str]:

@@ -497,3 +497,92 @@ def test_check_without_budget_key_passes(project: Path, clean_env):
     write_cfg(project, step_runs={"timeout": 60})
     errors = plan_accept.check_draft(project, draft_file(project))
     assert not any("step_runs.budget" in text for text in errors), errors
+
+
+# ───────── находка F1 ревью 17-S5: бюджет видит те же прогоны, что и движок ─────────
+# Своя построчная регулярка не видела форм, которые чтит `next_step._parse_run`:
+# бюджета «0 ошибок» хватало, чтобы черновик прошёл `plan --check`, а шаг лёг на прогоне.
+
+DRAFT_ONE_RUN = """# 9. Черновик с долгим прогоном
+
+## Шаги
+
+### S1. Шаг с одним прогоном (1 дн)
+
+{run}
+- Файл: `app/x.py`
+- Готово = прогон зелёный
+
+## Журнал выполнения
+
+| Дата | Шаг | Коммиты | Прогоны и доказательства | Статус |
+|---|---|---|---|---|
+| — | S1 | — | — | открыт |
+"""
+
+DRAFT_TAIL_RUN = """# 9. Черновик с прогоном вне шага
+
+## Шаги
+
+### S1. Шаг без прогонов (1 дн)
+
+- Файл: `app/x.py`
+
+## Приложение
+
+- Прогон: `python -m pytest` → exit 0; таймаут 1800 сек
+"""
+
+
+def draft_with(project: Path, text: str) -> Path:
+    """Черновик с заданным текстом — рядом с `9-draft.md`, без перезаписи образца."""
+    folder = Path(project) / "docs" / "plans" / "drafts"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "9-budget-forms.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("run", [
+    "- Прогон: `python -m pytest` → exit 0; таймаут: 1800 сек",
+    "- Прогон: `python -m pytest` → exit 0; Таймаут 1800 сек",
+    "- Прогон: `python -m pytest` → exit 0;\n  таймаут 1800 сек",
+    "Прогон: `python -m pytest` → exit 0; таймаут 1800",
+])
+def test_budget_sees_every_run_form_the_engine_reads(project: Path, clean_env, run):
+    """Формы `таймаут: 1800`, `Таймаут 1800 сек`, переноса и пункта без буллета — ошибка.
+
+    Все четыре движок читает одинаково (`next_step._parse_run` → `timeout == 1800`),
+    значит и проверка бюджета обязана дать ошибку, а не «0 ошибок».
+    """
+    write_cfg(project, step_runs={"timeout": 60, "budget": 600})
+    errors = plan_accept.check_draft(
+        project, draft_with(project, DRAFT_ONE_RUN.format(run=run)))
+    assert any("шаг S1" in text and "таймаут прогона 1800 с больше step_runs.budget=600 с" in text
+               for text in errors), errors
+
+
+def test_budget_ignores_run_the_engine_cannot_parse(project: Path, clean_env):
+    """Пункт, который движок не разбирает (нет стрелки), бюджетом не считается.
+
+    Один разбор на двоих: прогон, которого нет в контракте шага, не исполняется,
+    и бюджет на него тратиться не может — иначе проверка блокировала бы пустое место.
+    """
+    write_cfg(project, step_runs={"timeout": 60, "budget": 600})
+    errors = plan_accept.check_draft(
+        project, draft_with(project, DRAFT_ONE_RUN.format(
+            run="- Прогон: `python -m pytest` таймаут 1800 сек")))
+    assert not any("step_runs.budget" in text for text in errors), errors
+
+
+def test_budget_does_not_sum_run_from_neighbour_section(project: Path, clean_env):
+    """Прогон из раздела после шага — не сумма шага: имя «—», а не S1.
+
+    Раздел шага кончается на заголовке того же или более высокого уровня
+    (`registry.section_end`), иначе прогон приложения приписался бы чужому шагу.
+    """
+    write_cfg(project, step_runs={"timeout": 60, "budget": 600})
+    errors = plan_accept.check_draft(project, draft_with(project, DRAFT_TAIL_RUN))
+    assert any(text.startswith("шаг —: таймаут прогона 1800 с") for text in errors), errors
+    assert not any("шаг S1" in text and "step_runs.budget" in text for text in errors), errors
+
