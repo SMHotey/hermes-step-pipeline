@@ -24,6 +24,8 @@
         с `Риск: high` при `risk_gate: spec` — ещё и блок «Спека» нужного объёма
         и состава (четыре подраздела, не меньше 600 символов)
     W1  в блоке «Вопросы» не больше 3 вопросительных знаков (предупреждение)
+    W2  в блоке «Роль и цель» есть строка `Артефакт:` — путь файла, который шаг создаёт
+        первым (предупреждение: правило живёт в роли постановщика, а не в примере шага)
 """
 from __future__ import annotations
 
@@ -64,6 +66,18 @@ COMMAND_HINT = re.compile(
 )
 EXPECTED_HINT = re.compile(r"(passed|failed|EXIT|ожида|вернёт|вернет|PASS|FAIL)")
 
+#: Строка артефакта шага (17-S6): путь, по которому страж проверяет, начал ли шаг работу.
+#: Источник пути один — объявление в блоке «Роль и цель», а не первый файл из «Что сделать»:
+#: «первый файл списка» это совпадение, а не намерение постановщика.
+ARTIFACT_SECTION = "Роль и цель"
+ARTIFACT_LINE_RE = re.compile(r"^(?:[-*+]\s+)?(\*\*)?артефакт", re.IGNORECASE)
+ARTIFACT_QUOTED_RE = re.compile(r"`([^`]*)`")
+ARTIFACT_TRAILING = " \t.,;"
+#: Значения, которыми постановка отказывается от артефакта: шаг нового файла не создаёт,
+#: стражу нечего ждать. Отказ — такое же законное объявление, как путь.
+ARTIFACT_NONE_VALUES = ("", "нет", "—", "-")
+
+
 
 def split_sections(text: str) -> dict[str, str]:
     """Разложить markdown на блоки `## <заголовок> -> тело`."""
@@ -88,6 +102,41 @@ def find_section(sections: dict[str, str], marker: str) -> str | None:
     for title, body in sections.items():
         if lowered in title.lower():
             return body
+    return None
+
+
+def artifact_line(text: str) -> str | None:
+    """Путь файла-артефакта шага из объявленной строки блока «Роль и цель».
+
+    Источник пути один (решение Д1 постановки): объявление начинается словом `Артефакт:`
+    — допустимы маркер списка `- ` и `**` вокруг слова. Текст перед словом в той же строке
+    считается прозой: объявлением такая строка не является. Несколько кандидатов проверка
+    не перебирает: первое объявление в блоке — ответ.
+
+    Как читается значение: содержимое первых обратных кавычек, иначе первое слово после
+    двоеточия; краевые точки и запятые срезаются. `None` — объявления нет: строки нет
+    вовсе, блока нет или после слова не стоит двоеточие.
+    """
+    body = find_section(split_sections(text), ARTIFACT_SECTION)
+    if not body:
+        return None
+    for line in body.splitlines():
+        stripped = line.strip()
+        match = ARTIFACT_LINE_RE.match(stripped)
+        if not match:
+            continue
+        rest = stripped[match.end():].strip().lstrip("*").strip()
+        if not rest.startswith(":"):
+            continue
+        rest = rest[1:].strip()
+        quoted = ARTIFACT_QUOTED_RE.search(rest)
+        if quoted:
+            value = quoted.group(1)
+        else:
+            words = rest.split()
+            value = words[0] if words else ""
+        value = value.strip().strip(ARTIFACT_TRAILING).strip()
+        return value or None
     return None
 
 
@@ -185,7 +234,7 @@ def check_prompt(text: str, reviewer_role: str = "reviewer",
         reasons.append(f"в блоке «Ревью» нет роли `{reviewer_role}` "
                        f"и вердикта APPROVE/REQUEST_CHANGES")
     # Спека — вторая обязанность C7 (D1): отдельного кода не заводим, иначе строка роли
-    # постановщика, ARCHITECTURE.md и «проверок 8» разъехались бы с номером проверки.
+    # постановщика, ARCHITECTURE.md и «проверок 9» разъехались бы с номером проверки.
     want_spec = (str(risk or "").strip().lower() == "high"
                  and str(risk_gate or "spec").strip().lower() == "spec")
     if want_spec:
@@ -202,6 +251,18 @@ def check_prompt(text: str, reviewer_role: str = "reviewer",
                                       f"(> {MAX_QUESTIONS})"))
     else:
         results.append(("PASS", "W1", f"вопросов в пределах нормы ({marks})"))
+
+    # Артефакт шага (17-S6): правило сначала в роли постановщика, поэтому отсутствие строки —
+    # предупреждение, а не провал постановки. Отказ («Артефакт: нет») — законное объявление.
+    artifact = artifact_line(text)
+    if artifact is None:
+        results.append(("WARN", "W2", "в блоке «Роль и цель» нет строки `Артефакт:`: "
+                                      "страж не предупредит о шаге, который ещё ничего "
+                                      "не записал"))
+    elif artifact.strip().lower() in ARTIFACT_NONE_VALUES:
+        results.append(("PASS", "W2", "артефакта нет: шаг объявил, что файла не создаёт"))
+    else:
+        results.append(("PASS", "W2", f"артефакт шага назван: {artifact}"))
 
     return results
 

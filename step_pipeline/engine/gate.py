@@ -1056,6 +1056,62 @@ def prompt_rel(p: Paths, step_id: str) -> str | None:
     return p.cfg.rel(matches[-1])
 
 
+# ─────────────────────── первый артефакт шага (план 17, S6) ───────────────────────
+# Шаг, у которого заявлен файл-артефакт, но файла нет, виден только глазами по логу.
+# Правило: на 60 % лимита карточки страж пишет в карточку «артефакта нет» и уведомляет
+# владельца. Шага это не касается — он не убивается и метод не меняется (17-S6).
+
+#: Доля лимита карточки, с которой страж смотрит на объявленный файл-артефакт.
+ARTIFACT_FIRST_SHARE = 0.6
+
+
+def artifact_path(p: Paths, step_id: str) -> str | None:
+    """Объявленный файл-артефакт шага: строка `Артефакт:` из блока «Роль и цель» постановки.
+
+    Источник пути один — объявление постановщика (`check_task_prompt.artifact_line`), а не
+    первый файл из «Что сделать»: перебор кандидатов — угадывание. `None` — постановки нет,
+    объявления нет, объявлен отказ (`Артефакт: нет`) или файл постановки не читается.
+    """
+    sid = str(step_id or "")
+    if not sid:
+        return None
+    try:
+        rel = prompt_rel(p, sid)
+        if not rel:
+            return None
+        text = (Path(p.repo) / rel).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    value = check_task_prompt.artifact_line(text)
+    if value is None or value.strip().lower() in check_task_prompt.ARTIFACT_NONE_VALUES:
+        return None
+    return value
+
+
+def artifact_first_lines(p: Paths, step: dict) -> list[str]:
+    """Блок «ПЕРВЫЙ АРТЕФАКТ» для тела карточки шага (17-S6).
+
+    Печатается, только когда постановка объявила путь: у шага без объявления тело карточки
+    остаётся прежним дословно. Битое чтение карточку не отменяет: шаг важнее правила.
+    """
+    try:
+        path = artifact_path(p, str((step or {}).get("id") or ""))
+    except Exception as exc:  # noqa: BLE001 - тело карточки не имеет права падать
+        config_mod.debug_note("artifact_first_body", exc)
+        return []
+    if not path:
+        return []
+    share = int(round(ARTIFACT_FIRST_SHARE * 100))
+    return [
+        "ПЕРВЫЙ АРТЕФАКТ (правило стража)",
+        f"- `{path}` создаётся ПЕРВЫМ — до кода и длинных чтений: работа должна быть",
+        "  видна на диске, а не жить в контексте.",
+        f"- На {share} % лимита карточки страж проверит этот файл и напишет в карточку",
+        "  «артефакта нет», если его до сих пор нет; шаг при этом не останавливается.",
+        "",
+    ]
+
+
 # ───────────── отпечаток входа постановки: второй признак устаревания (план 12, S1) ─────────────
 
 #: Литерал вместо `sha256` для входа, которого нет на диске (или это не файл).
@@ -3290,6 +3346,7 @@ def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
     lines = [f"ШАГ ПЛАНА {plan_id} {step['id']} — {step['title']}", ""]
     if prompt:
         lines += [f"ПОСТАНОВКА (прочитать ПЕРВОЙ, до кода): `{prompt}`", ""]
+    lines += artifact_first_lines(p, step)          # ← 17-S6: файл раньше кода
     lines += continuation_block_lines(p, step)      # ← 17-S3: продолжение с места убийства
     lines += [f"Цель: {step.get('goal', '')}", "", "Файлы (править/создавать):"]
     lines += [f"- {f}" for f in step.get("files") or []]
@@ -7412,6 +7469,91 @@ def report_stalls(p: Paths, ctx: dict) -> int:
     return sent
 
 
+# ───────────────────── правило «артефакт первым» (план 17, S6) ─────────────────────
+# Замер основания: ревью постановки 2-S6 шло 118 минут и не создало ни одного файла —
+# работа целиком жила в контексте, и владелец узнал об этом только по концу лимита. Правило
+# отвечает на это предупреждением на середине шага, а не убийством попытки.
+
+#: Сколько отметок «уже сказали» держать в состоянии плана — как `KILL_SNAPSHOT`/`STALL_KEEP`:
+#: отметка нужна, чтобы не повторять комментарий по той же карточке, а не как отчёт.
+ARTIFACT_REPORTED_KEEP = 20
+
+
+def artifact_first_report(p: Paths, ctx: dict) -> dict | None:
+    """Проба «шаг идёт, а объявленного артефакта нет» либо `None`.
+
+    Источник времени — карточка шага: `started_at` и `max_runtime_seconds` из `read_cards`.
+    Строки нет, лимита нет, карточка терминальная — проба молчит; путь берётся только из
+    постановки (`artifact_path`). Существование файла проверяется на диске, а не в git:
+    несохранённый в коммит файл — уже работа.
+    """
+    step = ctx.get("next") or {}
+    step_id = str(step.get("id") or "")
+    if not step_id:
+        return None
+    cards = card_of(ctx.get("cards") or [], "step")
+    if not cards:
+        return None
+    card = cards[-1]
+    if str(card.get("status") or "") in TERMINAL:
+        return None
+    started = _as_int(card.get("started_at"), 0)
+    limit = _as_int(card.get("max_runtime_seconds"), 0)
+    if started <= 0 or limit <= 0:
+        return None
+    elapsed = max(0, int(_now() - started))
+    if elapsed < ARTIFACT_FIRST_SHARE * limit:
+        return None
+    path = artifact_path(p, step_id)
+    if not path:
+        return None
+    target = Path(path)
+    if not target.is_absolute():
+        target = Path(p.repo) / path
+    if target.is_file():
+        return None
+    elapsed_min, limit_min = elapsed // 60, limit // 60
+    return {"card": str(card.get("id") or ""), "path": path, "elapsed": elapsed,
+            "limit": limit, "elapsed_min": elapsed_min, "limit_min": limit_min,
+            "text": f"артефакта нет: {path}, прошло {elapsed_min} мин из {limit_min}"}
+
+
+def artifact_first_hook(p: Paths, ctx: dict, say=None) -> dict | None:
+    """Строка «артефакта нет» в карточку шага и уведомление владельцу; вернуть пробу.
+
+    Тик не останавливается и вердикт не меняется: предупреждение — довод вернуться к файлу,
+    а не решение стража. Пара «карточка + проба» отмечается один раз: отметка
+    `artifact_reported` живёт в состоянии плана и держит id карточек, о которых уже сказали.
+    Отметка ставится после попытки (как у залипания): недоступная борда не должна превращать
+    правило в поток повторов на каждом тике — причина уже в stderr (`[comment]`).
+    """
+    try:
+        report = artifact_first_report(p, ctx)
+    except Exception as exc:  # noqa: BLE001 - проба не имеет права валить тик
+        config_mod.debug_note("artifact_first", exc)
+        return None
+    if not report:
+        return None
+    state = ctx.get("state")
+    card_id = str(report.get("card") or "")
+    if not isinstance(state, dict) or not card_id:
+        return None
+    reported = [str(item) for item in (state.get("artifact_reported") or [])]
+    if card_id in reported:
+        return None
+    _comment(p, card_id, report["text"])
+    step_id = str((ctx.get("next") or {}).get("id") or "")
+    text = f"⏳ шаг {step_id}: {report['text']} (карточка {card_id})"
+    if say is not None:
+        say(text)
+    else:
+        notify(p.cfg, text)
+    reported.append(card_id)
+    state["artifact_reported"] = reported[-ARTIFACT_REPORTED_KEEP:]
+    save_state(p, state)
+    return report
+
+
 # ───────────────── бюджет попытки по роли карточки (план 17, S5) ─────────────────
 # Потолок вызовов модели и токенов вывода живёт в `pipeline.json` (`budgets.<роль>`), а
 # проверяется здесь: идущая попытка считается на месте (`step_metrics.live_row`), решение
@@ -9241,6 +9383,13 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         kill_snapshot_hook(p, ctx, say_raw)
     except Exception as exc:  # noqa: BLE001 - снимок не имеет права валить тик
         config_mod.debug_note("kill_snapshot", exc)
+    # Артефакт первым (план 17, S6): шаг идёт, а объявленного файла до сих пор нет — строка
+    # «артефакта нет» в карточку и уведомление владельцу. Шага это не касается: попытка
+    # продолжается, решение стража прежнее.
+    try:
+        artifact_first_hook(p, ctx, say_raw)
+    except Exception as exc:  # noqa: BLE001 - предупреждение не имеет права валить тик
+        config_mod.debug_note("artifact_first", exc)
     if closed:
         return result
 

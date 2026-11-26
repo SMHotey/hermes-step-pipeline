@@ -178,7 +178,11 @@ def test_spec_missing_fails_c7_at_high_risk():
     assert level == "FAIL", results
     assert "Спека" in msg
     # Строк результата столько же, сколько было: C7 совмещает ревью и спеку (D1).
-    assert len(ctk.check_prompt(GOOD, "reviewer", "", risk="high")) == 8
+    # `9` вместо `8` — отдельная строка W2 про артефакт шага (17-S6): она про постановку,
+    # а не про C7, и проверка «C7 не плодит строк» держится вторым утверждением.
+    rows = ctk.check_prompt(GOOD, "reviewer", "", risk="high")
+    assert len(rows) == 9
+    assert [code for _level, code, _msg in rows].count("C7") == 1
 
 
 def test_full_spec_passes_c7():
