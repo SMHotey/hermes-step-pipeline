@@ -1377,16 +1377,19 @@ def _missing_snapshot(state: State) -> dict:
 
 
 def _notify_event(project: str, plan_id: str, step_id: str, kind: str,
-                  ts: float | None, text: str, card: str = "") -> dict[str, Any]:
+                  ts: float | None, text: str, card: str = "",
+                  dedupe: str = "") -> dict[str, Any]:
     """Событие внимания в форме ответа: ключ дедупликации, поля адреса и текст.
 
     `key` — «проект+план+шаг+вид» (D4): одна запись истории и три одинаковые попытки
-    дают одно событие, а не три.
+    дают одно событие, а не три. `dedupe` заменяет шаг в ключе там, где событие к шагу
+    не относится (стоп плана): иначе строки журнала с разными шагами давали разные
+    ключи при одном и том же тексте.
     """
     step = str(step_id or "").upper()
     flag = ("bad" if kind in NOTIFY_BAD else
             "warn" if kind in NOTIFY_WARN else "")
-    return {"key": f"{project}:{plan_id}:{step}:{kind}", "project": project,
+    return {"key": f"{project}:{plan_id}:{dedupe or step}:{kind}", "project": project,
             "plan": str(plan_id or ""), "step": step, "kind": kind,
             "label": NOTIFY_LABELS.get(kind, kind), "text": text,
             "ts": ts, "at": snap._fmt_ts(ts, with_seconds=True),
@@ -1410,6 +1413,21 @@ def _stop_mtime(state: State, plan_id: str) -> float | None:
         return float(path.stat().st_mtime)
     except OSError:
         return None
+
+
+def _stop_dedupe(state: State, plan_id: str, stop: Any, ts: float | None) -> str:
+    """Метка эпохи стопа вместо шага в ключе события.
+
+    Один стоп — одно событие: метка берётся из стоп-флага (его `at` пишется при каждой
+    записи флага), без неё — время файла или время журнальной строки. Сняли стоп и
+    остановились снова — метка новая, событие придёт снова.
+    """
+    data = stop if isinstance(stop, dict) else {}
+    at = str(data.get("at") or "").strip()
+    if at:
+        return f"stop@{at}"
+    mtime = _stop_mtime(state, plan_id)
+    return f"stop@{int(mtime or ts or 0)}"
 
 
 def _watchdog_hours(project: Path) -> float:
@@ -1465,8 +1483,21 @@ def _notify_candidates(state: State, data: dict, allowed: set[str], now: float) 
 
     stops = {str(row.get("id")): row.get("stop") for row in (data.get("plans") or [])
              if isinstance(row, dict)}
-    seen_stop: set[str] = set()
     rows = ((data.get("events") or {}).get("rows") or [])
+    # Стоп плана — ОДНО событие на текущий стоп-флаг, а не на каждую журнальную строку.
+    # В журнале у плана копится по строке `stop` на тик, а текст события берётся из
+    # стоп-флага (он один на план). Пока `step` журнальной строки входил в ключ, эти
+    # строки давали разные ключи с одинаковым текстом, и панель отправляла одно и то же
+    # сообщение по разу в NOTIFY_GAP секунд (26.11.2026, gapaudit план 1: «стоп плана 1:
+    # остановка владельца» три раза подряд; 24.11.2026, doorsystem план 34: пять).
+    # Дата события — самая свежая строка `stop` плана, иначе время файла флага.
+    stop_ts: dict[str, float | None] = {}
+    for row in rows:
+        stop_plan = str(row.get("plan") or "")
+        if stop_plan and str(row.get("kind") or "") == "stop":
+            ts = snap._ts(row.get("ts"))
+            if stop_plan not in stop_ts or (ts or 0) > (stop_ts.get(stop_plan) or 0):
+                stop_ts[stop_plan] = ts
     for row in rows:
         kind = str(row.get("kind") or "")
         plan = str(row.get("plan") or "")
@@ -1481,25 +1512,21 @@ def _notify_candidates(state: State, data: dict, allowed: set[str], now: float) 
             out.append(_notify_event(project, plan, step, "changes_requested", ts,
                                      f"ревью вернуло правки: шаг {step.upper()}",
                                      row.get("card")))
-        if kind == "stop" and "plan_stopped" in allowed:
-            seen_stop.add(plan)
-            out.append(_notify_event(project, plan, step, "plan_stopped", ts,
-                                     _notify_stop_text(plan, stops.get(plan)), row.get("card")))
         if kind in NOTIFY_TICK_ACTIONS and "tick_action" in allowed:
             label = str(row.get("label") or kind)
             text = f"тик: {label} — план {plan} {step.upper()}".strip()
             out.append(_notify_event(project, plan, step, "tick_action", ts, text,
                                      row.get("card")))
 
-    # Стоп без строки в истории: флаг есть, действие ещё не записано — дата по файлу.
-    for stop_plan, stop in stops.items():
-        if not isinstance(stop, dict) or not stop or stop_plan in seen_stop:
-            continue
-        if "plan_stopped" not in allowed:
-            continue
-        out.append(_notify_event(project, stop_plan, "", "plan_stopped",
-                                 _stop_mtime(state, stop_plan) or now,
-                                 _notify_stop_text(stop_plan, stop)))
+    # Стоп-флаг авторитетен: есть флаг — есть событие, нет флага (сняли) — события нет.
+    if "plan_stopped" in allowed:
+        for stop_plan, stop in stops.items():
+            if not isinstance(stop, dict) or not stop:
+                continue
+            ts = stop_ts.get(stop_plan) or _stop_mtime(state, stop_plan) or now
+            out.append(_notify_event(project, stop_plan, "", "plan_stopped", ts,
+                                     _notify_stop_text(stop_plan, stop),
+                                     dedupe=_stop_dedupe(state, stop_plan, stop, ts)))
 
     if "plan_idle" in allowed:
         hours = _watchdog_hours(state.project)

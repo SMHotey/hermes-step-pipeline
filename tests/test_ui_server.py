@@ -3133,6 +3133,77 @@ def test_first_frame_marks_history_and_second_frame_silent(
     assert len(calls) == 1 and "T8" in calls[0][2]
 
 
+def test_plan_stop_notifies_once_per_stop_flag(
+        tmp_path: Path, hermes_stub: Path, isolated_hermes_home: Path, monkeypatch):
+    """Один стоп плана — одно сообщение, сколько бы строк `stop` ни было в журнале.
+
+    Симптом 24–26.11.2026 (план 34 doorsystem — пять одинаковых «инцидент плана 34»,
+    план 1 gapaudit — три «стоп плана 1: остановка владельца»). Текст события берётся из
+    стоп-флага и потому одинаков, а ключ нёс шаг журнальной строки: пять строк `stop`
+    с разными шагами давали пять разных ключей, и панель отправляла одно и то же
+    сообщение по разу в `NOTIFY_GAP` секунд.
+    """
+    alpha = install_project(tmp_path / "alpha", board="uiboard")
+    notify_registry(isolated_hermes_home, [
+        {"id": "alpha", "name": "Альфа", "root": str(alpha),
+         "notify": {"enabled": True, "events": ["plan_stopped"]}}])
+    cfg = json.loads((alpha / "pipeline.json").read_text(encoding="utf-8"))
+    cfg["notify"] = {**(cfg.get("notify") or {}), "enabled": True}
+    (alpha / "pipeline.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                                        encoding="utf-8")
+    now = int(time.time())
+    write_history({"root": alpha}, [
+        {"ts": now - 900, "plan": "1", "step": "S5", "action": "stop",
+         "detail": "реестр находок S5 не читается", "commit": ""},
+        {"ts": now - 600, "plan": "1", "step": "S6", "action": "stop",
+         "detail": "реестр находок S6 не читается", "commit": ""},
+        {"ts": now - 300, "plan": "1", "step": "S9", "action": "stop",
+         "detail": "карточка шага t_618cb5e9 в статусе blocked", "commit": ""}])
+    path = stop_file({"root": alpha})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stop = {"kind": "incident", "source": "gate",
+            "reason": "карточка шага t_f16484ed в статусе blocked", "at": "26.11.2026 07:44:19"}
+    path.write_text(json.dumps(stop, ensure_ascii=False), encoding="utf-8")
+    snapshot.clear_cache()
+    calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(ui_server.telegram, "send_message",
+                        lambda token, chat, text, **__: calls.append((token, chat, text)))
+    monkeypatch.setattr(ui_server.proj, "profile_env", lambda root: {
+        "STEP_PIPELINE_TELEGRAM_BOT_TOKEN": "token-тест",
+        "STEP_PIPELINE_TELEGRAM_CHAT_ID": "42"})
+
+    state = ui_server.State(alpha, project_id="alpha", name="Альфа")
+    state.notify_primed = True
+    feed = ui_server.notify_feed(state, "1")
+    stops = [event for event in feed["events"] if event["kind"] == "plan_stopped"]
+    assert len(stops) == 1, [event["key"] for event in feed["events"]]
+    assert stops[0]["text"] == "инцидент плана 1: карточка шага t_f16484ed в статусе blocked"
+    assert len(ui_server.notify_deliver(state, feed)) == 1
+    assert len(calls) == 1
+
+    # Тот же стоп следующими кадрами молчит: ключ один, а не по ключу на строку журнала.
+    for _ in range(3):
+        assert ui_server.notify_deliver(state, ui_server.notify_feed(state, "1")) == []
+    assert len(calls) == 1
+
+    # Сняли стоп — события нет совсем (флаг авторитетен, журнальные строки его не заменяют).
+    path.unlink()
+    snapshot.clear_cache()
+    feed = ui_server.notify_feed(state, "1")
+    assert [event for event in feed["events"] if event["kind"] == "plan_stopped"] == []
+
+    # Новый стоп после снятия — новое событие: метка эпохи в ключе сменилась.
+    stop["at"] = "26.11.2026 09:10:05"
+    path.write_text(json.dumps(stop, ensure_ascii=False), encoding="utf-8")
+    snapshot.clear_cache()
+    state.notified_project.clear()     # пауза троттлинга NOTIFY_GAP истекла
+    feed = ui_server.notify_feed(state, "1")
+    stops = [event for event in feed["events"] if event["kind"] == "plan_stopped"]
+    assert len(stops) == 1 and "09:10:05" in stops[0]["key"]
+    assert len(ui_server.notify_deliver(state, feed)) == 1
+    assert len(calls) == 2
+
+
 def test_index_notify_screen_markup():
     """Экран «Уведомления»: выключатель, разрешение браузера, строки, тест и история (§4.4)."""
     html = index_html()
