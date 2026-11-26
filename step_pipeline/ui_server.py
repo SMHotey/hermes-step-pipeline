@@ -1718,11 +1718,15 @@ def pause_text(info: dict) -> str:
 
 
 def pause_channels(rows: list[dict]) -> list[dict]:
-    """Куда уходит пуш: по одному адресу на (токен, чат), а не на проект.
+    """Куда уходит пуш: по одному адресу на (чат, префикс), а не на проект и не на бота.
 
-    Пауза — жест на всю панель, и один и тот же бот с одним чатом получил бы столько
-    сообщений, сколько проектов в реестре. Адрес берётся у первого проекта, где
-    уведомления включены и канал готов; настройки у каждого проекта свои.
+    Пауза — жест на всю панель, а текст пуша один и тот же (`pause_text`), поэтому
+    «одинаковых сообщений» в чате должно быть одно, от кого бы оно ни пришло. Раньше
+    адрес считался парой (токен, чат), а у каждого проекта свой бот — три проекта с
+    включёнными уведомлениями давали три одинаковых сообщения в один чат (живой случай
+    26.11.2026, 12:12:28: doorsystem и gapaudit записали один и тот же пуш). Токен
+    берётся у первого готового проекта этого чата; префикс входит в ключ, потому что
+    он часть текста — сообщения с разными префиксами уже не одинаковые.
     """
     settings = proj.read_notify()
     if not settings.get("global"):
@@ -1741,12 +1745,13 @@ def pause_channels(rows: list[dict]) -> list[dict]:
         chat = str(channel.get("chat") or "")
         if not (channel.get("enabled") and token and chat):
             continue
-        pair = (token, chat)
+        prefix = str(channel.get("prefix") or "")
+        pair = (chat, prefix)
         if pair in seen:
             continue
         seen.add(pair)
         out.append({"project": str(row.get("id")), "root": root, "token": token,
-                    "chat": chat, "prefix": str(channel.get("prefix") or ""), "env": env})
+                    "chat": chat, "prefix": prefix, "env": env})
     return out
 
 

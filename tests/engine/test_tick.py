@@ -358,9 +358,17 @@ def test_installed_tick_reports_missing_gate(tmp_path: Path):
 
 
 def test_existing_job_refreshes_installed_script(tmp_path: Path, monkeypatch):
-    """Джоба уже есть — скрипт всё равно обновляется, вторая джоба не создаётся (D3)."""
+    """Джоба уже есть — скрипт всё равно обновляется, вторая джоба не создаётся (D3).
+
+    Заодно проверяется, что джоба на старой обёртке (`plan_gate_tick.py`, без `.env`
+    профиля — тик молчал уведомлениями) перевешивается на тик-скрипт движка (0.44.2).
+    """
     home = _fake_profiles(monkeypatch, tmp_path)
-    calls = _stub_hermes(monkeypatch, stdout=f"{JOB_NAME}   */10 * * * *   local")
+    listing = ("  093d620b921c [active]\n"
+               f"    Name:      {JOB_NAME}\n"
+               "    Schedule:  */10 * * * *\n"
+               "    Script:    plan_gate_tick.py\n")
+    calls = _stub_hermes(monkeypatch, stdout=listing)
     scripts = home / "profiles" / "shop" / "scripts"
     scripts.mkdir(parents=True)
     installed = scripts / "pipeline_tick.py"
@@ -373,7 +381,29 @@ def test_existing_job_refreshes_installed_script(tmp_path: Path, monkeypatch):
 
     assert installed.read_bytes() == TICK.read_bytes()
     assert not [call for call in calls if "create" in call], calls
-    assert any("тик-скрипт обновлён" in line for line in log.lines), log.lines
+    edits = [call for call in calls if "edit" in call]
+    assert len(edits) == 1 and "093d620b921c" in edits[0], calls
+    assert setup_flow.TICK_SCRIPT_NAME in edits[0] and str(project) in edits[0]
+    assert any("перевешена" in line for line in log.lines), log.lines
+
+
+def test_unparsed_job_listing_does_not_create_second_job(tmp_path: Path, monkeypatch):
+    """Имя в `cron list` есть, поля не разобрались — вторую джобу не заводим.
+
+    Дешевле спросить человека, чем завести дубль: две джобы стража означают два тика
+    на одной базе и «загадочные» падения (грабли конвейера).
+    """
+    _fake_profiles(monkeypatch, tmp_path)
+    calls = _stub_hermes(monkeypatch, stdout=f"{JOB_NAME}   */10 * * * *   local")
+    project = tmp_path / "shop"
+    project.mkdir()
+    log = setup_flow.Log()
+
+    setup_flow.ensure_cron("shop", project, log, skip=False)
+
+    assert not [call for call in calls if "create" in call], calls
+    assert not [call for call in calls if "edit" in call], calls
+    assert any("не разобрать" in line for line in log.lines), log.lines
 
 
 def test_upgrade_refreshes_tick_script_and_keeps_jobs(tmp_path: Path, monkeypatch):

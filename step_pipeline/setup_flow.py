@@ -96,6 +96,8 @@ OWNER_ENV = "STEP_PIPELINE_TELEGRAM_OWNER_ID"
 #: двух разных копий движка при равном VERSION — 02.11.2026 (1-S17).
 TICK_SOURCE = proj.ENGINE_SRC / "tick.py"
 TICK_SCRIPT = TICK_SOURCE.read_text(encoding="utf-8")
+#: Имя файла тик-скрипта в `profiles/<профиль>/scripts/` — по нему cron-джоба и запускает тик.
+TICK_SCRIPT_NAME = "pipeline_tick.py"
 
 
 def install_tick_script(driver: str) -> Path:
@@ -106,7 +108,7 @@ def install_tick_script(driver: str) -> Path:
     """
     scripts = proj.profile_dir(driver) / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    target = scripts / "pipeline_tick.py"
+    target = scripts / TICK_SCRIPT_NAME
     target.write_bytes(TICK_SOURCE.read_bytes())
     return target
 
@@ -1163,25 +1165,112 @@ def ensure_cron_all(driver: str, project: Path, log: Log, *, skip: bool,
     ensure_keeper_cron(driver, project, log, skip=False)
 
 
+#: Строка джобы в `hermes cron list`: `  093d620b921c [active]`.
+CRON_JOB_RE = re.compile(r"^\s{2,}([0-9a-f]{6,})\s+\[(\w+)\]\s*$")
+
+
+def cron_listing(driver: str) -> str:
+    """Текст `hermes -p <профиль> cron list` — машинного формата команда не отдаёт."""
+    res = proj.run_hermes("-p", driver, "cron", "list")
+    return res.stdout or ""
+
+
+def parse_cron_jobs(text: str) -> list[dict[str, str]]:
+    """Разобрать вывод `cron list` на джобы: id, статус, имя, скрипт, рабочий каталог.
+
+    Джобу стража узнаём по имени, но сверять надо и то, что она запускает: джоба,
+    заведённая старой обёрткой, при обновлении движка оставалась на ней навсегда
+    (`plan_gate_tick.py`), и тик молчал уведомлениями — `.env` профиля читает
+    `pipeline_tick.py`, а старая обёртка нет (живой случай — doorsystem, 26.11.2026).
+    """
+    jobs: list[dict[str, str]] = []
+    for line in text.splitlines():
+        match = CRON_JOB_RE.match(line)
+        if match:
+            jobs.append({"id": match.group(1), "status": match.group(2),
+                         "name": "", "script": "", "workdir": ""})
+            continue
+        if not jobs:
+            continue
+        key, sep, value = line.strip().partition(":")
+        if not sep:
+            continue
+        text_value = value.strip()
+        if key == "Name":
+            jobs[-1]["name"] = text_value
+        elif key == "Script":
+            jobs[-1]["script"] = text_value
+        elif key == "Workdir":
+            jobs[-1]["workdir"] = text_value
+    return jobs
+
+
+def cron_jobs(driver: str) -> list[dict[str, str]]:
+    return parse_cron_jobs(cron_listing(driver))
+
+
+def _same_dir(left: str, right: str) -> bool:
+    """Один и тот же каталог по нормализованному пути (Windows не различает регистр)."""
+    if not left or not right:
+        return False
+    return (os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right)))
+
+
+def tick_job_state(job: dict[str, str], project: Path) -> str:
+    """Пусто — джоба запускает наш тик в корне проекта; иначе что именно не так.
+
+    Проверка нужна мастеру: «джоба с таким именем есть» не значит «джоба запускает тик
+    конвейера в этом проекте».
+    """
+    script = Path(str(job.get("script") or "")).name
+    if script != TICK_SCRIPT_NAME:
+        return f"запускает {script or 'не скрипт'}, а не {TICK_SCRIPT_NAME}"
+    if not _same_dir(str(job.get("workdir") or ""), str(project)):
+        return f"рабочий каталог джобы — {job.get('workdir') or 'не задан'}, а проект — {project}"
+    return ""
+
+
 def ensure_cron(driver: str, project: Path, log: Log, *, skip: bool) -> None:
     """Cron-джоба стража: no-agent, каждые 10 минут, доставка local.
 
     Тик-скрипт профиля пишется при каждом запуске мастера, в том числе когда джоба уже
     есть: иначе джоба, заведённая со старой копией, остаётся с ней навсегда (1-S17).
+    Джоба с нужным именем ещё не значит нужная: скрипт и рабочий каталог сверяются, и
+    устаревшая джоба перевешивается на `pipeline_tick.py` (0.44.2).
     """
     if skip:
         log.warn("cron не заводил (--no-cron)")
         return
     install_tick_script(driver)
     name = "План: страж шага (конвейер)"
-    listing = proj.run_hermes("-p", driver, "cron", "list")
-    if name in (listing.stdout or ""):
-        log.ok("cron-джоба стража уже есть (тик-скрипт обновлён)")
+    listing = cron_listing(driver)
+    job = next((item for item in parse_cron_jobs(listing) if item.get("name") == name), None)
+    if job is not None:
+        mismatch = tick_job_state(job, project)
+        if not mismatch:
+            log.ok("cron-джоба стража уже есть (тик-скрипт обновлён)")
+            _write_cron_marker(project, driver, name)
+            return
+        res = proj.run_hermes("-p", driver, "cron", "edit", str(job.get("id")),
+                              "--script", TICK_SCRIPT_NAME, "--no-agent",
+                              "--workdir", str(project))
+        if res.returncode == 0:
+            log.ok(f"cron-джоба стража перевешена на {TICK_SCRIPT_NAME} ({mismatch})")
+        else:
+            log.warn(f"cron: джоба стража не перевешена ({mismatch}): "
+                     f"{(res.stderr or res.stdout or '').strip()[:300]}")
+            log.warn("перевесить вручную: " + cron_command(driver, project))
+        _write_cron_marker(project, driver, name)
+        return
+    if name in listing:
+        # Формат `cron list` не разобрался, но джоба в списке есть: вторую не заводим.
+        log.warn("cron: джоба стража в списке есть, но её поля не разобрать — вторую не завожу")
+        log.warn(f"проверь вручную: hermes -p {driver} cron list")
         _write_cron_marker(project, driver, name)
         return
     res = proj.run_hermes("-p", driver, "cron", "create", "*/10 * * * *",
                           "--name", name, "--no-agent",
-                          "--script", "pipeline_tick.py",
+                          "--script", TICK_SCRIPT_NAME,
                           "--deliver", "local",
                           "--workdir", str(project))
     if res.returncode == 0:
@@ -1194,7 +1283,7 @@ def ensure_cron(driver: str, project: Path, log: Log, *, skip: bool) -> None:
 
 def cron_command(driver: str, project: Path) -> str:
     return (f'hermes -p {driver} cron create "*/10 * * * *" --name "План: страж шага (конвейер)" '
-            f'--no-agent --script pipeline_tick.py --deliver local --workdir "{project}"')
+            f'--no-agent --script {TICK_SCRIPT_NAME} --deliver local --workdir "{project}"')
 
 
 #: Ежедневное автообновление: релиз выходит не каждый день, а проверка дешёвая (один

@@ -3204,6 +3204,60 @@ def test_plan_stop_notifies_once_per_stop_flag(
     assert len(calls) == 2
 
 
+def test_pause_push_goes_once_per_chat(
+        tmp_path: Path, hermes_stub: Path, isolated_hermes_home: Path, monkeypatch):
+    """Три проекта с тремя ботами в одном чате — один пуш, а не три (0.44.2).
+
+    Текст пуша общий (`pause_text`), поэтому «одинаковых сообщений» в чате должно быть
+    одно, от кого бы оно ни пришло: адрес считается парой (чат, префикс), а не (токен, чат).
+    """
+    names = ("alpha", "beta", "gamma")
+    roots = {name: install_project(tmp_path / name, board="uiboard") for name in names}
+    channels_cfg = {"alpha": ("token-alpha", "42", ""), "beta": ("token-beta", "42", ""),
+                    "gamma": ("token-gamma", "42", "")}
+
+    def write_cfg(name: str) -> None:
+        _token, chat, prefix = channels_cfg[name]
+        cfg = json.loads((roots[name] / "pipeline.json").read_text(encoding="utf-8"))
+        cfg["notify"] = {**(cfg.get("notify") or {}), "enabled": True, "chat": chat,
+                         "prefix": prefix}
+        (roots[name] / "pipeline.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                                                  encoding="utf-8")
+
+    for name in names:
+        write_cfg(name)
+    notify_registry(isolated_hermes_home, [
+        {"id": name, "name": name, "root": str(roots[name]),
+         "notify": {"enabled": True, "events": ["plan_stopped"]}} for name in names])
+    monkeypatch.setattr(ui_server.proj, "engine_env", lambda root: {
+        "STEP_PIPELINE_TELEGRAM_BOT_TOKEN": channels_cfg[Path(root).name][0],
+        "STEP_PIPELINE_TELEGRAM_CHAT_ID": channels_cfg[Path(root).name][1]})
+    rows = [{"id": name, "name": name, "root": str(roots[name])} for name in names]
+
+    channels = ui_server.pause_channels(rows)
+    assert [channel["project"] for channel in channels] == ["alpha"]
+    assert channels[0]["token"] == "token-alpha" and channels[0]["chat"] == "42"
+
+    # Другой чат — свой пуш: это уже не одинаковые сообщения.
+    channels_cfg["beta"] = ("token-beta", "77", "")
+    snapshot.clear_cache()
+    channels = ui_server.pause_channels(rows)
+    assert [channel["project"] for channel in channels] == ["alpha", "beta"]
+
+    # Другой префикс — другой текст, значит и своё сообщение.
+    channels_cfg["beta"] = ("token-beta", "42", "[доска] ")
+    write_cfg("beta")
+    snapshot.clear_cache()
+    channels = ui_server.pause_channels(rows)
+    assert [channel["project"] for channel in channels] == ["alpha", "beta"]
+    assert channels[1]["prefix"] == "[доска] "
+
+    # Выключенный проект и неготовый канал пуш не получают.
+    channels_cfg["gamma"] = ("", "42", "")
+    channels = ui_server.pause_channels(rows)
+    assert [channel["project"] for channel in channels] == ["alpha", "beta"]
+
+
 def test_index_notify_screen_markup():
     """Экран «Уведомления»: выключатель, разрешение браузера, строки, тест и история (§4.4)."""
     html = index_html()

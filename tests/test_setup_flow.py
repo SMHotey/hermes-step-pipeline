@@ -392,6 +392,97 @@ def test_cron_script_written(monkeypatch, tmp_path: Path):
     assert any("cron" in " ".join(c) for c in calls)
 
 
+CRON_LISTING = """\
+  093d620b921c [active]
+    Name:      План: страж шага (конвейер)
+    Schedule:  */10 * * * *
+    Deliver:   local
+    Script:    plan_gate_tick.py
+
+  cb1b88ab92c7 [active]
+    Name:      План: бот команды (конвейер)
+    Script:    pipeline_commands.py
+    Workdir:   C:\\Projects\\shop
+"""
+
+
+def test_cron_list_parsed_into_jobs(monkeypatch):
+    """`cron list` разбирается на джобы: id, имя, скрипт и рабочий каталог."""
+    class Result:
+        returncode = 0
+        stdout = CRON_LISTING
+        stderr = ""
+
+    monkeypatch.setattr(setup_flow.proj, "run_hermes", lambda *a, **k: Result())
+    jobs = setup_flow.cron_jobs("shop")
+    assert [job["id"] for job in jobs] == ["093d620b921c", "cb1b88ab92c7"]
+    assert jobs[0]["name"] == "План: страж шага (конвейер)"
+    assert jobs[0]["script"] == "plan_gate_tick.py"
+    assert jobs[0]["workdir"] == ""
+    assert jobs[1]["workdir"] == r"C:\Projects\shop"
+
+
+def test_stale_tick_job_is_repointed(monkeypatch, tmp_path: Path):
+    """Джоба на старой обёртке перевешивается на `pipeline_tick.py` с workdir проекта (0.44.2).
+
+    Симптом: `setup --upgrade` писал «джоба уже есть (тик-скрипт обновлён)», а джоба звала
+    `plan_gate_tick.py` без `.env` профиля — уведомления движка молчали (doorsystem,
+    26.11.2026: в каждом запуске `[notify] нет токена/чата`).
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr(setup_flow.proj, "profile_dir", lambda p: home / "profiles" / p)
+    calls: list[tuple] = []
+
+    class Result:
+        def __init__(self, stdout: str = ""):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def run(*argv, timeout=180):
+        calls.append(argv)
+        return Result(CRON_LISTING if "list" in argv else "")
+
+    monkeypatch.setattr(setup_flow.proj, "run_hermes", run)
+    project = tmp_path / "shop"
+    project.mkdir()
+    setup_flow.ensure_cron("shop", project, setup_flow.Log(), skip=False)
+
+    edits = [call for call in calls if "edit" in call]
+    assert len(edits) == 1 and "093d620b921c" in edits[0]
+    assert setup_flow.TICK_SCRIPT_NAME in edits[0]
+    assert str(project) in edits[0]
+    assert not [call for call in calls if "create" in call]
+    assert (home / "profiles" / "shop" / "scripts" / "pipeline_tick.py").is_file()
+
+
+def test_current_tick_job_is_left_alone(monkeypatch, tmp_path: Path):
+    """Джоба уже запускает `pipeline_tick.py` в корне проекта — ни `edit`, ни `create`."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(setup_flow.proj, "profile_dir", lambda p: home / "profiles" / p)
+    project = tmp_path / "shop"
+    project.mkdir()
+    listing = ("  093d620b921c [active]\n"
+               "    Name:      План: страж шага (конвейер)\n"
+               "    Script:    pipeline_tick.py\n"
+               f"    Workdir:   {project}\n")
+    calls: list[tuple] = []
+
+    class Result:
+        def __init__(self, stdout: str = ""):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def run(*argv, timeout=180):
+        calls.append(argv)
+        return Result(listing if "list" in argv else "")
+
+    monkeypatch.setattr(setup_flow.proj, "run_hermes", run)
+    setup_flow.ensure_cron("shop", project, setup_flow.Log(), skip=False)
+    assert not [call for call in calls if "edit" in call or "create" in call]
+
+
 def test_update_cron_writes_script_and_creates_job(monkeypatch, tmp_path: Path):
     """Автообновление — своя cron-джоба со скриптом из профиля, а не «когда открыта панель»."""
     home = tmp_path / "home"
