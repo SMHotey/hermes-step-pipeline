@@ -9,12 +9,13 @@
 Использование:
     python .pipeline/next_step.py                # пакет контекста
     python .pipeline/next_step.py --brief        # короткая версия (для промта)
-    python .pipeline/next_step.py --json         # машинный формат (его читает gate.py)
+    python .pipeline/next_step.py --json         # машинный формат (только чтение, ничего не пишет)
     python .pipeline/next_step.py --step S3      # принудительно конкретный шаг
     python .pipeline/next_step.py --list         # все шаги плана и статус
     python .pipeline/next_step.py --list-plans   # все планы: следующий шаг, закрыто
 
-Скрипт только ЧИТАЕТ репозиторий и ничего не меняет.
+Скрипт репозиторий не меняет: единственная запись — пакет шага (объявленные файлы целиком)
+в каталог состояния `<state_dir>/digest/` (план 9, S5).
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as config_mod  # noqa: E402 - модуль рядом
+import digest  # noqa: E402 - пакет шага: объявленные файлы целиком (план 9, S5)
 import registry  # noqa: E402 - реестр планов
 
 
@@ -373,8 +375,13 @@ def git_state(cfg: config_mod.Config) -> dict[str, object]:
 
 
 def build_package(cfg: config_mod.Config, plan_id: str | None = None,
-                  force_step: str | None = None, brief: bool = False) -> dict[str, Any]:
-    """Пакет контекста шага: контракт, состояние git, что осталось."""
+                  force_step: str | None = None, brief: bool = False,
+                  persist: bool = True) -> dict[str, Any]:
+    """Пакет контекста шага: контракт, состояние git, что осталось.
+
+    `persist=False` — режим чтения (машинный `--json` для панели и предпросмотра): пакет
+    шага считается, но в проект ничего не пишется, иначе просмотр менял бы дерево.
+    """
     plan_id = registry.normalize(plan_id or registry.default_plan_id(cfg))
     spec = registry.get(cfg, plan_id)
     steps = plan_steps(cfg, Path(spec.file))
@@ -408,7 +415,41 @@ def build_package(cfg: config_mod.Config, plan_id: str | None = None,
                        f"(заголовки `### <ШАГ>. название`)")
     elif target is None:
         pkg["note"] = f"все шаги плана {plan_id} закрыты — следующих нет"
+    if target is not None:
+        pkg["digest"] = digest_meta(cfg, plan_id, spec, target, persist)
     return pkg
+
+
+def digest_meta(cfg: config_mod.Config, plan_id: str, spec, step: Step,
+                persist: bool = True) -> dict[str, Any]:
+    """Мета пакета шага (S5): файл пакета в каталоге состояния и числа «целиком/фрагментами».
+
+    Пакет собирается здесь же, потому что это вход исполнителя: сессия, начатая командой
+    `python .pipeline/next_step.py`, получает файл с объявленными файлами шага целиком, а не
+    первые 400 строк. Сбой сборки — строка `error` в мете, а не падение команды. Машинный
+    режим (`persist=False`) пакет считает, но в проект не пишет: так смотрит панель.
+    """
+    try:
+        return digest.collect(cfg, asdict(step), plan_id, Path(spec.file), persist=persist)
+    except (OSError, ValueError, KeyError) as exc:
+        return {"error": str(exc)[:200]}
+
+
+def digest_render_lines(meta: dict[str, Any]) -> list[str]:
+    """Строки пакета шага в человеческом выводе: файл, числа «целиком/фрагментами» и F09."""
+    if not meta:
+        return []
+    if meta.get("error"):
+        return [f"  пакет шага: не собран — {meta['error']}"]
+    out = [f"  пакет шага: {meta.get('path')} — целиком: {len(meta.get('full') or [])}, "
+           f"фрагментами: {len(meta.get('fragmented') or [])}, "
+           f"не вошло: {len(meta.get('omitted') or [])} "
+           f"(бюджет {meta.get('budget')} символов на окне {meta.get('window')})"]
+    if meta.get("written") is False:
+        out.append("  пакет не записан: режим чтения (--json) в проект не пишет")
+    if meta.get("finding"):
+        out.append(f"  {meta['finding']}")
+    return out
 
 
 def render(pkg: dict[str, Any], brief: bool) -> str:
@@ -436,6 +477,7 @@ def render(pkg: dict[str, Any], brief: bool) -> str:
     lines.append("")
     lines.append("Файлы (правим/создаём):")
     lines.extend(f"  - {f}" for f in step["files"])
+    lines += digest_render_lines(pkg.get("digest") or {})
     lines.append("Гейты (запустить и показать результат):")
     lines.extend(f"  $ {g}" for g in step["gates"])
     lines.append(f"Готово = {step['dod']}")
@@ -492,7 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Контекст следующего шага плана")
     parser.add_argument("--plan", help="номер плана (по умолчанию из pipeline.json)")
     parser.add_argument("--step", help="принудительный шаг, например S3")
-    parser.add_argument("--json", action="store_true", help="машинный вывод")
+    parser.add_argument("--json", action="store_true",
+                        help="машинный вывод (только чтение: пакет шага не пишется)")
     parser.add_argument("--brief", action="store_true", help="короткая версия для промта")
     parser.add_argument("--list", action="store_true", help="все шаги плана и статус")
     parser.add_argument("--list-plans", action="store_true",
@@ -527,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        pkg = build_package(cfg, plan_id, args.step, args.brief)
+        pkg = build_package(cfg, plan_id, args.step, args.brief, persist=not args.json)
     except registry.PlanNotFound as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 2

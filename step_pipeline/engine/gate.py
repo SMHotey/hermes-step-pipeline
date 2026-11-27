@@ -102,6 +102,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import analyze  # noqa: E402 - исход идеи, вопросы и ретроспектива (план 5, S10)
 import approval  # noqa: E402 - утверждение плана и привязка ревью к версии (S6)
 import config as config_mod  # noqa: E402 - модуль рядом
+import digest  # noqa: E402 - пакет шага: объявленные файлы целиком (план 9, S5)
 import registry  # noqa: E402 - реестр планов
 import plan_cycle  # noqa: E402 - гейт корректировки плана по разведке (план 5, S4)
 import next_step  # noqa: E402 - шаги плана: проверка номера в ручном допуске
@@ -1287,15 +1288,12 @@ def _f01_allowed(path: str, declared: list[str]) -> bool:
 
 
 def _f01_declared(step: dict) -> list[str]:
-    """Объявленные файлы шага из пункта «Файл:» плана — нормализованные пути."""
-    out: list[str] = []
-    for item in step.get("files") or []:
-        path = str(item).strip().strip("`").replace("\\", "/")
-        while path.startswith("./"):
-            path = path[2:]
-        if path and path not in out:
-            out.append(path)
-    return out
+    """Объявленные файлы шага из пункта «Файл:» плана — нормализованные пути.
+
+    Нормализация одна на пакет (S5) и на проверку F01 (S4): два списка «объявленных» файлов
+    разошлись бы ровно так же, как когда-то список движка и список копирования.
+    """
+    return digest.declared_files(step)
 
 
 def step_file_offenders(p: Paths, step: dict, sha: str) -> list[str]:
@@ -3534,6 +3532,19 @@ def continuation_block_lines(p: Paths, step: dict) -> list[str]:
         return []
 
 
+def package_block_lines(p: Paths, step: dict, reuse: bool = False) -> list[str]:
+    """Блок «пакет шага» для карточки шага и карточки ревью (план 9, S5).
+
+    Сбой сборки пакета шаг не останавливает: пакет — предохранитель объёма, а не решение
+    стража. Вместо тишины карточка несёт строку с причиной, чтобы исполнитель знал, что
+    файлы целиком не приложены.
+    """
+    try:
+        return digest.package_lines(p.cfg, step, p.plan_id, Path(p.plan_file), reuse=reuse)
+    except (OSError, ValueError, KeyError) as exc:
+        return [digest.PACKAGE_HEADER, f"- пакет не собран: {str(exc)[:200]}"]
+
+
 def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
     plan_id = p.plan_id
     plan_rel = p.cfg.rel(Path(p.plan_file))
@@ -3544,6 +3555,7 @@ def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
     lines += continuation_block_lines(p, step)      # ← 17-S3: продолжение с места убийства
     lines += [f"Цель: {step.get('goal', '')}", "", "Файлы (править/создавать):"]
     lines += [f"- {f}" for f in step.get("files") or []]
+    lines += [""] + package_block_lines(p, step)
     lines += ["", "Гейты (запустить и показать фактический результат):"]
     lines += [f"- {g}" for g in step.get("gates") or []]
     lines += execution_check_lines(p, step)          # ← 7-S3: находки реестра к проверке в работе
@@ -4142,6 +4154,8 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
         *prompt_block,
         *runs_block,
         "",
+        *package_block_lines(p, step, reuse=True),
+        "",
         "РЕЕСТР НАХОДОК ШАГА (обязательно)",
         f"- Файл: `{step_findings_rel(p, step['id'])}`; шапка таблицы — "
         f"`{findings_table([], STEP_FINDINGS_HEADER, STEP_FINDINGS_KEYS)[0]}`.",
@@ -4735,6 +4749,8 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
         "",
         *registry,
         *checks,
+        "",
+        *package_block_lines(p, step, reuse=True),
         *answer,
         "ЧТО ДЕЛАТЬ",
         "- Исправить БЛОКИРУЮЩИЕ находки полностью; значимые — по существу (не косметикой).",
