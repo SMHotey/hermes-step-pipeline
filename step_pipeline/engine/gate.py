@@ -299,7 +299,7 @@ NOTICE_TOTAL_CAP = 3300
 FINDING_KINDS = ("замысел", "двусмысленность", "формат-стража", "гейт-исполнение", "стиль")
 FINDING_STATUSES = ("открыто", "закрыто", "не блокирует")
 FINDINGS_HEADER = ("ID", "Шаг", "Класс", "Находка", "Что сделать", "Статус")
-FINDING_ID_RE = re.compile(r"F(\d+)")
+FINDING_ID_RE = re.compile(r"F-?(\d+)")
 # Реестр находок постановки (план 12, S2): та же таблица без колонки «Шаг» — постановка
 # принадлежит одному шагу. Порядок ключей идёт за шапкой: разбор ячеек и запись строки
 # живут на одном списке ключей, иначе шапка и данные разошлись бы молча.
@@ -2164,9 +2164,16 @@ def parse_findings(text: str, path, header: tuple = FINDINGS_HEADER,
                             f"нужно {len(header)}: {path}")
         item = dict(zip(keys, cells))
         if "id" in keys:
-            if not id_re.fullmatch(item["id"]):
+            id_match = id_re.fullmatch(item["id"])
+            if not id_match:
                 raise GateError(f"{what}, строка {number}: идентификатор не вида {id_hint}: "
                                 f"{item['id']!r}: {path}")
+            # Канонизация: `F-1` и `F1` — один и тот же номер. Разделитель после префикса
+            # допускается только как украшение записи (находки пишут его по привычке из
+            # `Q-1`), а дедуп и сверка идут по канону — иначе `F-1` открывал новый номер
+            # и реестр расходился с журналом. Случай 27.11.2026: реестр постановки S5
+            # остановил план 36 инцидентом из-за строки `F-1`.
+            item["id"] = f"{id_prefix}{id_sep}{id_match.group(1)}"
             if item["id"] in seen:
                 raise GateError(f"{what}: идентификатор {item['id']} повторяется: {path}")
             seen.add(item["id"])
@@ -8242,7 +8249,22 @@ def _create_card(p: Paths, title: str, body: str, assignee: str, key: str,
         cmd += ["--skill", skill]
     if parent:
         cmd += ["--parent", parent]
-    res = _run(cmd, Path(p.repo), timeout=180)
+    try:
+        res = _run(cmd, Path(p.repo), timeout=180)
+    except subprocess.TimeoutExpired:
+        # Борда занята (`database is locked`) или CLI не успел стартовать: один повтор
+        # после паузы. Без повтора тик стража падал инцидентом, стоп-флаг оставался
+        # на плане и конвейер стоял до вмешательства владельца (случаи 20.11, 24.11,
+        # 26.11.2026 — планы 25, 6, 31 DoorSystem).
+        print("[card] hermes kanban create не ответил за 180 с — повтор через 15 с",
+              file=sys.stderr)
+        time.sleep(15)
+        try:
+            res = _run(cmd, Path(p.repo), timeout=240)
+        except subprocess.TimeoutExpired as exc:
+            print(f"[card] повтор тоже не ответил ({exc}); карточка не заказана",
+                  file=sys.stderr)
+            return None
     out = (res.stdout or "") + (res.stderr or "")
     m = re.search(r"t_[0-9a-f]{6,}", out)
     if res.returncode != 0 and not m:

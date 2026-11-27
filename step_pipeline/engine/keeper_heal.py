@@ -169,7 +169,7 @@ REASON_NO_PROOF = "no_proof"         # находке не хватает адр
 #: разошлась бы с читателем движка, и `gate.load_findings` перестал бы находить таблицу.
 #: Паритет копии стережёт тест.
 FINDING_HEADER = ("ID", "Шаг", "Класс", "Находка", "Что сделать", "Статус")
-FINDING_ID_RE = re.compile(r"F(\d+)")
+FINDING_ID_RE = re.compile(r"F-?(\d+)")
 ADDRESS_RE = re.compile(r".+:\d+")
 FINDING_TITLE = "# Реестр находок смотрителя"
 FINDING_NOTE = ("Файл ведёт движок (`keeper_heal.py`): строки дописываются прогоном,"
@@ -541,7 +541,7 @@ def parse_registry(text: str) -> list[dict]:
         match = FINDING_ID_RE.fullmatch(cells[0])
         if match is None:
             raise FindingsError(f"идентификатор {cells[0]!r} не вида F<число>")
-        rows.append({"id": cells[0], "number": int(match.group(1)),
+        rows.append({"id": f"F{int(match.group(1))}", "number": int(match.group(1)),
                      "cells": cells, "line": "| " + " | ".join(cells) + " |"})
     return rows
 
