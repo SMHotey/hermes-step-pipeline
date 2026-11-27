@@ -102,7 +102,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import analyze  # noqa: E402 - исход идеи, вопросы и ретроспектива (план 5, S10)
 import approval  # noqa: E402 - утверждение плана и привязка ревью к версии (S6)
 import config as config_mod  # noqa: E402 - модуль рядом
-import digest  # noqa: E402 - пакет шага: объявленные файлы целиком (план 9, S5)
 import registry  # noqa: E402 - реестр планов
 import plan_cycle  # noqa: E402 - гейт корректировки плана по разведке (план 5, S4)
 import next_step  # noqa: E402 - шаги плана: проверка номера в ручном допуске
@@ -1293,7 +1292,7 @@ def _f01_declared(step: dict) -> list[str]:
     Нормализация одна на пакет (S5) и на проверку F01 (S4): два списка «объявленных» файлов
     разошлись бы ровно так же, как когда-то список движка и список копирования.
     """
-    return digest.declared_files(step)
+    return next_step._digest_declared(step)
 
 
 def step_file_offenders(p: Paths, step: dict, sha: str) -> list[str]:
@@ -3532,30 +3531,64 @@ def continuation_block_lines(p: Paths, step: dict) -> list[str]:
         return []
 
 
-def package_block_lines(p: Paths, step: dict, reuse: bool = False) -> list[str]:
-    """Блок «пакет шага» для карточки шага и карточки ревью (план 9, S5).
+def package_for_card(p: Paths, step: dict) -> dict:
+    """Сводка пакета шага для карточки: файл собирается, только если его ещё нет (Д5).
 
-    Сбой сборки пакета шаг не останавливает: пакет — предохранитель объёма, а не решение
-    стража. Вместо тишины карточка несёт строку с причиной, чтобы исполнитель знал, что
-    файлы целиком не приложены.
+    Пересборки поверх существующего файла нет: вход исполнителя и ревьюера должен быть одним
+    и тем же. Сбой сборки шаг не останавливает: карточка несёт строку с причиной, чтобы
+    исполнитель знал, что файлы целиком не приложены.
     """
     try:
-        return digest.package_lines(p.cfg, step, p.plan_id, Path(p.plan_file), reuse=reuse)
-    except (OSError, ValueError, KeyError) as exc:
-        return [digest.PACKAGE_HEADER, f"- пакет не собран: {str(exc)[:200]}"]
+        path = next_step.digest_path(p.cfg, p.plan_id, str(step.get("id") or ""))
+        if path.is_file():
+            return next_step.digest_summary(p.cfg, step, p.plan_id)
+        return next_step.build_digest(p.cfg, step, p.plan_id)
+    except (OSError, ValueError, KeyError, AttributeError) as exc:
+        return {"error": str(exc)[:200]}
 
 
-def step_card_body(p: Paths, step: dict, prompt: str | None = None) -> str:
+def package_block_lines(package: dict | None, header: str = "ПАКЕТ ШАГА") -> list[str]:
+    """Блок пакета шага в карточке: путь, числа «целиком/фрагментами», бюджет и объём."""
+    if not package:
+        return []
+    if package.get("error"):
+        return [header, f"- пакет не собран: {package['error']}"]
+    mode = "фрагменты" if package.get("fragments") or package.get("missing") else "целиком"
+    return [
+        header,
+        f"- Файл: `{package.get('path')}` — читать до кода, тихой обрезки нет.",
+        f"- Файлов целиком: {len(package.get('whole') or [])}, фрагментами: "
+        f"{len(package.get('fragments') or [])}; режим: {mode}.",
+        f"- Бюджет пакета {package.get('budget')} символов (окно {package.get('window')}), "
+        f"объём {package.get('chars')} символов.",
+    ]
+
+
+def package_comment(package: dict | None) -> str:
+    """Один комментарий карточке шага: тот же путь и те же числа, что в теле карточки (Д5)."""
+    if not package or package.get("error"):
+        return ""
+    return (f"ПАКЕТ ШАГА: файл `{package.get('path')}`; файлов целиком: "
+            f"{len(package.get('whole') or [])}, фрагментами: "
+            f"{len(package.get('fragments') or [])}; бюджет {package.get('budget')} символов, "
+            f"объём {package.get('chars')} символов")
+
+
+def step_card_body(p: Paths, step: dict, prompt: str | None = None,
+                   *, package: dict | None = None) -> str:
     plan_id = p.plan_id
     plan_rel = p.cfg.rel(Path(p.plan_file))
     lines = [f"ШАГ ПЛАНА {plan_id} {step['id']} — {step['title']}", ""]
     if prompt:
         lines += [f"ПОСТАНОВКА (прочитать ПЕРВОЙ, до кода): `{prompt}`", ""]
+    if package:
+        # Пакет — сразу после постановки и до «первого артефакта»: исполнитель читает код,
+        # а не догадывается о нём по фрагментам (план 9, S5).
+        lines += [*package_block_lines(package), ""]
     lines += artifact_first_lines(p, step)          # ← 17-S6: файл раньше кода
     lines += continuation_block_lines(p, step)      # ← 17-S3: продолжение с места убийства
     lines += [f"Цель: {step.get('goal', '')}", "", "Файлы (править/создавать):"]
     lines += [f"- {f}" for f in step.get("files") or []]
-    lines += [""] + package_block_lines(p, step)
     lines += ["", "Гейты (запустить и показать фактический результат):"]
     lines += [f"- {g}" for g in step.get("gates") or []]
     lines += execution_check_lines(p, step)          # ← 7-S3: находки реестра к проверке в работе
@@ -4154,7 +4187,7 @@ def review_card_body(p: Paths, step: dict, attempt: int, report_rel: str,
         *prompt_block,
         *runs_block,
         "",
-        *package_block_lines(p, step, reuse=True),
+        *package_block_lines(package_for_card(p, step), "ПАКЕТ ШАГА (тот же вход)"),
         "",
         "РЕЕСТР НАХОДОК ШАГА (обязательно)",
         f"- Файл: `{step_findings_rel(p, step['id'])}`; шапка таблицы — "
@@ -4750,7 +4783,7 @@ def fix_card_body(p: Paths, step: dict, round_no: int, report_rel: str,
         *registry,
         *checks,
         "",
-        *package_block_lines(p, step, reuse=True),
+        *package_block_lines(package_for_card(p, step), "ПАКЕТ ШАГА (тот же вход)"),
         *answer,
         "ЧТО ДЕЛАТЬ",
         "- Исправить БЛОКИРУЮЩИЕ находки полностью; значимые — по существу (не косметикой).",
@@ -9907,14 +9940,20 @@ def run_gate(p: Paths, execute: bool = True, create_card=_create_card,
         assignee, reason = assignee_or_stop(step)
         if assignee is None:
             return result
+        # Пакет шага собирается здесь ОДИН раз: тело карточки и комментарий несут один и тот же
+        # путь и одни числа (план 9, S5). Файл остаётся входом ревьюера — тот же, без пересборки.
+        package = package_for_card(p, step)
         cid = create_card(p, f"[план {plan_id} {step['id']}] {step['title']}",
-                          step_card_body(p, step, prompt), assignee, key,
+                          step_card_body(p, step, prompt, package=package), assignee, key,
                           p.cfg.step_skills, max_runtime=p.cfg.step_runtime)
         if reused_card(cid, key, f"шаг {step['id']}"):
             return result
         result.update(applied=bool(cid), detail=f"карточка шага: {cid}")
         touch(f"create_step:{cid}")
         if cid:
+            package_note = package_comment(package)
+            if package_note:
+                _comment(p, cid, package_note)
             summary = _step_summary(step)
             lines = [f"план {plan_id}, шаг {step['id']} взят в работу — {step['title']}",
                      f"  что делаем: {summary}"]

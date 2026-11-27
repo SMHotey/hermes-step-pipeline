@@ -9,17 +9,19 @@
 Использование:
     python .pipeline/next_step.py                # пакет контекста
     python .pipeline/next_step.py --brief        # короткая версия (для промта)
-    python .pipeline/next_step.py --json         # машинный формат (только чтение, ничего не пишет)
+    python .pipeline/next_step.py --json         # машинный формат (его читает gate.py)
+    python .pipeline/next_step.py --package      # пакет шага: записать и напечатать путь и числа
     python .pipeline/next_step.py --step S3      # принудительно конкретный шаг
     python .pipeline/next_step.py --list         # все шаги плана и статус
     python .pipeline/next_step.py --list-plans   # все планы: следующий шаг, закрыто
 
-Скрипт репозиторий не меняет: единственная запись — пакет шага (объявленные файлы целиком)
-в каталог состояния `<state_dir>/digest/` (план 9, S5).
+Скрипт репозиторий не меняет: единственная запись — пакет шага (флаг `--package` и сборка карточки
+шага) в каталог состояния `<state_dir>/package-plan-<N>-<ШАГ>.md` (план 9, S5).
 """
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
@@ -31,7 +33,6 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config as config_mod  # noqa: E402 - модуль рядом
-import digest  # noqa: E402 - пакет шага: объявленные файлы целиком (план 9, S5)
 import registry  # noqa: E402 - реестр планов
 
 
@@ -375,13 +376,8 @@ def git_state(cfg: config_mod.Config) -> dict[str, object]:
 
 
 def build_package(cfg: config_mod.Config, plan_id: str | None = None,
-                  force_step: str | None = None, brief: bool = False,
-                  persist: bool = True) -> dict[str, Any]:
-    """Пакет контекста шага: контракт, состояние git, что осталось.
-
-    `persist=False` — режим чтения (машинный `--json` для панели и предпросмотра): пакет
-    шага считается, но в проект ничего не пишется, иначе просмотр менял бы дерево.
-    """
+                  force_step: str | None = None, brief: bool = False) -> dict[str, Any]:
+    """Пакет контекста шага: контракт, состояние git, что осталось."""
     plan_id = registry.normalize(plan_id or registry.default_plan_id(cfg))
     spec = registry.get(cfg, plan_id)
     steps = plan_steps(cfg, Path(spec.file))
@@ -415,41 +411,346 @@ def build_package(cfg: config_mod.Config, plan_id: str | None = None,
                        f"(заголовки `### <ШАГ>. название`)")
     elif target is None:
         pkg["note"] = f"все шаги плана {plan_id} закрыты — следующих нет"
-    if target is not None:
-        pkg["digest"] = digest_meta(cfg, plan_id, spec, target, persist)
     return pkg
 
 
-def digest_meta(cfg: config_mod.Config, plan_id: str, spec, step: Step,
-                persist: bool = True) -> dict[str, Any]:
-    """Мета пакета шага (S5): файл пакета в каталоге состояния и числа «целиком/фрагментами».
+# ANCHOR:дайджест — пакет шага: объявленные файлы целиком, лимит — предохранитель (план 9, S5)
+# Числа — из §S5 плана: под пакет идёт 45 % окна профиля, токен смешанного русского кода —
+# ≈1,35 символа. Бюджет считается из окна, а не зашивается константой: 607 500 и 77 760
+# символов — результаты на окнах 1 млн и 128k, а не константы. Смысл пакета не в экономии окна:
+# объём шага ограничен, вход исполнителя и ревьюера один и тот же, а объявленные файлы — ещё и
+# граница правок (F01). Тихая обрезка запрещена: что не влезло — помечено, перебор даёт F09.
+DIGEST_WINDOW_SHARE = 0.45
+DIGEST_CHARS_PER_TOKEN = 1.35
+DIGEST_WINDOW_DEFAULT = 128_000
+DIGEST_FRAGMENT_LINES = 80      # строк в окрестности якоря и в начале файла без якорей
+DIGEST_COMMITS = 3              # последних коммитов по объявленным файлам
+DIGEST_TEST_HINTS = 20          # строк «релевантные тесты по имени»
+DIGEST_RESERVE = 600            # запас бюджета под шапку, «что не вошло» и находки
+DIGEST_ANCHOR_RE = re.compile(r"ANCHOR:([\w\-]+)", re.UNICODE)
+DIGEST_FENCE = "````"           # ограда длиннее стандартной: в файлах движка есть свои ```
+DIGEST_OUTSIDE_NOTE = ("остальной репозиторий не читался: в пакет попадают только объявленные "
+                       "файлы шага")
+DIGEST_NO_COMMIT = "F01 — коммита шага нет: проверка в карточке ревью"
 
-    Пакет собирается здесь же, потому что это вход исполнителя: сессия, начатая командой
-    `python .pipeline/next_step.py`, получает файл с объявленными файлами шага целиком, а не
-    первые 400 строк. Сбой сборки — строка `error` в мете, а не падение команды. Машинный
-    режим (`persist=False`) пакет считает, но в проект не пишет: так смотрит панель.
+
+def window_tokens(cfg) -> tuple[int, str]:
+    """Окно профиля в токенах и источник значения (Д1).
+
+    Читается терпимо: целое, строка из цифр и целый `float` годятся; отсутствие ключа, ноль,
+    отрицательное, дробное и мусор дают `DIGEST_WINDOW_DEFAULT`. Опечатка владельца не роняет
+    конвейер, но и не проходит молча: шапка пакета говорит, откуда окно.
+    """
+    key = "checks.context_window_tokens"
+    raw = getattr(cfg, "state", None) or {}
+    block = raw.get("checks") if isinstance(raw, dict) else None
+    value = block.get("context_window_tokens") if isinstance(block, dict) else None
+    if value is None:
+        return DIGEST_WINDOW_DEFAULT, f"по умолчанию: в конфиге нет `{key}`"
+    number: int | None = None
+    if isinstance(value, bool):
+        number = None
+    elif isinstance(value, int):
+        number = value
+    elif isinstance(value, float) and value.is_integer():
+        number = int(value)
+    elif isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+    if number is None or number <= 0:
+        return DIGEST_WINDOW_DEFAULT, f"по умолчанию: `{key}`={value!r} не годится"
+    return number, f"из `{key}`"
+
+
+def digest_budget(window: int) -> int:
+    """Бюджет пакета в символах: `round(окно × 0,45 × 1,35)` (Д2, Д3 — символы, не байты)."""
+    return int(round(int(window) * DIGEST_WINDOW_SHARE * DIGEST_CHARS_PER_TOKEN))
+
+
+def digest_path(cfg, plan_id: str, step_id: str) -> Path:
+    """Файл пакета шага: `<state_dir>/package-plan-<N>-<ШАГ>.md`.
+
+    Имя `digest.json` не занимается: оно принадлежит сводке уведомлений проекта.
+    """
+    return Path(cfg.state_dir) / f"package-plan-{plan_id}-{str(step_id).upper()}.md"
+
+
+def _digest_declared(step: dict) -> list[str]:
+    """Объявленные файлы шага в порядке плана: нормализованные пути без дублей."""
+    out: list[str] = []
+    for item in step.get("files") or []:
+        path = str(item).strip().strip("`").replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        if path and path not in out:
+            out.append(path)
+    return out
+
+
+def _digest_num(value) -> str:
+    """Число с пробелами между разрядами: пакет читает человек."""
+    return f"{int(value or 0):,}".replace(",", " ")
+
+
+def _digest_read(path: Path) -> tuple[str, bool]:
+    """Текст файла; нет файла или не читается — `("", False)`, а не исключение."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace"), True
+    except OSError:
+        return "", False
+
+
+def _digest_ranges(text: str) -> list[tuple[int, int]]:
+    """Окрестности якорей `ANCHOR:` — ±`DIGEST_FRAGMENT_LINES` строк, пересечения слиты.
+
+    Якорей нет — первые `DIGEST_FRAGMENT_LINES` строк: пустой фрагмент был бы хуже честного
+    начала файла. Индексы с нуля, границы полуоткрытые.
+    """
+    lines = text.splitlines()
+    if not lines:
+        return []
+    starts = sorted({index for index, line in enumerate(lines) if DIGEST_ANCHOR_RE.search(line)})
+    if not starts:
+        return [(0, min(len(lines), DIGEST_FRAGMENT_LINES))]
+    ranges: list[tuple[int, int]] = []
+    for index in starts:
+        start = max(0, index - DIGEST_FRAGMENT_LINES)
+        end = min(len(lines), index + DIGEST_FRAGMENT_LINES + 1)
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+        else:
+            ranges.append((start, end))
+    return ranges
+
+
+def _digest_whole(rel: str, text: str) -> str:
+    """Файл целиком: заголовок с числом строк и символов, тело под оградой."""
+    lines = text.splitlines()
+    return (f"## Файл: {rel} — целиком ({_digest_num(len(lines))} строк, "
+            f"{_digest_num(len(text))} символов)\n\n"
+            f"{DIGEST_FENCE}\n{text.rstrip()}\n{DIGEST_FENCE}\n")
+
+
+def _digest_fragment(rel: str, text: str) -> str:
+    """Фрагменты файла с пометкой обрезки: видно, что прочитано не всё и докуда."""
+    lines = text.splitlines()
+    ranges = _digest_ranges(text)
+    if not ranges:
+        return f"## Файл: {rel} — обрезано: файл пуст\n"
+    spans = ", ".join(f"{start + 1}–{end}" for start, end in ranges)
+    tail = "" if DIGEST_ANCHOR_RE.search(text) else " (якорей нет)"
+    parts = [f"## Файл: {rel} — обрезано: строки {spans} из {_digest_num(len(lines))}{tail}\n"]
+    for start, end in ranges:
+        chunk = "\n".join(lines[start:end])
+        parts.append(f"{DIGEST_FENCE}\n# строки {start + 1}–{end} из {len(lines)}\n"
+                     f"{chunk}\n{DIGEST_FENCE}\n")
+    return "\n".join(parts)
+
+
+def _digest_commits(cfg, declared: list[str]) -> list[str]:
+    """Последние `DIGEST_COMMITS` коммитов по объявленным файлам: sha, дата, тема."""
+    if not declared:
+        return ["- объявленных файлов нет: коммитов не ищем"]
+    cmd = ["git", "log", f"-{DIGEST_COMMITS}", "--pretty=format:%h %ad %s", "--date=short",
+           "--", *declared]
+    try:
+        res = subprocess.run(cmd, cwd=str(cfg.repo), capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return ["- git недоступен: коммиты по файлам не прочитаны"]
+    if res.returncode != 0:
+        return ["- git недоступен: коммиты по файлам не прочитаны"]
+    rows = [line.strip() for line in (res.stdout or "").splitlines() if line.strip()]
+    return [f"- {row}" for row in rows] or ["- коммитов по объявленным файлам нет"]
+
+
+def _digest_tests(cfg, declared: list[str]) -> list[str]:
+    """Тесты, чьё имя содержит основу объявленного файла (`gate` → `test_gate_e2e.py`).
+
+    Содержимое тестов не читается — только имена: пакет даёт карту, а не второй прогон.
+    """
+    stems = {Path(rel).stem.lower() for rel in declared if Path(rel).suffix == ".py"}
+    if not stems:
+        return ["- тестов по имени нет: объявленные файлы не `*.py`"]
+    base = Path(cfg.repo) / "tests"
+    if not base.is_dir():
+        return ["- каталога `tests/` нет"]
+    found: list[str] = []
+    for path in sorted(base.rglob("*.py")):
+        name = path.name.lower()
+        if any(stem in name for stem in stems):
+            found.append(path.relative_to(Path(cfg.repo)).as_posix())
+    if not found:
+        return ["- тестов по имени нет"]
+    shown = [f"- {rel}" for rel in found[:DIGEST_TEST_HINTS]]
+    if len(found) > DIGEST_TEST_HINTS:
+        shown.append(f"- … и ещё {len(found) - DIGEST_TEST_HINTS}")
+    return shown
+
+
+def _digest_cut(text: str, budget: int) -> str:
+    """Обрезать пакет до бюджета с честной пометкой: предохранитель, а не украшение."""
+    mark = "\n…обрезано: пакет длиннее бюджета — объявленные файлы смотреть по одному\n"
+    if budget <= len(mark):
+        return mark.strip("\n")
+    return text[:budget - len(mark)] + mark
+
+
+def digest_f01(cfg, step: dict, plan_id: str) -> str:
+    """Строка F01 пакета: посторонние файлы коммита шага — проверка S4 (Д6).
+
+    Импорт `gate` ленивый: `gate.py` импортирует `next_step` на уровне модуля, и обратный
+    модульный импорт дал бы вторую копию модуля, когда `next_step.py` запускают скриптом.
+    «Коммита шага ещё нет» — это отсутствие доказательства прогонов на текущем HEAD: тот же
+    признак, по которому страж не кладёт `ctx["step_runs"]`.
     """
     try:
-        return digest.collect(cfg, asdict(step), plan_id, Path(spec.file), persist=persist)
-    except (OSError, ValueError, KeyError) as exc:
-        return {"error": str(exc)[:200]}
+        import gate  # ленивый импорт: обратный к модульному импорту gate
+
+        paths = gate.resolve_paths(cfg, plan_id)
+        sha = gate.head_commit(paths)
+        if not sha or gate.load_runs_proof(paths, str(step.get("id") or ""), sha) is None:
+            return DIGEST_NO_COMMIT
+        offenders = gate.step_file_offenders(paths, step, sha)
+        count = len(gate.commit_files(paths, sha))
+    except (OSError, ValueError, KeyError, AttributeError) as exc:
+        return f"F01 — не проверено: {str(exc)[:120]}"
+    if offenders:
+        return "F01 — файлов вне объявленных: " + ", ".join(offenders)
+    return f"F01 — файлов вне объявленных нет ({count} файлов)"
 
 
-def digest_render_lines(meta: dict[str, Any]) -> list[str]:
-    """Строки пакета шага в человеческом выводе: файл, числа «целиком/фрагментами» и F09."""
-    if not meta:
-        return []
-    if meta.get("error"):
-        return [f"  пакет шага: не собран — {meta['error']}"]
-    out = [f"  пакет шага: {meta.get('path')} — целиком: {len(meta.get('full') or [])}, "
-           f"фрагментами: {len(meta.get('fragmented') or [])}, "
-           f"не вошло: {len(meta.get('omitted') or [])} "
-           f"(бюджет {meta.get('budget')} символов на окне {meta.get('window')})"]
-    if meta.get("written") is False:
-        out.append("  пакет не записан: режим чтения (--json) в проект не пишет")
-    if meta.get("finding"):
-        out.append(f"  {meta['finding']}")
-    return out
+def _digest_build(cfg, step: dict, plan_id: str | None = None) -> dict[str, Any]:
+    """Собрать пакет шага без записи: шапка, файлы, коммиты, тесты, «что не вошло», находки.
+
+    Порядок разделов фиксирован (§4.2 постановки): по нему пакет читают и исполнитель, и
+    ревьюер. Файлы идут в порядке объявленного списка: целиком, если вписываются в остаток
+    бюджета, иначе — окрестностями якорей, иначе — в «что не вошло» с причиной.
+    """
+    plan_id = registry.normalize(plan_id or registry.default_plan_id(cfg))
+    step_id = str(step.get("id") or "").upper()
+    window, source = window_tokens(cfg)
+    budget = digest_budget(window)
+    declared = _digest_declared(step)
+    git = git_state(cfg)
+    head = [
+        f"ПАКЕТ ШАГА — {cfg.project}: план {plan_id}, шаг {step_id} — {step.get('title', '')}",
+        f"HEAD: {git.get('head') or '?'} · {git.get('branch') or '?'}",
+        f"Окно профиля: {_digest_num(window)} токенов ({source}); бюджет пакета "
+        f"{_digest_num(budget)} символов (45 % окна × 1,35 символа на токен)",
+    ]
+    tail = ["", f"## Последние {DIGEST_COMMITS} коммита по объявленным файлам",
+            *_digest_commits(cfg, declared),
+            "", "## Релевантные тесты по имени", *_digest_tests(cfg, declared)]
+    room = max(budget - len("\n".join(head)) - len("\n".join(tail)) - DIGEST_RESERVE, 0)
+    sections: list[str] = []
+    whole: list[str] = []
+    fragments: list[str] = []
+    missing: list[str] = []
+    omitted: list[str] = []
+    volume = 0
+    for rel in declared:
+        text, exists = _digest_read(Path(cfg.repo) / rel)
+        if not exists:
+            missing.append(rel)
+            sections.append(f"## Файл: {rel} — нет файла в репозитории\n")
+            continue
+        volume += len(text)
+        section = _digest_whole(rel, text)
+        if len(section) <= room:
+            sections.append(section)
+            room -= len(section)
+            whole.append(rel)
+            continue
+        piece = _digest_fragment(rel, text)
+        if len(piece) <= room:
+            sections.append(piece)
+            room -= len(piece)
+            fragments.append(rel)
+            continue
+        omitted.append(rel)
+    finding_f09 = ""
+    if fragments or omitted:
+        finding_f09 = (f"F09 — {registry.finding_code_title('F09')}: объём "
+                       f"{_digest_num(volume)} при бюджете {_digest_num(budget)}; файлов "
+                       f"фрагментами {len(fragments)} из {len(declared)}")
+    finding_f01 = digest_f01(cfg, step, plan_id)
+    outside = ["", "## Что не вошло", f"- {DIGEST_OUTSIDE_NOTE}"]
+    if omitted:
+        outside.append(f"- не вошло: бюджет исчерпан — {', '.join(omitted)}")
+    if missing:
+        outside.append(f"- нет файла в репозитории: {', '.join(missing)}")
+    founds = ["", "## Находки", f"- {finding_f01}"]
+    if finding_f09:
+        founds.append(f"- {finding_f09}")
+    mode = "фрагменты" if fragments or omitted else "целиком"
+    # «Объём пакета» — итог целиком, поэтому строка вставляется после сборки текста: иначе
+    # шапка показывала бы объём без хвоста (коммиты, «что не вошло», находки).
+    counts = (f"Объём пакета: {{v}} символов; режим: {mode}; файлов целиком: {len(whole)}, "
+              f"фрагментами: {len(fragments)}")
+    placeholder = counts.format(v=0)
+    head.append(placeholder)
+    text = "\n".join([*head, "", *sections, *tail, *outside, *founds]) + "\n"
+    line = counts.format(v=len(text))
+    text = text.replace(placeholder, line, 1)
+    exact = counts.format(v=len(text))
+    if exact != line:
+        text = text.replace(line, exact, 1)
+    if len(text) > budget:
+        text = _digest_cut(text, budget)
+    return {
+        "path": str(digest_path(cfg, plan_id, step_id)),
+        "text": text,
+        "chars": len(text),
+        "budget": budget,
+        "window": window,
+        "window_source": source,
+        "whole": whole,
+        "fragments": fragments,
+        "missing": missing,
+        "f09": finding_f09,
+        "f01": finding_f01,
+    }
+
+
+def _digest_write(path: Path, text: str) -> None:
+    """Атомарная запись пакета: временный файл рядом, fsync, `os.replace`.
+
+    `newline=""` обязателен: на Windows обычная запись превращает каждый перевод строки в
+    CRLF, и файл оказывается длиннее посчитанного объёма — предохранитель и число в шапке
+    начинают врать. Одинаковые байты на Windows и Linux — часть идемпотентности.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    try:
+        with io.open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def build_digest(cfg, step: dict, plan_id: str | None = None) -> dict[str, Any]:
+    """Пакет шага: собрать, записать атомарно и вернуть путь, объём, бюджет и находки.
+
+    Ни даты, ни времени, ни случайных значений — ни в имени, ни в теле: два прогона на одном
+    дереве дают одинаковые байты. Запись атомарная (`os.replace`): ревьюер не увидит пакет,
+    записанный наполовину.
+    """
+    pkg = _digest_build(cfg, step, plan_id)
+    _digest_write(Path(pkg["path"]), pkg["text"])
+    return pkg
+
+
+def digest_summary(cfg, step: dict, plan_id: str | None = None) -> dict[str, Any]:
+    """Тот же пакет, но без записи: файл уже есть, и пересобирать его поверх нельзя (Д5)."""
+    return _digest_build(cfg, step, plan_id)
 
 
 def render(pkg: dict[str, Any], brief: bool) -> str:
@@ -477,7 +778,6 @@ def render(pkg: dict[str, Any], brief: bool) -> str:
     lines.append("")
     lines.append("Файлы (правим/создаём):")
     lines.extend(f"  - {f}" for f in step["files"])
-    lines += digest_render_lines(pkg.get("digest") or {})
     lines.append("Гейты (запустить и показать результат):")
     lines.extend(f"  $ {g}" for g in step["gates"])
     lines.append(f"Готово = {step['dod']}")
@@ -529,14 +829,41 @@ def plans_overview(cfg: config_mod.Config) -> list[dict[str, Any]]:
     return rows
 
 
+def _package_step(cfg, plan_id: str, spec, force_step: str | None = None) -> Step | None:
+    """Шаг, для которого собирается пакет: названный `--step` или первый открытый."""
+    steps = plan_steps(cfg, Path(spec.file))
+    if force_step:
+        target = next((s for s in steps if s.id.upper() == force_step.upper()), None)
+        if target is None:
+            raise SystemExit(f"неизвестный шаг: {force_step} (план {plan_id}). Доступные: " +
+                             (", ".join(s.id for s in steps) or "шаги плана не распознаны"))
+        return target
+    closed_all = set(registry.closed_steps(spec, cfg))
+    return next((s for s in steps if s.id.upper() not in closed_all), None)
+
+
+def _print_package(cfg, plan_id: str, spec, force_step: str | None = None) -> int:
+    """`--package`: записать пакет шага и напечатать одной строкой путь, числа и объём."""
+    target = _package_step(cfg, plan_id, spec, force_step)
+    if target is None:
+        print(f"план {plan_id}: пакет не собран — открытых шагов нет")
+        return 0
+    pkg = build_digest(cfg, asdict(target), plan_id)
+    print(f"пакет шага: {pkg['path']} — файлов целиком: {len(pkg['whole'])}, фрагментами: "
+          f"{len(pkg['fragments'])}; бюджет {pkg['budget']} символов, "
+          f"объём {pkg['chars']} символов")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     config_mod.setup_stdio()
     parser = argparse.ArgumentParser(description="Контекст следующего шага плана")
     parser.add_argument("--plan", help="номер плана (по умолчанию из pipeline.json)")
     parser.add_argument("--step", help="принудительный шаг, например S3")
-    parser.add_argument("--json", action="store_true",
-                        help="машинный вывод (только чтение: пакет шага не пишется)")
+    parser.add_argument("--json", action="store_true", help="машинный вывод")
     parser.add_argument("--brief", action="store_true", help="короткая версия для промта")
+    parser.add_argument("--package", action="store_true",
+                        help="пакет шага: записать файл и напечатать путь и числа")
     parser.add_argument("--list", action="store_true", help="все шаги плана и статус")
     parser.add_argument("--list-plans", action="store_true",
                         help="все планы: следующий шаг и число закрытых")
@@ -569,8 +896,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"план {plan_id}: раздел шагов не распознан")
         return 0
 
+    if args.package:
+        return _print_package(cfg, plan_id, spec, args.step)
+
     try:
-        pkg = build_package(cfg, plan_id, args.step, args.brief, persist=not args.json)
+        pkg = build_package(cfg, plan_id, args.step, args.brief)
     except registry.PlanNotFound as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 2
